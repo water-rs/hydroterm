@@ -1,0 +1,25 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# Commands run from the repo root.
+# One-time setup: GBM headers for wgpu + the pinned nightly for water-rs/lints (dylint).
+initialize: |
+  sudo apt-get update && sudo apt-get install -y libgbm-dev xclip
+  rustup toolchain install nightly-2026-05-28 --component llvm-tools-preview --component rustc-dev
+  cargo install cargo-dylint dylint-link
+# Install project dependencies.
+maintenance: |
+  cargo fetch
+# Reference info for agent
+knowledge:
+  - name: lint
+    contents: |
+      # zero-warning policy: both must be clean
+      cargo clippy
+      cargo +nightly-2026-05-28 dylint --all
+  - name: run
+    contents: |
+      # llvmpipe-only VM — the fallback adapter env var is required
+      WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER=1 cargo run
+  - name: notes
+    contents: |
+      # Drive the running UI headlessly: wmctrl -a hydroterm; xdotool type/key/mousemove/click.
+      # Input-debug env: HYDROTERM_DEBUG_INPUT=1; see WATERUI_FEEDBACK.md for upstream gaps.
