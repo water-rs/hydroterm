@@ -164,14 +164,15 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Spawn a shell on a PTY and start parsing.
-    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>) -> io::Result<Self> {
+    /// Spawn a shell on a PTY and start parsing. `shell` overrides the
+    /// auto-injected shell integration (used by `shell =` config and `-e`).
+    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>, shell: Option<Shell>) -> io::Result<Self> {
         let (proxy, events_rx) = EventProxy::new();
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let options = Options {
-            shell: Some(shell_with_integration()),
+            shell: Some(shell.unwrap_or_else(shell_with_integration)),
             working_directory: cwd,
             drain_on_exit: false,
             env: [

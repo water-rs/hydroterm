@@ -25,6 +25,8 @@ use crate::fonts::FontStack;
 use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
 use crate::mouse::{self, CellPos, MouseAction};
 use crate::palette::Palette;
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::scene::{self, CursorInfo, DrawContext, PADDING, ScrollInfo, cursor_info};
 use crate::osctap::TapEvent;
 use crate::terminal::TermEvent;
@@ -66,7 +68,8 @@ pub struct TermSurface {
     session: Arc<Session>,
     app: AppState,
     fonts: FontStack,
-    palette: Palette,
+    /// Shared palette — swapped on theme reload.
+    palette: Rc<RefCell<Palette>>,
     font_size_pt: f32,
 
     // GPU plumbing
@@ -99,13 +102,14 @@ pub struct TermSurface {
 
 impl TermSurface {
     /// Wrap a session in a GPU surface renderer.
-    pub fn new(session: Arc<Session>, app: AppState) -> Self {
+    pub fn new(session: Arc<Session>, app: AppState, palette: Rc<RefCell<Palette>>) -> Self {
+        let font_size = session.font_size.get();
         Self {
             session,
             app,
-            fonts: FontStack::load(FONT_SIZE, 1.0),
-            palette: Palette::default(),
-            font_size_pt: FONT_SIZE,
+            fonts: FontStack::load(font_size, 1.0),
+            palette,
+            font_size_pt: font_size,
             scene: None,
             renderer: None,
             blit: None,
@@ -237,6 +241,33 @@ impl TermSurface {
             }
             TermAction::PromptPrev => self.jump_prompt(-1),
             TermAction::PromptNext => self.jump_prompt(1),
+            TermAction::SelectAll => {
+                let mut term = self.session.terminal.term.lock();
+                let history = term.grid().history_size();
+                let lines = term.grid().screen_lines();
+                let cols = term.grid().columns();
+                let start = Point::new(Line(-(history as i32)), Column(0));
+                let end = Point::new(Line(lines as i32 - 1), Column(cols - 1));
+                term.selection = Some(Selection::new(SelectionType::Simple, start, Side::Left));
+                if let Some(sel) = &mut term.selection {
+                    sel.update(end, Side::Right);
+                }
+            }
+            TermAction::ScrollToTop => {
+                self.session
+                    .terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Top);
+            }
+            TermAction::ScrollToBottom => {
+                self.session
+                    .terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Bottom);
+            }
+            TermAction::Quit => self.app.quit(),
         }
     }
 
@@ -351,7 +382,7 @@ impl TermSurface {
                     self.write(fmt(&text).into_bytes());
                 }
                 TermEvent::ColorRequest(index, fmt) => {
-                    let rgb = self.palette.at(index);
+                    let rgb = self.palette.borrow().at(index);
                     self.write(fmt(rgb).into_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(fmt) => {
@@ -440,6 +471,15 @@ impl TermSurface {
         }
         let mode = *self.session.terminal.term.lock().mode();
         if pressed {
+            // Config keybinds first — they may re-map or disable defaults.
+            match self.app.config(|c| c.lookup_keybind(key, mods)) {
+                Some(Some(action)) => {
+                    self.do_action(action);
+                    return;
+                }
+                Some(None) => return, // explicitly disabled
+                None => {}
+            }
             if let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods)) {
                 self.do_action(action);
                 return;
@@ -631,10 +671,13 @@ impl TermSurface {
             }
         } else if button == SurfacePointerButton::Primary {
             self.selecting = false;
-            // Click without drag (tiny movement) clears the selection.
             let mut term = self.session.terminal.term.lock();
             if term.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                // Click without drag (tiny movement) clears the selection.
                 term.selection = None;
+            } else if self.app.config(|c| c.copy_on_select) {
+                drop(term);
+                self.copy_selection();
             }
         }
     }
@@ -732,6 +775,7 @@ impl TermSurface {
             history_size: grid.history_size(),
             screen_lines: grid.screen_lines(),
         };
+        let palette = self.palette.borrow();
         let bell_alpha = self
             .bell_at
             .map(|t| (1.0 - t.elapsed().as_secs_f32() / BELL_FLASH_SECS).max(0.0) * 0.18)
@@ -740,7 +784,7 @@ impl TermSurface {
         let blink_on = self.blink_on();
         let focused = self.focused;
         let mut ctx = DrawContext {
-            palette: &self.palette,
+            palette: &palette,
             fonts: &mut self.fonts,
             width,
             height,
@@ -1008,6 +1052,7 @@ impl GpuView for TermSurface {
     }
 
     fn render(&mut self, frame: &mut GpuFrame) {
+        self.app.poll_config();
         self.drain_events();
         self.sync_fonts(frame.scale());
         self.sync_size(frame.width, frame.height);

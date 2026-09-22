@@ -1,20 +1,24 @@
 //! Application state: the session list, tab selection, and the actions the
 //! surfaces trigger (new/close/cycle tabs, font size, clipboard).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::term::Config;
+use alacritty_terminal::tty::Shell;
+use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
 use waterui::prelude::*;
 use waterui_graphics::GpuSurface;
 
+use crate::config::{AppConfig, ConfigWatcher};
+use crate::palette::Palette;
 use crate::surface::TermSurface;
 use crate::terminal::Terminal;
 
-/// How many lines of scrollback each session keeps.
-pub const HISTORY_LINES: usize = 10_000;
-/// Default font size in points.
+/// Default font size in points (the config file may override).
 pub const FONT_SIZE: f32 = 13.0;
 
 /// Shared per-session UI state: the bindings a tab label / window title /
@@ -34,20 +38,32 @@ pub struct Session {
 }
 
 impl Session {
-    fn spawn(id: u64, cwd: Option<std::path::PathBuf>) -> Self {
+    fn spawn(id: u64, cwd: Option<std::path::PathBuf>, cfg: &AppConfig) -> Self {
         let config = Config {
-            scrolling_history: HISTORY_LINES,
+            scrolling_history: cfg.scrollback,
             kitty_keyboard: true,
+            default_cursor_style: CursorStyle {
+                shape: cfg.cursor_shape,
+                blinking: cfg.cursor_blink,
+            },
             ..Default::default()
         };
+        // `-e` > `shell =` > auto-injected shell integration.
+        let shell = if let Some(cmd) = &cfg.command {
+            Some(Shell::new(cmd[0].clone(), cmd[1..].to_vec()))
+        } else {
+            cfg.shell
+                .as_ref()
+                .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
+        };
         // A reasonable initial grid; the surface resizes on its first frame.
-        let terminal = Terminal::spawn(config, 120, 32, (9, 18), cwd)
+        let terminal = Terminal::spawn(config, 120, 32, (9, 18), cwd, shell)
             .expect("failed to spawn PTY — is a shell available?");
         Self {
             id,
             terminal: Arc::new(terminal),
             title: binding(Str::from("Shell")),
-            font_size: Binding::f32(FONT_SIZE),
+            font_size: Binding::f32(cfg.font_size),
             exited: Binding::bool(false),
             cwd: std::sync::Mutex::new(None),
         }
@@ -66,6 +82,10 @@ pub struct AppState {
     pub tab_ids: Binding<Vec<u64>>,
     /// Window title binding.
     pub window_title: Binding<Str>,
+    /// Config file state (parsed values + mtime watch).
+    pub cfg: Rc<RefCell<ConfigWatcher>>,
+    /// The active palette — swapped wholesale on theme reload.
+    pub palette: Rc<RefCell<Palette>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -75,16 +95,59 @@ impl AppState {
     // and are consumed in `render`), so the `Arc`s only need UI confinement,
     // not Send+Sync — `Binding` is not Send+Sync by design.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new() -> Self {
+    pub fn new(config_path: Option<std::path::PathBuf>, command: Option<Vec<String>>) -> Self {
+        let mut watcher = ConfigWatcher::new(config_path);
+        watcher.config.command = command;
+        for e in &watcher.errors {
+            eprintln!("hydroterm config: {e}");
+        }
+        let palette = Palette::from_theme(&watcher.config.resolve_theme());
         let state = Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
             selected: Binding::u64(0),
             tab_ids: Binding::default(),
             window_title: binding(Str::from("hydroterm")),
+            cfg: Rc::new(RefCell::new(watcher)),
+            palette: Rc::new(RefCell::new(palette)),
             next_id: Arc::new(AtomicU64::new(0)),
         };
         state.new_tab();
+        // `-e` applies to the first session only (like xterm/kitty).
+        state.cfg.borrow_mut().config.command = None;
         state
+    }
+
+    /// Re-read the config file when it changed; live-applies font size,
+    /// theme and keybinds. Called from each surface's render loop.
+    pub fn poll_config(&self) {
+        let (config, errors, changed) = {
+            let mut w = self.cfg.borrow_mut();
+            if !w.poll() {
+                return;
+            }
+            (w.config.clone(), w.errors.clone(), true)
+        };
+        let _ = changed;
+        for e in &errors {
+            eprintln!("hydroterm config: {e}");
+        }
+        *self.palette.borrow_mut() = Palette::from_theme(&config.resolve_theme());
+        for s in self.sessions.lock().unwrap().iter() {
+            s.font_size.set(config.font_size);
+        }
+    }
+
+    /// Read-only access to the current config.
+    pub fn config<R>(&self, f: impl FnOnce(&AppConfig) -> R) -> R {
+        f(&self.cfg.borrow().config)
+    }
+
+    /// Shut every session down and exit the process.
+    pub fn quit(&self) {
+        for s in self.sessions.lock().unwrap().iter() {
+            s.terminal.shutdown();
+        }
+        std::process::exit(0);
     }
 
     /// Snapshot of the session list.
@@ -108,7 +171,8 @@ impl AppState {
             .iter()
             .find(|s| s.id == self.selected.get())
             .and_then(|s| s.cwd.lock().unwrap().clone());
-        let session = Arc::new(Session::spawn(id, cwd));
+        let cfg = self.cfg.borrow().config.clone();
+        let session = Arc::new(Session::spawn(id, cwd, &cfg));
         self.sessions.lock().unwrap().push(session);
         self.selected.set(id);
         self.tab_ids.append(id);
@@ -173,8 +237,13 @@ pub fn tabs_view(state: AppState) -> impl View {
             .filter_map(|id| sessions.iter().find(|s| s.id == *id).cloned())
             .map(|session| {
                 let app = state.clone();
+                let palette = state.palette.clone();
                 Tab::container(session.id, session.title.clone(), move || {
-                    GpuSurface::new(TermSurface::new(session.clone(), app.clone()))
+                    GpuSurface::new(TermSurface::new(
+                        session.clone(),
+                        app.clone(),
+                        palette.clone(),
+                    ))
                 })
             })
             .collect();

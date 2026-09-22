@@ -6,13 +6,16 @@
 //! selection (click/drag/word/line/block), copy/paste with bracketed paste,
 //! mouse reporting (X10/SGR/UTF-8 + wheel/drag), cursor styles + blink,
 //! IME preedit, OSC title, tabs, font-size chords, alternate scroll,
-//! OSC8 hyperlinks, bell, kitty keyboard protocol, in-surface search.
+//! OSC8 hyperlinks, bell, kitty keyboard protocol, in-surface search,
+//! `key = value` config with hot reload, named themes, OSC 133 prompt
+//! marks + jump, OSC 7 cwd inheritance, bash shell integration.
 
 // `#[allow]` targets water-rs/lints (dylint) lint names — unknown to stable
 // rustc, which would warn on the attribute itself.
 #![allow(unknown_lints)]
 
 mod app;
+mod config;
 mod fonts;
 mod keys;
 mod osctap;
@@ -21,12 +24,35 @@ mod palette;
 mod scene;
 mod surface;
 mod terminal;
+mod theme;
 
 use waterui::app::App;
 use waterui::prelude::*;
 
+/// `hydroterm [--config PATH] [-e|-- COMMAND...]`
+fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
+    let mut config_path = None;
+    let mut command = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => config_path = args.next().map(std::path::PathBuf::from),
+            "-e" | "--" => {
+                command = Some(args.by_ref().collect::<Vec<String>>());
+                break;
+            }
+            _ => {}
+        }
+    }
+    if let Some(cmd) = &command && cmd.is_empty() {
+        command = None;
+    }
+    (config_path, command)
+}
+
 fn main() {
-    let state = app::AppState::new();
+    let (config_path, command) = cli();
+    let state = app::AppState::new(config_path, command);
     let title = state.window_title.clone();
     let app = App::new(
         {

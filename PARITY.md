@@ -35,18 +35,19 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Clipboard | Paste via Ctrl+Shift+V / middle-click (bracketed) | ✅ | paste `hello` at prompt |
 | Clipboard | OSC 52 write + read | ✅ | `printf '\e]52;c;aGVsbG8=\a'` → `xclip -o` = hello |
 | Selection | Click-drag / word (dbl) / line (triple), right-click extend | ✅ | drag/select; timing multi-click |
-| Selection | Copy-on-select | ❌ | config key planned |
+| Selection | Copy-on-select | ✅ | `copy-on-select = true` in config |
 | Links | OSC 8 hyperlink render + Ctrl+click open | ✅ | `printf '\e]8;;https://example.com\e\\link\e]8;;\e\\'` |
 | Links | Plain-text URL detect + open | ❌ | regex over grid rows on click — planned |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, resize, focus nav | ❌ | pane tree inside tab — planned (needs custom container; hydrolysis has no splitter) |
 | Windows | Multi-window | 🚫 | hydrolysis winit runner spawns 1 window — needs upstream API |
 | Quick terminal | Drop-down/global-hotkey terminal | 🚫 | X11 global grab needs x11 dep; deferred |
-| Config | `key = value` config file (~/.config/hydroterm/config) | ❌ | parser + unit tests planned |
-| Config | Hot reload on file change | ❌ | mtime poll → apply |
-| Config | `keybind` bindings (trigger=action) | ❌ | planned |
-| Theme | Built-in themes | ❌ | planned |
-| Theme | Auto light/dark follow system | ❌ | `gsettings monitor` when present |
+| Config | `key = value` config file (~/.config/hydroterm/config) | ✅ | 8 parser unit tests; template auto-written |
+| Config | Hot reload on file change | ✅ | mtime poll (400ms); verified live font-size + theme swap |
+| Config | `keybind = chord=action` incl. unbind | ✅ | unit tests + live `ctrl+shift+q=quit` verified |
+| Theme | Built-in themes (hydroterm-dark/light, solarized-dark/light) | ✅ | `theme =` config; live swap verified |
+| Theme | `theme = auto` follows desktop color-scheme | 🟡 | resolved per (re)load via gsettings; no live OS-change subscription |
+| Cursor | `cursor-shape`/`cursor-blink` config | ✅ | spawn-time (alacritty has no config setter) |
 | Font | Fallback chain (fontconfig) | ✅ | missing glyph → fallback font |
 | Font | Ligatures | 🟡 | rustybuzz shapes runs — verify `=>`, `!=` visually |
 | Font | Emoji + grapheme clusters (ZWJ, VS16) | 🟡 | single emoji ok; ZWJ via segmentation — verify |
@@ -68,7 +69,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Window | Title reporting (OSC 0/2) | ✅ | title → window title binding |
 | Window | Fullscreen | 🟡 | WindowHandle.fullscreen exists — needs keybind |
 | Window | Confirm-close when child running | 🚫 | no close-request hook — WATERUI_FEEDBACK #4 |
-| Misc | `-e cmd`, `--config` args | ❌ | planned with config work |
+| Misc | `-e cmd`, `--config` args | ✅ | verified: `-e bash -c 'echo E_MARKER'` |
 | Misc | Quit action, process-group cleanup | ✅ | window close → Shutdown |
 
 ## Metrics (to be filled by benchmark task)

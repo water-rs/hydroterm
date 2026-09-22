@@ -76,6 +76,20 @@ impl Default for Palette {
 }
 
 impl Palette {
+    /// Build a palette from a named theme, keeping the standard
+    /// cube/grayscale ramps for indexed colors 16-255.
+    pub fn from_theme(theme: &crate::theme::Theme) -> Self {
+        let mut palette = Self::default();
+        palette.indexed[..16].copy_from_slice(&theme.ansi);
+        palette.foreground = theme.foreground;
+        palette.background = theme.background;
+        palette.cursor = theme.cursor;
+        palette.dim_foreground = theme.dim_foreground;
+        palette.selection_bg = theme.selection_bg;
+        palette.selection_fg = theme.selection_fg;
+        palette
+    }
+
     /// Static lookup by index (for `ColorRequest` replies): 0-255 indexed,
     /// 256 foreground, 257 background, 258 cursor, else foreground.
     pub fn at(&self, index: usize) -> Rgb {

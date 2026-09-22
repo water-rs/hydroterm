@@ -369,5 +369,12 @@ pub enum TermAction {
     /// Jump viewport to the previous/next OSC 133 prompt mark.
     PromptPrev,
     PromptNext,
+    /// Select the whole viewport.
+    SelectAll,
+    /// Scroll the viewport to the top of scrollback / the bottom.
+    ScrollToTop,
+    ScrollToBottom,
+    /// Shut down all sessions and exit.
+    Quit,
 }
 
