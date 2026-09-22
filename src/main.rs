@@ -29,6 +29,7 @@ mod theme;
 
 use waterui::app::App;
 use waterui::prelude::*;
+use waterui::window::Window;
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
@@ -55,13 +56,16 @@ fn main() {
     let (config_path, command) = cli();
     let state = app::AppState::new(config_path, command);
     let title = state.window_title.clone();
-    let app = App::new(
+    // Own the window-state binding so keybinds can toggle fullscreen;
+    // `App::new` would bury it inside the default main window.
+    let window = Window::new(
+        title,
+        state.window_state.clone(),
         {
             let state = state.clone();
             move || app::tabs_view(state.clone())
         },
-        Environment::new(),
-    )
-    .title(title);
+    );
+    let app = App::new_with_windows([window], Environment::new());
     hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use waterui_core::layout::{ProposalSize, Size, StretchAxis, ViewDimensions};
@@ -188,10 +189,19 @@ impl TermSurface {
         }
     }
 
-    /// Open the OSC8 hyperlink under `point` in the system browser.
+    /// Open the link under `point`: an OSC8 hyperlink first, then a
+    /// plain-text URL scanned off the row (like xterm/kitty Ctrl+click).
     fn open_link_at(&self, point: Point) -> bool {
         let term = self.session.terminal.term.lock();
         let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
+        let uri = uri.or_else(|| {
+            let chars: Vec<char> = term.grid()[point.line]
+                .into_iter()
+                .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|c| c.c)
+                .collect();
+            url_at(&chars, point.column.0)
+        });
         drop(term);
         if let Some(uri) = uri {
             // Detached open — we never wait on the launcher.
@@ -270,6 +280,7 @@ impl TermSurface {
             }
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
+            TermAction::Fullscreen => self.app.toggle_fullscreen(),
         }
     }
 
@@ -390,7 +401,12 @@ impl TermSurface {
                         true => Str::from("hydroterm"),
                         false => Str::from(title),
                     };
-                    self.app.set_session_title(self.session.id, t);
+                    *self.session.base_title.lock().unwrap() = t.clone();
+                    // A 🔔 badge holds the title until user attention clears
+                    // it — the real title keeps accumulating in base_title.
+                    if !*self.session.notify_badge.lock().unwrap() {
+                        self.app.set_session_title(self.session.id, t);
+                    }
                 }
                 TermEvent::ClipboardStore(_ty, text) => {
                     if let Some(clip) = self.clipboard.as_mut() {
@@ -439,8 +455,14 @@ impl TermSurface {
                     }
                     TapEvent::PromptEnd | TapEvent::CommandStart => {}
                     TapEvent::CommandEnd(_code) => {}
-                    TapEvent::Notify(_title, _body) => {
-                        // No system-notify path yet — tracked as a feedback item.
+                    TapEvent::Notify(title, body) => {
+                        // No desktop-notification channel yet — flash the
+                        // bell and badge the title until the next prompt.
+                        self.bell_at = Some(Instant::now());
+                        let text = if title.is_empty() { body } else { format!("{title}: {body}") };
+                        *self.session.notify_badge.lock().unwrap() = true;
+                        self.app
+                            .set_session_title(self.session.id, Str::from(format!("\u{1f514} {text}")));
                     }
                     TapEvent::Apc(_payload) => {}
                 },
@@ -508,7 +530,21 @@ impl TermSurface {
         }
     }
 
+    /// User attention on this pane clears a 🔔 notification badge.
+    fn clear_notify_badge(&mut self) {
+        let mut badge = self.session.notify_badge.lock().unwrap();
+        if *badge {
+            *badge = false;
+            let t = self.session.base_title.lock().unwrap().clone();
+            drop(badge);
+            self.app.set_session_title(self.session.id, t);
+        }
+    }
+
     fn on_key(&mut self, pressed: bool, key: &Key, code: Code, mods: Modifiers) {
+        if pressed {
+            self.clear_notify_badge();
+        }
         // Search mode captures keys into the query.
         if pressed && self.search.is_some() && self.search_key(key, mods) {
             return;
@@ -659,6 +695,7 @@ impl TermSurface {
         }
 
         if pressed {
+            self.clear_notify_badge();
             match button {
                 SurfacePointerButton::Primary => {
                     // Ctrl+click opens an OSC8 link.
@@ -1228,5 +1265,90 @@ impl GpuView for TermSurface {
             Point::new(Line(bottom.saturating_sub(5)), Column(0)),
             Point::new(Line(bottom), grid.last_column()),
         ))
+    }
+}
+
+/// Recognized URL schemes for plain-text detection.
+const URL_SCHEMES: [&str; 7] = [
+    "https://",
+    "http://",
+    "file://",
+    "ssh://",
+    "git://",
+    "ftp://",
+    "gemini://",
+];
+
+/// Scan `chars` (one grid row) for a scheme:// run covering `col`.
+/// Returns the URL; wraps at row boundaries are not followed.
+fn url_at(chars: &[char], col: usize) -> Option<String> {
+    for scheme in URL_SCHEMES {
+        let sc: Vec<char> = scheme.chars().collect();
+        let mut off = 0;
+        while off + sc.len() <= chars.len() {
+            if chars[off..off + sc.len()] == sc[..] {
+                let mut end = off + sc.len();
+                while end < chars.len() && is_url_char(chars[end]) {
+                    end += 1;
+                }
+                // Trailing sentence punctuation is almost never part of the URL.
+                while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                    end -= 1;
+                }
+                if col >= off && col < end {
+                    return Some(chars[off..end].iter().collect());
+                }
+                off = end;
+            } else {
+                off += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Bytes allowed inside a bare URL — printable ASCII minus delimiters
+/// and brackets (so `](https://x)` and `<https://x>` trim correctly).
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_graphic()
+        && !matches!(
+            c,
+            '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '`'
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn url_at_finds_url_under_col() {
+        let row = chars("see https://example.com/x for docs");
+        assert_eq!(url_at(&row, 10), Some("https://example.com/x".to_string()));
+        assert_eq!(url_at(&row, 0), None);
+        assert_eq!(url_at(&row, 30), None);
+    }
+
+    #[test]
+    fn url_at_trims_trailing_punct() {
+        let row = chars("open https://a.b/c, then");
+        assert_eq!(url_at(&row, 6), Some("https://a.b/c".to_string()));
+    }
+
+    #[test]
+    fn url_at_trims_brackets() {
+        let row = chars("[x](https://a.b/?q=(r)) ");
+        // Click inside the link: parens stop the scan.
+        assert_eq!(url_at(&row, 8), Some("https://a.b/?q=".to_string()));
+    }
+
+    #[test]
+    fn url_at_second_of_two() {
+        let row = chars("https://a.b/ and http://c.d/e");
+        assert_eq!(url_at(&row, 22), Some("http://c.d/e".to_string()));
     }
 }

@@ -309,6 +309,7 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "split_down" => TermAction::SplitDown,
         "focus_next_pane" => TermAction::FocusNextPane,
         "focus_prev_pane" => TermAction::FocusPrevPane,
+        "fullscreen" => TermAction::Fullscreen,
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)

@@ -13,6 +13,7 @@ use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
 use waterui::prelude::*;
 use waterui::widget::condition::when;
+use waterui::window::WindowState;
 use waterui_graphics::GpuSurface;
 
 use crate::config::{AppConfig, ConfigWatcher};
@@ -31,6 +32,10 @@ pub struct Session {
     pub terminal: Arc<Terminal>,
     /// OSC-set title (propagates to the tab when the pane is focused).
     pub title: Binding<Str>,
+    /// Last OSC 0/2 title — restored when a 🔔 notification badge clears.
+    pub base_title: std::sync::Mutex<Str>,
+    /// A 🔔 badge is currently overriding the title.
+    pub notify_badge: std::sync::Mutex<bool>,
     /// Current font size in points.
     pub font_size: Binding<f32>,
     /// Child process exited.
@@ -73,6 +78,8 @@ impl Session {
             id,
             terminal: Arc::new(terminal),
             title: binding(Str::from("Shell")),
+            base_title: std::sync::Mutex::new(Str::from("Shell")),
+            notify_badge: std::sync::Mutex::new(false),
             font_size: Binding::f32(cfg.font_size),
             exited: Binding::bool(false),
             cwd: std::sync::Mutex::new(None),
@@ -181,6 +188,9 @@ pub struct AppState {
     pub tab_ids: Binding<Vec<u64>>,
     /// Window title binding.
     pub window_title: Binding<Str>,
+    /// Window state binding — normal/minimized/fullscreen/closed.
+    /// Owned by us so keybinds can toggle fullscreen.
+    pub window_state: Binding<WindowState>,
     /// Config file state (parsed values + mtime watch).
     pub cfg: Rc<RefCell<ConfigWatcher>>,
     /// The active palette — swapped wholesale on theme reload.
@@ -208,6 +218,7 @@ impl AppState {
             selected: Binding::u64(0),
             tab_ids: Binding::default(),
             window_title: binding(Str::from("hydroterm")),
+            window_state: binding(WindowState::Normal),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -240,6 +251,15 @@ impl AppState {
     /// Read-only access to the current config.
     pub fn config<R>(&self, f: impl FnOnce(&AppConfig) -> R) -> R {
         f(&self.cfg.borrow().config)
+    }
+
+    /// Toggle borderless fullscreen on the main window.
+    pub fn toggle_fullscreen(&self) {
+        let next = match self.window_state.get() {
+            WindowState::Fullscreen => WindowState::Normal,
+            _ => WindowState::Fullscreen,
+        };
+        self.window_state.set(next);
     }
 
     /// Shut every session down and exit the process.

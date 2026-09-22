@@ -297,6 +297,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         return Some(match named {
             NamedKey::ArrowUp => TermAction::PromptPrev,
             NamedKey::ArrowDown => TermAction::PromptNext,
+            NamedKey::F11 => TermAction::Fullscreen,
             _ => return None,
         });
     }
@@ -387,5 +388,7 @@ pub enum TermAction {
     /// Cycle pane focus within the tab.
     FocusNextPane,
     FocusPrevPane,
+    /// Toggle borderless fullscreen.
+    Fullscreen,
 }
 

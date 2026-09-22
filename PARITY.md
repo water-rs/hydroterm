@@ -37,7 +37,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Selection | Click-drag / word (dbl) / line (triple), right-click extend | ✅ | drag/select; timing multi-click |
 | Selection | Copy-on-select | ✅ | `copy-on-select = true` in config |
 | Links | OSC 8 hyperlink render + Ctrl+click open | ✅ | `printf '\e]8;;https://example.com\e\\link\e]8;;\e\\'` |
-| Links | Plain-text URL detect + open | ❌ | regex over grid rows on click — planned |
+| Links | Plain-text URL detect + open | ✅ | scheme-scan over the clicked row's cells; Ctrl+click → xdg-open (verified: navigated Chrome) |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
 | Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #18) |
@@ -56,11 +56,10 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Font | Synthetic bold/italic | ✅ | stroke emboss / skew — `\e[1m`/`\e[3m` visually distinct |
 | Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
-| Shell int. | zsh/fish integration auto-inject | 🟡 | bash auto-inject via `--rcfile`; zsh/fish TODO |
+| Shell int. | zsh/fish integration auto-inject | ✅ | bash `--rcfile`, zsh `ZDOTDIR` env, fish `-C` init — all emit OSC 133 A/B/C/D + OSC 7 (verified live) |
 | Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected integration for bash (--rcfile), zsh (ZDOTDIR), fish (-C): all emit A/B/C/D; verified live jump in zsh + fish |
 | Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
-| Shell int. | Shell-integration scripts (bash/zsh/fish inject) | ❌ | inject via ENV at spawn |
-| Shell int. | OSC 9/777 notifications | 🟡 | tap emits; surface via notifier |
+| Shell int. | OSC 9/777 notifications | 🟡 | bell flash + 🔔 badge on tab/window title until user input (verified); no desktop-notification channel — freedesktop notify would need a dbus dep |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
 | Bell | Audible bell | ❌ | needs audio stack; low priority |
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight in grid, Enter jumps to next |
@@ -69,9 +68,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies, anchored to cursor row & scrolling with buffer (verified: PNG blitted in-grid); no unicode placements/z-layers/file mediums/crops/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
-| Perf | Scrolling/render performance | 🟡 | llvmpipe here; benchmark task pending |
+| Perf | Scrolling/render performance | 🟡 | 10.8 MB/s cat-throughput, ~72ms input latency (llvmpipe CPU render — see Metrics) |
 | Window | Title reporting (OSC 0/2) | ✅ | title → window title binding |
-| Window | Fullscreen | 🟡 | WindowHandle.fullscreen exists — needs keybind |
+| Window | Fullscreen | ✅ | Ctrl+Shift+F11 / `keybind = ...=fullscreen` — own `WindowState` binding via `App::new_with_windows` (verified live) |
 | Window | Confirm-close when child running | 🚫 | no close-request hook — WATERUI_FEEDBACK #4 |
 | Misc | `-e cmd`, `--config` args | ✅ | verified: `-e bash -c 'echo E_MARKER'` |
 | Misc | Quit action, process-group cleanup | ✅ | window close → Shutdown |
