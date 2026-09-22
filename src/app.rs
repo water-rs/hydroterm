@@ -11,10 +11,12 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
+use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
 use waterui::window::WindowState;
-use waterui_graphics::GpuSurface;
+use waterui_graphics::SceneView;
+use waterui_text::FontCollection;
 
 use crate::config::{AppConfig, ConfigWatcher};
 use crate::palette::Palette;
@@ -520,42 +522,60 @@ impl AppState {
     }
 }
 
+/// One terminal pane: the `SceneView` running `TermSurface` plus the
+/// search bar sibling above it. A `View` impl (not free-standing view code)
+/// because the shared `FontCollection` lives in the environment — grabbing it
+/// in `body` is what math/chart do, and it lets a pane that outlives a
+/// subtree rebuild keep its single font context.
+struct PaneLeaf {
+    session: Rc<Session>,
+    state: AppState,
+}
+
+impl View for PaneLeaf {
+    fn body(self, env: &Environment) -> impl View {
+        // Search bar: a real WaterUI row that appears above the surface —
+        // the field is a sibling, so toggling it never remounts the
+        // SceneView or drops its keyboard focus.
+        let query = self.session.search_query.clone();
+        let status = self.session.search_status.clone();
+        let open = self.session.search_open.clone();
+        let surface = Frame::new(SceneView::new(TermSurface::new(
+            self.session,
+            self.state.clone(),
+            self.state.palette,
+            FontCollection::from_env(env),
+        )));
+        let bar = when(open, move || {
+            hstack((
+                text("/ "),
+                field("find in buffer", &query),
+                text(status.clone()),
+            ))
+        })
+        .anyview();
+        vstack((bar, surface)).spacing(0.0)
+    }
+}
+
 /// Render one pane node as WaterUI views.
-fn pane_view(node: &SplitNode, state: &AppState, palette: &Rc<RefCell<Palette>>) -> AnyView {
+fn pane_view(node: &SplitNode, state: &AppState) -> AnyView {
     match node {
         SplitNode::Leaf(sid) => {
             let session = state.session(*sid);
             match session {
-                Some(session) => {
-                    // Search bar: a real WaterUI row that appears above the
-                    // surface — the field is a sibling, so toggling it never
-                    // remounts the GpuSurface or drops its keyboard focus.
-                    let query = session.search_query.clone();
-                    let status = session.search_status.clone();
-                    let open = session.search_open.clone();
-                    let surface = GpuSurface::new(TermSurface::new(
-                        session,
-                        state.clone(),
-                        palette.clone(),
-                    ))
-                    .anyview();
-                    let bar = when(open, move || {
-                        hstack((
-                            text("/ "),
-                            field("find in buffer", &query),
-                            text(status.clone()),
-                        ))
-                    })
-                    .anyview();
-                    vstack((bar, surface)).spacing(0.0).anyview()
+                Some(session) => PaneLeaf {
+                    session,
+                    state: state.clone(),
                 }
+                .anyview(),
                 None => text("pane closed").anyview(),
             }
         }
         SplitNode::Split { dir, children } => {
             let views: Vec<AnyView> = children
                 .iter()
-                .map(|child| pane_view(child, state, palette))
+                .map(|child| pane_view(child, state))
                 .collect();
             // Vec<AnyView> collects straight into a stack — no ForEach ids.
             match dir {
@@ -569,7 +589,7 @@ fn pane_view(node: &SplitNode, state: &AppState, palette: &Rc<RefCell<Palette>>)
 /// Build the tabs view: one pane-tree per tab.
 // `Tabs::new` needs a fully materialized `Vec<Tab>` — hydrolysis has no
 // reactive-collection tab API yet, so the whole set is rebuilt on change.
-// Each `GpuSurface` keeps its `Arc<Terminal>` alive across rebuilds.
+// Each `SceneView` keeps its `Arc<Terminal>` alive across rebuilds.
 #[allow(watch_over_collection)]
 pub fn tabs_view(state: AppState) -> impl View {
     watch(state.tab_ids.clone(), move |ids| {
@@ -579,13 +599,11 @@ pub fn tabs_view(state: AppState) -> impl View {
             .filter_map(|id| tabs.iter().find(|t| t.id == *id).cloned())
             .map(|tab| {
                 let app = state.clone();
-                let palette = state.palette.clone();
                 let tree = tab.tree.clone();
                 Tab::container(tab.id, tab.title.clone(), move || {
                     watch(tree.clone(), {
                         let app = app.clone();
-                        let palette = palette.clone();
-                        move |node: SplitNode| pane_view(&node, &app, &palette)
+                        move |node: SplitNode| pane_view(&node, &app)
                     })
                 })
             })

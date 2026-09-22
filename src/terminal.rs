@@ -75,8 +75,8 @@ struct ProxyInner {
     notifier: OnceLock<Notifier>,
     /// UI-thread queue for everything the renderer must act on.
     events: Sender<TermEvent>,
-    /// Wakes the UI thread — plugged in by the GpuView once it holds a
-    /// `RedrawHandle`.
+    /// Wakes the UI thread — plugged in by the scene content once it has
+    /// its channel installed.
     wake: Mutex<Box<dyn Fn() + Send + Sync>>,
 }
 
@@ -91,8 +91,8 @@ impl EventProxy {
         (Self { inner }, rx)
     }
 
-    /// Install the wake callback (called by the GpuView once it holds a
-    /// `RedrawHandle`).
+    /// Install the wake callback (called by `TermSurface::set_invalidator` —
+    /// a cross-thread ping into the main thread's local-executor queue).
     pub fn set_wake(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.inner.wake.lock().unwrap() = Box::new(f);
     }

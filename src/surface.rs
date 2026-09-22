@@ -1,8 +1,17 @@
-//! The `GpuView` that hosts a terminal session: input routing (keyboard,
-//! IME, pointer, scroll), the PTY event drain, resize bookkeeping, and the
-//! Vello/hybrid rasterization plumbing modeled on `SceneSurfaceRenderer`.
+//! The `SceneContent` that hosts a terminal session: input routing (keyboard,
+//! IME, pointer, scroll), the PTY event drain, and resize bookkeeping. Drawing
+//! goes through the shared `Scene2D` facilities — the same path math/chart
+//! use — inside `build_scene`; rendering itself belongs to the backend.
+//!
+//! The PTY parser runs on its own thread and cannot touch the main-thread
+//! `SceneInvalidator` (`Rc<dyn Fn()>`). Wake-ups therefore cross threads once —
+//! a `try_send` into a local channel — where a future spawned on the local
+//! executor drains the queue and calls the invalidator on the main thread.
+//! The winit event loop notices the local-task ping and turns it into a patch
+//! request, so this never needs an extra polling timer.
 
-use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
@@ -11,25 +20,21 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
-use waterui_core::layout::{ProposalSize, Size, StretchAxis, ViewDimensions};
-use waterui_core::{Environment, Str};
+use waterui::task::spawn_local;
+use waterui_core::Str;
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::scene2d::Scene2D;
-use waterui_graphics::scene2d_hybrid::{HybridScene2D, HybridUpload};
-use waterui_graphics::scene2d_vello::VelloScene2D;
-use waterui_graphics::shared_context::{SceneEngine, SharedSceneRenderer};
-use waterui_graphics::shaders::BLIT;
-use waterui_graphics::{Code, GpuContext, GpuFrame, GpuView, Key, Modifiers, NamedKey};
+use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
+use waterui_graphics::{Code, Key, Modifiers, NamedKey};
+use waterui_text::FontCollection;
 
 use crate::app::{AppState, FONT_SIZE, Session};
-use crate::fonts::FontStack;
+use crate::fonts::TermFonts;
 use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
 use crate::mouse::{self, CellPos, MouseAction};
-use crate::palette::Palette;
-use std::cell::RefCell;
-use std::rc::Rc;
-use crate::scene::{self, CursorInfo, DrawContext, PADDING, ScrollInfo, cursor_info};
 use crate::osctap::TapEvent;
+use crate::palette::Palette;
+use crate::scene::{self, CursorInfo, DrawContext, PADDING, ScrollInfo, cursor_info};
 use crate::terminal::TermEvent;
 
 /// Blink half-period for the cursor.
@@ -41,21 +46,6 @@ const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Max cell distance for a multi-click to count as same-cell.
 const MULTI_CLICK_RANGE: usize = 1;
 
-/// The engine's scene storage — mirrors `SceneSurfaceRenderer`.
-enum SceneBuf {
-    /// Compute pipeline → intermediate storage texture → blit.
-    Classic(Box<vello::Scene>),
-    /// CPU/GPU split pipeline, straight into the frame.
-    Hybrid(Box<vello_hybrid::Scene>),
-}
-
-/// Blit plumbing for the classic path.
-struct Blit {
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-}
-
 /// In-surface text search state (Ctrl+Shift+F).
 struct Search {
     query: String,
@@ -64,26 +54,30 @@ struct Search {
     active: usize,
 }
 
-/// One terminal surface — renderer + input owner for a session.
+/// One terminal surface — scene content + input owner for a session.
 pub struct TermSurface {
     session: Rc<Session>,
     app: AppState,
-    fonts: FontStack,
+    fonts: TermFonts,
     /// Shared palette — swapped on theme reload.
     palette: Rc<RefCell<Palette>>,
     font_size_pt: f32,
 
-    // GPU plumbing
-    scene: Option<SceneBuf>,
-    renderer: Option<Arc<SharedSceneRenderer>>,
-    blit: Option<Blit>,
-    intermediate: Option<(wgpu::Texture, wgpu::TextureView)>,
-    inter_size: (u32, u32),
-
-    // geometry (logical→physical scale from the last frame)
+    // geometry (grid size in cells, logical units at draw time)
     cols: u16,
     lines: u16,
-    scale: f64,
+
+    // The backend's frame-request callback — kept so input events (which
+    // don't schedule a frame on delivery) can request a repaint when they
+    // change what the scene draws.
+    invalidator: Option<SceneInvalidator>,
+    // cross-thread wake pipe: parser thread → channel → local future →
+    // SceneInvalidator on the main thread.
+    wake_tx: Option<async_channel::Sender<()>>,
+    /// Dead-man switch for the spawned future — cleared on teardown/None.
+    wake_alive: Rc<Cell<bool>>,
+    /// The parked drain future; dropped (detached) on teardown.
+    wake_task: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>,
 
     // interaction state
     focused: bool,
@@ -102,23 +96,27 @@ pub struct TermSurface {
 }
 
 impl TermSurface {
-    /// Wrap a session in a GPU surface renderer.
-    pub fn new(session: Rc<Session>, app: AppState, palette: Rc<RefCell<Palette>>) -> Self {
+    /// Scene content for one session — the host's shared font collection is
+    /// resolved once here, per pane.
+    pub fn new(
+        session: Rc<Session>,
+        app: AppState,
+        palette: Rc<RefCell<Palette>>,
+        fonts: FontCollection,
+    ) -> Self {
         let font_size = session.font_size.get();
         Self {
             session,
             app,
-            fonts: FontStack::load(font_size, 1.0),
+            fonts: TermFonts::load(fonts, font_size),
             palette,
             font_size_pt: font_size,
-            scene: None,
-            renderer: None,
-            blit: None,
-            intermediate: None,
-            inter_size: (0, 0),
             cols: 0,
             lines: 0,
-            scale: 1.0,
+            invalidator: None,
+            wake_tx: None,
+            wake_alive: Rc::new(Cell::new(false)),
+            wake_task: None,
             focused: false,
             modifiers: Modifiers::empty(),
             held_button: None,
@@ -133,17 +131,17 @@ impl TermSurface {
         }
     }
 
-    /// Logical pointer position → (col, row) in viewport coords.
+    /// Surface-local logical position → (col, row) in viewport coords.
     fn viewport_cell(&self, x: f64, y: f64) -> (usize, usize) {
         let m = self.fonts.metrics;
-        let pad = PADDING as f64 * m.scale;
+        let pad = PADDING as f64;
         let (cw, ch) = (m.cell_w as f64, m.cell_h as f64);
-        let col = ((x * self.scale - pad) / cw).clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
-        let row = ((y * self.scale - pad) / ch).clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
+        let col = ((x - pad) / cw).clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
+        let row = ((y - pad) / ch).clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
         (col, row)
     }
 
-    /// Logical pointer position → grid `Point` (scrollback-aware).
+    /// Surface-local logical position → grid `Point` (scrollback-aware).
     fn grid_point(&self, x: f64, y: f64) -> Point {
         let (col, row) = self.viewport_cell(x, y);
         let offset = self.session.terminal.term.lock().grid().display_offset();
@@ -153,9 +151,9 @@ impl TermSurface {
     /// Which side of a cell the pointer is on (for selection anchors).
     fn cell_side(&self, x: f64) -> Side {
         let m = self.fonts.metrics;
-        let pad = PADDING as f64 * m.scale;
+        let pad = PADDING as f64;
         let cw = m.cell_w as f64;
-        let within = (x * self.scale - pad).rem_euclid(cw);
+        let within = (x - pad).rem_euclid(cw);
         if within < cw * 0.5 { Side::Left } else { Side::Right }
     }
 
@@ -484,23 +482,21 @@ impl TermSurface {
         }
     }
 
-    /// Rebuild the font stack when size or scale changed.
-    fn sync_fonts(&mut self, scale: f64) {
+    /// Re-measure fonts when the size changes.
+    fn sync_fonts(&mut self) {
         let want = self.session.font_size.get();
-        if (want - self.font_size_pt).abs() > f32::EPSILON
-            || (self.fonts.metrics.scale - scale).abs() > f64::EPSILON
-        {
+        if (want - self.font_size_pt).abs() > f32::EPSILON {
             self.font_size_pt = want;
-            self.fonts = FontStack::load(want, scale);
+            self.fonts.resize(want);
         }
     }
 
-    /// Recompute the grid from the frame size and propagate resizes.
-    fn sync_size(&mut self, width_px: u32, height_px: u32) {
+    /// Recompute the grid from the logical frame size and propagate resizes.
+    fn sync_size(&mut self, width: f32, height: f32) {
         let m = self.fonts.metrics;
-        let pad = PADDING * m.scale as f32 * 2.0;
-        let cols = ((width_px as f32 - pad) / m.cell_w).floor().max(2.0) as u16;
-        let lines = ((height_px as f32 - pad) / m.cell_h).floor().max(1.0) as u16;
+        let pad = PADDING * 2.0;
+        let cols = ((width - pad) / m.cell_w).floor().max(2.0) as u16;
+        let lines = ((height - pad) / m.cell_h).floor().max(1.0) as u16;
         // Degenerate frames (window unmapped/collapsed) must not shrink the
         // PTY — a 1-line winsize breaks apps that read TIOCGWINSZ at start.
         if cols > 2 && lines > 1 && (cols != self.cols || lines != self.lines) {
@@ -819,7 +815,7 @@ impl TermSurface {
 
     // -- scene plumbing -------------------------------------------------------
 
-    /// Draw the terminal into the active scene.
+    /// Draw the terminal into the frame's scene.
     fn build(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) {
         let matches_view: Vec<(usize, usize)> = self
             .search
@@ -872,7 +868,7 @@ impl TermSurface {
         scene::draw_term(scene, &term, &mut ctx);
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = self.fonts.metrics;
-        let pad = PADDING * m.scale as f32;
+        let pad = PADDING;
         for img in &self.session.kitty.borrow().images {
             let row = img.line - top;
             let rows = if img.rows > 0 {
@@ -903,281 +899,81 @@ impl TermSurface {
             scene.draw_image(&img.brush, transform);
         }
     }
+}
 
-    /// Classic path: rasterize into an intermediate texture, then blit.
-    fn render_classic(
-        &mut self,
-        renderer: &SharedSceneRenderer,
-        frame: &mut GpuFrame,
-    ) {
-        let mut buf = self.scene.take().expect("scene used before setup");
-        let SceneBuf::Classic(scene) = &mut buf else {
-            panic!("TermSurface built a hybrid scene for the classic engine");
-        };
-
-        if self.inter_size != (frame.width, frame.height) {
-            let texture = frame.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("terminal intermediate texture"),
-                size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.intermediate = Some((texture, view));
-            self.inter_size = (frame.width, frame.height);
+impl Drop for TermSurface {
+    fn drop(&mut self) {
+        // Park the wake future: mark dead, then post one last ping so it
+        // exits instead of hanging on the channel forever.
+        self.wake_alive.set(false);
+        if let Some(tx) = &self.wake_tx {
+            let _ = tx.try_send(());
         }
-        // A fresh view each frame keeps `self` free for `build` to borrow.
-        let intermediate_view = self
-            .intermediate
-            .as_ref()
-            .expect("intermediate missing")
-            .0
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        scene.reset();
-        {
-            let mut scene2d = VelloScene2D::new(scene);
-            self.build(&mut scene2d, frame.width as f32, frame.height as f32);
-        }
-
-        renderer.with_classic(frame.device, |renderer| {
-            renderer
-                .render_to_texture(
-                    frame.device,
-                    frame.queue,
-                    scene,
-                    &intermediate_view,
-                    &vello::RenderParams {
-                        base_color: peniko::Color::TRANSPARENT,
-                        width: frame.width,
-                        height: frame.height,
-                        antialiasing_method: vello::AaConfig::Area,
-                    },
-                )
-                .expect("terminal vello render failed");
-        });
-
-        let blit = self.blit.as_ref().expect("blit missing");
-        let bind_group = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terminal blit bind group"),
-            layout: &blit.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&intermediate_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&blit.sampler),
-                },
-            ],
-        });
-
-        let mut encoder = frame
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("terminal blit encoder"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal blit pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&blit.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..6, 0..1);
-        }
-        frame.queue.submit([encoder.finish()]);
-        self.scene = Some(buf);
-    }
-
-    /// Hybrid path: CPU preprocess + render pass straight into the frame.
-    fn render_hybrid(
-        &mut self,
-        renderer: &SharedSceneRenderer,
-        frame: &mut GpuFrame,
-    ) {
-        let mut buf = self.scene.take().expect("scene used before setup");
-        let SceneBuf::Hybrid(scene) = &mut buf else {
-            panic!("TermSurface built a classic scene for the hybrid engine");
-        };
-
-        let width = u16::try_from(frame.width).expect("surface wider than a hybrid scene");
-        let height = u16::try_from(frame.height).expect("surface taller than a hybrid scene");
-        scene.reset_and_resize(width, height);
-
-        let mut encoder = frame
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("terminal hybrid encoder"),
-            });
-        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("terminal hybrid clear pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &frame.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        }));
-
-        renderer.with_hybrid(frame.device, frame.format, |hybrid| {
-            {
-                let upload = HybridUpload::new(frame.device, frame.queue, &mut encoder);
-                let mut scene2d = HybridScene2D::new(scene, hybrid, upload);
-                self.build(&mut scene2d, frame.width as f32, frame.height as f32);
-            }
-            hybrid
-                .renderer
-                .render(
-                    scene,
-                    &mut hybrid.resources,
-                    frame.device,
-                    frame.queue,
-                    &mut encoder,
-                    &vello_hybrid::RenderSize {
-                        width: frame.width,
-                        height: frame.height,
-                    },
-                    &frame.view,
-                    &vello_hybrid::TextureBindings::new(),
-                )
-                .expect("terminal hybrid render failed");
-        });
-
-        frame.queue.submit([encoder.finish()]);
-        self.scene = Some(buf);
+        self.session.terminal.proxy.set_wake(|| {});
     }
 }
 
-impl GpuView for TermSurface {
-    async fn setup(&mut self, ctx: &GpuContext<'_>, _env: &mut Environment) {
-        // Wake this surface whenever the parser has output or events.
-        let handle = ctx.redraw_handle.clone();
-        self.session.terminal.proxy.set_wake(move || handle.request_redraw());
-
-        self.renderer = Some(Arc::clone(ctx.scene_renderer()));
-        if ctx.scene_renderer().engine() == SceneEngine::Hybrid {
-            self.scene = Some(SceneBuf::Hybrid(Box::new(vello_hybrid::Scene::new(1, 1))));
-            return;
-        }
-        self.scene = Some(SceneBuf::Classic(Box::new(vello::Scene::new())));
-
-        let (vs, fs) =
-            BLIT.create_render_stages(ctx.device, "vs_main", "fs_main");
-        let layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("terminal blit bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("terminal blit pipeline layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        let pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terminal blit pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: vs.module(),
-                entry_point: Some(vs.entry_point()),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: fs.module(),
-                entry_point: Some(fs.entry_point()),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.surface_format,
-                    blend: ctx.alpha_blend_state(),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("terminal blit sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        self.blit = Some(Blit { pipeline, layout, sampler });
-    }
-
-    fn render(&mut self, frame: &mut GpuFrame) {
+impl SceneContent for TermSurface {
+    fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
         self.app.poll_config();
         self.drain_events();
         self.sync_search();
-        self.sync_fonts(frame.scale());
-        self.sync_size(frame.width, frame.height);
-        self.scale = frame.scale();
+        self.sync_fonts();
+        self.sync_size(width, height);
 
         // A blinking cursor or live bell flash needs the next frame anyway;
-        // the wake callback covers PTY output between frames.
+        // the wake pipe covers PTY output between frames.
         let cursor_blinking = self.session.terminal.term.lock().cursor_style().blinking;
         let bell_live = self
             .bell_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(BELL_FLASH_SECS));
-        if cursor_blinking || bell_live || self.search.is_some() {
-            frame.request_redraw();
-        }
 
-        let renderer = Arc::clone(self.renderer.as_ref().expect("renderer used before setup"));
-        match renderer.engine() {
-            SceneEngine::Classic => self.render_classic(&renderer, frame),
-            SceneEngine::Hybrid => self.render_hybrid(&renderer, frame),
+        self.build(scene, width, height);
+
+        cursor_blinking || bell_live || self.search.is_some()
+    }
+
+    fn set_invalidator(&mut self, invalidator: Option<SceneInvalidator>) {
+        self.invalidator = invalidator.clone();
+        match invalidator {
+            Some(invalidator) => {
+                // One channel per surface: the parser thread's wake callback
+                // does a `try_send` (the closure must be Send+Sync), and this
+                // future — running on the winit main thread via the local
+                // executor — drains it and calls the real invalidator.
+                let (tx, rx) = async_channel::unbounded::<()>();
+                self.session
+                    .terminal
+                    .proxy
+                    .set_wake({
+                        let tx = tx.clone();
+                        move || {
+                            let _ = tx.try_send(());
+                        }
+                    });
+                self.wake_alive.set(true);
+                let alive = Rc::clone(&self.wake_alive);
+                self.wake_task = Some(Box::pin(spawn_local(async move {
+                    while rx.recv().await.is_ok() {
+                        if !alive.get() {
+                            break;
+                        }
+                        // Coalesce bursts: one invalidation per batch.
+                        while rx.try_recv().is_ok() {}
+                        invalidator();
+                    }
+                })));
+                self.wake_tx = Some(tx);
+            }
+            None => {
+                self.wake_alive.set(false);
+                if let Some(tx) = &self.wake_tx {
+                    let _ = tx.try_send(());
+                }
+                self.wake_tx = None;
+                self.wake_task = None;
+                self.session.terminal.proxy.set_wake(|| {});
+            }
         }
     }
 
@@ -1219,9 +1015,16 @@ impl GpuView for TermSurface {
                 self.preedit = None;
             }
         }
+        // Delivering an event does not schedule a frame — anything the
+        // handler changed (selection, scroll offset, focus, preedit) paints
+        // on the next requested one.
+        if let Some(invalidator) = &self.invalidator {
+            invalidator();
+        }
     }
 
-    /// IME window position: the cell under the caret, in surface coordinates.
+    /// IME window position: the cell under the caret, in surface-local
+    /// logical coordinates — the same space `build_scene` draws in.
     fn ime_caret(&self) -> Option<kurbo::Rect> {
         let term = self.session.terminal.term.lock();
         let CursorInfo { row, col, .. } = cursor_info(&term);
@@ -1229,28 +1032,9 @@ impl GpuView for TermSurface {
             return None;
         }
         let m = self.fonts.metrics;
-        // Convert physical-px metrics back to logical coordinates.
-        let cw = m.cell_w as f64 / m.scale;
-        let ch = m.cell_h as f64 / m.scale;
-        let x = PADDING as f64 + col as f64 * cw;
-        let y = PADDING as f64 + row as f64 * ch;
-        Some(kurbo::Rect::new(x, y, x + 2.0, y + ch))
-    }
-
-    fn is_opaque(&self) -> bool {
-        true
-    }
-
-    fn measure(&self, proposal: ProposalSize) -> ViewDimensions {
-        // Fill whatever the tab gives us; report the proposal back.
-        ViewDimensions::new(Size::new(
-            proposal.width.unwrap_or(640.0),
-            proposal.height.unwrap_or(400.0),
-        ))
-    }
-
-    fn stretch_axis(&self) -> StretchAxis {
-        StretchAxis::Both
+        let x = PADDING as f64 + col as f64 * m.cell_w as f64;
+        let y = PADDING as f64 + row as f64 * m.cell_h as f64;
+        Some(kurbo::Rect::new(x, y, x + 2.0, y + m.cell_h as f64))
     }
 
     fn accessibility_label(&self) -> Option<String> {

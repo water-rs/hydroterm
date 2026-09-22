@@ -1,66 +1,20 @@
-//! Font loading, discovery, shaping, and the cell-metrics math a terminal
-//! grid is built on.
+//! Terminal typography on the host's shared parley stack: cell metrics from a
+//! probe layout, per-run shaping with fontique's automatic fallback, and the
+//! faux-bold / faux-italic synthesis parley reports back per run.
+//!
+//! The family's `parley::FontContext` is the host's own — installed into the
+//! environment at startup and shared through `FontCollection` — so a pane
+//! never enumerates system fonts for itself, and the shaped glyph runs hand
+//! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use parley::fontique::Synthesis;
+use parley::{Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle,
+             FontWeight, Layout, LayoutContext, StyleProperty, style::GenericFamily};
+use waterui_text::FontCollection;
 
-use peniko::{Blob, FontData};
-
-/// One loaded font face: bytes kept alive for the process, a rustybuzz face
-/// for shaping and metrics, and a peniko `FontData` the Vello scene draws.
-pub struct Face {
-    pub font: FontData,
-    pub face: rustybuzz::Face<'static>,
-}
-
-impl Face {
-    fn from_bytes(bytes: &'static [u8], index: u32) -> Option<Self> {
-        let face = rustybuzz::Face::from_slice(bytes, index)?;
-        Some(Self { font: FontData::new(Blob::new(Arc::new(bytes.to_vec())), index), face })
-    }
-}
-
-/// Pixel metrics of the terminal cell grid, derived from the primary face at
-/// the configured point size and the display scale.
-#[derive(Debug, Clone, Copy)]
-pub struct CellMetrics {
-    /// Grid cell width in physical pixels.
-    pub cell_w: f32,
-    /// Grid cell height in physical pixels.
-    pub cell_h: f32,
-    /// Distance from a cell's top edge to the text baseline, in pixels.
-    pub baseline: f32,
-    /// Underline offset below the baseline, in pixels.
-    pub underline_pos: f32,
-    /// Underline / strikethrough stroke thickness, in pixels.
-    pub stroke: f32,
-    /// Strikethrough offset below the baseline, in pixels.
-    pub strikeout_pos: f32,
-    /// Physical pixels per logical unit.
-    pub scale: f64,
-    /// Em size in physical pixels (point size × scale).
-    pub size_px: f32,
-}
-
-/// The loaded font family variants plus the coverage-driven fallback list.
-pub struct FontStack {
-    pub regular: Face,
-    pub bold: Option<Face>,
-    pub italic: Option<Face>,
-    pub bold_italic: Option<Face>,
-    /// Faces consulted in order when the styled variant lacks a glyph.
-    pub fallbacks: Vec<Face>,
-    /// Cache: char → index into `fallbacks`, for codepoints the primary faces
-    /// could not cover. Negative answers are tracked by simply not caching;
-    /// a miss is retried only when the same char shows up again.
-    coverage_cache: HashMap<char, usize>,
-    /// Raw fontdb face records kept for lazy fallback loading.
-    db_faces: Vec<(fontdb::ID, fontdb::Source, u32)>,
-    loaded_fallback: HashMap<fontdb::ID, usize>,
-    pub metrics: CellMetrics,
-}
-
-/// Which family the app prefers, in order.
+/// Families asked for first, in preference order. Everything they cannot
+/// cover — box drawing, CJK, emoji — falls back through fontique's own
+/// cascade rather than a hand-rolled face list.
 const PRIMARY_FAMILIES: &[&str] = &[
     "JetBrains Mono",
     "Fira Code",
@@ -71,244 +25,165 @@ const PRIMARY_FAMILIES: &[&str] = &[
     "monospace",
 ];
 
-/// Curated broad-coverage families consulted before a linear scan of the
-/// whole system database (which is ordered arbitrarily and often useless).
-const FALLBACK_FAMILIES: &[&str] = &[
-    "Noto Sans Mono",
-    "Noto Sans",
-    "DejaVu Sans",
-    "FreeMono",
-    "Noto Sans Symbols2",
-    "Noto Sans Symbols",
-    "Noto Color Emoji",
-    "OpenMoji",
-    "Noto Sans CJK SC",
-    "Noto Sans CJK JP",
-    "WenQuanYi Micro Hei",
-];
-
-fn face_source_bytes(source: &fontdb::Source) -> Option<Vec<u8>> {
-    match source {
-        fontdb::Source::File(path) => std::fs::read(path).ok(),
-        fontdb::Source::SharedFile(path, data) => {
-            // A shared file's bytes are already mapped; copy the whole file —
-            // the Face is built against it with `index` picking the face.
-            let _ = data;
-            std::fs::read(path).ok()
-        }
-        fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-    }
+/// Logical-cell geometry of the terminal grid, derived from a probe layout
+/// of the primary family at the configured size.
+#[derive(Debug, Clone, Copy)]
+pub struct CellMetrics {
+    /// Grid cell width in logical units.
+    pub cell_w: f32,
+    /// Grid cell height in logical units.
+    pub cell_h: f32,
+    /// Distance from a cell's top edge to the text baseline.
+    pub baseline: f32,
+    /// Underline offset below the baseline.
+    pub underline_pos: f32,
+    /// Underline / strikethrough stroke thickness.
+    pub stroke: f32,
+    /// Strikethrough offset below the baseline.
+    pub strikeout_pos: f32,
+    /// Em size the runs shape at, in logical units.
+    pub size_px: f32,
 }
 
-fn load_face(db: &fontdb::Database, id: fontdb::ID) -> Option<Face> {
-    let info = db.face(id)?;
-    let bytes = face_source_bytes(&info.source)?;
-    Face::from_bytes(Box::leak(bytes.into_boxed_slice()), info.index)
+/// Shaping state shared by every draw pass of one pane: the host's font
+/// collection handle, a reusable parley `LayoutContext`, and the resolved
+/// primary family.
+pub struct TermFonts {
+    collection: FontCollection,
+    layout_cx: LayoutContext<[u8; 4]>,
+    /// The primary monospace family as a parley `FontFamily` — a named family
+    /// when one of the preferences is installed, generic monospace otherwise.
+    family: FontFamily<'static>,
+    size_px: f32,
+    pub metrics: CellMetrics,
 }
 
-fn query_family(
-    db: &fontdb::Database,
-    family: &str,
-    weight: fontdb::Weight,
-    style: fontdb::Style,
-) -> Option<fontdb::ID> {
-    db.query(&fontdb::Query {
-        families: &[fontdb::Family::Name(family)],
-        weight,
-        style,
-        ..fontdb::Query::default()
-    })
-}
-
-impl FontStack {
-    /// Load the primary monospace family and the curated fallback set.
-    pub fn load(size_pt: f32, scale: f64) -> Self {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-
-        let mut primary_id: Option<fontdb::ID> = None;
-        for family in PRIMARY_FAMILIES {
-            if let Some(id) = query_family(&db, family, fontdb::Weight::NORMAL, fontdb::Style::Normal)
-            {
-                primary_id = Some(id);
-                break;
+impl TermFonts {
+    /// Resolve the primary family in `collection` and measure the cell.
+    pub fn load(collection: FontCollection, size_pt: f32) -> Self {
+        let (family, family_name) = collection.use_fonts(|fonts| {
+            for name in PRIMARY_FAMILIES {
+                if fonts.collection.family_by_name(name).is_some() {
+                    return (
+                        FontFamily::Single(FontFamilyName::Named(std::borrow::Cow::Owned(
+                            (*name).to_string(),
+                        ))),
+                        (*name).to_string(),
+                    );
+                }
             }
-        }
-        let primary_id = primary_id.expect("no monospace font found on this system");
-        let family_name = db
-            .face(primary_id)
-            .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
-            .unwrap_or_else(|| "monospace".to_owned());
+            (
+                FontFamily::from(GenericFamily::Monospace),
+                "monospace".to_string(),
+            )
+        });
         tracing::info!(family = %family_name, "terminal primary font");
 
-        let regular = load_face(&db, primary_id).expect("primary font bytes unreadable");
-        let bold = query_family(&db, &family_name, fontdb::Weight::BOLD, fontdb::Style::Normal)
-            .and_then(|id| load_face(&db, id));
-        let italic = query_family(&db, &family_name, fontdb::Weight::NORMAL, fontdb::Style::Italic)
-            .and_then(|id| load_face(&db, id));
-        let bold_italic =
-            query_family(&db, &family_name, fontdb::Weight::BOLD, fontdb::Style::Italic)
-                .and_then(|id| load_face(&db, id));
+        let mut fonts = Self {
+            collection,
+            layout_cx: LayoutContext::new(),
+            family,
+            size_px: size_pt,
+            metrics: CellMetrics::fallback(size_pt),
+        };
+        fonts.metrics = fonts.probe_metrics();
+        fonts
+    }
 
-        // Lazily-loadable records for every face in the database, used by the
-        // coverage cascade.
-        let db_faces: Vec<(fontdb::ID, fontdb::Source, u32)> = db
-            .faces()
-            .map(|f| (f.id, f.source.clone(), f.index))
-            .collect();
+    /// Re-measure after a font-size change.
+    pub fn resize(&mut self, size_pt: f32) {
+        self.size_px = size_pt;
+        self.metrics = self.probe_metrics();
+    }
 
-        // Eagerly load the curated fallback families — they cover the bulk of
-        // what a terminal actually sees (box drawing, powerline, CJK, emoji).
-        let mut fallbacks = Vec::new();
-        let mut loaded_fallback = HashMap::new();
-        for family in FALLBACK_FAMILIES {
-            if let Some(id) =
-                query_family(&db, family, fontdb::Weight::NORMAL, fontdb::Style::Normal)
-            {
-                if id == primary_id || loaded_fallback.contains_key(&id) {
-                    continue;
-                }
-                if let Some(face) = load_face(&db, id) {
-                    loaded_fallback.insert(id, fallbacks.len());
-                    fallbacks.push(face);
-                }
+    /// Shape `text` as one terminal line: single line, left aligned, with the
+    /// cell's style applied as the default run style. Fontique splits the
+    /// result into one run per face the text actually needs, which is where
+    /// the terminal's font fallback now comes from.
+    pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> Layout<[u8; 4]> {
+        let size = self.size_px;
+        let family = self.family.clone();
+        self.collection.use_fonts(|fonts| {
+            let mut builder = self
+                .layout_cx
+                .ranged_builder(fonts, text, 1.0, false);
+            builder.push_default(StyleProperty::Brush([255, 255, 255, 255]));
+            builder.push_default(StyleProperty::FontSize(size));
+            builder.push_default(StyleProperty::FontFamily(family));
+            builder.push_default(StyleProperty::FontWeight(FontWeight::new(
+                if bold { 700.0 } else { 400.0 },
+            )));
+            builder.push_default(StyleProperty::FontStyle(if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            }));
+            let mut layout = builder.build(text);
+            layout.break_all_lines(None);
+            layout.align(Alignment::Start, AlignmentOptions::default());
+            layout
+        })
+    }
+
+    /// Measure the cell grid off a probe layout: digit advance for the cell
+    /// width, typographic line height for the cell height.
+    fn probe_metrics(&mut self) -> CellMetrics {
+        const PROBE: &str = "0000000000";
+        let layout = self.shape_run(PROBE, false, false);
+        let mut metrics = CellMetrics::fallback(self.size_px);
+        if let Some(line) = layout.lines().next() {
+            let m = line.metrics();
+            if m.advance > 0.0 {
+                metrics.cell_w = (m.advance / PROBE.len() as f32).ceil().max(1.0);
+            }
+            let height = m.ascent + m.descent + m.leading.max(0.0);
+            if height > 0.0 {
+                metrics.cell_h = height.ceil().max(1.0);
+                metrics.baseline = m.baseline.max(0.0);
+                metrics.strikeout_pos = (m.ascent * 0.32).round();
             }
         }
-
-        let metrics = CellMetrics::compute(&regular.face, size_pt, scale);
-
-        Self {
-            regular,
-            bold,
-            italic,
-            bold_italic,
-            fallbacks,
-            coverage_cache: HashMap::new(),
-            db_faces,
-            loaded_fallback,
-            metrics,
-        }
-    }
-
-    /// The styled variant for a cell's flags, if a designed face exists.
-    pub fn variant(&self, bold: bool, italic: bool) -> &Face {
-        match (bold, italic) {
-            (true, true) => self.bold_italic.as_ref().or(self.bold.as_ref()).unwrap_or(&self.regular),
-            (true, false) => self.bold.as_ref().unwrap_or(&self.regular),
-            (false, true) => self.italic.as_ref().unwrap_or(&self.regular),
-            (false, false) => &self.regular,
-        }
-    }
-
-    /// True when the styled run should draw with a synthetic bold overdraw:
-    /// the run wants bold but no designed bold face exists.
-    pub fn needs_synthetic_bold(&self, bold: bool) -> bool {
-        bold && self.bold.is_none()
-    }
-
-    /// True when the styled run should shear: italic wanted, no italic face.
-    pub fn needs_synthetic_italic(&self, italic: bool) -> bool {
-        italic && self.italic.is_none()
-    }
-
-    /// Does this face have a glyph for `ch`?
-    pub fn face_covers(face: &rustybuzz::Face, ch: char) -> bool {
-        face.glyph_index(ch).is_some_and(|gid| gid.0 != 0)
-    }
-
-    /// Index into `self.fallbacks` covering `ch`, loading new faces lazily.
-    pub fn fallback_for(&mut self, ch: char) -> Option<usize> {
-        if let Some(&idx) = self.coverage_cache.get(&ch) {
-            return Some(idx);
-        }
-        for (idx, face) in self.fallbacks.iter().enumerate() {
-            if Self::face_covers(&face.face, ch) {
-                self.coverage_cache.insert(ch, idx);
-                return Some(idx);
-            }
-        }
-        // Scan the remaining database faces lazily.
-        for &(id, ref source, index) in &self.db_faces.clone() {
-            if self.loaded_fallback.contains_key(&id) {
-                continue;
-            }
-            let Some(bytes) = face_source_bytes(source) else { continue };
-            let Some(face) = Face::from_bytes(Box::leak(bytes.into_boxed_slice()), index)
-            else {
-                continue;
-            };
-            self.loaded_fallback.insert(id, self.fallbacks.len());
-            self.fallbacks.push(face);
-            if Self::face_covers(&self.fallbacks.last().unwrap().face, ch) {
-                let idx = self.fallbacks.len() - 1;
-                self.coverage_cache.insert(ch, idx);
-                return Some(idx);
-            }
-        }
-        None
+        metrics.finish();
+        metrics
     }
 }
 
 impl CellMetrics {
-    /// Derive cell geometry from a face's vertical metrics and the pixel size.
-    pub fn compute(face: &rustybuzz::Face, size_pt: f32, scale: f64) -> Self {
-        let px = (size_pt as f64 * scale) as f32;
-        let upem = face.units_per_em() as f32;
-        let k = px / upem;
-        let ascent = face.ascender() as f32 * k;
-        let descent = (-face.descender()) as f32 * k;
-        let leading = face.line_gap() as f32 * k;
-        let cell_h = (ascent + descent + leading.max(0.0)).ceil().max(1.0);
-        let baseline = (ascent + leading.max(0.0) * 0.5).round();
-
-        let cell_w = face
-            .glyph_index('0')
-            .and_then(|gid| face.glyph_hor_advance(gid))
-            .map(|adv| adv as f32 * k)
-            .unwrap_or(px * 0.6)
-            .ceil()
-            .max(1.0);
-
-        let stroke = (px / 18.0).max(1.0);
+    /// Geometry fallback before the first probe layout completes.
+    fn fallback(size_px: f32) -> Self {
         Self {
-            cell_w,
-            cell_h,
-            baseline,
-            underline_pos: (px / 11.0).max(1.0).round(),
-            stroke,
-            strikeout_pos: (ascent * 0.32).round(),
-            scale,
-            size_px: px,
+            cell_w: (size_px * 0.6).ceil().max(1.0),
+            cell_h: (size_px * 1.25).ceil().max(1.0),
+            baseline: (size_px * 0.85).round(),
+            underline_pos: (size_px / 11.0).max(1.0).round(),
+            stroke: (size_px / 18.0).max(1.0),
+            strikeout_pos: (size_px * 0.35).round(),
+            size_px,
         }
+    }
+
+    /// Recompute the heuristic decoration geometry once ascent/descent are
+    /// known (called after the probe fills the real values in).
+    fn finish(&mut self) {
+        self.underline_pos = (self.size_px / 11.0).max(1.0).round();
+        self.stroke = (self.size_px / 18.0).max(1.0);
     }
 }
 
-/// Shape `text` with `face` at `size_px`. Returns per glyph
-/// `(glyph_id, cluster_byte_offset, x_offset, y_offset, x_advance, y_advance)`
-/// with geometry scaled to pixels. Harfbuzz clusters are byte offsets into
-/// `text`.
-pub fn shape_span(
-    face: &rustybuzz::Face,
-    text: &str,
-    size_px: f32,
-) -> Vec<(u32, u32, f32, f32, f32, f32)> {
-    let upem = face.units_per_em() as f32;
-    let k = size_px / upem;
-    let mut buffer = rustybuzz::UnicodeBuffer::new();
-    buffer.push_str(text);
-    let out = rustybuzz::shape(face, &[], buffer);
-    let infos = out.glyph_infos();
-    let positions = out.glyph_positions();
-    let mut result = Vec::with_capacity(infos.len());
-    for (info, pos) in infos.iter().zip(positions.iter()) {
-        result.push((
-            info.glyph_id,
-            info.cluster,
-            pos.x_offset as f32 * k,
-            pos.y_offset as f32 * k,
-            pos.x_advance as f32 * k,
-            pos.y_advance as f32 * k,
-        ));
+/// Faux-bold / faux-italic flags for one shaped run, straight from the
+/// synthesis fontique computed for it.
+pub struct RunStyle {
+    /// Draw the run a second time offset right (no designed bold face).
+    pub embolden: bool,
+    /// Shear to apply for a faux oblique, in degrees (no italic face).
+    pub skew: Option<f32>,
+}
+
+impl From<Synthesis> for RunStyle {
+    fn from(s: Synthesis) -> Self {
+        Self {
+            embolden: s.embolden(),
+            skew: s.skew(),
+        }
     }
-    result
 }

@@ -10,7 +10,7 @@ use kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use peniko::{Brush, Color, Fill, StyleRef};
 use waterui_graphics::scene2d::{Glyph, GlyphRun, Scene2D};
 
-use crate::fonts::{FontStack, shape_span};
+use crate::fonts::TermFonts;
 use crate::palette::{Palette, peniko, peniko_alpha};
 use crate::terminal::EventProxy;
 
@@ -31,8 +31,8 @@ pub struct ScrollInfo {
 /// Runtime state the scene pass needs beyond the term's renderable content.
 pub struct DrawContext<'a> {
     pub palette: &'a Palette,
-    pub fonts: &'a mut FontStack,
-    /// Frame size in physical px.
+    pub fonts: &'a mut TermFonts,
+    /// Frame size in logical units.
     pub width: f32,
     pub height: f32,
     /// Cursor blink phase — when false a blinking cursor is not drawn.
@@ -49,13 +49,6 @@ pub struct DrawContext<'a> {
     pub search_active: Option<(usize, usize)>,
     /// Alpha for the bell flash overlay.
     pub bell_flash: f32,
-}
-
-impl DrawContext<'_> {
-    /// Font em size in physical pixels for this frame's scale.
-    pub fn font_size_px(&self) -> f32 {
-        self.fonts.metrics.size_px
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +261,7 @@ fn style_runs(row: &[CellData]) -> Vec<(usize, usize, StyleKey)> {
 #[allow(clippy::too_many_lines)]
 pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut DrawContext<'_>) {
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING * m.scale as f32);
+    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
 
     let (grid, cursor) = harvest(term, ctx);
     let mode = *term.mode();
@@ -359,7 +352,10 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
     }
 }
 
-/// Segment a style run further by chosen font, shape, and emit glyph runs.
+/// Shape one style run through the host's parley stack and emit one scene
+/// `GlyphRun` per run fontique split it into. Fontique's per-cluster fallback
+/// replaces the old hand-rolled coverage cascade; per-cluster cell anchoring
+/// keeps every glyph at its grid position (ligatures included).
 #[allow(clippy::too_many_arguments)]
 fn draw_text_run(
     scene: &mut dyn Scene2D,
@@ -372,78 +368,9 @@ fn draw_text_run(
     baseline_y: f32,
     ctx: &mut DrawContext<'_>,
 ) {
-    // Choose the designed variant for the run.
-    let bold = style.bold;
-    let italic = style.italic;
-    let fonts = &mut *ctx.fonts;
-
-    // Per-cell font choice: primary (0) or fallback index +1.
-    // A cell's text goes to the first font covering its first missing char.
-    let mut cell_font: Vec<usize> = Vec::with_capacity(end - start);
-    for cell in &row[start..end] {
-        let covers = {
-            let primary = fonts.variant(bold, italic);
-            cell.text.chars().all(|c| FontStack::face_covers(&primary.face, c))
-        };
-        let idx = if covers {
-            0
-        } else {
-            let missing = {
-                let primary = fonts.variant(bold, italic);
-                cell.text
-                    .chars()
-                    .find(|&c| !FontStack::face_covers(&primary.face, c))
-            };
-            missing
-                .and_then(|c| fonts.fallback_for(c))
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        };
-        cell_font.push(idx);
-    }
-
-    // Split into font sub-runs.
-    let mut i = 0usize;
-    while i < cell_font.len() {
-        let fidx = cell_font[i];
-        let mut j = i + 1;
-        while j < cell_font.len() && cell_font[j] == fidx {
-            j += 1;
-        }
-        emit_glyph_run(scene, row, start + i, start + j, fidx, style, pad, baseline_y, ctx);
-        i = j;
-    }
-}
-
-/// Shape one font sub-run and emit a `GlyphRun` per contiguous pen range.
-#[allow(clippy::too_many_arguments)]
-fn emit_glyph_run(
-    scene: &mut dyn Scene2D,
-    row: &[CellData],
-    start: usize,
-    end: usize,
-    fidx: usize,
-    style: StyleKey,
-    pad: f32,
-    baseline_y: f32,
-    ctx: &mut DrawContext<'_>,
-) {
-    let size_px = ctx.font_size_px();
-    let fonts = &mut *ctx.fonts;
-    let m = fonts.metrics;
-    let cw = m.cell_w;
-
-    let face = if fidx == 0 {
-        fonts.variant(style.bold, style.italic)
-    } else {
-        &fonts.fallbacks[fidx - 1]
-    };
-    let face_ref = &face.face;
-
-    // Build the sub-run text and per-cell byte-offset map.
+    // Sub-run text plus a byte-offset → grid column map the clusters anchor to.
     let mut text = String::new();
-    // byte offset → absolute grid col
-    let mut cell_marks: Vec<(usize, usize)> = Vec::new();
+    let mut cell_marks: Vec<(usize, usize)> = Vec::with_capacity(end - start);
     for (k, cell) in row[start..end].iter().enumerate() {
         cell_marks.push((text.len(), start + k));
         text.push_str(&cell.text);
@@ -452,54 +379,76 @@ fn emit_glyph_run(
         return;
     }
 
-    let shaped = shape_span(face_ref, &text, size_px);
-    let mut glyphs: Vec<Glyph> = Vec::with_capacity(shaped.len());
-
-    // Map each shaped glyph's cluster to its cell, then place the glyph at the
-    // cell origin + intra-cluster pen advance (this reproduces ligatures
-    // spanning cells in a monospace layout).
-    let mut cluster_col = start;
-    let mut pen_in_cluster = 0.0f32;
-    let mut mark_idx = 0usize;
-    for (gid, cluster, x_off, y_off, x_adv, _y_adv) in shaped {
-        // Advance the cell map to the cluster's cell.
-        while mark_idx + 1 < cell_marks.len() && cell_marks[mark_idx + 1].0 <= cluster as usize {
-            mark_idx += 1;
-        }
-        let this_col = cell_marks[mark_idx].1;
-        if this_col != cluster_col {
-            cluster_col = this_col;
-            pen_in_cluster = 0.0;
-        }
-        let x = col_x(pad, cw, cluster_col) + pen_in_cluster + x_off;
-        glyphs.push(Glyph { id: gid, x, y: y_off });
-        pen_in_cluster += x_adv;
-    }
-
+    let layout = ctx.fonts.shape_run(&text, style.bold, style.italic);
+    let cw = ctx.fonts.metrics.cell_w;
     let brush = Brush::Solid(peniko(style.fg));
-    let mut transform = Affine::translate((0.0, baseline_y as f64));
-    if style.italic && fonts.needs_synthetic_italic(true) {
-        transform *= Affine::skew(-0.25, 0.0);
-    }
-    let run = GlyphRun {
-        font: &face.font,
-        font_size: size_px,
-        normalized_coords: &[],
-        transform,
-        brush: &brush,
-        brush_alpha: 1.0,
-        style: StyleRef::Fill(Fill::NonZero),
-        glyphs: &glyphs,
-    };
-    scene.draw_glyph_run(&run);
+    let mut glyphs: Vec<Glyph> = Vec::new();
 
-    // Synthetic bold: redraw with a half-pixel offset.
-    if style.bold && fonts.needs_synthetic_bold(true) {
-        let run2 = GlyphRun {
-            transform: Affine::translate((0.6, baseline_y as f64)),
-            ..run
-        };
-        scene.draw_glyph_run(&run2);
+    for line in layout.lines() {
+        for item in line.items() {
+            let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                continue;
+            };
+            let run = gr.run();
+            glyphs.clear();
+
+            // Anchor each cluster's pen at the cell its text range starts in,
+            // then advance the pen inside the cluster — a ligature spanning
+            // cells keeps its shaped geometry, wide chars stay on their cell.
+            let mut mark_idx = 0usize;
+            let mut cur_col = start;
+            let mut pen = 0.0f32;
+            for cluster in run.visual_clusters() {
+                let cs = cluster.text_range().start;
+                while mark_idx + 1 < cell_marks.len() && cell_marks[mark_idx + 1].0 <= cs {
+                    mark_idx += 1;
+                }
+                let col = cell_marks[mark_idx].1;
+                if col != cur_col {
+                    cur_col = col;
+                    pen = 0.0;
+                }
+                let cell_x = col_x(pad, cw, col);
+                for g in cluster.glyphs() {
+                    glyphs.push(Glyph {
+                        id: g.id,
+                        x: cell_x + pen + g.x,
+                        y: g.y,
+                    });
+                    pen += g.advance;
+                }
+            }
+            if glyphs.is_empty() {
+                continue;
+            }
+
+            let synthesis = crate::fonts::RunStyle::from(run.synthesis());
+            let mut transform = Affine::translate((0.0, baseline_y as f64));
+            if let Some(deg) = synthesis.skew {
+                transform *= Affine::skew(f64::from(-deg).to_radians(), 0.0);
+            }
+            let out = GlyphRun {
+                font: run.font(),
+                font_size: run.font_size(),
+                normalized_coords: run.normalized_coords(),
+                transform,
+                brush: &brush,
+                brush_alpha: 1.0,
+                style: StyleRef::Fill(Fill::NonZero),
+                glyphs: &glyphs,
+            };
+            scene.draw_glyph_run(&out);
+
+            // Faux bold: redraw with a half-cell-fraction offset, like the
+            // offset emboldening native text stacks apply.
+            if synthesis.embolden {
+                let bold_run = GlyphRun {
+                    transform: Affine::translate((0.6, baseline_y as f64)),
+                    ..out
+                };
+                scene.draw_glyph_run(&bold_run);
+            }
+        }
     }
 }
 
@@ -594,7 +543,7 @@ fn draw_cursor(
         return;
     }
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING * m.scale as f32);
+    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
     let row = cursor.row as usize;
     let x = col_x(pad, cw, cursor.col);
     let y = row_y(pad, ch, row);
@@ -657,14 +606,38 @@ fn draw_preedit(
         return;
     }
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING * m.scale as f32);
-    let size_px = ctx.font_size_px();
+    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
     let baseline_y = row_y(pad, ch, cursor.row as usize) + m.baseline;
     let x0 = col_x(pad, cw, cursor.col);
 
-    // Dim chip behind the preedit.
-    let shaped = crate::fonts::shape_span(&ctx.fonts.regular.face, text, size_px);
-    let w = shaped.iter().map(|g| g.4).sum::<f32>().max(cw);
+    // Shape the preedit like any other run; the chip is sized off the total
+    // advance so the composed text always has a backdrop.
+    let layout = ctx.fonts.shape_run(text, false, false);
+    let brush = Brush::Solid(peniko(ctx.palette.foreground));
+
+    // Collect positioned glyphs per parley run; pen advances across runs.
+    let mut pen = 0.0f32;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    for line in layout.lines() {
+        for item in line.items() {
+            let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                continue;
+            };
+            let start = glyphs.len();
+            for g in gr.glyphs() {
+                glyphs.push(Glyph {
+                    id: g.id,
+                    x: x0 + pen + g.x,
+                    y: g.y,
+                });
+                pen += g.advance;
+            }
+            runs.push((start, glyphs.len()));
+        }
+    }
+
+    let w = pen.max(cw);
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
@@ -672,22 +645,28 @@ fn draw_preedit(
         None,
         &rect(x0, baseline_y - m.baseline, w, ch),
     );
-    let glyphs: Vec<Glyph> = shaped
-        .iter()
-        .map(|(id, _c, x, y, _xa, _ya)| Glyph { id: *id, x: x0 + x, y: *y })
-        .collect();
-    let brush = Brush::Solid(peniko(ctx.palette.foreground));
-    let run = GlyphRun {
-        font: &ctx.fonts.regular.font,
-        font_size: size_px,
-        normalized_coords: &[],
-        transform: Affine::translate((0.0, baseline_y as f64)),
-        brush: &brush,
-        brush_alpha: 1.0,
-        style: StyleRef::Fill(Fill::NonZero),
-        glyphs: &glyphs,
-    };
-    scene.draw_glyph_run(&run);
+
+    let mut idx = 0usize;
+    for line in layout.lines() {
+        for item in line.items() {
+            let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                continue;
+            };
+            let (start, end) = runs[idx];
+            idx += 1;
+            let run = gr.run();
+            scene.draw_glyph_run(&GlyphRun {
+                font: run.font(),
+                font_size: run.font_size(),
+                normalized_coords: run.normalized_coords(),
+                transform: Affine::translate((0.0, baseline_y as f64)),
+                brush: &brush,
+                brush_alpha: 1.0,
+                style: StyleRef::Fill(Fill::NonZero),
+                glyphs: &glyphs[start..end],
+            });
+        }
+    }
     let mut p = BezPath::new();
     p.move_to((x0 as f64, (baseline_y + m.underline_pos) as f64));
     p.line_to(((x0 + w) as f64, (baseline_y + m.underline_pos) as f64));
@@ -700,8 +679,6 @@ fn draw_scrollbar(scene: &mut dyn Scene2D, ctx: &DrawContext<'_>) {
     if s.history_size == 0 {
         return;
     }
-    let m = ctx.fonts.metrics;
-    let _ = m;
     let total = s.history_size + s.screen_lines;
     let frac = s.screen_lines as f32 / total as f32;
     // display_offset counts lines scrolled back; 0 = live bottom.
