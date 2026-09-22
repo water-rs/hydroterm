@@ -3,6 +3,7 @@
 //! drains each frame.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -174,17 +175,23 @@ impl Terminal {
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
+        let (shell, extra_env) = match shell {
+            Some(s) => (s, HashMap::new()),
+            None => shell_with_integration(),
+        };
+        let mut env: HashMap<String, String> = [
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("COLORTERM".to_owned(), "truecolor".to_owned()),
+            ("TERM_PROGRAM".to_owned(), "hydroterm".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        env.extend(extra_env);
         let options = Options {
-            shell: Some(shell.unwrap_or_else(shell_with_integration)),
+            shell: Some(shell),
             working_directory: cwd,
             drain_on_exit: false,
-            env: [
-                ("TERM".to_owned(), "xterm-256color".to_owned()),
-                ("COLORTERM".to_owned(), "truecolor".to_owned()),
-                ("TERM_PROGRAM".to_owned(), "hydroterm".to_owned()),
-            ]
-            .into_iter()
-            .collect(),
+            env,
         };
         let pty = tty::new(
             &options,
@@ -237,31 +244,54 @@ impl Terminal {
     }
 }
 
-/// The user's `$SHELL` plus args that inject shell integration where
-/// supported — bash gets `--rcfile <generated>` emitting OSC 133 prompt
-/// marks and OSC 7 cwd. Other shells spawn plain (integration TODO).
-fn shell_with_integration() -> Shell {
+/// The user's `$SHELL` plus args/env that inject shell integration where
+/// supported — bash gets `--rcfile <generated>`, zsh a `ZDOTDIR` with a
+/// chain-sourcing `.zshrc`, fish a `-C` init command. All emit OSC 133
+/// prompt marks and OSC 7 cwd.
+fn shell_with_integration() -> (Shell, HashMap<String, String>) {
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let name = program.rsplit('/').next().unwrap_or("");
     match name {
         "bash" => match bash_integration_rc() {
-            Some(rc) => Shell::new(program, vec!["--rcfile".into(), rc]),
-            None => Shell::new(program, Vec::new()),
+            Some(rc) => (Shell::new(program, vec!["--rcfile".into(), rc]), HashMap::new()),
+            None => (Shell::new(program, Vec::new()), HashMap::new()),
         },
-        _ => Shell::new(program, Vec::new()),
+        "zsh" => match zsh_integration_dir() {
+            Some(dir) => {
+                let env = HashMap::from([("ZDOTDIR".to_owned(), dir)]);
+                (Shell::new(program, Vec::new()), env)
+            }
+            None => (Shell::new(program, Vec::new()), HashMap::new()),
+        },
+        "fish" => (Shell::new(program, vec!["-C".into(), FISH_INTEGRATION.into()]), HashMap::new()),
+        _ => (Shell::new(program, Vec::new()), HashMap::new()),
     }
 }
 
-/// Write the bash integration rcfile to the cache dir; returns its path.
-fn bash_integration_rc() -> Option<String> {
+/// Cache dir for generated integration files.
+fn integration_base() -> Option<PathBuf> {
     let base = std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache"))
         .join("hydroterm");
     std::fs::create_dir_all(&base).ok()?;
-    let path = base.join("shell-integration.bash");
+    Some(base)
+}
+
+/// Write the bash integration rcfile to the cache dir; returns its path.
+fn bash_integration_rc() -> Option<String> {
+    let path = integration_base()?.join("shell-integration.bash");
     std::fs::write(&path, BASH_INTEGRATION).ok()?;
     Some(path.to_string_lossy().into_owned())
+}
+
+/// Write the zsh `ZDOTDIR` (a dir containing `.zshrc` that chain-sources
+/// the user's real rc); returns the dir path.
+fn zsh_integration_dir() -> Option<String> {
+    let dir = integration_base()?.join("zsh");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join(".zshrc"), ZSH_INTEGRATION).ok()?;
+    Some(dir.to_string_lossy().into_owned())
 }
 
 /// Bash rcfile: sources the user's normal rc, then emits OSC 133 marks
@@ -281,6 +311,30 @@ esac
 PS0='\e]133;C\e\\'
 PS1='\e]133;B\e\\'"$PS1"
 "#;
+
+/// Zsh `ZDOTDIR/.zshrc`: sources the user's real zshrc, then hooks
+/// `precmd`/`preexec` for OSC 133 marks + OSC 7 cwd. `B` is injected at
+/// the head of PS1; zsh's $HOST is the short hostname.
+const ZSH_INTEGRATION: &str = r#"# hydroterm shell integration (auto-generated)
+[ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
+[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc"
+__hydro_precmd() {
+  local s=$?
+  printf '\e]133;D;%s\e\\\e]7;file://%s%s\e\\\e]133;A\e\\' "$s" "$HOST" "$PWD"
+}
+__hydro_preexec() { printf '\e]133;C\e\\' }
+precmd_functions+=(__hydro_precmd)
+preexec_functions+=(__hydro_preexec)
+PS1=$'\e]133;B\e\\'$PS1
+"#;
+
+/// Fish `-C` init command: `fish_postexec`/`fish_preexec` events carry
+/// the marks; `fish_prompt` is wrapped — its sequential stdout is the
+/// prompt, so `A`, the original prompt, and `B` print in order.
+const FISH_INTEGRATION: &str = "function __hydro_postexec --on-event fish_postexec; printf '\\e]133;D;%s\\e\\\\\\e]7;file://%s%s\\e\\\\' $status (hostname) $PWD; end; \
+function __hydro_preexec --on-event fish_preexec; printf '\\e]133;C\\e\\\\'; end; \
+functions -c fish_prompt __hydro_orig_fish_prompt 2>/dev/null; or function __hydro_orig_fish_prompt; echo -n '> '; end; \
+function fish_prompt; printf '\\e]133;A\\e\\\\'; __hydro_orig_fish_prompt; printf '\\e]133;B\\e\\\\'; end";
 
 
 // -- Byte-stream tap ---------------------------------------------------------

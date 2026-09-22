@@ -57,8 +57,8 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
 | Shell int. | zsh/fish integration auto-inject | 🟡 | bash auto-inject via `--rcfile`; zsh/fish TODO |
-| Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected bash rc emits marks; verified: scrollback jump lands mark at viewport top |
-| Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | bash integration auto-reports; verified: new tab spawns in /tmp |
+| Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected integration for bash (--rcfile), zsh (ZDOTDIR), fish (-C): all emit A/B/C/D; verified live jump in zsh + fish |
+| Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
 | Shell int. | Shell-integration scripts (bash/zsh/fish inject) | ❌ | inject via ENV at spawn |
 | Shell int. | OSC 9/777 notifications | 🟡 | tap emits; surface via notifier |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
