@@ -3,6 +3,7 @@
 //! drains each frame.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,7 +13,7 @@ use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{ClipboardType, Config, Term};
-use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 use alacritty_terminal::vte::ansi::Rgb;
 use polling::{Event as PollingEvent, PollMode, Poller};
 
@@ -153,6 +154,11 @@ pub struct Terminal {
     // a Mutex so Terminal stays Send+Sync.
     io: Mutex<EventLoopSender>,
     pub proxy: EventProxy,
+    /// Absolute grid rows of OSC 133 prompt-start marks
+    /// (`history_size + screen line`, recorded on the reader thread).
+    /// Rows drift if scrollback overflows — the oldest lines drop without a
+    /// hook to rebase stored marks.
+    pub prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
     pub events: Mutex<Receiver<TermEvent>>,
     _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
 }
@@ -165,12 +171,13 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         let options = Options {
-            shell: None,
+            shell: Some(shell_with_integration()),
             working_directory: cwd,
             drain_on_exit: false,
             env: [
                 ("TERM".to_owned(), "xterm-256color".to_owned()),
                 ("COLORTERM".to_owned(), "truecolor".to_owned()),
+                ("TERM_PROGRAM".to_owned(), "hydroterm".to_owned()),
             ]
             .into_iter()
             .collect(),
@@ -185,14 +192,20 @@ impl Terminal {
             },
             0,
         )?;
-        let pty = TapPty::new(pty, proxy.inner.events.clone());
+        let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
+        let pty = TapPty::new(
+            pty,
+            term.clone(),
+            prompt_marks.clone(),
+            proxy.inner.events.clone(),
+        );
 
         let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let io = event_loop.channel();
         proxy.inner.notifier.set(Notifier(io.clone())).ok();
         let join = event_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, events: Mutex::new(events_rx), _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, events: Mutex::new(events_rx), _join: join })
     }
 
     /// Write user input bytes to the PTY.
@@ -220,41 +233,152 @@ impl Terminal {
     }
 }
 
+/// The user's `$SHELL` plus args that inject shell integration where
+/// supported — bash gets `--rcfile <generated>` emitting OSC 133 prompt
+/// marks and OSC 7 cwd. Other shells spawn plain (integration TODO).
+fn shell_with_integration() -> Shell {
+    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let name = program.rsplit('/').next().unwrap_or("");
+    match name {
+        "bash" => match bash_integration_rc() {
+            Some(rc) => Shell::new(program, vec!["--rcfile".into(), rc]),
+            None => Shell::new(program, Vec::new()),
+        },
+        _ => Shell::new(program, Vec::new()),
+    }
+}
+
+/// Write the bash integration rcfile to the cache dir; returns its path.
+fn bash_integration_rc() -> Option<String> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache"))
+        .join("hydroterm");
+    std::fs::create_dir_all(&base).ok()?;
+    let path = base.join("shell-integration.bash");
+    std::fs::write(&path, BASH_INTEGRATION).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Bash rcfile: sources the user's normal rc, then emits OSC 133 marks
+/// (`A` before PS1, `B` at PS1 end, `C` pre-exec via PS0, `D` post-exec)
+/// and OSC 7 cwd on every prompt.
+const BASH_INTEGRATION: &str = r#"# hydroterm shell integration (auto-generated)
+[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+__hydro_osc() {
+  local s=$?
+  printf '\e]133;D;%s\e\\\e]7;file://%s%s\e\\\e]133;A\e\\' "$s" "$HOSTNAME" "$PWD"
+}
+case ";$PROMPT_COMMAND;" in
+  *__hydro_osc*) ;;
+  *) PROMPT_COMMAND="__hydro_osc${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+esac
+PS0='\e]133;C\e\\'
+PS1='\e]133;B\e\\'"$PS1"
+"#;
+
+
 // -- Byte-stream tap ---------------------------------------------------------
 
 /// PTY wrapper whose reader additionally feeds an `OscScanner`, so sequences
 /// vte's `osc_dispatch` drops (OSC 133, OSC 7, OSC 9/777, APC) still reach us.
+/// The scanner also segments reads at string boundaries, so the cursor
+/// position sampled when a string completes is exactly where its sender saw
+/// it — `EventLoop` locks the `Term` via `try_lock_unfair` while parsing,
+/// and never holds it during `read` itself.
 pub struct TapPty {
     inner: tty::Pty,
     reader: TapReader,
 }
 
+/// A `*const Term` dereferenced only on the event-loop thread. The
+/// `EventLoop`'s `terminal` Option keeps the `FairMutex` guard alive across
+/// the whole `pty_read`, so `try_lock_unfair` inside `read` always fails on
+/// the second iteration onward. `cursor.point` and `history_size` are only
+/// written on that same thread (resize is the sole exception — a torn read
+/// just yields a slightly stale mark), so a raw read on it is race-free.
+struct TermPtr(*const Term<EventProxy>);
+
+// SAFETY: the pointer is only dereferenced inside `TapReader::read`, which
+// runs exclusively on the event-loop thread.
+unsafe impl Send for TermPtr {}
+
 /// Reads the PTY and scans for the sequences the VT layer ignores.
 pub struct TapReader {
     file: std::fs::File,
     scanner: OscScanner,
+    scratch: Vec<u8>,
+    term: TermPtr,
+    /// Keeps the `Term` pointed to by `term` alive.
+    _term: Arc<FairMutex<Term<EventProxy>>>,
+    marks: Arc<std::sync::Mutex<Vec<i64>>>,
+    sink: Sender<TermEvent>,
 }
 
 impl TapPty {
-    fn new(pty: tty::Pty, sink: Sender<TermEvent>) -> Self {
+    fn new(
+        pty: tty::Pty,
+        term: Arc<FairMutex<Term<EventProxy>>>,
+        marks: Arc<std::sync::Mutex<Vec<i64>>>,
+        sink: Sender<TermEvent>,
+    ) -> Self {
+        let term_ptr = {
+            let guard = term.lock();
+            TermPtr(&*guard as *const Term<EventProxy>)
+        };
         let reader = TapReader {
             // `try_clone` yields a second fd onto the same open file
             // description: the reader consumes the identical byte stream the
             // event loop's `register()` polls on the inner file.
             file: pty.file().try_clone().expect("dup pty fd"),
-            scanner: OscScanner::new(sink),
+            scanner: OscScanner::new(),
+            scratch: vec![0; 65536],
+            term: term_ptr,
+            _term: term,
+            marks,
+            sink,
         };
         Self { inner: pty, reader }
     }
 }
 
+impl TapReader {
+    /// Route a completed tap event: prompt marks snapshot the cursor
+    /// position (this runs on the event-loop thread, with the `Term` only
+    /// try-lockable — `lock` would deadlock against the reader's lease).
+    fn dispatch(&mut self, ev: TapEvent) {
+        if matches!(ev, TapEvent::PromptStart) {
+            // SAFETY: dereferenced on the event-loop thread only (see
+            // `TermPtr`); the `Arc<FairMutex<Term>>` outlives the reader.
+            let term = unsafe { &*self.term.0 };
+            let abs = term.grid().history_size() as i64
+                + i64::from(term.grid().cursor.point.line.0);
+            let mut marks = self.marks.lock().unwrap();
+            if marks.last() != Some(&abs) {
+                marks.push(abs);
+            }
+        }
+        let _ = self.sink.send(TermEvent::Tap(ev));
+    }
+}
+
 impl Read for TapReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.file.read(buf)?;
-        if n > 0 {
-            self.scanner.feed(&buf[..n]);
+        loop {
+            let (n, events) = self.scanner.take(buf);
+            for ev in events {
+                self.dispatch(ev);
+            }
+            if n > 0 {
+                return Ok(n);
+            }
+            let got = self.file.read(&mut self.scratch)?;
+            if got == 0 {
+                return Ok(0);
+            }
+            self.scanner.feed(&self.scratch[..got]);
         }
-        Ok(n)
     }
 }
 

@@ -243,7 +243,7 @@ impl TermSurface {
     /// Scroll so the next OSC 133 prompt mark sits at the viewport top.
     /// `dir` -1 = previous prompt, +1 = next.
     fn jump_prompt(&mut self, dir: i32) {
-        let marks = self.session.prompt_marks.lock().unwrap();
+        let marks = self.session.terminal.prompt_marks.lock().unwrap();
         if marks.is_empty() {
             return;
         }
@@ -253,7 +253,17 @@ impl TermSurface {
         // Raw row index shown at screen row 0.
         let top = history - offset;
         let target = if dir < 0 {
-            marks.iter().copied().filter(|&m| m < top).max()
+            marks
+                .iter()
+                .copied()
+                .filter(|&m| m < top)
+                .max()
+                // At the bottom, every mark is on screen; jump to the one
+                // before the prompt the user is typing at.
+                .or_else(|| {
+                    (offset == 0 && marks.len() >= 2)
+                        .then(|| marks[marks.len() - 2])
+                })
         } else {
             marks.iter().copied().filter(|&m| m > top).min()
         };
@@ -363,18 +373,9 @@ impl TermSurface {
                     self.app.close_tab(self.session.id);
                 }
                 TermEvent::Tap(tap) => match tap {
-                    TapEvent::PromptStart => {
-                        // Absolute raw row = history + screen Line — stable as
-                        // content scrolls into scrollback.
-                        let term = self.session.terminal.term.lock();
-                        let abs = term.grid().history_size() as i64
-                            + i64::from(term.grid().cursor.point.line.0);
-                        drop(term);
-                        let mut marks = self.session.prompt_marks.lock().unwrap();
-                        if marks.last() != Some(&abs) {
-                            marks.push(abs);
-                        }
-                    }
+                    // Marks are recorded on the reader thread where the
+                    // cursor still sits at the mark position.
+                    TapEvent::PromptStart => {}
                     TapEvent::Cwd(path) => {
                         *self.session.cwd.lock().unwrap() = Some(path);
                     }

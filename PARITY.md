@@ -53,8 +53,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Font | Synthetic bold/italic | ✅ | stroke emboss / skew |
 | Font | Color emoji (COLR/CBDT) | ❌ | outline-only pipeline; bitmap emoji needs blit path |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
-| Shell int. | OSC 133 prompt marks + jump prev/next prompt | 🟡 | byte-stream tap implemented; jump keybind next |
-| Shell int. | OSC 7 cwd → new tab/split inherits cwd | 🟡 | tap implemented; wire spawn cwd next |
+| Shell int. | zsh/fish integration auto-inject | 🟡 | bash auto-inject via `--rcfile`; zsh/fish TODO |
+| Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected bash rc emits marks; verified: scrollback jump lands mark at viewport top |
+| Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | bash integration auto-reports; verified: new tab spawns in /tmp |
 | Shell int. | Shell-integration scripts (bash/zsh/fish inject) | ❌ | inject via ENV at spawn |
 | Shell int. | OSC 9/777 notifications | 🟡 | tap emits; surface via notifier |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |

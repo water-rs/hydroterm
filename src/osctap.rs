@@ -1,9 +1,16 @@
 //! Byte-stream tap on the PTY output, catching sequences vte drops before
 //! `Term` ever sees them: OSC 133 prompt marks, OSC 7 working directory,
 //! OSC 9/777 notifications, APC kitty graphics.
+//!
+//! The scanner doubles as a read filter: `feed` buffers raw bytes, and
+//! `take` hands them to the event loop in segments cut at string
+//! boundaries — plain text before a tapped string is returned separately
+//! from the string itself. Since the event loop parses each returned
+//! segment immediately, the cursor position sampled while emitting a
+//! string segment is exactly where the sender's prompt sat.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 
 /// Max buffered bytes inside one OSC/APC sequence before we drop it.
 /// kitty image payloads chunk at ~4KiB each; 1MiB is far past a sane OSC.
@@ -28,9 +35,6 @@ pub enum TapEvent {
     Apc(Vec<u8>),
 }
 
-/// Where the tap sends decoded events (same channel `EventProxy` uses).
-pub type TapSink = Sender<crate::terminal::TermEvent>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Ground,
@@ -43,22 +47,87 @@ enum State {
     Skip(bool),
 }
 
-/// Incremental scanner fed with raw PTY bytes.
+/// Incremental scanner fed with raw PTY bytes, emitting them in
+/// string-boundary-aligned segments.
 pub struct OscScanner {
     state: State,
+    /// Payload of the current string sequence.
     buf: Vec<u8>,
-    sink: TapSink,
+    /// Fed bytes not yet taken.
+    pending: Vec<u8>,
+    /// Segment ends within `pending`: (end index, is string end).
+    cuts: VecDeque<(usize, bool)>,
+    /// Events produced since the last emitted string segment.
+    events: Vec<TapEvent>,
 }
 
 impl OscScanner {
-    pub fn new(sink: TapSink) -> Self {
-        Self { state: State::Ground, buf: Vec::new(), sink }
+    pub fn new() -> Self {
+        Self {
+            state: State::Ground,
+            buf: Vec::new(),
+            pending: Vec::new(),
+            cuts: VecDeque::new(),
+            events: Vec::new(),
+        }
     }
 
+    /// Scan raw bytes, buffering them for segmented `take` calls.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
+            self.pending.push(b);
+            let prev = self.state;
             self.step(b);
+            match (prev, self.state) {
+                // A tapped string opens: cut the segment just before its ESC.
+                (State::Esc, State::Osc(_)) | (State::Esc, State::Apc(_)) => {
+                    self.cuts.push_back((self.pending.len() - 2, false));
+                }
+                // A tapped string closed: cut right after its terminator.
+                (State::Osc(_), State::Ground) | (State::Apc(_), State::Ground) => {
+                    self.cuts.push_back((self.pending.len(), true));
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Emit the next pending segment into `out`; returns the byte count and
+    /// the events to dispatch — attached to the segment that completes a
+    /// tapped string, when the parser has consumed everything before it.
+    pub fn take(&mut self, out: &mut [u8]) -> (usize, Vec<TapEvent>) {
+        while let Some(&(cut, string_end)) = self.cuts.front() {
+            let n = cut.min(out.len());
+            out[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            for c in self.cuts.iter_mut() {
+                c.0 -= n;
+            }
+            if n == cut {
+                self.cuts.pop_front();
+            }
+            if n > 0 {
+                let events = if string_end {
+                    std::mem::take(&mut self.events)
+                } else {
+                    Vec::new()
+                };
+                return (n, events);
+            }
+            // Zero-length cut at the segment start — pop and continue.
+        }
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(out.len());
+            out[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            // A partially emitted in-progress string shifts the recorded
+            // end cut; plain text never carries one.
+            for c in self.cuts.iter_mut() {
+                c.0 -= n;
+            }
+            return (n, Vec::new());
+        }
+        (0, Vec::new())
     }
 
     fn step(&mut self, b: u8) {
@@ -87,15 +156,15 @@ impl OscScanner {
                 }
             }
             Osc(esc) | Apc(esc) | Skip(esc) => {
-                let in_osc = self.state == Osc(true) || self.state == Osc(false);
-                let in_apc = self.state == Apc(true) || self.state == Apc(false);
+                let in_osc = matches!(self.state, Osc(_));
+                let in_apc = matches!(self.state, Apc(_));
                 if esc {
                     self.state = if b == b'\\' {
                         self.finish_string(in_osc, in_apc);
                         Ground
                     } else if b == 0x1b {
                         // ESC ESC inside a string: stay pending.
-                        Osc(true).min_state(in_osc, in_apc)
+                        min_state(true, in_osc, in_apc)
                     } else {
                         // ESC + other byte aborts the string per ECMA-48.
                         self.buf.clear();
@@ -136,38 +205,36 @@ impl OscScanner {
             self.dispatch_osc();
         } else if apc {
             let payload = std::mem::take(&mut self.buf);
-            let _ = self.sink.send(crate::terminal::TermEvent::Tap(TapEvent::Apc(payload)));
+            self.events.push(TapEvent::Apc(payload));
         }
         self.buf.clear();
     }
 
-    fn dispatch_osc(&self) {
+    fn dispatch_osc(&mut self) {
         let params: Vec<&[u8]> = self.buf.split(|&b| b == b';').collect();
-        let tap = |e: TapEvent| {
-            let _ = self.sink.send(crate::terminal::TermEvent::Tap(e));
-        };
+        let tap = |e: TapEvent, evs: &mut Vec<TapEvent>| evs.push(e);
         match params.first().copied().unwrap_or(b"") {
             b"7" => {
                 if let Some(p) = params.get(1).and_then(|u| cwd_from_uri(u)) {
-                    tap(TapEvent::Cwd(p));
+                    tap(TapEvent::Cwd(p), &mut self.events);
                 }
             }
             b"9" => {
                 if let Some(t) = params.get(1).and_then(|p| std::str::from_utf8(p).ok()) {
-                    tap(TapEvent::Notify(String::new(), t.to_owned()));
+                    tap(TapEvent::Notify(String::new(), t.to_owned()), &mut self.events);
                 }
             }
             b"133" => match params.get(1).copied().unwrap_or(b"") {
-                b"A" => tap(TapEvent::PromptStart),
-                b"B" => tap(TapEvent::PromptEnd),
-                b"C" => tap(TapEvent::CommandStart),
+                b"A" => tap(TapEvent::PromptStart, &mut self.events),
+                b"B" => tap(TapEvent::PromptEnd, &mut self.events),
+                b"C" => tap(TapEvent::CommandStart, &mut self.events),
                 // `133;D;{code}` — also `133;D` alone.
                 p if p.first() == Some(&b'D') => {
                     let code = params
                         .get(2)
                         .and_then(|s| std::str::from_utf8(s).ok())
                         .and_then(|s| s.parse::<i32>().ok());
-                    tap(TapEvent::CommandEnd(code));
+                    tap(TapEvent::CommandEnd(code), &mut self.events);
                 }
                 _ => (),
             },
@@ -176,7 +243,7 @@ impl OscScanner {
                 if let (Some(t), Some(b)) = (params.get(2), params.get(3))
                     && let (Ok(t), Ok(b)) = (std::str::from_utf8(t), std::str::from_utf8(b))
                 {
-                    tap(TapEvent::Notify(t.to_owned(), b.to_owned()));
+                    tap(TapEvent::Notify(t.to_owned(), b.to_owned()), &mut self.events);
                 }
             }
             _ => (),
@@ -208,72 +275,104 @@ fn cwd_from_uri(uri: &[u8]) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8_lossy(&out).as_ref()))
 }
 
-impl State {
-    /// Keep the same string state when re-entering pending-ESC.
-    fn min_state(self, osc: bool, apc: bool) -> Self {
-        let _ = self;
-        if osc {
-            State::Osc(true)
-        } else if apc {
-            State::Apc(true)
-        } else {
-            State::Skip(true)
-        }
+/// The string state to re-enter when a pending-ESC turns out to be another
+/// ESC inside the same string.
+fn min_state(esc: bool, in_osc: bool, in_apc: bool) -> State {
+    if in_osc {
+        State::Osc(esc)
+    } else if in_apc {
+        State::Apc(esc)
+    } else {
+        State::Skip(esc)
+    }
+}
+
+impl Default for OscScanner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::TermEvent;
-    use std::sync::mpsc;
 
-    fn scan(bytes: &[u8]) -> Vec<TapEvent> {
-        let (tx, rx) = mpsc::channel();
-        let mut s = OscScanner::new(tx);
+    /// Feed bytes, then drain every segment collecting events and the
+    /// re-emitted stream.
+    fn scan(bytes: &[u8]) -> (Vec<TapEvent>, Vec<u8>) {
+        let mut s = OscScanner::new();
         s.feed(bytes);
-        drop(s);
-        rx.iter()
-            .filter_map(|e| match e {
-                TermEvent::Tap(t) => Some(t),
-                _ => None,
-            })
-            .collect()
+        let mut events = Vec::new();
+        let mut stream = Vec::new();
+        let mut out = [0u8; 64];
+        loop {
+            let (n, evs) = s.take(&mut out);
+            events.extend(evs);
+            if n == 0 {
+                break;
+            }
+            stream.extend_from_slice(&out[..n]);
+        }
+        (events, stream)
+    }
+
+    #[test]
+    fn passthrough_preserves_stream() {
+        let input = b"text\x1b]133;A\x07more\x1b_Ga=T;XX\x1b\\tail\x1bPq\x1b]7;x\x07y\x1b\\end";
+        let (_evs, stream) = scan(input);
+        assert_eq!(stream, input);
+    }
+
+    #[test]
+    fn segments_split_around_string() {
+        let mut s = OscScanner::new();
+        s.feed(b"pre\x1b]133;A\x07post");
+        let mut out = [0u8; 64];
+        let (n1, e1) = s.take(&mut out);
+        assert_eq!(&out[..n1], b"pre");
+        assert!(e1.is_empty());
+        let (n2, e2) = s.take(&mut out);
+        assert_eq!(&out[..n2], b"\x1b]133;A\x07");
+        assert!(matches!(e2.as_slice(), [TapEvent::PromptStart]));
+        let (n3, e3) = s.take(&mut out);
+        assert_eq!(&out[..n3], b"post");
+        assert!(e3.is_empty());
     }
 
     #[test]
     fn osc133_marks() {
-        let ev = scan(b"\x1b]133;A\x07prompt$ \x1b]133;B\x07ls\x1b]133;D;0\x07");
+        let (ev, _) = scan(b"\x1b]133;A\x07prompt$ \x1b]133;B\x07ls\x1b]133;D;0\x07");
         assert!(matches!(ev.as_slice(), [TapEvent::PromptStart, TapEvent::PromptEnd, TapEvent::CommandEnd(Some(0))]));
     }
 
     #[test]
     fn osc133_st_terminated() {
-        let ev = scan(b"\x1b]133;C\x1b\\rest");
+        let (ev, _) = scan(b"\x1b]133;C\x1b\\rest");
         assert!(matches!(ev.as_slice(), [TapEvent::CommandStart]));
     }
 
     #[test]
-    fn osc133_split_across_reads() {
-        let (tx, rx) = mpsc::channel();
-        let mut s = OscScanner::new(tx);
+    fn osc133_split_across_feeds() {
+        let mut s = OscScanner::new();
         s.feed(b"ls\x1b]13");
         s.feed(b"3;A\x07hi");
         s.feed(b"\x1b]133;D;42\x1b\\");
-        drop(s);
-        let ev: Vec<TapEvent> = rx
-            .iter()
-            .filter_map(|e| match e {
-                TermEvent::Tap(t) => Some(t),
-                _ => None,
-            })
-            .collect();
-        assert!(matches!(ev.as_slice(), [TapEvent::PromptStart, TapEvent::CommandEnd(Some(42))]));
+        let mut events = Vec::new();
+        let mut out = [0u8; 64];
+        loop {
+            let (n, evs) = s.take(&mut out);
+            let empty = n == 0 && evs.is_empty();
+            events.extend(evs);
+            if empty {
+                break;
+            }
+        }
+        assert!(matches!(events.as_slice(), [TapEvent::PromptStart, TapEvent::CommandEnd(Some(42))]));
     }
 
     #[test]
     fn osc7_cwd() {
-        let ev = scan(b"\x1b]7;file://devin-box/home/ubuntu/projects%20x\x07");
+        let (ev, _) = scan(b"\x1b]7;file://devin-box/home/ubuntu/projects%20x\x07");
         assert!(
             matches!(ev.as_slice(), [TapEvent::Cwd(p)] if p == &PathBuf::from("/home/ubuntu/projects x"))
         );
@@ -282,20 +381,21 @@ mod tests {
     #[test]
     fn no_false_positive_in_dcs() {
         // An ESC] inside DCS must not start an OSC.
-        let ev = scan(b"\x1bPq\x1b]133;A\x07stuff\x1b\\after");
+        let (ev, stream) = scan(b"\x1bPq\x1b]133;A\x07stuff\x1b\\after");
         assert!(ev.is_empty());
+        assert_eq!(stream, b"\x1bPq\x1b]133;A\x07stuff\x1b\\after");
     }
 
     #[test]
     fn esc_abort() {
         // ESC inside OSC aborts it; the next sequence still parses.
-        let ev = scan(b"\x1b]133;\x1bX\x1b]133;A\x07");
+        let (ev, _) = scan(b"\x1b]133;\x1bX\x1b]133;A\x07");
         assert!(matches!(ev.as_slice(), [TapEvent::PromptStart]));
     }
 
     #[test]
     fn apc_captured() {
-        let ev = scan(b"\x1b_Ga=T,f=32;QUJD\x1b\\x");
+        let (ev, _) = scan(b"\x1b_Ga=T,f=32;QUJD\x1b\\x");
         assert!(matches!(ev.as_slice(), [TapEvent::Apc(p)] if p == b"Ga=T,f=32;QUJD"));
     }
 }

@@ -29,8 +29,6 @@ pub struct Session {
     pub font_size: Binding<f32>,
     /// Child process exited.
     pub exited: Binding<bool>,
-    /// Absolute grid rows of OSC 133 prompt-start marks (`history + line`).
-    pub prompt_marks: std::sync::Mutex<Vec<i64>>,
     /// Latest working directory reported via OSC 7.
     pub cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
@@ -51,7 +49,6 @@ impl Session {
             title: binding(Str::from("Shell")),
             font_size: Binding::f32(FONT_SIZE),
             exited: Binding::bool(false),
-            prompt_marks: std::sync::Mutex::new(Vec::new()),
             cwd: std::sync::Mutex::new(None),
         }
     }
