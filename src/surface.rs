@@ -65,7 +65,7 @@ struct Search {
 
 /// One terminal surface — renderer + input owner for a session.
 pub struct TermSurface {
-    session: Arc<Session>,
+    session: Rc<Session>,
     app: AppState,
     fonts: FontStack,
     /// Shared palette — swapped on theme reload.
@@ -102,7 +102,7 @@ pub struct TermSurface {
 
 impl TermSurface {
     /// Wrap a session in a GPU surface renderer.
-    pub fn new(session: Arc<Session>, app: AppState, palette: Rc<RefCell<Palette>>) -> Self {
+    pub fn new(session: Rc<Session>, app: AppState, palette: Rc<RefCell<Palette>>) -> Self {
         let font_size = session.font_size.get();
         Self {
             session,
@@ -214,7 +214,7 @@ impl TermSurface {
             TermAction::NewTab => {
                 self.app.new_tab();
             }
-            TermAction::CloseTab => self.app.close_tab(self.session.id),
+            TermAction::CloseTab => self.app.close_pane(self.session.id),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),
@@ -268,6 +268,14 @@ impl TermSurface {
                     .scroll_display(Scroll::Bottom);
             }
             TermAction::Quit => self.app.quit(),
+            TermAction::SplitRight => {
+                self.app.split_pane(crate::app::SplitDir::Row, self.session.id);
+            }
+            TermAction::SplitDown => {
+                self.app.split_pane(crate::app::SplitDir::Column, self.session.id);
+            }
+            TermAction::FocusNextPane => self.app.cycle_pane(1),
+            TermAction::FocusPrevPane => self.app.cycle_pane(-1),
         }
     }
 
@@ -363,10 +371,7 @@ impl TermSurface {
                         true => Str::from("hydroterm"),
                         false => Str::from(title),
                     };
-                    self.session.title.set(t.clone());
-                    if self.app.selected.get() == self.session.id {
-                        self.app.window_title.set(t);
-                    }
+                    self.app.set_session_title(self.session.id, t);
                 }
                 TermEvent::ClipboardStore(_ty, text) => {
                     if let Some(clip) = self.clipboard.as_mut() {
@@ -458,6 +463,9 @@ impl TermSurface {
 
     fn on_focus(&mut self, gained: bool) {
         self.focused = gained;
+        if gained {
+            self.app.focus_pane(self.session.id);
+        }
         let mode = *self.session.terminal.term.lock().mode();
         if mode.contains(TermMode::FOCUS_IN_OUT) {
             self.write(if gained { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });

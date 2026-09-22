@@ -39,7 +39,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Links | OSC 8 hyperlink render + Ctrl+click open | ✅ | `printf '\e]8;;https://example.com\e\\link\e]8;;\e\\'` |
 | Links | Plain-text URL detect + open | ❌ | regex over grid rows on click — planned |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
-| Splits | Horizontal/vertical split, resize, focus nav | ❌ | pane tree inside tab — planned (needs custom container; hydrolysis has no splitter) |
+| Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
+| Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #18) |
+| Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#16) |
 | Windows | Multi-window | 🚫 | hydrolysis winit runner spawns 1 window — needs upstream API |
 | Quick terminal | Drop-down/global-hotkey terminal | 🚫 | X11 global grab needs x11 dep; deferred |
 | Config | `key = value` config file (~/.config/hydroterm/config) | ✅ | 8 parser unit tests; template auto-written |

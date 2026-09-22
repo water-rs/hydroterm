@@ -307,6 +307,11 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "t" => TermAction::NewTab,
         "w" => TermAction::CloseTab,
         "n" => TermAction::NewTab,
+        "a" => TermAction::SelectAll,
+        "e" => TermAction::SplitRight,
+        "d" => TermAction::SplitDown,
+        "]" | "}" => TermAction::FocusNextPane,
+        "[" | "{" => TermAction::FocusPrevPane,
         "+" | "=" => TermAction::FontBigger,
         "-" | "_" => TermAction::FontSmaller,
         "0" | ")" => TermAction::FontReset,
@@ -376,5 +381,11 @@ pub enum TermAction {
     ScrollToBottom,
     /// Shut down all sessions and exit.
     Quit,
+    /// Split the focused pane right/down (new pane takes half its slot).
+    SplitRight,
+    SplitDown,
+    /// Cycle pane focus within the tab.
+    FocusNextPane,
+    FocusPrevPane,
 }
 

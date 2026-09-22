@@ -94,8 +94,9 @@ copy-on-select = false
 # new_tab, close_tab, next_tab, prev_tab, select_tab_1..8,
 # font_bigger, font_smaller, font_reset, clear_scrollback, search,
 # prompt_prev, prompt_next, select_all, scroll_to_top,
-# scroll_to_bottom, quit
-# keybind = ctrl+shift+e=scroll_to_bottom
+# scroll_to_bottom, quit, split_right, split_down,
+# focus_next_pane, focus_prev_pane
+# keybind = ctrl+alt+a=select_all
 ";
 
 impl AppConfig {
@@ -304,6 +305,10 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "scroll_to_top" => TermAction::ScrollToTop,
         "scroll_to_bottom" => TermAction::ScrollToBottom,
         "quit" => TermAction::Quit,
+        "split_right" => TermAction::SplitRight,
+        "split_down" => TermAction::SplitDown,
+        "focus_next_pane" => TermAction::FocusNextPane,
+        "focus_prev_pane" => TermAction::FocusPrevPane,
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)
