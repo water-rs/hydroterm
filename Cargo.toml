@@ -1,0 +1,40 @@
+[package]
+name = "hydroterm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "A modern GPU terminal emulator built on WaterUI's hydrolysis backend"
+
+[dependencies]
+waterui = { version = "0.5.2", default-features = false, features = ["gpu"] }
+waterui-graphics = { version = "0.5.1", default-features = false, features = ["gpu", "vello-scene"] }
+waterui-core = "0.5.0"
+hydrolysis = { version = "0.3.1", features = ["winit"] }
+hydrolysis-m3 = "0.3.1"
+nami = "0.11.0"
+alacritty_terminal = "0.26.0"
+fontdb = "0.24"
+rustybuzz = "0.20"
+unicode-segmentation = "1.13"
+waterkit-clipboard = "0.1.4"
+vello = "0.9"
+peniko = "0.6"
+kurbo = "0.13"
+wgpu = "29.0.4"
+vello_hybrid = { version = "0.2", features = ["std", "wgpu", "text"] }
+keyboard-types = "0.8"
+pollster = "1.0"
+parking_lot = "0.12"
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace]
+
+[workspace.metadata.dylint]
+libraries = [
+  { git = "https://github.com/water-rs/lints", rev = "b60983da70b4f9f553cef5cd813a8719168ee837" },
+]
