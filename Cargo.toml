@@ -27,6 +27,7 @@ keyboard-types = "0.8"
 pollster = "1.0"
 parking_lot = "0.12"
 tracing = "0.1"
+polling = "3.8.0"
 
 [profile.release]
 lto = "thin"

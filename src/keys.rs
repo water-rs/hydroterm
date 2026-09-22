@@ -293,6 +293,13 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
     if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
         return None;
     }
+    if let Key::Named(named) = key {
+        return Some(match named {
+            NamedKey::ArrowUp => TermAction::PromptPrev,
+            NamedKey::ArrowDown => TermAction::PromptNext,
+            _ => return None,
+        });
+    }
     let Key::Character(text) = key else { return None };
     Some(match text.to_ascii_lowercase().as_str() {
         "c" => TermAction::Copy,
@@ -359,5 +366,8 @@ pub enum TermAction {
     FontReset,
     ClearScrollback,
     Search,
+    /// Jump viewport to the previous/next OSC 133 prompt mark.
+    PromptPrev,
+    PromptNext,
 }
 

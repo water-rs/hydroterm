@@ -15,6 +15,7 @@
 mod app;
 mod fonts;
 mod keys;
+mod osctap;
 mod mouse;
 mod palette;
 mod scene;

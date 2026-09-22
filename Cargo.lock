@@ -2776,6 +2776,7 @@ dependencies = [
  "nami",
  "parking_lot",
  "peniko",
+ "polling",
  "pollster 1.0.1",
  "rustybuzz",
  "tracing",

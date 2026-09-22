@@ -29,17 +29,21 @@ pub struct Session {
     pub font_size: Binding<f32>,
     /// Child process exited.
     pub exited: Binding<bool>,
+    /// Absolute grid rows of OSC 133 prompt-start marks (`history + line`).
+    pub prompt_marks: std::sync::Mutex<Vec<i64>>,
+    /// Latest working directory reported via OSC 7.
+    pub cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl Session {
-    fn spawn(id: u64) -> Self {
+    fn spawn(id: u64, cwd: Option<std::path::PathBuf>) -> Self {
         let config = Config {
             scrolling_history: HISTORY_LINES,
             kitty_keyboard: true,
             ..Default::default()
         };
         // A reasonable initial grid; the surface resizes on its first frame.
-        let terminal = Terminal::spawn(config, 120, 32, (9, 18))
+        let terminal = Terminal::spawn(config, 120, 32, (9, 18), cwd)
             .expect("failed to spawn PTY — is a shell available?");
         Self {
             id,
@@ -47,6 +51,8 @@ impl Session {
             title: binding(Str::from("Shell")),
             font_size: Binding::f32(FONT_SIZE),
             exited: Binding::bool(false),
+            prompt_marks: std::sync::Mutex::new(Vec::new()),
+            cwd: std::sync::Mutex::new(None),
         }
     }
 }
@@ -93,11 +99,19 @@ impl AppState {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Spawn a session, append a tab, select it.
+    /// Spawn a session, append a tab, select it. Inherits the OSC 7 cwd
+    /// of the currently selected session when the shell reported one.
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new_tab(&self) -> u64 {
         let id = self.alloc_id();
-        let session = Arc::new(Session::spawn(id));
+        let cwd = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == self.selected.get())
+            .and_then(|s| s.cwd.lock().unwrap().clone());
+        let session = Arc::new(Session::spawn(id, cwd));
         self.sessions.lock().unwrap().push(session);
         self.selected.set(id);
         self.tab_ids.append(id);

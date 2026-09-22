@@ -26,6 +26,7 @@ use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab
 use crate::mouse::{self, CellPos, MouseAction};
 use crate::palette::Palette;
 use crate::scene::{self, CursorInfo, DrawContext, PADDING, ScrollInfo, cursor_info};
+use crate::osctap::TapEvent;
 use crate::terminal::TermEvent;
 
 /// Blink half-period for the cursor.
@@ -234,6 +235,33 @@ impl TermSurface {
                     active: 0,
                 });
             }
+            TermAction::PromptPrev => self.jump_prompt(-1),
+            TermAction::PromptNext => self.jump_prompt(1),
+        }
+    }
+
+    /// Scroll so the next OSC 133 prompt mark sits at the viewport top.
+    /// `dir` -1 = previous prompt, +1 = next.
+    fn jump_prompt(&mut self, dir: i32) {
+        let marks = self.session.prompt_marks.lock().unwrap();
+        if marks.is_empty() {
+            return;
+        }
+        let mut term = self.session.terminal.term.lock();
+        let history = term.grid().history_size() as i64;
+        let offset = term.grid().display_offset() as i64;
+        // Raw row index shown at screen row 0.
+        let top = history - offset;
+        let target = if dir < 0 {
+            marks.iter().copied().filter(|&m| m < top).max()
+        } else {
+            marks.iter().copied().filter(|&m| m > top).min()
+        };
+        let Some(abs) = target else { return };
+        let want = (history - abs).clamp(0, history) as i32;
+        let delta = want - offset as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
         }
     }
 
@@ -334,6 +362,31 @@ impl TermSurface {
                 TermEvent::Exit => {
                     self.app.close_tab(self.session.id);
                 }
+                TermEvent::Tap(tap) => match tap {
+                    TapEvent::PromptStart => {
+                        // Absolute raw row = history + screen Line — stable as
+                        // content scrolls into scrollback.
+                        let term = self.session.terminal.term.lock();
+                        let abs = term.grid().history_size() as i64
+                            + i64::from(term.grid().cursor.point.line.0);
+                        drop(term);
+                        let mut marks = self.session.prompt_marks.lock().unwrap();
+                        if marks.last() != Some(&abs) {
+                            marks.push(abs);
+                        }
+                    }
+                    TapEvent::Cwd(path) => {
+                        *self.session.cwd.lock().unwrap() = Some(path);
+                    }
+                    TapEvent::PromptEnd | TapEvent::CommandStart => {}
+                    TapEvent::CommandEnd(_code) => {}
+                    TapEvent::Notify(_title, _body) => {
+                        // No system-notify path yet — tracked as a feedback item.
+                    }
+                    TapEvent::Apc(_payload) => {
+                        // kitty graphics land here once the decoder lands.
+                    }
+                },
             }
         }
     }

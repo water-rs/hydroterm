@@ -3,17 +3,20 @@
 //! drains each frame.
 
 use std::borrow::Cow;
-use std::io;
+use std::io::{self, Read};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use alacritty_terminal::event::{Event, EventListener, Notify, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{ClipboardType, Config, Term};
-use alacritty_terminal::tty::{self, Options};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options};
 use alacritty_terminal::vte::ansi::Rgb;
+use polling::{Event as PollingEvent, PollMode, Poller};
+
+use crate::osctap::{OscScanner, TapEvent};
 
 /// Everything the render loop needs to know that isn't cell data.
 pub enum TermEvent {
@@ -33,6 +36,8 @@ pub enum TermEvent {
     ChildExit(String),
     /// Event loop itself shut down.
     Exit,
+    /// Byte-stream tap (OSC 133/7/9/777, APC) that vte drops before `Term`.
+    Tap(TapEvent),
 }
 
 /// Grid dimensions handed to `Term` — what `Dimensions` wants.
@@ -149,19 +154,19 @@ pub struct Terminal {
     io: Mutex<EventLoopSender>,
     pub proxy: EventProxy,
     pub events: Mutex<Receiver<TermEvent>>,
-    _join: std::thread::JoinHandle<(EventLoop<tty::Pty, EventProxy>, State)>,
+    _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
 }
 
 impl Terminal {
     /// Spawn a shell on a PTY and start parsing.
-    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16)) -> io::Result<Self> {
+    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>) -> io::Result<Self> {
         let (proxy, events_rx) = EventProxy::new();
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let options = Options {
             shell: None,
-            working_directory: None,
+            working_directory: cwd,
             drain_on_exit: false,
             env: [
                 ("TERM".to_owned(), "xterm-256color".to_owned()),
@@ -180,6 +185,7 @@ impl Terminal {
             },
             0,
         )?;
+        let pty = TapPty::new(pty, proxy.inner.events.clone());
 
         let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let io = event_loop.channel();
@@ -211,5 +217,85 @@ impl Terminal {
     /// Ask the event loop to quit (kills the child).
     pub fn shutdown(&self) {
         let _ = self.io.lock().unwrap().send(Msg::Shutdown);
+    }
+}
+
+// -- Byte-stream tap ---------------------------------------------------------
+
+/// PTY wrapper whose reader additionally feeds an `OscScanner`, so sequences
+/// vte's `osc_dispatch` drops (OSC 133, OSC 7, OSC 9/777, APC) still reach us.
+pub struct TapPty {
+    inner: tty::Pty,
+    reader: TapReader,
+}
+
+/// Reads the PTY and scans for the sequences the VT layer ignores.
+pub struct TapReader {
+    file: std::fs::File,
+    scanner: OscScanner,
+}
+
+impl TapPty {
+    fn new(pty: tty::Pty, sink: Sender<TermEvent>) -> Self {
+        let reader = TapReader {
+            // `try_clone` yields a second fd onto the same open file
+            // description: the reader consumes the identical byte stream the
+            // event loop's `register()` polls on the inner file.
+            file: pty.file().try_clone().expect("dup pty fd"),
+            scanner: OscScanner::new(sink),
+        };
+        Self { inner: pty, reader }
+    }
+}
+
+impl Read for TapReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if n > 0 {
+            self.scanner.feed(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+impl EventedReadWrite for TapPty {
+    type Reader = TapReader;
+    type Writer = std::fs::File;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: PollingEvent,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.inner.register(poll, interest, poll_opts) }
+    }
+
+    fn reregister(&mut self, poll: &Arc<Poller>, interest: PollingEvent, poll_opts: PollMode) -> io::Result<()> {
+        self.inner.reregister(poll, interest, poll_opts)
+    }
+
+    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+        self.inner.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        &mut self.reader
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.inner.writer()
+    }
+}
+
+impl EventedPty for TapPty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.inner.next_child_event()
+    }
+}
+
+impl OnResize for TapPty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.inner.on_resize(window_size);
     }
 }
