@@ -2713,7 +2713,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
  "parley",
- "png",
+ "png 0.18.1",
  "pollster 1.0.1",
  "rayon",
  "rustc-hash 2.1.3",
@@ -2776,6 +2776,7 @@ dependencies = [
  "nami",
  "parking_lot",
  "peniko",
+ "png 0.17.16",
  "polling",
  "pollster 1.0.1",
  "rustybuzz",
@@ -3190,7 +3191,7 @@ dependencies = [
  "image-webp",
  "moxcms",
  "num-traits",
- "png",
+ "png 0.18.1",
  "tiff",
  "zune-core",
  "zune-jpeg",
@@ -5325,6 +5326,19 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "png"
+version = "0.17.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
+dependencies = [
+ "bitflags 1.3.2",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
@@ -7192,7 +7206,7 @@ dependencies = [
  "futures-intrusive",
  "log",
  "peniko",
- "png",
+ "png 0.18.1",
  "skrifa 0.42.1",
  "static_assertions",
  "thiserror 2.0.20",
@@ -7749,7 +7763,7 @@ dependencies = [
  "parking_lot",
  "pastey 0.2.3",
  "peniko",
- "png",
+ "png 0.18.1",
  "pollster 1.0.1",
  "rayon",
  "shaderloom",

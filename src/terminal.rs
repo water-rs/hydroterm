@@ -39,6 +39,9 @@ pub enum TermEvent {
     Exit,
     /// Byte-stream tap (OSC 133/7/9/777, APC) that vte drops before `Term`.
     Tap(TapEvent),
+    /// kitty graphics payload with the cursor position at transmit time:
+    /// `(payload, absolute line, col)` — same line convention as marks.
+    Apc(Vec<u8>, i64, usize),
 }
 
 /// Grid dimensions handed to `Term` — what `Dimensions` wants.
@@ -359,6 +362,16 @@ impl TapReader {
             if marks.last() != Some(&abs) {
                 marks.push(abs);
             }
+        }
+        if let TapEvent::Apc(payload) = ev {
+            // SAFETY: same TermPtr read as marks — the cursor still sits at
+            // the placement position on the reader thread.
+            let term = unsafe { &*self.term.0 };
+            let abs = term.grid().history_size() as i64
+                + i64::from(term.grid().cursor.point.line.0);
+            let col = term.grid().cursor.point.column.0;
+            let _ = self.sink.send(TermEvent::Apc(payload, abs, col));
+            return;
         }
         let _ = self.sink.send(TermEvent::Tap(ev));
     }

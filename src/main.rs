@@ -18,6 +18,7 @@ mod app;
 mod config;
 mod fonts;
 mod keys;
+mod kitty;
 mod osctap;
 mod mouse;
 mod palette;

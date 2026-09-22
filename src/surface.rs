@@ -427,6 +427,9 @@ impl TermSurface {
                 TermEvent::Exit => {
                     self.app.close_tab(self.session.id);
                 }
+                TermEvent::Apc(payload, line, col) => {
+                    self.handle_apc(&payload, line, col);
+                }
                 TermEvent::Tap(tap) => match tap {
                     // Marks are recorded on the reader thread where the
                     // cursor still sits at the mark position.
@@ -439,11 +442,23 @@ impl TermSurface {
                     TapEvent::Notify(_title, _body) => {
                         // No system-notify path yet — tracked as a feedback item.
                     }
-                    TapEvent::Apc(_payload) => {
-                        // kitty graphics land here once the decoder lands.
-                    }
+                    TapEvent::Apc(_payload) => {}
                 },
             }
+        }
+    }
+
+    /// kitty graphics: parse + store + reply `\x1b_Gi=<id>;<status>\x1b\\`.
+    fn handle_apc(&mut self, payload: &[u8], line: i64, col: usize) {
+        let Some(cmd) = crate::kitty::parse(payload) else { return };
+        let quiet = cmd.quiet();
+        let (id, status) = self
+            .session
+            .kitty
+            .borrow_mut()
+            .handle(cmd, line, col);
+        if !quiet {
+            self.write(format!("\x1b_Gi={id};{status}\x1b\\").into_bytes());
         }
     }
 
@@ -818,6 +833,38 @@ impl TermSurface {
             bell_flash: bell_alpha,
         };
         scene::draw_term(scene, &term, &mut ctx);
+        let top = scroll.history_size as i64 - scroll.display_offset as i64;
+        let m = self.fonts.metrics;
+        let pad = PADDING * m.scale as f32;
+        for img in &self.session.kitty.borrow().images {
+            let row = img.line - top;
+            let rows = if img.rows > 0 {
+                img.rows as i64
+            } else {
+                (img.px_h as f32 / m.cell_h).ceil() as i64
+            };
+            if row + rows < 0 || row >= self.lines as i64 {
+                continue;
+            }
+            let x = pad + img.col as f32 * m.cell_w;
+            let y = pad + row as f32 * m.cell_h;
+            let w = if img.cols > 0 {
+                img.cols as f32 * m.cell_w
+            } else {
+                img.px_w as f32
+            };
+            let h = if img.rows > 0 {
+                img.rows as f32 * m.cell_h
+            } else {
+                img.px_h as f32
+            };
+            let transform = kurbo::Affine::translate((x as f64, y as f64))
+                * kurbo::Affine::scale_non_uniform(
+                    w as f64 / img.px_w as f64,
+                    h as f64 / img.px_h as f64,
+                );
+            scene.draw_image(&img.brush, transform);
+        }
     }
 
     /// Classic path: rasterize into an intermediate texture, then blit.

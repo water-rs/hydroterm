@@ -25,6 +25,7 @@ wgpu = "29.0.4"
 vello_hybrid = { version = "0.2", features = ["std", "wgpu", "text"] }
 keyboard-types = "0.8"
 pollster = "1.0"
+png = "0.17"
 parking_lot = "0.12"
 tracing = "0.1"
 polling = "3.8.0"

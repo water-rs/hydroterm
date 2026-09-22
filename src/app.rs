@@ -43,6 +43,8 @@ pub struct Session {
     pub search_query: Binding<Str>,
     /// Match summary shown next to the field ("3 matches" / "").
     pub search_status: Binding<Str>,
+    /// kitty graphics placements transmitted on this session.
+    pub kitty: Rc<RefCell<crate::kitty::KittyStore>>,
 }
 
 impl Session {
@@ -77,6 +79,7 @@ impl Session {
             search_open: Binding::bool(false),
             search_query: binding(Str::from("")),
             search_status: binding(Str::from("")),
+            kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
         }
     }
 }

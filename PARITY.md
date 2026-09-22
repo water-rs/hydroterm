@@ -67,7 +67,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell UI | Settings page | 🟡 | deferred — config file + hot reload covers it; no settings GUI yet |
 | Shell UI | Command palette | 🟡 | deferred — all actions reachable via keybinds; palette not built yet |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
-| Graphics | kitty image protocol | ❌ | APC captured by tap; decode+render planned |
+| Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies, anchored to cursor row & scrolling with buffer (verified: PNG blitted in-grid); no unicode placements/z-layers/file mediums/crops/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
 | Perf | Scrolling/render performance | 🟡 | llvmpipe here; benchmark task pending |
 | Window | Title reporting (OSC 0/2) | ✅ | title → window title binding |
