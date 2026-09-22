@@ -445,7 +445,9 @@ impl TermSurface {
         let pad = PADDING * m.scale as f32 * 2.0;
         let cols = ((width_px as f32 - pad) / m.cell_w).floor().max(2.0) as u16;
         let lines = ((height_px as f32 - pad) / m.cell_h).floor().max(1.0) as u16;
-        if cols != self.cols || lines != self.lines {
+        // Degenerate frames (window unmapped/collapsed) must not shrink the
+        // PTY — a 1-line winsize breaks apps that read TIOCGWINSZ at start.
+        if cols > 2 && lines > 1 && (cols != self.cols || lines != self.lines) {
             self.cols = cols;
             self.lines = lines;
             self.session

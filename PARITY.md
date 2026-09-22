@@ -78,7 +78,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 
 | Test | Result | Method |
 |------|--------|--------|
-| vttest | _pending_ | `vttest` suite in hydroterm |
-| esctest | _pending_ | esctest subset |
+| vttest | visual spot-check only (interactive suite, no automated score) | menu + "test of cursor movements" DECALN frame rendered correctly on 2026-09-22 run |
+| esctest | 57/559 pass (10%) | `esctest --expected-terminal xterm`, 2026-09-22; ~450 tests verify screen contents via DECRQCRA (CSI ... * y) which alacritty_terminal does not implement — those all timeout-fail. Real failures: winops reports (14t/18t resize-px), BS/wrap semantics, OSC4 color queries |
 | Throughput | _pending_ | `time cat bigfile` (≥64MB) in hydroterm |
 | Input latency | _pending_ | keypress→echo render time |
