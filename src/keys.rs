@@ -307,7 +307,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "v" => TermAction::Paste,
         "t" => TermAction::NewTab,
         "w" => TermAction::CloseTab,
-        "n" => TermAction::NewTab,
+        "n" => TermAction::NewWindow,
         "a" => TermAction::SelectAll,
         "e" => TermAction::SplitRight,
         "d" => TermAction::SplitDown,
@@ -318,6 +318,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "0" | ")" => TermAction::FontReset,
         "k" => TermAction::ClearScrollback,
         "f" => TermAction::Search,
+        "p" => TermAction::Palette,
+        "," | "<" => TermAction::Settings,
         _ => return None,
     })
 }
@@ -364,6 +366,8 @@ pub enum TermAction {
     Paste,
     NewTab,
     CloseTab,
+    /// Open a whole new OS window (its own tabs and sessions).
+    NewWindow,
     NextTab,
     PrevTab,
     SelectTab(usize),
@@ -390,5 +394,9 @@ pub enum TermAction {
     FocusPrevPane,
     /// Toggle borderless fullscreen.
     Fullscreen,
+    /// Open the command palette.
+    Palette,
+    /// Open the settings page.
+    Settings,
 }
 

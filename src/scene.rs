@@ -49,6 +49,9 @@ pub struct DrawContext<'a> {
     pub search_active: Option<(usize, usize)>,
     /// Alpha for the bell flash overlay.
     pub bell_flash: f32,
+    /// Alpha of the default background fill (window transparency; 1.0 =
+    /// opaque). Cells with explicit (non-default) backgrounds stay opaque.
+    pub bg_opacity: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +275,7 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        &Brush::Solid(peniko(default_bg)),
+        &Brush::Solid(peniko_alpha(default_bg, ctx.bg_opacity)),
         None,
         &rect(0.0, 0.0, ctx.width, ctx.height),
     );
@@ -283,6 +286,11 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
         }
         let y = row_y(pad, ch, row_i);
         for (start, end, style) in style_runs(row) {
+            // Cells on the default bg are covered by the base fill — skipping
+            // them keeps explicit backgrounds opaque over a translucent base.
+            if style.bg == default_bg {
+                continue;
+            }
             let x = col_x(pad, cw, start);
             let w = (end - start) as f32 * cw;
             let bgc = style.bg;

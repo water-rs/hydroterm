@@ -42,13 +42,13 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
 | Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #18) |
 | Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#16) |
-| Windows | Multi-window | 🚫 | hydrolysis winit runner spawns 1 window — needs upstream API |
+| Windows | Multi-window | ✅ | Ctrl+Shift+N → `Window::show(env)` via the runner's `WindowManager` mounts a real winit window with a fresh session set (verified live: `<2>` title, independent session) |
 | Quick terminal | Drop-down/global-hotkey terminal | 🚫 | X11 global grab needs x11 dep; deferred |
 | Config | `key = value` config file (~/.config/hydroterm/config) | ✅ | 8 parser unit tests; template auto-written |
 | Config | Hot reload on file change | ✅ | mtime poll (400ms); verified live font-size + theme swap |
 | Config | `keybind = chord=action` incl. unbind | ✅ | unit tests + live `ctrl+shift+q=quit` verified |
 | Theme | Built-in themes (hydroterm-dark/light, solarized-dark/light) | ✅ | `theme =` config; live swap verified |
-| Theme | `theme = auto` follows desktop color-scheme | 🟡 | resolved per (re)load via gsettings; no live OS-change subscription |
+| Theme | `theme = auto` follows desktop color-scheme | ✅ | gsettings get at resolve + `gsettings monitor` subscription re-resolves palette live (KDE box lacks GNOME schemas — dark fallback verified; monitor spawn is no-op there) |
 | Cursor | `cursor-shape`/`cursor-blink` config | ✅ | spawn-time (alacritty has no config setter) |
 | Font | Fallback chain (fontconfig) | ✅ | 中文カタ rendered via Noto CJK fallback (screenshot-verified) |
 | Font | Ligatures | ✅ | `->`, `=>`, `!=`, `ffi`, `fl` shape to ligature glyphs (screenshot-verified) |
@@ -59,19 +59,20 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell int. | zsh/fish integration auto-inject | ✅ | bash `--rcfile`, zsh `ZDOTDIR` env, fish `-C` init — all emit OSC 133 A/B/C/D + OSC 7 (verified live) |
 | Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected integration for bash (--rcfile), zsh (ZDOTDIR), fish (-C): all emit A/B/C/D; verified live jump in zsh + fish |
 | Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
-| Shell int. | OSC 9/777 notifications | 🟡 | bell flash + 🔔 badge on tab/window title until user input (verified); no desktop-notification channel — freedesktop notify would need a dbus dep |
+| Shell int. | OSC 9/777 notifications | ✅ | bell flash + 🔔 badge on title until user input + freedesktop `notify-send` desktop notification where available (badge verified; notify-send spawned, best-effort) |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
 | Bell | Audible bell | ❌ | needs audio stack; low priority |
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight in grid, Enter jumps to next |
-| Shell UI | Settings page | 🟡 | deferred — config file + hot reload covers it; no settings GUI yet |
-| Shell UI | Command palette | 🟡 | deferred — all actions reachable via keybinds; palette not built yet |
+| Shell UI | Settings page | ✅ | Ctrl+Shift+, → WaterUI stepper/picker/toggle; Apply writes config file → hot reload |
+| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + filtered action list; Enter/click runs |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
-| Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies, anchored to cursor row & scrolling with buffer (verified: PNG blitted in-grid); no unicode placements/z-layers/file mediums/crops/animation |
+| Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies + `t=f` file medium (verified: PNG blitted in-grid, file-loaded PNG rendered); no unicode placements/z-layers/shared mediums/crops/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
 | Perf | Scrolling/render performance | 🟡 | 10.8 MB/s cat-throughput, ~72ms input latency (llvmpipe CPU render — see Metrics) |
 | Window | Title reporting (OSC 0/2) | ✅ | title → window title binding |
 | Window | Fullscreen | ✅ | Ctrl+Shift+F11 / `keybind = ...=fullscreen` — own `WindowState` binding via `App::new_with_windows` (verified live) |
 | Window | Confirm-close when child running | 🚫 | no close-request hook — WATERUI_FEEDBACK #4 |
+| Window | Background transparency | 🟡 | `background-opacity` config wired end-to-end (`Window::background` + scene alpha) — upstream render bug: transparent window composites but draws zero content incl. native text (repro in WATERUI_FEEDBACK #8); works when upstream lands the fix |
 | Misc | `-e cmd`, `--config` args | ✅ | verified: `-e bash -c 'echo E_MARKER'` |
 | Misc | Quit action, process-group cleanup | ✅ | window close → Shutdown |
 

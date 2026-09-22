@@ -56,16 +56,19 @@ fn main() {
     let (config_path, command) = cli();
     let state = app::AppState::new(config_path, command);
     let title = state.window_title.clone();
-    // Own the window-state binding so keybinds can toggle fullscreen;
-    // `App::new` would bury it inside the default main window.
+    // A background Color below full opacity flips hydrolysis into a
+    // transparent winit window; at 1.0 the window stays opaque.
+    let opacity = state.config(|c| c.background_opacity);
+    let bg = state.config(|c| c.resolve_theme().background);
     let window = Window::new(
         title,
         state.window_state.clone(),
         {
             let state = state.clone();
-            move || app::tabs_view(state.clone())
+            move || app::app_root(state.clone())
         },
-    );
+    )
+    .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
     let app = App::new_with_windows([window], Environment::new());
     hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }

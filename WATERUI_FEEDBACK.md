@@ -2,6 +2,8 @@
 
 Real gaps/wishes found while building a modern terminal on hydrolysis. Each item notes severity for a terminal workload. Filed upstream issues are referenced per item; entries whose number is missing were not filed (or are purely informational).
 
+Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
+
 ## Findings
 
 1. **Keyboard focus for an input-receiving surface is click-only.** A surface with `wants_input_events()` receives `Focus(true)` only after a pointer press. A terminal must accept keyboard input at app launch, on a newly created tab, and after a subtree rebuild, without requiring a click — we observed all three: new surfaces get no `Focus` event, and a rebuild (split-pane tree swapping `Leaf` → `HStack{child, child}` inside `watch`) remounts every surface and drops focus with keystrokes. Wish: programmatic focus (`request_focus()`, a `.focused(&binding)` modifier, or a stable caller-provided key that survives remounts). → **water-rs/hydrolysis#90** (Critical)
@@ -18,7 +20,19 @@ Real gaps/wishes found while building a modern terminal on hydrolysis. Each item
 
 7. **No resize event / presentation timestamp distinct from scene builds.** Terminal recomputes cols/rows from `build_scene`'s width/height each frame — works, at frame rather than event granularity. → **water-rs/waterui#1197** (Minor)
 
-8. **Transparent windows aren't reachable on hydrolysis (winit + vello):** `WindowStyle`/`WindowBackground::Color` + alpha can't produce a translucent window. (Nice-to-have)
+8. **Transparent windows accept the flag but render no content.** `Window::background(Color..with_opacity(<1))` flips `window_requires_transparency` → winit `with_transparent(true)`, and the OS window does composite transparently — BUT the scene produces zero pixels: the whole window is see-through, with *no* view content at all (not even native `text!()`, so this is not a SceneView-specific path). Opaque windows render fine.
+
+   Minimal repro (pins above, `hydrolysis` features `["winit"]`):
+   ```rust
+   let state = binding(WindowState::Normal);
+   let window = Window::new("trans-repro", state, || {
+       vstack((text!("TRANSPARENT WINDOW TEST"), text!("you should see this text")))
+   })
+   .background(Color::srgb(30, 30, 30).with_opacity(0.5));
+   let app = App::new_with_windows([window], Environment::new());
+   hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
+   ```
+   Result on X11 + llvmpipe (`WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER=1`): transparent window frame, desktop shows through, zero rendered content — looks like the surface/swapchain never composites. (Critical for the feature — transparency plumbing exists end-to-end but the renderer produces nothing. hydroterm wires `background-opacity` in config; disabled-by-default until this lands.)
 
 9. **No scroll "momentum"/natural-scroll phase data** — deltas arrive but no phase beyond `finished`. Fine in practice. → **water-rs/waterui#1198** (Minor)
 
@@ -28,14 +42,10 @@ Real gaps/wishes found while building a modern terminal on hydrolysis. Each item
 
 12. **Clipboard paste must be implemented app-side** — `TextInput` covers typed text; a paste event / `ClipboardRequest` on input-receiving surfaces would simplify bracketed-paste correctness. → **water-rs/waterui#1199** (Nice-to-have)
 
-13. **`HStack<ForEach<...>>` is not itself a `View`.** `HStack::for_each(vec, …)` produces a specialization that doesn't satisfy `View`; the working path is `views.into_iter().collect::<HStack<(Vec<AnyView>,)>>()`, discoverable only in the impl block. Wish: make it return a `View`, or document the collect pattern. (Minor — workaround exists)
+13. **No splitter/resizable-divider component.** Split panes distribute space equally via `HStack`/`VStack`; no draggable divider, per-child weight, or pointer-grab affordance — "resize a split" can't be built without a custom divider surface. Wish: `SplitPane`/`ResizableStack` over `Vec<(weight, View)>` with drag handles. → **water-rs/waterui#1203** (Important — every terminal, IDE, multiplexer needs it)
 
-14. **No splitter/resizable-divider component.** Split panes distribute space equally via `HStack`/`VStack`; no draggable divider, per-child weight, or pointer-grab affordance — "resize a split" can't be built without a custom divider surface. Wish: `SplitPane`/`ResizableStack` over `Vec<(weight, View)>` with drag handles. (Important — every terminal, IDE, multiplexer needs it)
+14. **No `Send`-able frame request for merged `SceneContent`.** `SceneInvalidator` is `Rc<dyn Fn()>` — correct for signal-driven content on the main thread, but data arriving on a background thread (our PTY parser) has no safe way to request a frame. Workaround that works today: an `async-channel` ping consumed by a `waterui::task::spawn_local` drain future that calls the invalidator on the main thread — relying on hydrolysis pumping the local executor through `PollLocalTasks`. Wish: a `Send + Sync` wake/`request_frame` handle handed to the content. → **water-rs/waterui#1202** (Important — every producer-thread scene hits this)
 
-15. **hydrolysis winit runner spawns exactly one window** — `new_with_windows` accepts extras but only the main window is realized; no runtime "open another window" for Ctrl+Shift+N. Wish: `Window::show()` that spawns a winit window at runtime. (Important — multi-window is table stakes)
+15. **parley/ICU4X logs `No segmentation model for complex script: Chinese/Japanese`** on every CJK run in the shared text stack (the packaged data set lacks the segmenter models). Glyphs still shape and render correctly — cell anchoring doesn't depend on line breaking — but each CJK frame writes error lines. → **water-rs/waterui#1204** (Minor)
 
-16. **No `Send`-able frame request for merged `SceneContent`.** `SceneInvalidator` is `Rc<dyn Fn()>` — correct for signal-driven content on the main thread, but data arriving on a background thread (our PTY parser) has no safe way to request a frame. Workaround that works today: an `async-channel` ping consumed by a `waterui::task::spawn_local` drain future that calls the invalidator on the main thread — relying on hydrolysis pumping the local executor through `PollLocalTasks`. Wish: a `Send + Sync` wake/`request_frame` handle handed to the content. (Important — every producer-thread scene hits this)
-
-17. **`SceneContent::input` does not schedule a frame on delivery** — documented, but easy to miss: handlers that change visuals (selection, scroll, preedit) must call the invalidator themselves or the update waits for the next coincidental frame. We call it unconditionally at the end of `input()`. Worth a doc callout on `set_invalidator`. (Minor)
-
-18. **parley/ICU4X logs `No segmentation model for complex script: Chinese/Japanese`** on every CJK run in the shared text stack (the packaged data set lacks the segmenter models). Glyphs still shape and render correctly — cell anchoring doesn't depend on line breaking — but each CJK frame writes error lines. (Minor)
+16. **`TextField` has no submit/focus API.** A mounted `field()` receives `TextInput` automatically once focused, but Enter/Escape produce no submit event and focus can't be requested programmatically — a search bar or command palette must intercept those keys on an adjacent input-receiving surface and route plain text into the field's binding manually (what both our search bar and palette do). Wish: an `on_submit` callback and `.focused(&binding)` on the field. Related: water-rs/hydrolysis#90. (Nice-to-have)

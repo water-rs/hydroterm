@@ -105,6 +105,7 @@ impl TermSurface {
         fonts: FontCollection,
     ) -> Self {
         let font_size = session.font_size.get();
+        app.register_theme_wake(&session.terminal);
         Self {
             session,
             app,
@@ -223,6 +224,7 @@ impl TermSurface {
                 self.app.new_tab();
             }
             TermAction::CloseTab => self.app.close_pane(self.session.id),
+            TermAction::NewWindow => self.app.new_window(),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),
@@ -279,6 +281,8 @@ impl TermSurface {
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
+            TermAction::Palette => self.app.toggle_palette(),
+            TermAction::Settings => self.app.toggle_settings(),
         }
     }
 
@@ -388,6 +392,11 @@ impl TermSurface {
 
     /// Drain events pushed by the parser thread since last frame.
     fn drain_events(&mut self) {
+        // Palette-queued actions share the key-chord dispatch path.
+        let queued: Vec<TermAction> = self.session.pending_actions.borrow_mut().drain(..).collect();
+        for action in queued {
+            self.do_action(action);
+        }
         let events: Vec<TermEvent> = {
             let rx = self.session.terminal.events.lock().unwrap();
             rx.try_iter().collect()
@@ -454,9 +463,10 @@ impl TermSurface {
                     TapEvent::PromptEnd | TapEvent::CommandStart => {}
                     TapEvent::CommandEnd(_code) => {}
                     TapEvent::Notify(title, body) => {
-                        // No desktop-notification channel yet — flash the
-                        // bell and badge the title until the next prompt.
+                        // Bell flash + title badge, plus a freedesktop
+                        // notification where `notify-send` exists.
                         self.bell_at = Some(Instant::now());
+                        notify_desktop(&title, &body);
                         let text = if title.is_empty() { body } else { format!("{title}: {body}") };
                         *self.session.notify_badge.lock().unwrap() = true;
                         self.app
@@ -541,7 +551,14 @@ impl TermSurface {
         if pressed {
             self.clear_notify_badge();
         }
-        // Search mode captures keys into the query.
+        // Overlay pages capture keys first: palette query, settings
+        // commit/close, then the search bar's query.
+        if pressed && self.app.palette_open.get() && self.palette_key(key, mods) {
+            return;
+        }
+        if pressed && self.app.settings_open.get() && self.settings_key(key, mods) {
+            return;
+        }
         if pressed && self.search.is_some() && self.search_key(key, mods) {
             return;
         }
@@ -565,6 +582,44 @@ impl TermSurface {
             }
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
             self.write(bytes);
+        }
+    }
+
+    /// Feed one key into the open command palette. Enter runs the top
+    /// match, Escape closes, plain characters edit the query (the surface
+    /// keeps keyboard focus — the TextField can't be focused
+    /// programmatically, water-rs/hydrolysis#90 — so the binding is driven
+    /// from here; a focused field also writes the same binding directly).
+    fn palette_key(&mut self, key: &Key, mods: Modifiers) -> bool {
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                let query = self.app.palette_query.get().to_string();
+                if let Some(item) = crate::app::palette_matches(&query).first() {
+                    self.app.run_palette_action(item.action);
+                } else {
+                    self.app.palette_open.set(false);
+                }
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.app.palette_open.set(false);
+                true
+            }
+            Key::Named(NamedKey::Backspace) if mods.is_empty() => {
+                let mut q = self.app.palette_query.get().to_string();
+                q.pop();
+                self.app.palette_query.set_from(q);
+                true
+            }
+            // Printable keys: consume here — the text itself arrives via
+            // `SurfaceInputEvent::TextInput` (see `on_text`). Mod-chords
+            // (Ctrl+Shift+P to close, etc.) fall through to the chord path.
+            Key::Character(_)
+                if !mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META) =>
+            {
+                true
+            }
+            _ => false,
         }
     }
 
@@ -623,8 +678,42 @@ impl TermSurface {
         }
     }
 
-    /// Append typed text — search query when searching, else PTY.
+    /// Feed one key into the open settings page: Enter applies, Escape
+    /// closes, printable keys are swallowed (edits go through the
+    /// controls' own focus/pointer path).
+    fn settings_key(&mut self, key: &Key, mods: Modifiers) -> bool {
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                self.app.apply_settings();
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.app.settings_open.set(false);
+                true
+            }
+            // Printable keys: swallowed (controls own their own editing);
+            // mod-chords like Ctrl+Shift+, fall through to close/toggle.
+            Key::Character(_)
+                if !mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Append typed text — palette query while open, search query when
+    /// searching, else PTY.
     fn on_text(&mut self, text: &str) {
+        if self.app.settings_open.get() {
+            return;
+        }
+        if self.app.palette_open.get() {
+            let mut q = self.app.palette_query.get().to_string();
+            q.push_str(text);
+            self.app.palette_query.set_from(q);
+            return;
+        }
         if self.search.is_some() {
             let mut q = self.session.search_query.get().to_string();
             q.push_str(text);
@@ -852,6 +941,7 @@ impl TermSurface {
 
         let blink_on = self.blink_on();
         let focused = self.focused;
+        let bg_opacity = self.app.config(|c| c.background_opacity);
         let mut ctx = DrawContext {
             palette: &palette,
             fonts: &mut self.fonts,
@@ -864,6 +954,7 @@ impl TermSurface {
             search_matches: &matches_view,
             search_active: active,
             bell_flash: bell_alpha,
+            bg_opacity,
         };
         scene::draw_term(scene, &term, &mut ctx);
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
@@ -1100,6 +1191,24 @@ fn is_url_char(c: char) -> bool {
             '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '`'
         )
 }
+
+/// OSC 9/777 → a freedesktop desktop notification via `notify-send` when
+/// the desktop provides it; a missing binary or session bus just leaves
+/// the in-app bell/badge path to carry the notification.
+#[cfg(target_os = "linux")]
+fn notify_desktop(title: &str, body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .arg("--app-name=hydroterm")
+        .arg(if title.is_empty() { "hydroterm" } else { title })
+        .arg(body)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_desktop(_title: &str, _body: &str) {}
 
 #[cfg(test)]
 mod tests {

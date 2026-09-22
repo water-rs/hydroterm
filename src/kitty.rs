@@ -3,10 +3,11 @@
 //! Supported: `a=T` (transmit+display) and `a=t`/`a=q`, formats `f=100`
 //! (PNG), `f=32` (RGBA) and `f=24` (RGB) with `s=`/`v=` pixel dims,
 //! `m=` chunk assembly, `i=`/`I=` image ids, `c=`/`r=` cell spans,
-//! `a=d` delete (by `i=` or all), `q=` quiet. Placement anchors to the
+//! `a=d` delete (by `i=` or all), `q=` quiet, `t=f` regular-file
+//! medium (payload is the base64 of the path). Placement anchors to the
 //! cursor row at transmit time and scrolls with the buffer.
-//! Not supported: unicode placements (`p=`, `u=`), `z=` layers, file
-//! mediums (`t=f`/`t=t`/`t=s`/`t=o`), `x`/`y`/`w`/`h` crops, `a=f`/`a=p`.
+//! Not supported: unicode placements (`p=`, `u=`), `z=` layers,
+//! `t=t`/`t=s`/`t=o` shared mediums, `x`/`y`/`w`/`h` crops, `a=f`/`a=p`.
 
 use std::collections::BTreeMap;
 
@@ -156,11 +157,24 @@ impl KittyStore {
     }
 
     fn place(&mut self, cmd: &KittyCmd, line: i64, col: usize) -> Handled {
-        if cmd.get('t').is_some_and(|t| t != "d") {
-            return (cmd.id(), "EINVAL:unsupported medium".to_string());
-        }
-        let Some(raw) = b64_decode(&cmd.data) else {
-            return (cmd.id(), "EBADMSG:base64".to_string());
+        let raw = match cmd.get('t').unwrap_or("d") {
+            "d" => match b64_decode(&cmd.data) {
+                Some(raw) => raw,
+                None => return (cmd.id(), "EBADMSG:base64".to_string()),
+            },
+            // `t=f`: the payload is the base64 of the file's path.
+            "f" => {
+                let Some(path) =
+                    b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
+                else {
+                    return (cmd.id(), "EBADMSG:path".to_string());
+                };
+                match std::fs::read(path.trim()) {
+                    Ok(raw) => raw,
+                    Err(e) => return (cmd.id(), format!("ENOENT:{e}")),
+                }
+            }
+            _ => return (cmd.id(), "EINVAL:unsupported medium".to_string()),
         };
         let fmt = cmd.get('f').unwrap_or("100");
         let rgba: Option<(Vec<u8>, u32, u32)> = match fmt {

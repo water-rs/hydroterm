@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::term::Config;
@@ -14,14 +14,17 @@ use nami::{Binding, binding};
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
-use waterui::window::WindowState;
+use waterui::window::{Window, WindowState};
 use waterui_graphics::SceneView;
+use waterui_graphics::color::Srgb;
 use waterui_text::FontCollection;
 
 use crate::config::{AppConfig, ConfigWatcher};
+use crate::keys::TermAction;
 use crate::palette::Palette;
 use crate::surface::TermSurface;
 use crate::terminal::Terminal;
+use waterui::form::picker::picker;
 
 /// Default font size in points (the config file may override).
 pub const FONT_SIZE: f32 = 13.0;
@@ -52,6 +55,9 @@ pub struct Session {
     pub search_status: Binding<Str>,
     /// kitty graphics placements transmitted on this session.
     pub kitty: Rc<RefCell<crate::kitty::KittyStore>>,
+    /// Actions queued by the command palette — drained by the surface on
+    /// the next frame (keeps one dispatch path for every action).
+    pub pending_actions: Rc<RefCell<Vec<TermAction>>>,
 }
 
 impl Session {
@@ -89,6 +95,7 @@ impl Session {
             search_query: binding(Str::from("")),
             search_status: binding(Str::from("")),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
+            pending_actions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -197,6 +204,25 @@ pub struct AppState {
     pub cfg: Rc<RefCell<ConfigWatcher>>,
     /// The active palette — swapped wholesale on theme reload.
     pub palette: Rc<RefCell<Palette>>,
+    /// The backend environment, captured by `AppRoot::body` — needed at
+    /// runtime to spawn new windows via `Window::show(env)`.
+    env: Rc<std::cell::OnceCell<Environment>>,
+    /// Command palette open (Ctrl+Shift+P).
+    pub palette_open: Binding<bool>,
+    /// Live palette query — bound to the WaterUI `TextField`.
+    pub palette_query: Binding<Str>,
+    /// Settings page open (Ctrl+Shift+,).
+    pub settings_open: Binding<bool>,
+    /// Settings edits — snapshotted from the config each time the page
+    /// opens; `Apply` writes them back to the file (hot reload applies).
+    pub set_font: Binding<i32>,
+    pub set_theme: Binding<usize>,
+    pub set_blink: Binding<bool>,
+    /// The desktop color-scheme may have changed (gsettings monitor).
+    pub theme_dirty: Arc<AtomicBool>,
+    /// Weak handles to live terminals so the theme monitor thread can
+    /// request frames (dirty is only read inside `poll_config`).
+    theme_wakes: Arc<Mutex<Vec<std::sync::Weak<Terminal>>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -213,6 +239,8 @@ impl AppState {
             eprintln!("hydroterm config: {e}");
         }
         let palette = Palette::from_theme(&watcher.config.resolve_theme());
+        #[cfg(target_os = "linux")]
+        let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto);
         let state = Self {
             sessions: Rc::new(RefCell::new(Vec::new())),
             tabs: Rc::new(RefCell::new(Vec::new())),
@@ -223,17 +251,68 @@ impl AppState {
             window_state: binding(WindowState::Normal),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
+            env: Rc::new(std::cell::OnceCell::new()),
+            palette_open: Binding::bool(false),
+            palette_query: binding(Str::from("")),
+            settings_open: Binding::bool(false),
+            set_font: Binding::i32(13),
+            set_theme: Binding::usize(0),
+            set_blink: Binding::bool(true),
+            theme_dirty: Arc::new(AtomicBool::new(false)),
+            theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         };
         state.new_tab();
         // `-e` applies to the first session only (like xterm/kitty).
         state.cfg.borrow_mut().config.command = None;
+        // `theme = auto`: watch the desktop color-scheme. gsettings
+        // `monitor` prints a line per change; flag dirty + poke every
+        // live surface so `poll_config` re-resolves on its next frame.
+        #[cfg(target_os = "linux")]
+        if theme_is_auto {
+            let dirty = state.theme_dirty.clone();
+            let wakes = state.theme_wakes.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let Ok(mut child) = std::process::Command::new("gsettings")
+                    .args(["monitor", "org.gnome.desktop.interface", "color-scheme"])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                else {
+                    return;
+                };
+                let Some(out) = child.stdout.take() else { return };
+                for _ in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                    dirty.store(true, Ordering::Relaxed);
+                    wakes.lock().unwrap().retain(|w| match w.upgrade() {
+                        Some(t) => {
+                            t.proxy.request_frame();
+                            true
+                        }
+                        None => false,
+                    });
+                }
+            });
+        }
         state
+    }
+
+    /// Register a live surface's frame-wake for the theme monitor.
+    pub fn register_theme_wake(&self, terminal: &Arc<Terminal>) {
+        self.theme_wakes
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(terminal));
     }
 
     /// Re-read the config file when it changed; live-applies font size,
     /// theme and keybinds. Called from each surface's render loop.
     pub fn poll_config(&self) {
+        // Desktop color-scheme flip under `theme = auto`.
+        if self.theme_dirty.swap(false, Ordering::Relaxed) {
+            *self.palette.borrow_mut() =
+                Palette::from_theme(&self.cfg.borrow().config.resolve_theme());
+        }
         let (config, errors) = {
             let mut w = self.cfg.borrow_mut();
             if !w.poll() {
@@ -262,6 +341,27 @@ impl AppState {
             _ => WindowState::Fullscreen,
         };
         self.window_state.set(next);
+    }
+
+    /// Spawn a whole new OS window with a fresh session set (same config
+    /// file, independent tabs and sessions). Uses the runner's
+    /// `WindowManager` — `Window::show` mounts a real winit window.
+    pub fn new_window(&self) {
+        let Some(env) = self.env.get() else { return };
+        let state = AppState::new(Some(self.cfg.borrow().path.clone()), None);
+        // Same launch-time transparency as the main window.
+        let opacity = state.config(|c| c.background_opacity);
+        let bg = state.config(|c| c.resolve_theme().background);
+        let window = Window::new(
+            state.window_title.clone(),
+            state.window_state.clone(),
+            {
+                let state = state.clone();
+                move || app_root(state.clone())
+            },
+        )
+        .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        window.show(env);
     }
 
     /// Shut every session down and exit the process.
@@ -586,13 +686,42 @@ fn pane_view(node: &SplitNode, state: &AppState) -> AnyView {
     }
 }
 
+/// Root of every hydroterm window: `body` runs inside the environment, so
+/// it captures `env` for `AppState::new_window` before rendering the tabs.
+struct AppRoot {
+    state: AppState,
+}
+
+impl View for AppRoot {
+    fn body(self, env: &Environment) -> impl View {
+        let _ = self.state.env.set(env.clone());
+        tabs_view(self.state)
+    }
+}
+
+/// Window content — used for both the main window and spawned ones.
+pub fn app_root(state: AppState) -> impl View {
+    AppRoot { state }
+}
+
 /// Build the tabs view: one pane-tree per tab.
 // `Tabs::new` needs a fully materialized `Vec<Tab>` — hydrolysis has no
 // reactive-collection tab API yet, so the whole set is rebuilt on change.
 // Each `SceneView` keeps its `Arc<Terminal>` alive across rebuilds.
 #[allow(watch_over_collection)]
 pub fn tabs_view(state: AppState) -> impl View {
-    watch(state.tab_ids.clone(), move |ids| {
+    let palette_overlay = when(state.palette_open.clone(), {
+        let state = state.clone();
+        move || palette_view(state.clone())
+    })
+    .anyview();
+    let settings_overlay = when(state.settings_open.clone(), {
+        let state = state.clone();
+        move || settings_view(state.clone())
+    })
+    .anyview();
+    zstack((
+        watch(state.tab_ids.clone(), move |ids| {
         let tabs = state.tabs.borrow().clone();
         let tab_views: Vec<Tab<u64>> = ids
             .iter()
@@ -615,5 +744,195 @@ pub fn tabs_view(state: AppState) -> impl View {
             return Tabs::new(&state.selected, vec![t]);
         }
         Tabs::new(&state.selected, tab_views)
-    })
+        }),
+        palette_overlay,
+        settings_overlay,
+    ))
+}
+
+/// A command-palette row: display name, chord hint, action.
+pub struct PaletteItem {
+    pub name: &'static str,
+    pub chord: &'static str,
+    pub action: TermAction,
+}
+
+/// Everything reachable from the palette — same actions as keybinds.
+pub const PALETTE_ITEMS: &[PaletteItem] = &[
+    PaletteItem { name: "New Tab", chord: "ctrl+shift+t", action: TermAction::NewTab },
+    PaletteItem { name: "New Window", chord: "ctrl+shift+n", action: TermAction::NewWindow },
+    PaletteItem { name: "Close Pane / Tab", chord: "ctrl+shift+w", action: TermAction::CloseTab },
+    PaletteItem { name: "Split Right", chord: "ctrl+shift+e", action: TermAction::SplitRight },
+    PaletteItem { name: "Split Down", chord: "ctrl+shift+d", action: TermAction::SplitDown },
+    PaletteItem { name: "Focus Next Pane", chord: "ctrl+shift+]", action: TermAction::FocusNextPane },
+    PaletteItem { name: "Focus Previous Pane", chord: "ctrl+shift+[", action: TermAction::FocusPrevPane },
+    PaletteItem { name: "Copy", chord: "ctrl+shift+c", action: TermAction::Copy },
+    PaletteItem { name: "Paste", chord: "ctrl+shift+v", action: TermAction::Paste },
+    PaletteItem { name: "Select All", chord: "ctrl+shift+a", action: TermAction::SelectAll },
+    PaletteItem { name: "Find in Buffer", chord: "ctrl+shift+f", action: TermAction::Search },
+    PaletteItem { name: "Settings", chord: "ctrl+shift+,", action: TermAction::Settings },
+    PaletteItem { name: "Clear Scrollback", chord: "ctrl+shift+k", action: TermAction::ClearScrollback },
+    PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::FontBigger },
+    PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::FontSmaller },
+    PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
+    PaletteItem { name: "Jump to Previous Prompt", chord: "ctrl+shift+up", action: TermAction::PromptPrev },
+    PaletteItem { name: "Jump to Next Prompt", chord: "ctrl+shift+down", action: TermAction::PromptNext },
+    PaletteItem { name: "Scroll to Top", chord: "", action: TermAction::ScrollToTop },
+    PaletteItem { name: "Scroll to Bottom", chord: "", action: TermAction::ScrollToBottom },
+    PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
+    PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
+    PaletteItem { name: "Toggle Fullscreen", chord: "ctrl+shift+f11", action: TermAction::Fullscreen },
+    PaletteItem { name: "Quit", chord: "", action: TermAction::Quit },
+];
+
+/// Theme names offered by the settings page — index order is the
+/// picker's selection value.
+pub const THEME_CHOICES: &[&str] = &[
+    "auto",
+    "hydroterm-dark",
+    "hydroterm-light",
+    "solarized-dark",
+    "solarized-light",
+];
+
+/// `ThemeRef` → settings picker index.
+pub fn theme_index(theme: &crate::config::ThemeRef) -> usize {
+    match theme {
+        crate::config::ThemeRef::Auto => 0,
+        crate::config::ThemeRef::Named(name) => THEME_CHOICES
+            .iter()
+            .position(|t| t == name)
+            .unwrap_or(0),
+    }
+}
+
+/// Substring-filter the palette items (empty query → all).
+pub fn palette_matches(query: &str) -> Vec<&'static PaletteItem> {
+    let q = query.trim().to_lowercase();
+    PALETTE_ITEMS
+        .iter()
+        .filter(|item| q.is_empty() || item.name.to_lowercase().contains(&q))
+        .collect()
+}
+
+impl AppState {
+    /// Open/close the palette (Ctrl+Shift+P). Opening clears the query.
+    pub fn toggle_palette(&self) {
+        let next = !self.palette_open.get();
+        if next {
+            self.palette_query.set_from("");
+        }
+        self.palette_open.set(next);
+    }
+
+    /// Open/close the settings page (Ctrl+Shift+,). Opening snapshots
+    /// the live config into the edit bindings.
+    pub fn toggle_settings(&self) {
+        let next = !self.settings_open.get();
+        if next {
+            let (font, theme, blink) =
+                self.config(|c| (c.font_size as i32, theme_index(&c.theme), c.cursor_blink));
+            self.set_font.set(font);
+            self.set_theme.set(theme);
+            self.set_blink.set(blink);
+        }
+        self.settings_open.set(next);
+    }
+
+    /// Persist the settings edits back into the config file — the
+    /// hot-reload watcher applies them on the next poll, same as a
+    /// manual edit.
+    pub fn apply_settings(&self) {
+        self.settings_open.set(false);
+        let path = self.cfg.borrow().path.clone();
+        let theme = THEME_CHOICES[self.set_theme.get().min(THEME_CHOICES.len() - 1)];
+        let blink = self.set_blink.get();
+        crate::config::upsert_config_key(&path, "font-size", &self.set_font.get().to_string());
+        crate::config::upsert_config_key(&path, "theme", theme);
+        crate::config::upsert_config_key(
+            &path,
+            "cursor-blink",
+            if blink { "true" } else { "false" },
+        );
+    }
+
+    /// Run a palette action: close the overlay, then queue it on the
+    /// focused session's surface so every action shares the key-chord
+    /// dispatch path. Falls back to the app-level subset when no session
+    /// is focused (e.g. the last one exited).
+    pub fn run_palette_action(&self, action: TermAction) {
+        self.palette_open.set(false);
+        if let Some(session) = self.focused_session() {
+            session.pending_actions.borrow_mut().push(action);
+            session.terminal.proxy.request_frame();
+            return;
+        }
+        match action {
+            TermAction::NewTab => {
+                self.new_tab();
+            }
+            TermAction::NewWindow => self.new_window(),
+            TermAction::NextTab => self.cycle_tab(1),
+            TermAction::PrevTab => self.cycle_tab(-1),
+            TermAction::Fullscreen => self.toggle_fullscreen(),
+            TermAction::Quit => self.quit(),
+            _ => {}
+        }
+    }
+}
+
+/// The palette overlay: a field + filtered action list, stacked over the
+/// tabs. Enter runs the top match (handled on the surface's key path);
+/// a row's button runs it directly.
+fn palette_view(state: AppState) -> impl View {
+    let query = state.palette_query.clone();
+    let list = watch(query, {
+        let state = state.clone();
+        move |q: Str| {
+            let rows: Vec<AnyView> = palette_matches(q.as_str())
+                .into_iter()
+                .map(|item| {
+                    let app = state.clone();
+                    button(format!("{:<28} {}", item.name, item.chord))
+                        .action(move || app.run_palette_action(item.action))
+                        .anyview()
+                })
+                .collect();
+            rows.into_iter()
+                .collect::<VStack<_>>()
+                .spacing(2.0)
+                .anyview()
+        }
+    });
+    let panel = vstack((field("type a command", &state.palette_query), list))
+        .spacing(8.0)
+        .padding()
+        .background(Srgb::from_hex("#1E222A").with_opacity(0.98));
+    vstack((panel, Spacer::flexible()))
+}
+
+/// The settings page: font size stepper, theme picker, cursor-blink
+/// toggle, Apply writes the config file (hot reload picks it up).
+/// Escape/Enter close it via the surface's key path.
+fn settings_view(state: AppState) -> impl View {
+    let theme_items: Vec<PickerItem<usize>> = THEME_CHOICES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| text(*name).tag(i))
+        .collect();
+    let panel = vstack((
+        text("Settings"),
+        stepper("Font size", &state.set_font),
+        picker("Theme", theme_items, &state.set_theme),
+        toggle("Cursor blink", &state.set_blink),
+        {
+            let app = state.clone();
+            button("Apply").action(move || app.apply_settings())
+        },
+    ))
+    .spacing(8.0)
+    .padding()
+    .foreground(Srgb::WHITE)
+    .background(Srgb::from_hex("#1E222A").with_opacity(0.98));
+    vstack((panel, Spacer::flexible()))
 }

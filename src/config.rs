@@ -43,6 +43,11 @@ pub struct AppConfig {
     pub command: Option<Vec<String>>,
     /// `keybind = <chord>=<action>` entries; `None` action = disabled.
     pub keybinds: Vec<(String, Option<TermAction>)>,
+    /// Window/transparency: alpha of the terminal's own background fill,
+    /// 0.0 (invisible) ..= 1.0 (opaque). The winit window is created
+    /// transparent when this starts below 1.0 — raising it live works;
+    /// dropping it on an opaque-start window just darkens.
+    pub background_opacity: f32,
 }
 
 impl Default for AppConfig {
@@ -58,6 +63,7 @@ impl Default for AppConfig {
             shell: None,
             command: None,
             keybinds: Vec::new(),
+            background_opacity: 1.0,
         }
     }
 }
@@ -91,12 +97,16 @@ copy-on-select = false
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
 # chords: ctrl+shift+c, alt+enter, ...  actions: copy, paste,
-# new_tab, close_tab, next_tab, prev_tab, select_tab_1..8,
+# new_tab, close_tab, new_window, next_tab, prev_tab, select_tab_1..8,
 # font_bigger, font_smaller, font_reset, clear_scrollback, search,
 # prompt_prev, prompt_next, select_all, scroll_to_top,
 # scroll_to_bottom, quit, split_right, split_down,
 # focus_next_pane, focus_prev_pane
 # keybind = ctrl+alt+a=select_all
+
+# Alpha of the terminal background fill (0..1); set below 1.0 at launch
+# for a translucent window over the desktop.
+# background-opacity = 0.85
 ";
 
 impl AppConfig {
@@ -144,6 +154,10 @@ impl AppConfig {
                 "scrollback" => match value.parse::<usize>() {
                     Ok(v) => cfg.scrollback = v.min(1_000_000),
                     Err(_) => errors.push(format!("line {}: bad scrollback {value:?}", n + 1)),
+                },
+                "background-opacity" | "background_opacity" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
+                    _ => errors.push(format!("line {}: bad background-opacity {value:?}", n + 1)),
                 },
                 "theme" => {
                     if value.eq_ignore_ascii_case("auto") {
@@ -292,6 +306,7 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "paste" => TermAction::Paste,
         "new_tab" => TermAction::NewTab,
         "close_tab" => TermAction::CloseTab,
+        "new_window" => TermAction::NewWindow,
         "next_tab" => TermAction::NextTab,
         "prev_tab" => TermAction::PrevTab,
         "font_bigger" => TermAction::FontBigger,
@@ -310,6 +325,8 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "focus_next_pane" => TermAction::FocusNextPane,
         "focus_prev_pane" => TermAction::FocusPrevPane,
         "fullscreen" => TermAction::Fullscreen,
+        "palette" | "command_palette" => TermAction::Palette,
+        "settings" => TermAction::Settings,
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)
@@ -418,6 +435,42 @@ impl ConfigWatcher {
     }
 }
 
+
+/// Insert or replace `key = value` in the config file, preserving every
+/// other line (comments, unknown keys). Creates the file and parent dirs
+/// when missing — used by the in-app settings page; the watcher then
+/// hot-reloads the change like a manual edit.
+pub fn upsert_config_key(path: &Path, key: &str, value: &str) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count() + 1);
+    let mut done = false;
+    for line in text.lines() {
+        let k = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if k == key {
+            if !done {
+                out.push(format!("{key} = {value}"));
+                done = true;
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !done {
+        out.push(format!("{key} = {value}"));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, out.join("\n") + "\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +572,23 @@ mod tests {
         std::fs::write(&path, "font-size = 22\n").unwrap();
         // mtime granularity may tie; poll must still see the new mtime.
         assert!(w.poll() || w.config.font_size == 20.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_replaces_and_appends_keys() {
+        let dir = std::env::temp_dir().join(format!("hydroterm-upsert-{}", std::process::id()));
+        let path = dir.join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "# comment\nfont-size = 13\ntheme = auto\n").unwrap();
+        upsert_config_key(&path, "theme", "solarized-dark");
+        upsert_config_key(&path, "cursor-blink", "true");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# comment"));
+        assert!(text.contains("font-size = 13"));
+        assert!(text.contains("theme = solarized-dark"));
+        assert!(text.contains("cursor-blink = true"));
+        assert!(!text.contains("theme = auto"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

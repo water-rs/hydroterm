@@ -97,6 +97,12 @@ impl EventProxy {
         *self.inner.wake.lock().unwrap() = Box::new(f);
     }
 
+    /// Ask the surface to build a frame (e.g. a queued palette action that
+    /// arrives without a PTY event to trigger one).
+    pub fn request_frame(&self) {
+        self.wake();
+    }
+
     fn wake(&self) {
         (self.inner.wake.lock().unwrap())();
     }
