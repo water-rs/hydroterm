@@ -12,6 +12,7 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
 use waterui::prelude::*;
+use waterui::widget::condition::when;
 use waterui_graphics::GpuSurface;
 
 use crate::config::{AppConfig, ConfigWatcher};
@@ -36,6 +37,12 @@ pub struct Session {
     pub exited: Binding<bool>,
     /// Latest working directory reported via OSC 7.
     pub cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Search bar visible above the pane (Ctrl+Shift+F toggles).
+    pub search_open: Binding<bool>,
+    /// Live search query — bound to the WaterUI `TextField`.
+    pub search_query: Binding<Str>,
+    /// Match summary shown next to the field ("3 matches" / "").
+    pub search_status: Binding<Str>,
 }
 
 impl Session {
@@ -67,6 +74,9 @@ impl Session {
             font_size: Binding::f32(cfg.font_size),
             exited: Binding::bool(false),
             cwd: std::sync::Mutex::new(None),
+            search_open: Binding::bool(false),
+            search_query: binding(Str::from("")),
+            search_status: binding(Str::from("")),
         }
     }
 }
@@ -494,9 +504,27 @@ fn pane_view(node: &SplitNode, state: &AppState, palette: &Rc<RefCell<Palette>>)
             let session = state.session(*sid);
             match session {
                 Some(session) => {
-                    let surface =
-                        TermSurface::new(session, state.clone(), palette.clone());
-                    GpuSurface::new(surface).anyview()
+                    // Search bar: a real WaterUI row that appears above the
+                    // surface — the field is a sibling, so toggling it never
+                    // remounts the GpuSurface or drops its keyboard focus.
+                    let query = session.search_query.clone();
+                    let status = session.search_status.clone();
+                    let open = session.search_open.clone();
+                    let surface = GpuSurface::new(TermSurface::new(
+                        session,
+                        state.clone(),
+                        palette.clone(),
+                    ))
+                    .anyview();
+                    let bar = when(open, move || {
+                        hstack((
+                            text("/ "),
+                            field("find in buffer", &query),
+                            text(status.clone()),
+                        ))
+                    })
+                    .anyview();
+                    vstack((bar, surface)).spacing(0.0).anyview()
                 }
                 None => text("pane closed").anyview(),
             }

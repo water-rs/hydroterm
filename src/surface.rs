@@ -232,13 +232,7 @@ impl TermSurface {
                 term.grid_mut().clear_history();
                 term.scroll_display(Scroll::Bottom);
             }
-            TermAction::Search => {
-                self.search = Some(Search {
-                    query: String::new(),
-                    matches: Vec::new(),
-                    active: 0,
-                });
-            }
+            TermAction::Search => self.session.search_open.toggle(),
             TermAction::PromptPrev => self.jump_prompt(-1),
             TermAction::PromptNext => self.jump_prompt(1),
             TermAction::SelectAll => {
@@ -322,11 +316,32 @@ impl TermSurface {
         Some(-line + self.lines as i32 / 2)
     }
 
+    /// Sync local search state with the session bindings: the WaterUI
+    /// search bar owns open/close and the query text; the surface owns the
+    /// match list and which match is active. Called every frame while open.
+    fn sync_search(&mut self) {
+        let open = self.session.search_open.get();
+        if open != self.search.is_some() {
+            self.search = open.then_some(Search {
+                query: String::new(),
+                matches: Vec::new(),
+                active: 0,
+            });
+        }
+        let Some(s) = &self.search else { return };
+        let q = self.session.search_query.get().to_string();
+        if s.query != q {
+            self.search.as_mut().unwrap().query = q;
+            self.run_search();
+        }
+    }
+
     /// Search the whole buffer for `query`; fills `matches`, scrolls to #1.
     fn run_search(&mut self) {
         let Some(search) = &mut self.search else { return };
         search.matches.clear();
         if search.query.is_empty() {
+            self.session.search_status.set_from("");
             return;
         }
         let query = search.query.to_lowercase();
@@ -345,6 +360,10 @@ impl TermSurface {
         }
         search.active = 0;
         drop(term);
+        let n = search.matches.len();
+        self.session
+            .search_status
+            .set_from(if n == 0 { "no matches".to_string() } else { format!("{n} matches") });
         if let Some(target) = self.search_scroll_target() {
             let cur = self.session.terminal.term.lock().grid().display_offset() as i32;
             let delta = target - cur;
@@ -521,14 +540,13 @@ impl TermSurface {
                 true
             }
             Key::Named(NamedKey::Escape) => {
-                self.search = None;
+                self.session.search_open.set(false);
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(s) = &mut self.search {
-                    s.query.pop();
-                }
-                self.run_search();
+                let mut q = self.session.search_query.get().to_string();
+                q.pop();
+                self.session.search_query.set_from(q);
                 true
             }
             Key::Named(NamedKey::ArrowUp)
@@ -561,10 +579,9 @@ impl TermSurface {
     /// Append typed text — search query when searching, else PTY.
     fn on_text(&mut self, text: &str) {
         if self.search.is_some() {
-            if let Some(s) = &mut self.search {
-                s.query.push_str(text);
-            }
-            self.run_search();
+            let mut q = self.session.search_query.get().to_string();
+            q.push_str(text);
+            self.session.search_query.set_from(q);
             return;
         }
         self.write(text.as_bytes().to_vec());
@@ -770,13 +787,7 @@ impl TermSurface {
                 .get(s.active)
                 .map(|&(c, line)| (c, (line + offset) as usize))
         });
-        // Prepend the live query as a synthetic match-free banner: draw it via
-        // preedit when searching (the search bar lives in the preedit slot).
-        let preedit = self.preedit.clone().or_else(|| {
-            self.search
-                .as_ref()
-                .map(|s| (format!("/{}", s.query), s.query.len()))
-        });
+        let preedit = self.preedit.clone();
 
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
@@ -1064,6 +1075,7 @@ impl GpuView for TermSurface {
     fn render(&mut self, frame: &mut GpuFrame) {
         self.app.poll_config();
         self.drain_events();
+        self.sync_search();
         self.sync_fonts(frame.scale());
         self.sync_size(frame.width, frame.height);
         self.scale = frame.scale();

@@ -50,11 +50,11 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Theme | Built-in themes (hydroterm-dark/light, solarized-dark/light) | ✅ | `theme =` config; live swap verified |
 | Theme | `theme = auto` follows desktop color-scheme | 🟡 | resolved per (re)load via gsettings; no live OS-change subscription |
 | Cursor | `cursor-shape`/`cursor-blink` config | ✅ | spawn-time (alacritty has no config setter) |
-| Font | Fallback chain (fontconfig) | ✅ | missing glyph → fallback font |
-| Font | Ligatures | 🟡 | rustybuzz shapes runs — verify `=>`, `!=` visually |
-| Font | Emoji + grapheme clusters (ZWJ, VS16) | 🟡 | single emoji ok; ZWJ via segmentation — verify |
-| Font | Synthetic bold/italic | ✅ | stroke emboss / skew |
-| Font | Color emoji (COLR/CBDT) | ❌ | outline-only pipeline; bitmap emoji needs blit path |
+| Font | Fallback chain (fontconfig) | ✅ | 中文カタ rendered via Noto CJK fallback (screenshot-verified) |
+| Font | Ligatures | ✅ | `->`, `=>`, `!=`, `ffi`, `fl` shape to ligature glyphs (screenshot-verified) |
+| Font | Emoji + grapheme clusters (ZWJ, VS16) | 🟡 | single emoji ✅, regional-indicator flag merges ✅, combining é ✅; ZWJ family renders as separate heads (no cross-cell merge) |
+| Font | Synthetic bold/italic | ✅ | stroke emboss / skew — `\e[1m`/`\e[3m` visually distinct |
+| Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
 | Shell int. | zsh/fish integration auto-inject | 🟡 | bash auto-inject via `--rcfile`; zsh/fish TODO |
 | Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected bash rc emits marks; verified: scrollback jump lands mark at viewport top |
@@ -63,7 +63,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell int. | OSC 9/777 notifications | 🟡 | tap emits; surface via notifier |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
 | Bell | Audible bell | ❌ | needs audio stack; low priority |
-| Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F |
+| Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight in grid, Enter jumps to next |
+| Shell UI | Settings page | 🟡 | deferred — config file + hot reload covers it; no settings GUI yet |
+| Shell UI | Command palette | 🟡 | deferred — all actions reachable via keybinds; palette not built yet |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | ❌ | APC captured by tap; decode+render planned |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
@@ -80,5 +82,5 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 |------|--------|--------|
 | vttest | visual spot-check only (interactive suite, no automated score) | menu + "test of cursor movements" DECALN frame rendered correctly on 2026-09-22 run |
 | esctest | 57/559 pass (10%) | `esctest --expected-terminal xterm`, 2026-09-22; ~450 tests verify screen contents via DECRQCRA (CSI ... * y) which alacritty_terminal does not implement — those all timeout-fail. Real failures: winops reports (14t/18t resize-px), BS/wrap semantics, OSC4 color queries |
-| Throughput | _pending_ | `time cat bigfile` (≥64MB) in hydroterm |
-| Input latency | _pending_ | keypress→echo render time |
+| Throughput | 48.7MB in 4.53s (~10.8 MB/s, llvmpipe CPU render) | `time cat` of 800k-line file; pty backpressure = read+parse+render drain |
+| Input latency | ~72ms keypress→PTY byte (upper bound, includes X/xdotool dispatch; adds ≤1-2 render frames for echo) | raw-tty `os.read` timestamp vs send timestamp, same clock |
