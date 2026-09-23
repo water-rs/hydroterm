@@ -69,6 +69,10 @@ pub struct Session {
     /// Actions queued by the command palette — drained by the surface on
     /// the next frame (keeps one dispatch path for every action).
     pub pending_actions: Rc<RefCell<Vec<TermAction>>>,
+    /// The program currently holds mouse reporting (DECSET 1000/1002/
+    /// 1006) — while on, secondary clicks belong to it and the context
+    /// menu is suppressed (signal-driven `.context_menu` items).
+    pub mouse_reporting: Binding<bool>,
 }
 
 impl Session {
@@ -114,6 +118,7 @@ impl Session {
             search_status: binding(Str::from("")),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
+            mouse_reporting: Binding::bool(false),
         }
     }
 }
@@ -187,6 +192,47 @@ impl SplitNode {
                 children.iter().flat_map(Self::leaves).collect()
             }
         }
+    }
+
+    /// Does this subtree contain leaf `id`?
+    fn contains(&self, id: u64) -> bool {
+        match self {
+            Self::Leaf(i) => *i == id,
+            Self::Split { children, .. } => children.iter().any(|c| c.contains(id)),
+        }
+    }
+
+    /// The leaf at the `first` (left/top) or last (right/bottom) edge.
+    fn edge_leaf(&self, first: bool) -> u64 {
+        match self {
+            Self::Leaf(id) => *id,
+            Self::Split { children, .. } => {
+                children[if first { 0 } else { children.len() - 1 }].edge_leaf(first)
+            }
+        }
+    }
+
+    /// Where a directional focus move from `focus` lands — the sibling
+    /// subtree across the nearest matching-axis split that has one, or
+    /// `None` at the layout's edge. `horizontal` selects left/right
+    /// (`Row` splits), `forward` = right/down.
+    fn neighbor(&self, focus: u64, horizontal: bool, forward: bool) -> Option<u64> {
+        let Self::Split { dir, children } = self else {
+            return None;
+        };
+        let i = children.iter().position(|c| c.contains(focus))?;
+        if matches!(dir, SplitDir::Row) == horizontal {
+            let j = if forward {
+                i + 1
+            } else {
+                i.checked_sub(1).unwrap_or(usize::MAX)
+            };
+            if j < children.len() {
+                // Enter the sibling from the edge facing the current pane.
+                return Some(children[j].edge_leaf(forward));
+            }
+        }
+        children[i].neighbor(focus, horizontal, forward)
     }
 }
 
@@ -676,6 +722,42 @@ impl AppState {
         self.focus_pane(leaves[next]);
     }
 
+    /// Directional pane focus inside the selected tab (Ghostty's
+    /// goto_split): the nearest leaf across the matching-axis split.
+    /// `horizontal` = left/right, `forward` = right/down.
+    pub fn focus_pane_dir(&self, horizontal: bool, forward: bool) {
+        let tab_id = self.selected.get();
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        if let Some(next) = tab
+            .tree
+            .get()
+            .neighbor(tab.focused.get(), horizontal, forward)
+        {
+            self.focus_pane(next);
+        }
+    }
+
+    /// Move the selected tab `dir` slots (wraps at both ends).
+    pub fn move_tab(&self, dir: isize) {
+        let cur = self.selected.get();
+        let tabs = self.tabs.snapshot();
+        let Some(i) = tabs.iter().position(|t| t.id == cur) else {
+            return;
+        };
+        if tabs.len() < 2 {
+            return;
+        }
+        let j = (i as isize + dir).rem_euclid(tabs.len() as isize) as usize;
+        if i == j {
+            return;
+        }
+        let tab = tabs[i].clone();
+        let _ = self.tabs.remove(i);
+        self.tabs.insert(j, tab);
+    }
+
     /// Toggle pane zoom on the selected tab: the focused pane fills the
     /// whole tab; toggling again (or re-focusing then toggling) restores
     /// the split layout.
@@ -800,10 +882,11 @@ impl View for PaneLeaf {
             self.state.palette,
             FontCollection::from_env(env),
         )));
+        let reporting = self.session.mouse_reporting.clone();
         let session = PaneSession(self.session); // `.state` stores a clone
         let bar = when(open, move || {
             hstack((
-                field("find in buffer", &query).max_width(f32::INFINITY),
+                field("find in buffer", &query),
                 text(status.clone()).muted(),
                 text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchPrev)),
                 text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchNext)),
@@ -813,18 +896,28 @@ impl View for PaneLeaf {
             .padding_vertical(4.0)
         })
         .anyview();
+        // The menu is attached only while the program is not reporting
+        // mouse input — under DECSET 1000/1002/1006 a secondary click is
+        // program input, so the item list collapses to empty and the
+        // click falls through to the surface (hydrolysis hit-testing).
+        let menu = reporting
+            .map(|reporting| -> Vec<MenuItem> {
+                if reporting {
+                    Vec::new()
+                } else {
+                    vec![
+                        "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)).into(),
+                        "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)).into(),
+                        "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)).into(),
+                        "Clear".action(|s: PaneSession| s.push_action(TermAction::ClearScrollback)).into(),
+                        "Search".action(|s: PaneSession| s.push_action(TermAction::Search)).into(),
+                    ]
+                }
+            })
+            .computed();
         vstack((bar, surface))
             .spacing(0.0)
-            .context_menu(vec![
-                "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)),
-                "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)),
-                "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)),
-                "Find in Buffer".action(|s: PaneSession| s.push_action(TermAction::Search)),
-                "Split Right".action(|s: PaneSession| s.push_action(TermAction::SplitRight)),
-                "Split Down".action(|s: PaneSession| s.push_action(TermAction::SplitDown)),
-                "Toggle Pane Zoom".action(|s: PaneSession| s.push_action(TermAction::PaneZoom)),
-                "Close Pane".action(|s: PaneSession| s.push_action(TermAction::CloseTab)),
-            ])
+            .context_menu(menu)
             .state(&session)
     }
 }
@@ -1019,11 +1112,19 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Scroll to Bottom", chord: "ctrl+shift+end", action: TermAction::ScrollToBottom },
     PaletteItem { name: "Scroll Page Up", chord: "shift+pageup", action: TermAction::ScrollPageUp },
     PaletteItem { name: "Scroll Page Down", chord: "shift+pagedown", action: TermAction::ScrollPageDown },
+    PaletteItem { name: "Scroll Line Up", chord: "shift+up", action: TermAction::ScrollLineUp },
+    PaletteItem { name: "Scroll Line Down", chord: "shift+down", action: TermAction::ScrollLineDown },
+    PaletteItem { name: "Move Tab Left", chord: "ctrl+shift+pageup", action: TermAction::MoveTabLeft },
+    PaletteItem { name: "Move Tab Right", chord: "ctrl+shift+pagedown", action: TermAction::MoveTabRight },
+    PaletteItem { name: "Focus Pane Left", chord: "ctrl+alt+left", action: TermAction::FocusPaneDir { horizontal: true, forward: false } },
+    PaletteItem { name: "Focus Pane Right", chord: "ctrl+alt+right", action: TermAction::FocusPaneDir { horizontal: true, forward: true } },
+    PaletteItem { name: "Focus Pane Up", chord: "ctrl+alt+up", action: TermAction::FocusPaneDir { horizontal: false, forward: false } },
+    PaletteItem { name: "Focus Pane Down", chord: "ctrl+alt+down", action: TermAction::FocusPaneDir { horizontal: false, forward: true } },
     PaletteItem { name: "URL Hints (open link by number)", chord: "ctrl+shift+u", action: TermAction::UrlHints },
     PaletteItem { name: "Copy Last Command Output", chord: "ctrl+shift+o", action: TermAction::CopyLastOutput },
     PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
     PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
-    PaletteItem { name: "Toggle Fullscreen", chord: "ctrl+shift+f11", action: TermAction::Fullscreen },
+    PaletteItem { name: "Toggle Fullscreen", chord: "f11", action: TermAction::Fullscreen },
     PaletteItem { name: "Quit", chord: "", action: TermAction::Quit },
 ];
 
@@ -1214,4 +1315,34 @@ fn settings_view(state: AppState) -> impl View {
     .padding()
     .background(Surface);
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SplitDir, SplitNode};
+
+    /// [0 | 1] split side-by-side, then 1 split down → [0 | {1 / 2}].
+    fn nested() -> SplitNode {
+        let mut t = SplitNode::Leaf(0);
+        assert!(t.split(SplitDir::Row, 0, 1));
+        assert!(t.split(SplitDir::Column, 1, 2));
+        t
+    }
+
+    #[test]
+    fn focus_navigates_directionally() {
+        let t = nested();
+        // Right from leaf 0 crosses the row split into leaf 1's edge.
+        assert_eq!(t.neighbor(0, true, true), Some(1));
+        // Left from leaf 1 returns to 0; left from 2 wraps to the edge
+        // leaf facing it on the same side.
+        assert_eq!(t.neighbor(1, true, false), Some(0));
+        assert_eq!(t.neighbor(2, true, false), Some(0));
+        // Down from 1 crosses the nested column split to 2, and back.
+        assert_eq!(t.neighbor(1, false, true), Some(2));
+        assert_eq!(t.neighbor(2, false, false), Some(1));
+        // Edges: past the right/bottom of the layout there is no neighbor.
+        assert_eq!(t.neighbor(2, true, true), None);
+        assert_eq!(t.neighbor(2, false, true), None);
+    }
 }

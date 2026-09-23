@@ -43,32 +43,154 @@ use crate::terminal::TermEvent;
 const BLINK_HALF: Duration = Duration::from_millis(530);
 /// Bell flash decay time.
 const BELL_FLASH_SECS: f32 = 0.15;
-/// Time window for double/triple click detection.
-/// (start col, end col exclusive) of each `query` match in `text`.
-/// `marks` maps text byte offsets to grid columns — a wide char is one
-/// `char` in `text` but two cells, so string positions can't be used as
-/// columns directly.
-fn match_columns(
-    text: &str,
-    marks: &[(usize, usize)],
-    query: &str,
-    grid_cols: usize,
-) -> Vec<(usize, usize)> {
-    let cell_at = |byte: usize| -> usize {
-        match marks.binary_search_by_key(&byte, |&(b, _)| b) {
-            Ok(i) => marks[i].1,
-            Err(0) => 0,
-            Err(i) => marks[i - 1].1,
-        }
-    };
-    text.match_indices(query)
-        .map(|(idx, _)| {
-            let c0 = cell_at(idx);
-            let end = idx + query.len();
-            let c1 = if end >= text.len() { grid_cols } else { cell_at(end) };
-            (c0, c1.max(c0 + 1))
+/// Peak overlay alpha of a bell flash, decaying linearly to 0 over
+/// `BELL_FLASH_SECS`.
+const BELL_FLASH_ALPHA: f32 = 0.18;
+
+fn bell_flash_alpha(bell_at: Option<Instant>, now: Instant) -> f32 {
+    bell_at
+        .map(|t| {
+            (1.0 - now.duration_since(t).as_secs_f32() / BELL_FLASH_SECS).max(0.0)
+                * BELL_FLASH_ALPHA
         })
-        .collect()
+        .unwrap_or(0.0)
+}
+/// Time window for double/triple click detection.
+/// One soft-wrap chain joined into a logical line, plus a map back to
+/// the grid cells that produced each char.
+struct LineMap {
+    /// Joined cell text — one char per `cell_text` item; wide-char
+    /// spacers contribute nothing and a cell's zerowidths follow its
+    /// base char.
+    chars: Vec<char>,
+    /// `(index into `chars`, grid line, start col, cell width)` per
+    /// contributing cell, in document order.
+    marks: Vec<(usize, i32, usize, usize)>,
+}
+
+/// The grid cell that produced `lm.chars[i]` as `(line, col, width)`.
+/// `lm.marks` must be non-empty.
+fn line_cell(lm: &LineMap, i: usize) -> (i32, usize, usize) {
+    let m = match lm.marks.binary_search_by_key(&i, |m| m.0) {
+        Ok(k) => lm.marks[k],
+        Err(0) => lm.marks[0],
+        Err(k) => lm.marks[k - 1],
+    };
+    (m.1, m.2, m.3)
+}
+
+/// A grid `line`'s row carries the soft-wrap flag on its last cell.
+fn row_wraps(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>, line: i32) -> bool {
+    grid[Line(line)]
+        .last()
+        .is_some_and(|c| c.flags.contains(Flags::WRAPLINE))
+}
+
+/// Join `top..=bottom` grid rows into logical lines: a row whose last
+/// cell is flagged WRAPLINE continues into the next row.
+fn logical_lines(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    top: i32,
+    bottom: i32,
+) -> Vec<LineMap> {
+    let mut out = Vec::new();
+    let mut lm = LineMap { chars: Vec::new(), marks: Vec::new() };
+    for line in top..=bottom {
+        let row = &grid[Line(line)];
+        let mut col = 0;
+        for cell in &row[..] {
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                col += 1;
+                continue;
+            }
+            let width = usize::from(cell.flags.contains(Flags::WIDE_CHAR)) + 1;
+            lm.marks.push((lm.chars.len(), line, col, width));
+            lm.chars.extend(crate::scene::cell_text(cell).chars());
+            col += 1;
+        }
+        if !row_wraps(grid, line) {
+            out.push(lm);
+            lm = LineMap { chars: Vec::new(), marks: Vec::new() };
+        }
+    }
+    if !lm.marks.is_empty() {
+        out.push(lm);
+    }
+    out
+}
+
+/// The logical line covering grid `line` — walks to the chain's edges.
+fn logical_line_at(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    line: i32,
+) -> LineMap {
+    let top = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let mut first = line.clamp(top, bottom);
+    while first > top && row_wraps(grid, first - 1) {
+        first -= 1;
+    }
+    let mut last = line.clamp(top, bottom);
+    while last < bottom && row_wraps(grid, last) {
+        last += 1;
+    }
+    logical_lines(grid, first, last).into_iter().next().unwrap()
+}
+
+/// `(start col, end col exclusive, grid line)` highlight segments
+/// covering `lm.chars[s..e]` — one entry per covered row, so a match
+/// crossing a soft wrap highlights both parts.
+fn span_segments(lm: &LineMap, s: usize, e: usize, cols: usize) -> Vec<(usize, usize, i32)> {
+    debug_assert!(s < e);
+    let (l0, c0, _) = line_cell(lm, s);
+    let (l1, c1, w1) = line_cell(lm, e - 1);
+    if l0 == l1 {
+        vec![(c0, c1 + w1, l0)]
+    } else {
+        let mut segs = vec![(c0, cols, l0)];
+        for l in l0 + 1..l1 {
+            segs.push((0, cols, l));
+        }
+        segs.push((0, c1 + w1, l1));
+        segs
+    }
+}
+
+/// Every `query` hit in one logical line — each match is a list of
+/// `(start col, end col exclusive, grid line)` segments (more than one
+/// when the match crosses a soft wrap). `query` is lowercase chars.
+fn line_map_matches(
+    lm: &LineMap,
+    query: &[char],
+    cols: usize,
+) -> Vec<Vec<(usize, usize, i32)>> {
+    if lm.marks.is_empty() || query.is_empty() {
+        return Vec::new();
+    }
+    // Lowercase char-wise with a remap back to `chars` indices, so owner
+    // lookups survive expansion (e.g. `İ` → `i` + combining dot).
+    let mut lower = Vec::with_capacity(lm.chars.len());
+    let mut remap = Vec::with_capacity(lm.chars.len());
+    for (i, &c) in lm.chars.iter().enumerate() {
+        for lc in c.to_lowercase() {
+            lower.push(lc);
+            remap.push(i);
+        }
+    }
+    let q = query.len();
+    if lower.len() < q {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for j in 0..=(lower.len() - q) {
+        if lower[j..j + q] == query[..] {
+            out.push(span_segments(lm, remap[j], remap[j + q - 1] + 1, cols));
+        }
+    }
+    out
 }
 
 const MULTI_CLICK: Duration = Duration::from_millis(400);
@@ -89,10 +211,15 @@ fn ring_bell(last: &mut Option<Instant>) {
 /// In-surface text search state (Ctrl+Shift+F).
 struct Search {
     query: String,
-    /// (start col, end col exclusive, grid line) — grid lines go
-    /// negative into scrollback. A match's CJK/emoji cells span 2 cols.
-    matches: Vec<(usize, usize, i32)>,
+    /// One entry per match — `(start col, end col exclusive, grid
+    /// line)` segments; a match crossing a soft wrap has one segment
+    /// per covered row. Grid lines go negative into scrollback.
+    matches: Vec<Vec<(usize, usize, i32)>>,
     active: usize,
+    /// `(cols, history, screen lines, content gen)` at the last run —
+    /// any change (reflow on resize, new output) re-runs the search so
+    /// highlights stay on the moved match cells.
+    stamp: (usize, usize, usize, u64),
 }
 
 /// URL hint mode state — numbered link chips + the digits typed so far.
@@ -125,6 +252,9 @@ pub struct TermSurface {
     // cross-thread wake pipe: parser thread → channel → local future →
     // SceneInvalidator on the main thread.
     wake_tx: Option<async_channel::Sender<()>>,
+    /// Bumped on every drained parser wake — part of the search stamp,
+    /// so new output re-runs an open search.
+    content_gen: Rc<Cell<u64>>,
     /// Dead-man switch for the spawned future — cleared on teardown/None.
     wake_alive: Rc<Cell<bool>>,
     /// The parked drain future; dropped (detached) on teardown.
@@ -171,6 +301,7 @@ impl TermSurface {
             lines: 0,
             invalidator: None,
             wake_tx: None,
+            content_gen: Rc::new(Cell::new(0)),
             wake_alive: Rc::new(Cell::new(false)),
             wake_task: None,
             focused: false,
@@ -257,12 +388,16 @@ impl TermSurface {
         let term = self.session.terminal.term.lock();
         let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
         let uri = uri.or_else(|| {
-            let chars: Vec<char> = term.grid()[point.line]
-                .into_iter()
-                .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
-                .map(|c| c.c)
-                .collect();
-            url_at(&chars, point.column.0)
+            // Scan the logical line (soft wraps joined) so a link that
+            // wraps across rows still resolves; the click's char index
+            // is the mark of the cell under it.
+            let lm = logical_line_at(term.grid(), point.line.0);
+            let idx = lm
+                .marks
+                .iter()
+                .rfind(|m| m.1 == point.line.0 && m.2 <= point.column.0)
+                .map(|m| m.0)?;
+            url_at(&lm.chars, idx)
         });
         drop(term);
         if let Some(uri) = uri {
@@ -340,6 +475,25 @@ impl TermSurface {
                 let page = term.grid().screen_lines().saturating_sub(1) as i32;
                 term.scroll_display(Scroll::Delta(-page));
             }
+            TermAction::ScrollLineUp => {
+                self.session
+                    .terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Delta(1));
+            }
+            TermAction::ScrollLineDown => {
+                self.session
+                    .terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Delta(-1));
+            }
+            TermAction::MoveTabLeft => self.app.move_tab(-1),
+            TermAction::MoveTabRight => self.app.move_tab(1),
+            TermAction::FocusPaneDir { horizontal, forward } => {
+                self.app.focus_pane_dir(horizontal, forward);
+            }
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
             TermAction::OpenScrollbackEditor => self.open_scrollback_editor(),
@@ -399,7 +553,7 @@ impl TermSurface {
     /// (col, row) the active search match should scroll to center.
     fn search_scroll_target(&self) -> Option<i32> {
         let search = self.search.as_ref()?;
-        let &(_, _, line) = search.matches.get(search.active)?;
+        let line = search.matches.get(search.active)?.first()?.2;
         // Target display_offset so the match sits mid-viewport.
         Some(-line + self.lines as i32 / 2)
     }
@@ -414,6 +568,7 @@ impl TermSurface {
                 query: String::new(),
                 matches: Vec::new(),
                 active: 0,
+                stamp: (0, 0, 0, 0),
             });
         }
         let Some(s) = &self.search else { return };
@@ -425,46 +580,37 @@ impl TermSurface {
     }
 
     /// Search the whole buffer for `query`; fills `matches`, scrolls to #1.
+    /// Matches are found on logical lines (soft wraps joined) and mapped
+    /// back to grid cells of the grid as it is laid out NOW — the stamp
+    /// makes a reflow or new output re-run the search.
     fn run_search(&mut self) {
+        let generation = self.content_gen.get();
         let Some(search) = &mut self.search else { return };
-        search.matches.clear();
-        if search.query.is_empty() {
-            self.session.search_status.set_from("");
-            return;
-        }
-        let query = search.query.to_lowercase();
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
-        let top = -(grid.history_size() as i32);
-        let bottom = grid.screen_lines() as i32 - 1;
-        for line in top..=bottom {
-            let row = &grid[Line(line)];
-            // Byte offset -> cell col: wide chars occupy 2 cells but one
-            // `char` in the line text, so match positions must map through
-            // the cells, not `chars().count()`.
-            let mut text = String::new();
-            let mut marks: Vec<(usize, usize)> = Vec::new();
-            for (col, cell) in row[..].iter().enumerate() {
-                if cell
-                    .flags
-                    .intersects(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                marks.push((text.len(), col));
-                text.push_str(&crate::scene::cell_text(cell));
-            }
-            let text = text.to_lowercase();
-            for (c0, c1) in match_columns(&text, &marks, &query, grid.columns()) {
-                search.matches.push((c0, c1, line));
+        let (cols, history, lines) = (grid.columns(), grid.history_size(), grid.screen_lines());
+        search.stamp = (cols, history, lines, generation);
+        search.matches.clear();
+        search.active = 0;
+        if !search.query.is_empty() {
+            let query: Vec<char> = search
+                .query
+                .chars()
+                .flat_map(char::to_lowercase)
+                .collect();
+            for lm in logical_lines(grid, -(history as i32), lines as i32 - 1) {
+                search.matches.extend(line_map_matches(&lm, &query, cols));
             }
         }
-        search.active = 0;
         drop(term);
         let n = search.matches.len();
-        self.session
-            .search_status
-            .set_from(if n == 0 { "no matches".to_string() } else { format!("{n} matches") });
+        self.session.search_status.set_from(if search.query.is_empty() {
+            String::new()
+        } else if n == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{n} matches")
+        });
         if let Some(target) = self.search_scroll_target() {
             let cur = self.session.terminal.term.lock().grid().display_offset() as i32;
             let delta = target - cur;
@@ -1000,31 +1146,35 @@ impl TermSurface {
     /// or scroll clears the mode (the grid may have moved).
     fn url_hints(&mut self) {
         let term = self.session.terminal.term.lock();
-        let lines = term.grid().screen_lines();
-        let offset = term.grid().display_offset() as i32;
+        let grid = term.grid();
+        let (cols, history, lines) = (grid.columns(), grid.history_size(), grid.screen_lines());
+        let offset = grid.display_offset() as i32;
+        let screen = lines as i32;
         let mut spans: Vec<HintSpan> = Vec::new();
         let mut urls: Vec<String> = Vec::new();
-        for vis_row in 0..lines {
-            let line = Line(vis_row as i32 - offset);
-            let chars: Vec<char> = term.grid()[line]
-                .into_iter()
-                .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
-                .map(|c| c.c)
-                .collect();
-            for (c0, c1) in url_spans(&chars) {
-                urls.push(chars[c0..c1].iter().collect());
+        // URLs are detected on logical lines (soft wraps joined) so a
+        // link spanning a wrap is one span, then mapped back to cells —
+        // the badge anchors on its first visible row part.
+        'outer: for lm in logical_lines(grid, -(history as i32), lines as i32 - 1) {
+            for (s, e) in url_spans(&lm.chars) {
+                let segments: Vec<(usize, usize, usize)> = span_segments(&lm, s, e, cols)
+                    .into_iter()
+                    .filter_map(|(c0, c1, l)| {
+                        let r = l + offset;
+                        (r >= 0 && r < screen).then_some((c0, c1, r as usize))
+                    })
+                    .collect();
+                if segments.is_empty() {
+                    continue;
+                }
+                urls.push(lm.chars[s..e].iter().collect());
                 spans.push(HintSpan {
-                    col0: c0,
-                    col1: c1,
-                    row: vis_row,
+                    segments,
                     label: spans.len() + 1,
                 });
                 if spans.len() >= 99 {
-                    break;
+                    break 'outer;
                 }
-            }
-            if spans.len() >= 99 {
-                break;
             }
         }
         drop(term);
@@ -1205,6 +1355,29 @@ impl TermSurface {
 
     /// Draw the terminal into the frame's scene.
     fn build(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) {
+        {
+            // Grid fingerprint for the frame — the open search re-runs
+            // when reflow (resize/font zoom) or new output moved its
+            // matches. The surface's mouse-reporting flag follows the
+            // same grid state so the context menu yields to DECSET
+            // 1000/1002/1006 programs.
+            let term = self.session.terminal.term.lock();
+            let grid = term.grid();
+            let stamp = (
+                grid.columns(),
+                grid.history_size(),
+                grid.screen_lines(),
+                self.content_gen.get(),
+            );
+            let reporting = term.mode().intersects(TermMode::MOUSE_MODE);
+            drop(term);
+            if self.session.mouse_reporting.get() != reporting {
+                self.session.mouse_reporting.set(reporting);
+            }
+            if self.search.as_ref().is_some_and(|s| s.stamp != stamp) {
+                self.run_search();
+            }
+        }
         let matches_view: Vec<(usize, usize, usize)> = self
             .search
             .as_ref()
@@ -1212,17 +1385,24 @@ impl TermSurface {
                 let offset = self.session.terminal.term.lock().grid().display_offset() as i32;
                 s.matches
                     .iter()
+                    .flatten()
                     .map(|&(c0, c1, line)| (c0, c1, (line + offset) as usize))
                     .filter(|&(_, _, r)| r < self.lines as usize)
                     .collect()
             })
             .unwrap_or_default();
-        let active = self.search.as_ref().and_then(|s| {
-            let offset = self.session.terminal.term.lock().grid().display_offset() as i32;
-            s.matches
-                .get(s.active)
-                .map(|&(c0, c1, line)| (c0, c1, (line + offset) as usize))
-        });
+        let active: Vec<(usize, usize, usize)> = self
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(s.active))
+            .map(|segs| {
+                let offset = self.session.terminal.term.lock().grid().display_offset() as i32;
+                segs.iter()
+                    .map(|&(c0, c1, line)| (c0, c1, (line + offset) as usize))
+                    .filter(|&(_, _, r)| r < self.lines as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         let preedit = self.preedit.clone();
 
         let term = self.session.terminal.term.lock();
@@ -1233,10 +1413,7 @@ impl TermSurface {
             screen_lines: grid.screen_lines(),
         };
         let palette = self.palette.borrow();
-        let bell_alpha = self
-            .bell_at
-            .map(|t| (1.0 - t.elapsed().as_secs_f32() / BELL_FLASH_SECS).max(0.0) * 0.18)
-            .unwrap_or(0.0);
+        let bell_alpha = bell_flash_alpha(self.bell_at, Instant::now());
 
         let hint_spans: Vec<HintSpan> = self
             .hints
@@ -1261,7 +1438,7 @@ impl TermSurface {
             preedit,
             scroll,
             search_matches: &matches_view,
-            search_active: active,
+            search_active: &active,
             bell_flash: bell_alpha,
             bg_opacity,
             hints: &hint_spans,
@@ -1391,6 +1568,7 @@ impl SceneContent for TermSurface {
                     });
                 self.wake_alive.set(true);
                 let alive = Rc::clone(&self.wake_alive);
+                let content_gen = Rc::clone(&self.content_gen);
                 self.wake_task = Some(Box::pin(spawn_local(async move {
                     while rx.recv().await.is_ok() {
                         if !alive.get() {
@@ -1398,6 +1576,7 @@ impl SceneContent for TermSurface {
                         }
                         // Coalesce bursts: one invalidation per batch.
                         while rx.try_recv().is_ok() {}
+                        content_gen.set(content_gen.get() + 1);
                         invalidator();
                     }
                 })));
@@ -1667,19 +1846,94 @@ mod tests {
         assert_eq!(url_at(&row, 22), Some("http://c.d/e".to_string()));
     }
 
-    /// Marks map text byte offsets to grid cols; a CJK char is one char in
-    /// the text but two cells, so a match's highlight must span the cells,
-    /// not the char count.
     #[test]
-    fn match_columns_spans_wide_chars() {
-        // "你好ab" — 你 at cells 0..2, 好 at 2..4, a at 4, b at 5.
-        let text = "你好ab";
-        let marks: Vec<(usize, usize)> = vec![(0, 0), (3, 2), (6, 4), (7, 5)];
-        assert_eq!(match_columns(text, &marks, "好", 6), vec![(2, 4)]);
-        assert_eq!(match_columns(text, &marks, "好a", 6), vec![(2, 5)]);
-        // Match to end of line covers to grid end.
-        assert_eq!(match_columns(text, &marks, "你好ab", 8), vec![(0, 8)]);
-        // ASCII inside a CJK line.
-        assert_eq!(match_columns(text, &marks, "ab", 6), vec![(4, 6)]);
+    fn bell_flash_decays_to_zero() {
+        let t0 = Instant::now();
+        assert!((bell_flash_alpha(Some(t0), t0) - BELL_FLASH_ALPHA).abs() < 1e-6);
+        let mid = t0 + Duration::from_secs_f32(BELL_FLASH_SECS / 2.0);
+        let a = bell_flash_alpha(Some(t0), mid);
+        assert!((a - BELL_FLASH_ALPHA / 2.0).abs() < 1e-5, "{a}");
+        let past = t0 + Duration::from_secs_f32(BELL_FLASH_SECS + 0.05);
+        assert_eq!(bell_flash_alpha(Some(t0), past), 0.0);
+        assert_eq!(bell_flash_alpha(None, t0), 0.0);
+    }
+
+    // -- logical-line model ---------------------------------------------------
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    #[derive(Clone, Copy)]
+    struct Sz(usize, usize);
+    impl Dimensions for Sz {
+        fn total_lines(&self) -> usize {
+            self.0
+        }
+        fn screen_lines(&self) -> usize {
+            self.0
+        }
+        fn columns(&self) -> usize {
+            self.1
+        }
+    }
+
+    fn feed(term: &mut Term<VoidListener>, bytes: &str) {
+        let mut p: Processor = Processor::new();
+        p.advance(term, bytes.as_bytes());
+    }
+
+    /// A match that crosses a soft wrap is ONE hit whose highlight covers
+    /// the correct cells on both rows — match positions are computed on
+    /// the grid as it is laid out, soft wraps included.
+    #[test]
+    fn search_match_spanning_soft_wrap() {
+        let mut term = Term::new(Config::default(), &Sz(24, 20), VoidListener);
+        feed(&mut term, "see https://example.com/alpha here");
+        let grid = term.grid();
+        let top = -(grid.history_size() as i32);
+        let bottom = grid.screen_lines() as i32 - 1;
+        let query: Vec<char> = "https://example.com"
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect();
+        let hits: Vec<Vec<(usize, usize, i32)>> = logical_lines(grid, top, bottom)
+            .iter()
+            .flat_map(|lm| line_map_matches(lm, &query, grid.columns()))
+            .collect();
+        assert_eq!(hits.len(), 1, "wrap-crossing URL is one match: {hits:?}");
+        // "see " occupies cols 0..4 of row 0; "https://example." fills
+        // cols 4..20, then "com" continues on row 1 cols 0..3.
+        assert_eq!(hits[0], vec![(4, 20, 0), (0, 3, 1)]);
+    }
+
+    /// URL detection on logical lines: a link split across a soft wrap is
+    /// one span that maps back to cells on both rows.
+    #[test]
+    fn url_span_maps_across_soft_wrap() {
+        let mut term = Term::new(Config::default(), &Sz(24, 20), VoidListener);
+        feed(&mut term, "see https://example.com/alpha here");
+        let grid = term.grid();
+        let lm = logical_line_at(grid, 0);
+        let spans = url_spans(&lm.chars);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let (s, e) = spans[0];
+        let url: String = lm.chars[s..e].iter().collect();
+        assert_eq!(url, "https://example.com/alpha");
+        // cols 4..20 of row 0 ("https://example."), then "com/alpha" on
+        // row 1 cols 0..9.
+        assert_eq!(span_segments(&lm, s, e, grid.columns()), vec![(4, 20, 0), (0, 9, 1)]);
+    }
+
+    /// Wide chars occupy two cells: match segments span cells, not chars.
+    #[test]
+    fn match_segments_span_wide_chars() {
+        let mut term = Term::new(Config::default(), &Sz(24, 20), VoidListener);
+        feed(&mut term, "你好ab");
+        let grid = term.grid();
+        let lm = logical_line_at(grid, 0);
+        let query: Vec<char> = "好a".chars().flat_map(char::to_lowercase).collect();
+        assert_eq!(line_map_matches(&lm, &query, grid.columns()), vec![vec![(2, 5, 0)]]);
     }
 }

@@ -2,7 +2,7 @@
 
 Real gaps/wishes found while building a modern terminal on hydrolysis. Each item notes severity for a terminal workload. Filed upstream issues are referenced per item; entries whose number is missing were not filed (or are purely informational).
 
-Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
+Pins under test: waterui `b838d734`, hydrolysis `79dc2ec` (dev).
 
 ## Findings
 
@@ -33,6 +33,8 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
    hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
    ```
    Result on X11 + llvmpipe (`WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER=1`): transparent window frame, desktop shows through, zero rendered content — looks like the surface/swapchain never composites. (Critical for the feature — transparency plumbing exists end-to-end but the renderer produces nothing. hydroterm wires `background-opacity` in config; disabled-by-default until this lands.)
+
+   **RESOLVED upstream** — translucent-window rendering landed via water-rs/hydrolysis PR #109; retesting this round.
 
 9. **No scroll "momentum"/natural-scroll phase data** — deltas arrive but no phase beyond `finished`. Fine in practice. → **water-rs/waterui#1198** (Minor)
 
@@ -82,6 +84,8 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
 
     (Important — every interactive canvas: terminals, editors, video players, canvases that want a WaterUI right-click menu. Possible fixes: evaluate the context-menu target before the embedded sink on secondary clicks, or let `SceneContent::input` report handled-ness so an unconsumed secondary click falls through to the wrapper.)
 
+    **RESOLVED upstream** — fixed on dev by water-rs/hydrolysis PR #114: the secondary-press path now hit-tests the enclosing `.context_menu` target first, and falls through to `sink.pointer_button` when `popup_menu_nodes` is empty. hydroterm drives that fall-through with a `Computed<Vec<MenuItem>>` over `Session::mouse_reporting` — the menu items collapse to `vec![]` while a program reports the mouse, so the click reaches the program instead of opening a menu (verified live both ways).
+
 23. **`.on_tap` on `List` row content never fires.** → **water-rs/hydrolysis#111** A `hstack(...).on_tap(...)` inside `List::for_each` rows receives nothing — no panic, no callback (verified live: clicking a row with an `eprintln` probe produced nothing). Row activation only works through `button(...)`: the List injects `ButtonStyle::Plain` + `ListRowChrome` into each row's environment, which is clearly the intended contract — but a tap gesture that silently dies is a footgun for callers reaching for `on_tap` first. `.on_tap` does work on content outside `List` (our search-bar and tab-strip buttons fire correctly, and `ListItem::new(hstack(..).on_tap(..))` tapped at row centre fires on dev per the issue's own repro). The exact shape that failed in hydroterm — extractor-parameter action, `.state` re-injected on the row, inside `watch`-rebuilt `List::for_each`, inside a `when(...)` overlay with a dim mask:
 
     ```rust
@@ -111,3 +115,12 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
     Differences from the passing repro worth bisecting: (a) the action took an `Extractor` parameter (`AppState`) with `.state(&state)` injected on the row, (b) the List was built inside `watch(...)` (Dynamic rebuild) and mounted inside a `when(...)` overlay, (c) `.scroll_controller` + `.anyview()` on the List. No panic — the tap simply produced no callback. App-side we now use `button(Label::new(name, || row_view)).action(...)` for palette rows — the idiomatic shape. (Informational — either intended (then worth a doc line on `List`) or a gesture-routing gap between row hit-testing and content gestures in one of the layers above.)
 
 24. **NOT A BUG — the ancestor environment DOES reach `when`/`for_each`/`watch` builder content.** hydroterm earlier claimed `.state(&x)` had to be re-injected inside lazy builders because the ancestor env did not reach them. Proven wrong live (r10): a 20-line probe app with `.state(&ProbeState)` injected only at the root had all of `when`-body `button.action(|s: ProbeState|)`, a direct `text().on_tap(|s: ProbeState|)`, and `HStack::for_each` row `button`/`text().on_tap` extractors fire correctly — 4/4 clicks, zero extraction panics. `DynamicHostNode` captures the scoped env at build and rebuilds dynamic children under it (`nodes.rs` ~900; `window.rs` `patch()` documents "a rebuild uses the node's own captured environment"). hydroterm's redundant inner `.state` re-injections were removed; the app still works (palette row click inside `when` runs `AppState` actions with no inner injection). (Informational — recorded so the earlier claim isn't propagated further.)
+
+25. **`.context_menu` popup window mounts but paints zero item pixels — the menu is a uniform blank rectangle.** After the water-rs/hydrolysis#110 hit-test fix, a secondary press correctly mounts a `WindowStyle::Borderless` winit window: `topmost_context_menu_target_enclosing` → `show_popup_menu_nodes` → `popup_menu_window` resolves the `MenuItem` labels into popup rows and creates a correctly-sized window at the right origin (verified: `xwininfo` reports e.g. 163×241 at the click point for a 5-item menu). But the popup's backing pixmap is a **uniform `Surface` fill with zero item pixels** (single-color `import -window` dump), on screen it presents as a blank rectangle covering the surface, item clicks never fire, and clicks do not dismiss it. Root-cause candidate: `popup_menu.rs`'s `animated_popup_panel` (lines 151–166 at 79dc2ec) wraps the item rows in `.opacity(opacity.with(anim))` where the Binding starts at **0.0** and `.on_appear` drives it to **0.96** through a 120 ms bezier — while the panel fill sits outside the faded layer. If `on_appear`/the animation driver never advances inside popup windows, items stay pinned at alpha 0 while the fill paints normally — exactly matching the observed fill-only output. Minimal repro (in the hydrolysis checkout at `examples/context_menu_probe.rs` — both the static `vec![MenuItem]` and a `Computed<Vec<MenuItem>>` variant fail identically on a plain opaque `Window::new`):
+
+    ```rust
+    let menu = vec!["Copy".action(|| {}).into(), "Paste".action(|| {}).into()];
+    Window::new(text("right-click me").padding().context_menu(menu))
+    ```
+
+    Correction to earlier data: a previous probe run appeared to show item text pixels — that binary was **stale** (built before the pin bump; cargo served the old artifact until its fingerprint was cleared). Re-verified at 79dc2ec: every variant paints fill-only. Possibly related, unproven: hydroterm's command-palette rows (`button(Label::new(name, || row))` styled by the List's `ButtonStyle::Plain` + `ListRowChrome` env) also render as blank rows in the current build — same borderless-button-label family, same build. If the palette blankness resolves with this fix, the two share the root cause.

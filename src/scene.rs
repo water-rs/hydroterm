@@ -28,15 +28,13 @@ pub struct ScrollInfo {
     pub screen_lines: usize,
 }
 
-/// One numbered URL-hint chip over a row span (URL hint mode).
+/// One numbered URL-hint chip over a link span (URL hint mode).
 #[derive(Clone)]
 pub struct HintSpan {
-    /// Start column (exclusive end in `col1`), viewport row, 1-based label.
-    pub col0: usize,
-    /// End column (exclusive).
-    pub col1: usize,
-    /// Viewport row.
-    pub row: usize,
+    /// `(start col, end col exclusive, viewport row)` per visible row
+    /// part — a link that crosses a soft wrap has one per covered row.
+    /// The badge anchors on the first visible segment.
+    pub segments: Vec<(usize, usize, usize)>,
     /// 1-based hint number the user types to open this link.
     pub label: usize,
 }
@@ -59,8 +57,9 @@ pub struct DrawContext<'a> {
     /// Search match cells to highlight (col,row in viewport coords).
     /// (start col, end col exclusive, row) per match.
     pub search_matches: &'a [(usize, usize, usize)],
-    /// Currently active search match.
-    pub search_active: Option<(usize, usize, usize)>,
+    /// Segments of the currently active search match (a wrap-crossing
+    /// match highlights its rows on both sides).
+    pub search_active: &'a [(usize, usize, usize)],
     /// Alpha for the bell flash overlay.
     pub bell_flash: f32,
     /// Alpha of the default background fill (window transparency; 1.0 =
@@ -331,7 +330,7 @@ pub fn draw_term(
 
     // -- Search highlights --------------------------------------------------
     for &(c0, c1, r) in ctx.search_matches {
-        let active = ctx.search_active == Some((c0, c1, r));
+        let active = ctx.search_active.contains(&(c0, c1, r));
         let color = if active {
             Rgb { r: 0xff, g: 0xa5, b: 0x00 }
         } else {
@@ -371,18 +370,24 @@ pub fn draw_term(
         for h in ctx.hints {
             let label = h.label.to_string();
             let w = label.chars().count() as f32 * cw;
-            let x = col_x(pad, cw, h.col0);
-            let y = row_y(pad, ch, h.row);
-            // Accent underline under the whole URL span ties the badge to
-            // its link without washing out the text.
-            let span_w = (h.col1 - h.col0) as f32 * cw;
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &span_line,
-                None,
-                &rect(x, y + ch - 1.5, span_w, 1.5),
-            );
+            // Accent underline under every visible row part ties the
+            // badge to its link — including parts across a soft wrap —
+            // without washing out the text.
+            for &(c0, c1, row) in &h.segments {
+                let x = col_x(pad, cw, c0);
+                let y = row_y(pad, ch, row);
+                let span_w = (c1 - c0) as f32 * cw;
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &span_line,
+                    None,
+                    &rect(x, y + ch - 1.5, span_w, 1.5),
+                );
+            }
+            let &(bc, _, brow) = &h.segments[0];
+            let x = col_x(pad, cw, bc);
+            let y = row_y(pad, ch, brow);
             scene.fill(Fill::NonZero, Affine::IDENTITY, &chip_bg, None, &rect(x, y, w, ch));
             draw_chip_text(scene, &label, x, y + m.baseline, palette.accent_fg, ctx);
         }

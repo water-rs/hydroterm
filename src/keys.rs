@@ -290,6 +290,10 @@ fn kitty_csi_u(codepoint: u32, mods: Modifiers, release: bool) -> Vec<u8> {
 /// Returns the action name so the caller can run it instead of writing to
 /// the PTY.
 pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
+    // F11 alone toggles fullscreen (GNOME Terminal / VTE convention).
+    if matches!(key, Key::Named(NamedKey::F11)) && mods.is_empty() {
+        return Some(TermAction::Fullscreen);
+    }
     // Shift-only PageUp/PageDown scroll one page — the xterm/alacritty
     // convention (Ctrl+Shift+PageUp/Down stays bound to tab cycling).
     if mods.contains(Modifiers::SHIFT)
@@ -301,8 +305,41 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             return match named {
                 NamedKey::PageUp => Some(TermAction::ScrollPageUp),
                 NamedKey::PageDown => Some(TermAction::ScrollPageDown),
+                // Shift+Up/Down scroll one line — xterm/kitty convention.
+                NamedKey::ArrowUp => Some(TermAction::ScrollLineUp),
+                NamedKey::ArrowDown => Some(TermAction::ScrollLineDown),
                 // Shift+Insert pastes — the xterm/VTE convention.
                 NamedKey::Insert => Some(TermAction::Paste),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // Ctrl+Alt+Arrow: directional pane focus (Ghostty's goto_split —
+    // super is reserved for the WM on Linux, so Ctrl+Alt is the binding).
+    if mods.contains(Modifiers::CONTROL)
+        && mods.contains(Modifiers::ALT)
+        && !mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::ArrowLeft => Some(TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false,
+                }),
+                NamedKey::ArrowRight => Some(TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: true,
+                }),
+                NamedKey::ArrowUp => Some(TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: false,
+                }),
+                NamedKey::ArrowDown => Some(TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: true,
+                }),
                 _ => None,
             };
         }
@@ -315,9 +352,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         return Some(match named {
             NamedKey::ArrowUp => TermAction::PromptPrev,
             NamedKey::ArrowDown => TermAction::PromptNext,
+            // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
+            // convention) — plain Ctrl+PageUp/Down cycles them.
+            NamedKey::PageUp => TermAction::MoveTabLeft,
+            NamedKey::PageDown => TermAction::MoveTabRight,
             NamedKey::Home => TermAction::ScrollToTop,
             NamedKey::End => TermAction::ScrollToBottom,
-            NamedKey::F11 => TermAction::Fullscreen,
             _ => return None,
         });
     }
@@ -411,6 +451,19 @@ pub enum TermAction {
     /// Scroll one page up/down through scrollback (Shift+PageUp/Down).
     ScrollPageUp,
     ScrollPageDown,
+    /// Scroll one line up/down through scrollback (Shift+Up/Down).
+    ScrollLineUp,
+    ScrollLineDown,
+    /// Move the current tab one slot left/right (Ctrl+Shift+PageUp/Down).
+    MoveTabLeft,
+    MoveTabRight,
+    /// Focus the neighboring pane in a direction (Ctrl+Alt+Arrow).
+    FocusPaneDir {
+        /// Left/right (Row splits) when true, up/down (Column) when false.
+        horizontal: bool,
+        /// Right/down when true, left/up when false.
+        forward: bool,
+    },
     /// URL hint mode: number the visible links, type digits + Enter to
     /// open one without the mouse.
     UrlHints,
