@@ -10,16 +10,18 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
+use nami::collection::List as NamiList;
 use nami::{Binding, binding};
 use waterui::impl_extractor;
+use waterui::Identifiable;
 use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
 use waterui::window::{Window, WindowState};
 use waterui_graphics::SceneView;
-use waterui::theme::color::{Foreground, Surface};
-use waterui_graphics::color::Srgb;
+use waterui::theme::color::{Background, Foreground, Surface};
+use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
 
 use crate::config::{AppConfig, ConfigWatcher};
@@ -176,7 +178,11 @@ impl SplitNode {
 }
 
 /// A tab: one layout tree of panes plus a focused pane.
+/// `Clone` shares the bindings (Rc-backed state), so a cloned item from
+/// `nami::collection::List` reads and writes the same tab state.
+#[derive(Clone, Identifiable)]
 pub struct PaneTab {
+    #[id]
     pub id: u64,
     pub title: Binding<Str>,
     pub tree: Binding<SplitNode>,
@@ -193,14 +199,13 @@ pub struct AppState {
     /// Session list — panes index into it.
     sessions: Rc<RefCell<Vec<Rc<Session>>>>,
     /// Tabs in display order; `selected` holds the active tab's id.
-    tabs: Rc<RefCell<Vec<Rc<PaneTab>>>>,
+    /// A reactive collection so `ForEach` keeps each tab's view alive
+    /// across membership changes — no subtree rebuild, no focus loss.
+    tabs: NamiList<PaneTab>,
     /// session id → owning tab id.
     session_tab: Arc<Mutex<HashMap<u64, u64>>>,
     /// Selected tab id.
     pub selected: Binding<u64>,
-    /// Tab membership as tab ids — `watch` rebuilds `Tabs` from it,
-    /// since hydrolysis takes a static `Vec<Tab>`.
-    pub tab_ids: Binding<Vec<u64>>,
     /// Window title binding.
     pub window_title: Binding<Str>,
     /// Window state binding — normal/minimized/fullscreen/closed.
@@ -259,10 +264,9 @@ impl AppState {
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto);
         let state = Self {
             sessions: Rc::new(RefCell::new(Vec::new())),
-            tabs: Rc::new(RefCell::new(Vec::new())),
+            tabs: NamiList::new(),
             session_tab: Arc::new(Mutex::new(HashMap::new())),
             selected: Binding::u64(0),
-            tab_ids: Binding::default(),
             window_title: binding(Str::from("hydroterm")),
             window_state: binding(WindowState::Normal),
             cfg: Rc::new(RefCell::new(watcher)),
@@ -407,10 +411,7 @@ impl AppState {
     pub fn focused_session(&self) -> Option<Rc<Session>> {
         let tab_id = self.selected.get();
         let focused = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
+            .tabs.iter().find(|t| t.id == tab_id)
             .map(|t| t.focused.get())?;
         self.session(focused)
     }
@@ -430,21 +431,21 @@ impl AppState {
             .focused_session()
             .and_then(|s| s.cwd.lock().unwrap().clone());
         let session = self.spawn_session(cwd);
-        let tab = Rc::new(PaneTab {
+        let tab = PaneTab {
             id: self.alloc_id(),
             title: session.title.clone(),
             tree: binding(SplitNode::Leaf(session.id)),
             focused: Binding::u64(session.id),
             zoomed: Binding::default(),
-        });
+        };
         self.session_tab
             .lock()
             .unwrap()
             .insert(session.id, tab.id);
-        self.tabs.borrow_mut().push(tab.clone());
-        self.selected.set(tab.id);
-        self.tab_ids.append(tab.id);
-        tab.id
+        let tab_id = tab.id;
+        self.tabs.push(tab);
+        self.selected.set(tab_id);
+        tab_id
     }
 
     /// Split the pane `target` of the selected tab in `dir`; the new pane
@@ -452,11 +453,7 @@ impl AppState {
     pub fn split_pane(&self, dir: SplitDir, target: u64) -> Option<u64> {
         let tab_id = self.selected.get();
         let tab = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()?;
+            .tabs.iter().find(|t| t.id == tab_id)?;
         let cwd = self
             .session(target)
             .and_then(|s| s.cwd.lock().unwrap().clone());
@@ -486,11 +483,7 @@ impl AppState {
             return;
         };
         let Some(tab) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()
+            .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
@@ -508,10 +501,7 @@ impl AppState {
         }
         if let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied()
             && let Some(tab) = self
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.id == tab_id)
+                .tabs.iter().find(|t| t.id == tab_id)
                 && tab.focused.get() == session_id
             {
                 tab.title.set(title.clone());
@@ -525,11 +515,7 @@ impl AppState {
     pub fn cycle_pane(&self, dir: isize) {
         let tab_id = self.selected.get();
         let Some(tab) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()
+            .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
@@ -551,11 +537,7 @@ impl AppState {
     pub fn toggle_pane_zoom(&self) {
         let tab_id = self.selected.get();
         let Some(tab) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()
+            .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
@@ -570,11 +552,7 @@ impl AppState {
             return;
         };
         let Some(tab) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()
+            .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
@@ -606,11 +584,7 @@ impl AppState {
     /// Kill every session in a tab and drop the tab; selects a neighbor.
     pub fn close_tab(&self, tab_id: u64) {
         let Some(tab) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.id == tab_id)
-            .cloned()
+            .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
@@ -619,27 +593,25 @@ impl AppState {
             self.kill_session(*sid);
             self.session_tab.lock().unwrap().remove(sid);
         }
-        let mut tabs = self.tabs.borrow_mut();
+        let tabs = self.tabs.snapshot();
         if let Some(pos) = tabs.iter().position(|t| t.id == tab_id) {
-            tabs.remove(pos);
+            let _ = self.tabs.remove(pos);
             if self.selected.get() == tab_id {
-                let idx = pos.min(tabs.len().saturating_sub(1));
-                if let Some(next) = tabs.as_slice().get(idx) {
+                let remaining = self.tabs.snapshot();
+                let idx = pos.min(remaining.len().saturating_sub(1));
+                if let Some(next) = remaining.as_slice().get(idx) {
                     self.selected.set(next.id);
                 }
             }
         }
-        drop(tabs);
-        self.tab_ids.with_mut(|ids| ids.retain(|&x| x != tab_id));
     }
 
     /// Select the tab at 1-based index `n`.
     pub fn select_tab(&self, n: usize) {
         let id = self
             .tabs
-            .borrow()
-            .as_slice()
-            .get(n.saturating_sub(1))
+            .iter()
+            .nth(n.saturating_sub(1))
             .map(|t| t.id);
         if let Some(id) = id {
             self.selected.set(id);
@@ -648,7 +620,7 @@ impl AppState {
 
     /// Cycle tabs by `dir` (+1/-1).
     pub fn cycle_tab(&self, dir: isize) {
-        let tabs = self.tabs.borrow();
+        let tabs = self.tabs.snapshot();
         if tabs.is_empty() {
             return;
         }
@@ -741,11 +713,32 @@ pub fn app_root(state: AppState) -> impl View {
     AppRoot { state }
 }
 
-/// Build the tabs view: one pane-tree per tab.
-// `Tabs::new` needs a fully materialized `Vec<Tab>` — hydrolysis has no
-// reactive-collection tab API yet, so the whole set is rebuilt on change.
-// Each `SceneView` keeps its `Arc<Terminal>` alive across rebuilds.
-#[allow(watch_over_collection)]
+/// One tab's pane tree — zoomed single leaf or the full split layout.
+fn tab_content(tab: PaneTab, app: AppState) -> impl View {
+    watch(tab.zoomed.clone(), {
+        let app = app.clone();
+        let tree = tab.tree.clone();
+        move |z: Option<u64>| {
+            if let Some(z) = z.filter(|z| app.session(*z).is_some()) {
+                pane_view(&SplitNode::Leaf(z), &app)
+            } else {
+                watch(tree.clone(), {
+                    let app = app.clone();
+                    move |node: SplitNode| pane_view(&node, &app)
+                })
+                .anyview()
+            }
+        }
+    })
+}
+
+/// Build the window content: a tab strip over a `ZStack` holding every
+/// tab's pane tree. Both are `ForEach` collections over the reactive tab
+/// `List`, keyed by stable tab id — hydrolysis retains each item's
+/// subtree, so adding or switching tabs never rebuilds a sibling's
+/// `SceneView` or drops its keyboard focus (Principle 8: precise
+/// signals over `watch`). The active tab shows via `.visible`, which
+/// keeps the view mounted but undrawn and non-hittable.
 pub fn tabs_view(state: AppState) -> impl View {
     let palette_overlay = when(state.palette_open.clone(), {
         let state = state.clone();
@@ -757,43 +750,59 @@ pub fn tabs_view(state: AppState) -> impl View {
         move || settings_view(state.clone())
     })
     .anyview();
-    zstack((
-        watch(state.tab_ids.clone(), move |ids| {
-        let tabs = state.tabs.borrow().clone();
-        let tab_views: Vec<Tab<u64>> = ids
-            .iter()
-            .filter_map(|id| tabs.iter().find(|t| t.id == *id).cloned())
-            .map(|tab| {
-                let app = state.clone();
-                let tree = tab.tree.clone();
-                let zoomed = tab.zoomed.clone();
-                Tab::container(tab.id, tab.title.clone(), move || {
-                    watch(zoomed.clone(), {
+
+    let strip = {
+        let app = state.clone();
+        HStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
+            let app = app.clone();
+            let tab_id = tab.id;
+            let bg = signal_color(
+                app.selected
+                    .equal_to(tab_id)
+                    .select(Color::new(Surface), Color::new(Background)),
+            );
+            let sel = app.selected.clone();
+            hstack((
+                text(tab.title.clone()),
+                text("×")
+                    .muted()
+                    .padding()
+                    .on_tap({
                         let app = app.clone();
-                        let tree = tree.clone();
-                        move |z: Option<u64>| {
-                            if let Some(z) = z.filter(|z| app.session(*z).is_some()) {
-                                pane_view(&SplitNode::Leaf(z), &app)
-                            } else {
-                                watch(tree.clone(), {
-                                    let app = app.clone();
-                                    move |node: SplitNode| pane_view(&node, &app)
-                                })
-                                .anyview()
-                            }
-                        }
-                    })
-                })
-            })
-            .collect();
-        if tab_views.is_empty() {
-            // Hydrolysis requires at least one tab — a lone placeholder while
-            // the last session exits.
-            let t = Tab::container(0u64, "hydroterm", || text("No sessions"));
-            return Tabs::new(&state.selected, vec![t]);
-        }
-        Tabs::new(&state.selected, tab_views)
-        }),
+                        move || app.close_tab(tab_id)
+                    }),
+            ))
+            .padding()
+            .background(bg)
+            .on_tap(move |State(sel): State<Binding<u64>>| sel.set(tab_id))
+            .state(&sel)
+        })
+    };
+    let strip_bar = hstack((
+        strip,
+        text("+")
+            .muted()
+            .padding()
+            .on_tap({
+                let state = state.clone();
+                move || _ = state.new_tab()
+            }),
+    ))
+    .spacing(4.0)
+    .padding();
+
+    let content = {
+        let app = state.clone();
+        Frame::new(ZStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
+            let app = app.clone();
+            tab_content(tab.clone(), app.clone()).visible(app.selected.equal_to(tab.id))
+        }))
+        .max_width(f32::INFINITY)
+        .max_height(f32::INFINITY)
+    };
+
+    zstack((
+        vstack((strip_bar, content)).spacing(0.0),
         palette_overlay,
         settings_overlay,
     ))

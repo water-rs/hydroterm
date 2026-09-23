@@ -72,6 +72,17 @@ fn match_columns(
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Max cell distance for a multi-click to count as same-cell.
 const MULTI_CLICK_RANGE: usize = 1;
+/// Min spacing between X11 bell rings — throttles tab-completion storms.
+const BELL_AUDIO_MIN: Duration = Duration::from_millis(120);
+
+/// Ring the X11 keyboard bell (what xterm rings on BEL), throttled.
+fn ring_bell(last: &mut Option<Instant>) {
+    if last.is_some_and(|t| t.elapsed() < BELL_AUDIO_MIN) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let _ = std::process::Command::new("xkbbell").spawn();
+}
 
 /// In-surface text search state (Ctrl+Shift+F).
 struct Search {
@@ -118,6 +129,8 @@ pub struct TermSurface {
     preedit: Option<(String, usize)>,
     scroll_accum_px: f64,
     bell_at: Option<Instant>,
+    /// Last time the X11 bell actually rang (throttle).
+    bell_ring_at: Option<Instant>,
     blink_epoch: Instant,
     search: Option<Search>,
     clipboard: Option<waterkit_clipboard::Clipboard>,
@@ -154,6 +167,7 @@ impl TermSurface {
             preedit: None,
             scroll_accum_px: 0.0,
             bell_at: None,
+            bell_ring_at: None,
             blink_epoch: Instant::now(),
             search: None,
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
@@ -485,6 +499,9 @@ impl TermSurface {
                 }
                 TermEvent::Bell => {
                     self.bell_at = Some(Instant::now());
+                    if self.app.config(|c| c.audible_bell) {
+                        ring_bell(&mut self.bell_ring_at);
+                    }
                 }
                 TermEvent::ChildExit(_status) => {
                     self.session.exited.set(true);
@@ -1020,11 +1037,10 @@ impl TermSurface {
             bell_flash: bell_alpha,
             bg_opacity,
         };
-        scene::draw_term(scene, &term, &mut ctx);
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
-        let m = self.fonts.metrics;
+        let m = ctx.fonts.metrics;
         let pad = PADDING;
-        for img in &self.session.kitty.borrow().images {
+        let draw_img = |scene: &mut dyn Scene2D, img: &crate::kitty::KittyImage| {
             let row = img.line - top;
             let rows = if img.rows > 0 {
                 img.rows as i64
@@ -1032,7 +1048,7 @@ impl TermSurface {
                 (img.px_h as f32 / m.cell_h).ceil() as i64
             };
             if row + rows < 0 || row >= self.lines as i64 {
-                continue;
+                return;
             }
             let x = pad + img.col as f32 * m.cell_w;
             let y = pad + row as f32 * m.cell_h;
@@ -1052,6 +1068,16 @@ impl TermSurface {
                     h as f64 / img.px_h as f64,
                 );
             scene.draw_image(&img.brush, transform);
+        };
+        // z<0 images draw over cell backgrounds but below the text layer.
+        let images = self.session.kitty.borrow();
+        scene::draw_term(scene, &term, &mut ctx, &mut |scene| {
+            for img in images.images.iter().filter(|i| i.z < 0) {
+                draw_img(scene, img);
+            }
+        });
+        for img in images.images.iter().filter(|i| i.z >= 0) {
+            draw_img(scene, img);
         }
     }
 }
@@ -1072,6 +1098,8 @@ impl SceneContent for TermSurface {
     fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
         self.app.poll_config();
         self.drain_events();
+        // Rejoin ZWJ-split scalars before the frame is measured or drawn.
+        crate::terminal::fixup_graphemes(&mut self.session.terminal.term.lock());
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);

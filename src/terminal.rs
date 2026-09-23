@@ -498,6 +498,132 @@ impl OnResize for TapPty {
     }
 }
 
+/// Merge ZWJ-joined scalars into single cells.
+///
+/// `alacritty_terminal` stores each scalar of a ZWJ sequence in its own
+/// cell: U+200D lands on the previous cell's zerowidth list, but the next
+/// base scalar opens a new (usually wide) cell pair, so a family emoji such
+/// as 👨‍👩‍👧 occupies six cells instead of the two its grapheme needs —
+/// and every terminal reporting cursor or cell geometry disagrees with the
+/// app that wrote it. Rejoin the sequence here: while a cell's zerowidth
+/// chain still ends in U+200D, fold the following scalar cell into it, then
+/// shift the row's remaining cells left so the cluster occupies exactly the
+/// width of its head scalar. Runs over the display rows only, each pump —
+/// a pathological program paying for all 24x(N) scans is still microseconds.
+pub fn fixup_graphemes<T: EventListener>(term: &mut Term<T>) {
+    use alacritty_terminal::index::Line;
+    use alacritty_terminal::term::cell::Flags;
+
+    let grid = term.grid_mut();
+    let lines = grid.screen_lines();
+    let columns = grid.columns();
+    let cursor_line = grid.cursor.point.line;
+
+    for l in 0..lines {
+        let line = Line(l as i32);
+        let row_len = grid[line].len();
+        if row_len != columns {
+            continue;
+        }
+
+        // Fast check: does any cell in this row end a zerowidth chain on
+        // U+200D? Scanning zerowidth is cheaper than reconstructing rows.
+        let has_zwj = (0..columns).any(|c| {
+            grid[line][alacritty_terminal::index::Column(c)]
+                .zerowidth()
+                .is_some_and(|zw| zw.last() == Some(&'\u{200D}'))
+        });
+        if !has_zwj {
+            continue;
+        }
+
+        // Compact the row: copy cells left to right into `out`; a cell whose
+        // zerowidth chain ends in U+200D absorbs the following scalar cells
+        // (each donating its base char and its own zerowidth list) until the
+        // chain no longer asks for a continuation. Pair cells (wide-char
+        // spacers) travel with their head cell; consumed donors contribute
+        // nothing, and the row is padded out with cursor-template blanks.
+        let mut out: Vec<alacritty_terminal::term::cell::Cell> = Vec::with_capacity(columns);
+        // orig real-cell index of each consumed donor cell, for cursor fixup.
+        let mut consumed: Vec<(usize, usize)> = Vec::new(); // (orig_col, cell_width)
+        let mut col = 0usize;
+        while col < columns {
+            let cell = grid[line][alacritty_terminal::index::Column(col)].clone();
+            let wide = cell.flags.contains(Flags::WIDE_CHAR);
+            let head_i = out.len();
+            out.push(cell);
+
+            // Copy the spacer that completes a wide pair.
+            if wide && col + 1 < columns {
+                out.push(
+                    grid[line][alacritty_terminal::index::Column(col + 1)].clone(),
+                );
+            }
+            let mut next = col + if wide { 2 } else { 1 };
+
+            // While the head's chain ends in U+200D, absorb the next scalar.
+            loop {
+                let ends_zwj = out[head_i]
+                    .zerowidth()
+                    .is_some_and(|zw| zw.last() == Some(&'\u{200D}'));
+                if !ends_zwj || next >= columns {
+                    break;
+                }
+                let donor_col = next;
+                let donor = grid[line][alacritty_terminal::index::Column(donor_col)].clone();
+                let donor_wide = donor.flags.contains(Flags::WIDE_CHAR);
+                // Do not absorb a bare spacer or an untouched blank tail.
+                if donor.c == ' '
+                    && donor
+                        .zerowidth()
+                        .is_none_or(|zw| zw.is_empty())
+                {
+                    break;
+                }
+                let head = &mut out[head_i];
+                head.push_zerowidth(donor.c);
+                if let Some(zw) = donor.zerowidth() {
+                    for c in zw {
+                        head.push_zerowidth(*c);
+                    }
+                }
+                consumed.push((donor_col, if donor_wide { 2 } else { 1 }));
+                next = donor_col + if donor_wide { 2 } else { 1 };
+            }
+            col = next;
+        }
+
+        if consumed.is_empty() {
+            continue;
+        }
+
+        // Pad the compacted row with blanks matching the cursor template.
+        while out.len() < columns {
+            out.push(grid.cursor.template.clone());
+        }
+
+        // Rewrite the row in place.
+        for (c, cell) in out.into_iter().enumerate() {
+            grid[line][alacritty_terminal::index::Column(c)] = cell;
+        }
+
+        // Re-anchor the cursor: the written prefix shrank by the cells the
+        // merges consumed before the cursor's original column.
+        if cursor_line == line {
+            let old_col = grid.cursor.point.column.0;
+            let shrink: usize = consumed
+                .iter()
+                .filter(|(c, _)| *c < old_col)
+                .map(|(_, w)| *w)
+                .sum();
+            let new_col = old_col.saturating_sub(shrink);
+            grid.cursor.point.column = alacritty_terminal::index::Column(new_col);
+            grid.cursor.input_needs_wrap =
+                grid.cursor.input_needs_wrap && new_col + 1 >= columns;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +641,92 @@ mod tests {
     #[test]
     fn zsh_prompt_marks_are_zero_width() {
         assert!(ZSH_INTEGRATION.contains("PS1=$'%{\\e]133;B\\e\\\\%}'"));
+    }
+
+    // -- grapheme fixup -----------------------------------------------------
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    #[derive(Clone, Copy)]
+    struct Sz(usize, usize);
+    impl Dimensions for Sz {
+        fn total_lines(&self) -> usize {
+            self.0
+        }
+        fn screen_lines(&self) -> usize {
+            self.0
+        }
+        fn columns(&self) -> usize {
+            self.1
+        }
+    }
+
+    fn feed(term: &mut Term<VoidListener>, bytes: &str) {
+        let mut p: Processor = Processor::new();
+        p.advance(term, bytes.as_bytes());
+    }
+
+    /// Row text reconstructed as the renderer sees it: each cell's base char
+    /// followed by its zerowidth list, blanks as '.'.
+    fn row_text(term: &Term<VoidListener>, line: i32) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        let mut out = String::new();
+        for c in 0..term.columns() {
+            let cell = &term.grid()[Line(line)][Column(c)];
+            out.push(if cell.c == ' ' { '.' } else { cell.c });
+            if let Some(zw) = cell.zerowidth() {
+                for c in zw {
+                    out.push(*c);
+                }
+            }
+        }
+        out
+    }
+
+    /// A ZWJ sequence occupies exactly its head scalar's cells: the whole
+    /// cluster lands in one cell's zerowidth list, following text stays
+    /// adjacent, and the cursor anchors to the cluster's logical end.
+    #[test]
+    fn zwj_cluster_occupies_two_cells() {
+        let mut term = Term::new(Config::default(), &Sz(24, 80), VoidListener);
+        feed(&mut term, "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}ok");
+        // Before fixup alacritty spreads the scalars over six cells.
+        fixup_graphemes(&mut term);
+        let text = row_text(&term, 0);
+        assert!(
+            text.starts_with("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.ok"),
+            "cluster not merged into one cell: {text:?}"
+        );
+        assert_eq!(term.grid().cursor.point.column.0, 4, "cursor not anchored");
+    }
+
+    /// The same join works mid-row and for longer families.
+    #[test]
+    fn zwj_cluster_mid_row() {
+        let mut term = Term::new(Config::default(), &Sz(24, 80), VoidListener);
+        feed(
+            &mut term,
+            "x\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}y",
+        );
+        fixup_graphemes(&mut term);
+        let text = row_text(&term, 0);
+        assert!(
+            text.starts_with("x\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}.y"),
+            "{text:?}"
+        );
+        assert_eq!(term.grid().cursor.point.column.0, 4);
+    }
+
+    /// Plain wide emoji without ZWJ are left untouched.
+    #[test]
+    fn plain_emoji_untouched() {
+        let mut term = Term::new(Config::default(), &Sz(24, 80), VoidListener);
+        feed(&mut term, "\u{1F600}\u{1F601}");
+        fixup_graphemes(&mut term);
+        let text = row_text(&term, 0);
+        assert!(text.starts_with("\u{1F600}.\u{1F601}."), "{text:?}");
+        assert_eq!(term.grid().cursor.point.column.0, 4);
     }
 }

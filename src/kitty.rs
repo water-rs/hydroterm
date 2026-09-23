@@ -45,7 +45,8 @@ impl KittyCmd {
 /// The APC payload keeps its leading `G` graphics-command letter.
 pub fn parse(payload: &[u8]) -> Option<KittyCmd> {
     let text = std::str::from_utf8(payload).ok()?.strip_prefix('G')?;
-    let (keys, data) = text.split_once(';')?;
+    // Commands like `a=d`/`a=q` carry no `;` payload.
+    let (keys, data) = text.split_once(';').unwrap_or((text, ""));
     let mut map = BTreeMap::new();
     for kv in keys.split(',') {
         if kv.is_empty() {
@@ -100,6 +101,10 @@ pub struct KittyImage {
     /// Display size in cells (0,0 = native pixel size).
     pub cols: u32,
     pub rows: u32,
+    /// Z-index: negative draws below the text layer.
+    pub z: i32,
+    /// Placement id (`p=`); 0 = default placement.
+    pub placement: u32,
     /// Source pixel size for the draw transform.
     pub px_w: u32,
     pub px_h: u32,
@@ -144,15 +149,46 @@ impl KittyStore {
         let cmd = KittyCmd { keys, data };
         match cmd.get('a').unwrap_or("T") {
             "d" => {
-                match cmd.num('i') {
-                    Some(id) => self.images.retain(|img| img.id != id),
-                    None => self.images.clear(),
-                }
+                self.delete(&cmd, line, col);
                 (cmd.id(), "OK".to_string())
             }
             "q" => (cmd.id(), "OK".to_string()),
             "t" | "T" | "" => self.place(&cmd, line, col),
             _ => (cmd.id(), "EINVAL:unsupported action".to_string()),
+        }
+    }
+
+    /// `a=d` delete: `d=` selects the target — a(ll), i(image id), p(placement
+    /// under an id), z(z-index), c(placements intersecting the cursor cell).
+    fn delete(&mut self, cmd: &KittyCmd, line: i64, col: usize) {
+        match cmd.get('d').unwrap_or("a") {
+            "i" => {
+                if let Some(id) = cmd.num('i') {
+                    self.images.retain(|img| img.id != id);
+                }
+            }
+            "p" => {
+                if let (Some(id), Some(p)) = (cmd.num('i'), cmd.num('p')) {
+                    self.images
+                        .retain(|img| !(img.id == id && img.placement == p));
+                }
+            }
+            "z" => {
+                if let Some(z) = cmd.get('z').and_then(|v| v.parse::<i32>().ok()) {
+                    self.images.retain(|img| img.z != z);
+                }
+            }
+            "c" => self.images.retain(|img| {
+                let rows = img.rows.max(1) as i64;
+                let cols = img.cols.max(1) as usize;
+                !(line >= img.line && line < img.line + rows && col >= img.col && col < img.col + cols)
+            }),
+            // 'a' and any unknown selector: keep the pre-selector behavior —
+            // `i=` narrows to one id, otherwise clear the whole store.
+            _ => match cmd.num('i') {
+                Some(id) => self.images.retain(|img| img.id != id),
+                None => self.images.clear(),
+            },
         }
     }
 
@@ -170,6 +206,23 @@ impl KittyStore {
                     return (cmd.id(), "EBADMSG:path".to_string());
                 };
                 match std::fs::read(path.trim()) {
+                    Ok(raw) => raw,
+                    Err(e) => return (cmd.id(), format!("ENOENT:{e}")),
+                }
+            }
+            // `t=s`: payload is the base64 of a POSIX shm name (leading `/`);
+            // on Linux it maps onto /dev/shm.<name>.
+            "s" => {
+                let Some(name) =
+                    b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
+                else {
+                    return (cmd.id(), "EBADMSG:shm name".to_string());
+                };
+                let name = name.trim();
+                if name.contains("..") || !name.starts_with('/') {
+                    return (cmd.id(), "EINVAL:shm name".to_string());
+                }
+                match std::fs::read(format!("/dev/shm{name}")) {
                     Ok(raw) => raw,
                     Err(e) => return (cmd.id(), format!("ENOENT:{e}")),
                 }
@@ -205,6 +258,17 @@ impl KittyStore {
         let Some((px, w, h)) = rgba else {
             return (cmd.id(), "EINVAL:decode".to_string());
         };
+        // `x,y,w,h` source crop (kitty places a sub-rectangle).
+        let (px, w, h) = match (cmd.num('w'), cmd.num('h')) {
+            (Some(cw), Some(ch)) => {
+                let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
+                match crop_rgba(&px, w, h, cx, cy, cw, ch) {
+                    Some(c) => c,
+                    None => return (cmd.id(), "EINVAL:crop".to_string()),
+                }
+            }
+            _ => (px, w, h),
+        };
         let image = ImageData {
             data: Blob::new(std::sync::Arc::new(px)),
             format: ImageFormat::Rgba8,
@@ -213,8 +277,10 @@ impl KittyStore {
             height: h,
         };
         let id = cmd.id();
-        // Replace same-id placement.
-        self.images.retain(|img| img.id != id);
+        let placement = cmd.num('p').unwrap_or(0);
+        // Replace an existing placement of the same image id only.
+        self.images
+            .retain(|img| !(img.id == id && img.placement == placement));
         self.images.push(KittyImage {
             id,
             brush: peniko::ImageBrush::new(image),
@@ -222,6 +288,8 @@ impl KittyStore {
             col,
             cols: cmd.num('c').unwrap_or(0),
             rows: cmd.num('r').unwrap_or(0),
+            z: cmd.get('z').and_then(|v| v.parse::<i32>().ok()).unwrap_or(0),
+            placement,
             px_w: w,
             px_h: h,
         });
@@ -231,7 +299,11 @@ impl KittyStore {
 
 /// PNG → RGBA8. Kept small via the `png` crate.
 fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(data));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    // Normalize palette/grayscale/low-depth/16-bit PNGs to RGBA8.
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
+    );
     let mut reader = decoder.read_info().ok()?;
     let out_size = reader.output_buffer_size();
     if out_size == 0 {
@@ -239,23 +311,52 @@ fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     }
     let mut buf = vec![0u8; out_size];
     let info = reader.next_frame(&mut buf).ok()?;
-    let bytes = buf[..info.buffer_size()].to_vec();
-    match info.color_type {
-        png::ColorType::Rgba => Some((bytes, info.width, info.height)),
-        png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-            for px in bytes.chunks_exact(3) {
-                out.extend_from_slice(px);
-                out.push(255);
-            }
-            Some((out, info.width, info.height))
-        }
-        _ => None,
+    Some((buf[..info.buffer_size()].to_vec(), info.width, info.height))
+}
+
+/// Slice an RGBA8 buffer to `(x, y, w, h)`; bounds-checked.
+fn crop_rgba(
+    px: &[u8],
+    w: u32,
+    h: u32,
+    x: u32,
+    y: u32,
+    cw: u32,
+    ch: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    if cw == 0 || ch == 0 || x.checked_add(cw)? > w || y.checked_add(ch)? > h {
+        return None;
     }
+    let mut out = Vec::with_capacity((cw * ch * 4) as usize);
+    for row in y..y + ch {
+        let s = ((row * w + x) * 4) as usize;
+        out.extend_from_slice(&px[s..s + (cw * 4) as usize]);
+    }
+    Some((out, cw, ch))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn palette_png_decodes_to_rgba() {
+        // ImageMagick writes 2-color PNGs as color type 3 (palette); EXPAND
+        // must normalize them to RGBA8.
+        const B64: &str = concat!(
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAgAgMAAADf85YXAAAABGdBTUEAALGPC/xhBQAAACBj",
+            "SFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAACVBMVEX/AAAAAP//",
+            "//8Ul8VoAAAAAWJLR0QCZgt8ZAAAAAd0SU1FB+oJFwEWFctSpBgAAAAVSURBVCjPY2CAglAo",
+            "YBgVGBVACAAAA1dVAUNGf7UAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMjNUMDE6MjI6",
+            "MjErMDA6MDA4hzkqAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTIzVDAxOjIyOjIxKzAw",
+            "OjAwSdqBlgAAAABJRU5ErkJggg=="
+        );
+        let b64 = b64_decode(B64).unwrap();
+        let (px, w, h) = decode_png(&b64).unwrap();
+        assert_eq!((w, h, px.len()), (64, 32, 64 * 32 * 4));
+        // Left half red, right half blue.
+        assert_eq!(&px[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&px[(63 * 4)..(64 * 4)], &[0, 0, 255, 255]);
+    }
+
     use super::*;
 
     #[test]
@@ -305,5 +406,92 @@ mod tests {
         let (_, s2) = store.handle(second, 0, 0);
         assert_eq!(s2, "OK");
         assert_eq!(store.images.len(), 1);
+    }
+
+    #[test]
+    fn crop_slices_source() {
+        // 2x2 RGBA, distinct channels per pixel; crop the right column.
+        let px: Vec<u8> = (0u8..16).collect();
+        let (out, w, h) = crop_rgba(&px, 2, 2, 1, 0, 1, 2).unwrap();
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(out, vec![4, 5, 6, 7, 12, 13, 14, 15]);
+        assert!(crop_rgba(&px, 2, 2, 1, 0, 2, 2).is_none()); // out of bounds
+        assert!(crop_rgba(&px, 2, 2, 0, 0, 0, 2).is_none()); // zero width
+    }
+
+    #[test]
+    fn z_index_parses_signed() {
+        let mut store = KittyStore::default();
+        let cmd = parse(b"Ga=T,f=24,s=1,v=1,z=-1;/wAA").unwrap();
+        let (_, s) = store.handle(cmd, 0, 0);
+        assert_eq!(s.as_str(), "OK");
+        assert_eq!(store.images[0].z, -1);
+    }
+
+    #[test]
+    fn crop_placement() {
+        let mut store = KittyStore::default();
+        // f=32 RGBA 2x2, crop to the left column (x=0,y=0,w=1,h=2).
+        let cmd = parse(b"Ga=T,f=32,s=2,v=2,x=0,y=0,w=1,h=2;AAAAAAAAAAAAAAAAAAAAAA==").unwrap();
+        let (_, s) = store.handle(cmd, 0, 0);
+        assert_eq!(s.as_str(), "OK");
+        assert_eq!((store.images[0].px_w, store.images[0].px_h), (1, 2));
+    }
+
+    fn place_rgba(store: &mut KittyStore, keys: &str, line: i64, col: usize) {
+        let raw = "Ga=T,f=32,s=2,v=2".to_string() + "," + keys + ";AAAAAAAAAAAAAAAAAAAAAA==";
+        let cmd = parse(raw.as_bytes()).unwrap();
+        assert_eq!(store.handle(cmd, line, col).1.as_str(), "OK");
+    }
+
+    #[test]
+    fn delete_selectors() {
+        let mut s = KittyStore::default();
+        place_rgba(&mut s, "i=7,z=-1,c=2,r=2", 10, 3);
+        place_rgba(&mut s, "i=8,z=2", 20, 5);
+        place_rgba(&mut s, "i=9", 30, 7);
+        // d=z removes only the z=-1 image.
+        let cmd = parse(b"Ga=d,d=z,z=-1").unwrap();
+        s.handle(cmd, 0, 0);
+        assert_eq!(s.images.len(), 2);
+        // d=c removes placements intersecting the cursor cell.
+        let cmd = parse(b"Ga=d,d=c").unwrap();
+        s.handle(cmd, 20, 5);
+        assert_eq!(s.images.len(), 1);
+        assert_eq!(s.images[0].id, 9);
+        // d=i removes by id.
+        let cmd = parse(b"Ga=d,d=i,i=9").unwrap();
+        s.handle(cmd, 0, 0);
+        assert!(s.images.is_empty());
+    }
+
+    #[test]
+    fn placement_id_and_delete_p() {
+        let mut s = KittyStore::default();
+        place_rgba(&mut s, "i=7,p=3", 0, 0);
+        place_rgba(&mut s, "i=7,p=5", 0, 0);
+        assert_eq!(s.images.len(), 2);
+        let cmd = parse(b"Ga=d,d=p,i=7,p=3").unwrap();
+        s.handle(cmd, 0, 0);
+        assert_eq!(s.images.len(), 1);
+        assert_eq!(s.images[0].placement, 5);
+    }
+
+    #[test]
+    fn shm_medium() {
+        std::fs::write("/dev/shm/hydroterm-test-shm", b"pixels").unwrap();
+        let mut s = KittyStore::default();
+        // t=s with a PNG payload would decode; use bad bytes → EINVAL:decode
+        // proves the shm read path returned data rather than ENOENT.
+        let name = crate::kitty::b64_decode("L2h5ZHJvdGVybS10ZXN0LXNobQ==").unwrap();
+        assert_eq!(name, b"/hydroterm-test-shm");
+        let raw = b"Ga=T,f=32,s=1,v=1,t=s;".to_vec()
+            .into_iter()
+            .chain(b"L2h5ZHJvdGVybS10ZXN0LXNobQ==".iter().copied())
+            .collect::<Vec<_>>();
+        let cmd = parse(&raw).unwrap();
+        let (_, status) = s.handle(cmd, 0, 0);
+        assert_eq!(status.as_str(), "OK"); // "pixels" is ≥4 bytes → f=32 1x1
+        std::fs::remove_file("/dev/shm/hydroterm-test-shm").unwrap();
     }
 }

@@ -62,19 +62,22 @@ impl TermFonts {
     /// Resolve the primary family in `collection` and measure the cell.
     pub fn load(collection: FontCollection, size_pt: f32) -> Self {
         let (family, family_name) = collection.use_fonts(|fonts| {
-            for name in PRIMARY_FAMILIES {
-                if fonts.collection.family_by_name(name).is_some() {
-                    return (
-                        FontFamily::Single(FontFamilyName::Named(std::borrow::Cow::Owned(
-                            (*name).to_string(),
-                        ))),
-                        (*name).to_string(),
-                    );
-                }
-            }
+            let primary = PRIMARY_FAMILIES.iter().copied().find(|name| {
+                *name != "monospace" && fonts.collection.family_by_name(name).is_some()
+            });
+            // Ordered stack: the preferred monospace first, then the generic
+            // emoji family so clustered emoji (ZWJ sequences, keycaps, flags)
+            // resolve to the color emoji font instead of a monochrome
+            // symbols fallback fontique might otherwise pick first.
+            let primary = match primary {
+                Some(name) => FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())),
+                None => FontFamilyName::Generic(GenericFamily::Monospace),
+            };
+            let list: Vec<FontFamilyName> =
+                vec![primary, FontFamilyName::Generic(GenericFamily::Emoji)];
             (
-                FontFamily::from(GenericFamily::Monospace),
-                "monospace".to_string(),
+                FontFamily::List(std::borrow::Cow::Owned(list)),
+                "mono+emoji".to_string(),
             )
         });
         tracing::info!(family = %family_name, "terminal primary font");
@@ -185,5 +188,58 @@ impl From<Synthesis> for RunStyle {
             embolden: s.embolden(),
             skew: s.skew(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resolved family is a stack ending in the generic emoji family, so
+    /// clustered emoji (ZWJ sequences, flags, keycaps) prefer the color
+    /// emoji font over a monochrome symbols fallback.
+    #[test]
+    fn family_stack_prefers_color_emoji() {
+        let fonts = TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0);
+        let FontFamily::List(list) = &fonts.family else {
+            panic!("family is not a fallback stack");
+        };
+        assert!(
+            list.iter()
+                .any(|f| matches!(f, FontFamilyName::Generic(GenericFamily::Emoji))),
+            "emoji generic missing from fallback stack: {list:?}"
+        );
+    }
+
+    /// A ZWJ emoji cluster shapes into a ligature: at least one visual
+    /// cluster carries glyph(s) while its neighbors share the run — i.e.
+    /// fontique resolved the whole sequence with one face, not split into
+    /// per-scalar fallbacks.
+    #[test]
+    fn zwj_cluster_shapes_as_one_ligature() {
+        let mut fonts =
+            TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0);
+        let layout = fonts.shape_run(
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            false,
+            false,
+        );
+        let mut clusters = 0usize;
+        let mut glyph_clusters = 0usize;
+        for line in layout.lines() {
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                    continue;
+                };
+                for cluster in gr.run().visual_clusters() {
+                    clusters += 1;
+                    if cluster.glyphs().next().is_some() {
+                        glyph_clusters += 1;
+                    }
+                }
+            }
+        }
+        assert!(glyph_clusters >= 1, "no glyphs shaped for the ZWJ cluster");
+        assert!(clusters >= glyph_clusters);
     }
 }

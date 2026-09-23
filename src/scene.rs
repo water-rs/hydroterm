@@ -263,7 +263,14 @@ fn style_runs(row: &[CellData]) -> Vec<(usize, usize, StyleKey)> {
 
 /// Draw one frame into `scene`. `term` stays locked by the caller.
 #[allow(clippy::too_many_lines)]
-pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut DrawContext<'_>) {
+/// Draw the terminal grid. `underlay`, when given, paints between the cell
+/// backgrounds/highlights and the text layer — used for z<0 kitty images.
+pub fn draw_term(
+    scene: &mut dyn Scene2D,
+    term: &Term<EventProxy>,
+    ctx: &mut DrawContext<'_>,
+    underlay: &mut dyn FnMut(&mut dyn Scene2D),
+) {
     let m = ctx.fonts.metrics;
     let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
 
@@ -321,6 +328,9 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
             &rect(col_x(pad, cw, c0), row_y(pad, ch, r), (c1 - c0) as f32 * cw, ch),
         );
     }
+
+    // -- Images below text --------------------------------------------------
+    underlay(scene);
 
     // -- Text ---------------------------------------------------------------
     for (row_i, row) in grid.rows.iter().enumerate() {

@@ -25,7 +25,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Core | Underline variants + strikethrough + SGR 58 | ✅ | `\e[4:1..5m` single/double/curly/dotted/dashed + `\e[9m` strike + `\e[58;2;..m` colored underline — all verified in one live screenshot |
 | Core | Scrollback buffer + scrollbar | ✅ | `seq 1 500`, wheel scroll; HISTORY_LINES cap |
 | Core | Synchronized output (mode 2026) | ✅ | alacritty parser buffers frames; no wakeup mid-sync |
-| Core | Text reflow on resize | ❌ | alacritty grid is fixed-width — upstream gap |
+| Core | Text reflow on resize | ✅ | upstream `Grid::resize(reflow)` re-wraps soft-wrapped primary-screen rows on column change (alt screen untouched; cursor anchored). Verified live: window resize narrow↔wide, font zoom, split → pane-zoom full width, unzoom, pane close — wrap-chains rejoin byte-identically, zero residue (the reported mid-row prompt duplication is gone) |
 | Input | Full key encoding (arrows, F-keys, keypad, modifiers) | ✅ | `showkey -a` |
 | Input | Kitty keyboard protocol (disambiguate/event types/alternates) | ✅ | `kitty +kitten show_key -m kitty` |
 | Input | IME / preedit at caret + composition | ✅ | type CJK via IME; preedit drawn at caret |
@@ -42,8 +42,8 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
 | Splits | Pane zoom toggle (tmux-style) | ✅ | Ctrl+Shift+Z → focused pane fills the tab (`PaneTab.zoomed: Binding<Option<u64>>`); toggling restores the split — verified live both ways |
-| Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #18) |
-| Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#16) |
+| Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #13 → water-rs/waterui#1203) |
+| Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#18; also #19 — keys keep routing to a hidden focused surface) |
 | Windows | Multi-window | ✅ | Ctrl+Shift+N → `Window::show(env)` via the runner's `WindowManager` mounts a real winit window with a fresh session set (verified live: `<2>` title, independent session) |
 | Quick terminal | Drop-down/global-hotkey terminal | 🚫 | X11 global grab needs x11 dep; deferred |
 | Config | `key = value` config file (~/.config/hydroterm/config) | ✅ | 8 parser unit tests; template auto-written |
@@ -55,7 +55,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Cursor | DECSCUSR escape-driven shape (`\e[N q`) | ✅ | `\e[6 q` → steady bar cursor verified live (block/beam/underline/hollow all drawn) |
 | Font | Fallback chain (fontconfig) | ✅ | 中文カタ rendered via Noto CJK fallback (screenshot-verified) |
 | Font | Ligatures | ✅ | `->`, `=>`, `!=`, `ffi`, `fl` shape to ligature glyphs (screenshot-verified) |
-| Font | Emoji + grapheme clusters (ZWJ, VS16) | ✅ | single emoji ✅, flag merges ✅, combining é ✅, ZWJ family merges to ONE glyph cell (fontique cluster shaping); rendered monochrome when the composed glyph is absent from Noto Color Emoji |
+| Font | Emoji + grapheme clusters (ZWJ, VS16) | ✅ | single emoji ✅, flag merges ✅, combining é ✅; 👨‍👩‍👧‍👦 occupies **exactly 2 cells** (app-side `fixup_graphemes` merges ZWJ-split scalar cells into one cluster cell; `zwj_cluster_occupies_two_cells` test). Glyph comes through the emoji fallback path from NotoColorEmoji — this Debian font's own CBDT artwork for the family is a monochrome boxed pictograph (font design, not a fallback failure) |
 | Font | Synthetic bold/italic | ✅ | stroke emboss / skew — `\e[1m`/`\e[3m` visually distinct |
 | Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
@@ -64,12 +64,12 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
 | Shell int. | OSC 9/777 notifications | ✅ | bell flash + 🔔 badge on title until user input + freedesktop `notify-send` desktop notification where available (badge verified; notify-send spawned, best-effort) |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
-| Bell | Audible bell | ❌ | needs audio stack; low priority |
+| Bell | Audible bell | ✅ | `audible-bell = true` rings the X11 keyboard bell via `xkbbell` (what xterm rings), 120 ms throttled — verified end-to-end with a logging shim |
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight the *full* match span (wide chars cover both cells, `match_columns`), Enter jumps to next |
 | Shell UI | Settings page | ✅ | Ctrl+Shift+, → opaque token panel over a dim mask; labeled theme picker, font-size value + stepper, toggle; Apply writes config file → hot reload |
 | Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs, Esc closes |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
-| Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies + `t=f` file medium (verified: PNG blitted in-grid, file-loaded PNG rendered); no unicode placements/z-layers/shared mediums/crops/animation |
+| Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `i=`/`p=` image+placement ids + `\x1b_G…;OK` replies + `t=d` direct/`t=f` file/`t=s` shared-memory mediums + `x,y,w,h` source crop (verified: solid half drawn) + signed `z` z-index (`z<0` over cell bg, below text — verified with text over image) + `c`/`r` cell span + `a=d` delete with `d=a|i|p|z|c` selectors (verified live) + palette/grayscale/16-bit PNG normalize; no unicode placements/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
 | Perf | Scrolling/render performance | 🟡 | 10.8 MB/s cat-throughput, ~72ms input latency (llvmpipe CPU render — see Metrics) |
 | Window | Title reporting (OSC 0/2) | ✅ | title → window title binding |

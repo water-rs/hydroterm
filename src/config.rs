@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub command: Option<Vec<String>>,
     /// `keybind = <chord>=<action>` entries; `None` action = disabled.
     pub keybinds: Vec<(String, Option<TermAction>)>,
+    /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
+    pub audible_bell: bool,
     /// Window/transparency: alpha of the terminal's own background fill,
     /// 0.0 (invisible) ..= 1.0 (opaque). The winit window is created
     /// transparent when this starts below 1.0 — raising it live works;
@@ -63,6 +65,7 @@ impl Default for AppConfig {
             shell: None,
             command: None,
             keybinds: Vec::new(),
+            audible_bell: true,
             background_opacity: 1.0,
         }
     }
@@ -93,6 +96,7 @@ theme = hydroterm-dark
 cursor-shape = block        # block | beam | underline | hollow
 cursor-blink = true
 copy-on-select = false
+audible-bell = true       # ring the X11 keyboard bell on BEL
 # shell = /bin/bash
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
@@ -173,6 +177,7 @@ impl AppConfig {
                     }
                 }
                 "copy-on-select" => cfg.copy_on_select = bool_value(value, n, &mut errors),
+                "audible-bell" => cfg.audible_bell = bool_value(value, n, &mut errors),
                 "cursor-blink" => cfg.cursor_blink = bool_value(value, n, &mut errors),
                 "cursor-shape" => match value {
                     "block" => cfg.cursor_shape = CursorShape::Block,
