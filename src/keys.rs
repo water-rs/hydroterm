@@ -424,7 +424,7 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
 }
 
 /// Actions the app performs rather than forwarding as bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermAction {
     Copy,
     Paste,
@@ -471,6 +471,8 @@ pub enum TermAction {
     /// Cancel is Escape on the surface, not an action — the snackbar
     /// has a single action slot.
     PasteConfirm,
+    /// Drag-and-drop: paste the dropped item's path (shell-quoted).
+    DropText(String),
     /// Copy the output of the last finished (or running) command — the
     /// rows between its OSC 133 `C` and `D` marks.
     CopyLastOutput,

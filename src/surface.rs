@@ -22,6 +22,8 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
+use nami::{Binding, binding};
+use waterui::cursor::CursorStyle;
 use waterui::task::spawn_local;
 use waterui_core::Str;
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
@@ -285,6 +287,15 @@ pub struct TermSurface {
     cursor_hider: Option<crate::xcursor::CursorHider>,
     /// Set when the hider was attempted — avoid reconnecting per frame.
     cursor_hider_tried: bool,
+    /// Last pointer position in surface-local coords — re-evaluates the
+    /// Ctrl+hover link affordance when the modifier chord changes.
+    pointer_at: (f64, f64),
+    /// Ctrl-hovered link span in viewport segments `(c0, c1, row)` —
+    /// drawn underlined and drives the pointer cursor.
+    hover_link: Vec<(usize, usize, usize)>,
+    /// Drives `.cursor(...)` on the SceneView: IBeam over the grid,
+    /// PointingHand over a Ctrl-hovered link.
+    pub hover_cursor: Binding<CursorStyle>,
 }
 
 impl TermSurface {
@@ -328,6 +339,9 @@ impl TermSurface {
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
             cursor_hider: None,
             cursor_hider_tried: false,
+            pointer_at: (0.0, 0.0),
+            hover_link: Vec::new(),
+            hover_cursor: binding(CursorStyle::IBeam),
         }
     }
 
@@ -452,6 +466,7 @@ impl TermSurface {
             TermAction::Copy => self.copy_selection(),
             TermAction::Paste => self.paste_clipboard(),
             TermAction::PasteConfirm => self.paste_confirm(true),
+            TermAction::DropText(text) => self.drop_text(&text),
             TermAction::NewTab => {
                 self.app.new_tab();
             }
@@ -1120,8 +1135,9 @@ impl TermSurface {
             ) {
                 self.write(bytes);
             }
-            return;
         }
+
+        self.update_hover(x, y);
 
         if self.selecting {
             let point = self.grid_point(x, y);
@@ -1131,6 +1147,101 @@ impl TermSurface {
                 sel.update(point, side);
             }
         }
+    }
+
+    /// Ctrl+hover link affordance: while CONTROL is held, underline the
+    /// link under the pointer and switch the cursor to a pointing hand.
+    /// Re-runs on pointer moves and on modifier-chord changes.
+    fn update_hover(&mut self, x: f64, y: f64) {
+        self.pointer_at = (x, y);
+        let segs = if self.modifiers.contains(Modifiers::CONTROL) {
+            self.link_span_at(self.grid_point(x, y))
+        } else {
+            Vec::new()
+        };
+        if segs != self.hover_link {
+            self.hover_link = segs;
+        }
+        let cursor = if self.hover_link.is_empty() {
+            CursorStyle::IBeam
+        } else {
+            CursorStyle::PointingHand
+        };
+        if self.hover_cursor.get() != cursor {
+            self.hover_cursor.set(cursor);
+        }
+    }
+
+    /// Link span under `point` for the Ctrl+hover affordance: the OSC8
+    /// run with the same uri on this row first, else the plain-text URL
+    /// on the logical line mapped back to viewport segments.
+    fn link_span_at(&self, point: Point) -> Vec<(usize, usize, usize)> {
+        let term = self.session.terminal.term.lock();
+        let grid = term.grid();
+        if let Some(uri) = grid[point].hyperlink().map(|h| h.uri().to_string()) {
+            let line = point.line.0;
+            let same = |c: usize| {
+                grid[Point::new(Line(line), Column(c))]
+                    .hyperlink()
+                    .is_some_and(|h| h.uri() == uri)
+            };
+            let mut c0 = point.column.0;
+            let mut c1 = c0 + 1;
+            while c0 > 0 && same(c0 - 1) {
+                c0 -= 1;
+            }
+            while c1 < grid.columns() && same(c1) {
+                c1 += 1;
+            }
+            let row = line + grid.display_offset() as i32;
+            return if row >= 0 {
+                vec![(c0, c1, row as usize)]
+            } else {
+                Vec::new()
+            };
+        }
+        let lm = logical_line_at(grid, point.line.0);
+        let cols = grid.columns();
+        let offset = grid.display_offset() as i32;
+        let screen = grid.screen_lines() as i32;
+        let Some(idx) = lm
+            .marks
+            .iter()
+            .rfind(|m| m.1 == point.line.0 && m.2 <= point.column.0)
+            .map(|m| m.0)
+        else {
+            return Vec::new();
+        };
+        for (s, e) in url_spans(&lm.chars) {
+            if idx >= s && idx < e {
+                return span_segments(&lm, s, e, cols)
+                    .into_iter()
+                    .filter_map(|(c0, c1, l)| {
+                        let r = l + offset;
+                        (r >= 0 && r < screen).then_some((c0, c1, r as usize))
+                    })
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Drag-and-drop: paste the dropped item's path into this pane
+    /// (Ghostty/kitty drop behaviour — `file://` URIs decoded, each path
+    /// shell-quoted so it lands as one argument).
+    pub fn drop_text(&mut self, text: &str) {
+        let out = drop_payload(text);
+        if out.is_empty() {
+            return;
+        }
+        let bracketed = self
+            .session
+            .terminal
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE);
+        self.paste_text(&out, bracketed);
     }
 
     fn on_pointer_button(&mut self, pressed: bool, button: SurfacePointerButton, x: f64, y: f64) {
@@ -1529,6 +1640,8 @@ impl TermSurface {
             bg_opacity,
             hints: &hint_spans,
             hint_digits: &hint_digits,
+            bold_bright: self.app.config(|c| c.bold_is_bright),
+            hover_link: &self.hover_link,
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
@@ -1712,6 +1825,9 @@ impl SceneContent for TermSurface {
             }
             SurfaceInputEvent::Modifiers(mods) => {
                 self.modifiers = *mods;
+                // Ctrl toggles the link-hover affordance without a move.
+                let (x, y) = self.pointer_at;
+                self.update_hover(x, y);
                 false
             }
             SurfaceInputEvent::PointerMove { position } => {
@@ -1867,6 +1983,64 @@ fn url_spans(chars: &[char]) -> Vec<(usize, usize)> {
 }
 
 /// Detached `xdg-open` — never wait on the launcher.
+/// `file://` URI → filesystem path with percent-decoding; non-URI
+/// input returns verbatim.
+fn file_uri_to_path(text: &str) -> String {
+    let Some(rest) = text.strip_prefix("file://") else {
+        return text.to_string();
+    };
+    // Strip an optional authority (`file://host/path`); localhost and
+    // the empty authority both map to this machine.
+    let path = match rest.split_once('/') {
+        Some(("", p)) | Some(("localhost", p)) => format!("/{p}"),
+        Some((host, p)) => format!("//{host}/{p}"),
+        None => rest.to_string(),
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&path[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Dropped text → the line written to the PTY: each whitespace-separated
+/// item is URI-decoded and shell-quoted, joined with spaces.
+fn drop_payload(text: &str) -> String {
+    let mut out = String::new();
+    for item in text.split_whitespace() {
+        let path = file_uri_to_path(item);
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&shell_quote(&path));
+    }
+    out
+}
+
+/// Shell-quote a path so a dropped filename survives as one argument:
+/// alnum and `._/~-` stay bare, anything else wraps in single quotes
+/// with `'`\'' escaping (the POSIX idiom).
+fn shell_quote(path: &str) -> String {
+    if path
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '/' | '~' | '-'))
+    {
+        return path.to_string();
+    }
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 fn open_url(uri: &str) {
     let _ = std::process::Command::new("xdg-open")
         .arg(uri)
@@ -1900,6 +2074,33 @@ mod tests {
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    #[test]
+    fn drop_payload_decodes_and_quotes() {
+        assert_eq!(
+            drop_payload("file:///home/u/plain.txt"),
+            "/home/u/plain.txt"
+        );
+        assert_eq!(
+            drop_payload("file:///home/u/a%20b%20c.png"),
+            "'/home/u/a b c.png'"
+        );
+        assert_eq!(
+            drop_payload("file:///tmp/it's.txt"),
+            "'/tmp/it'\\''s.txt'"
+        );
+        // Multiple items on one drop join space-separated.
+        assert_eq!(
+            drop_payload("file:///a%20b\nfile:///c"),
+            "'/a b' /c"
+        );
+        // Non-URI text passes through (still quoted when needed).
+        assert_eq!(drop_payload("/x/y-z"), "/x/y-z");
+        // UTF-8 percent sequences decode, not byte-as-char corruption
+        // (non-ASCII letters are alphanumeric → stay unquoted).
+        assert_eq!(drop_payload("file:///tmp/%C3%A4"), "/tmp/ä");
+        assert_eq!(drop_payload("   "), "");
     }
 
     #[test]

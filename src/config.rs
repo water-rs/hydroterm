@@ -66,6 +66,9 @@ pub struct AppConfig {
     /// Whether programs may write the clipboard through OSC 52
     /// (Ghostty `clipboard-write` allow/deny).
     pub osc52_write: bool,
+    /// Bold text renders with the bright palette slot
+    /// (alacritty `draw_bold_text_with_bright_colors`, default true).
+    pub bold_is_bright: bool,
 }
 
 impl Default for AppConfig {
@@ -89,6 +92,7 @@ impl Default for AppConfig {
             window_padding_y: 0.0,
             term: "xterm-256color".to_string(),
             osc52_write: true,
+            bold_is_bright: true,
         }
     }
 }
@@ -114,6 +118,7 @@ window-padding-x = 0       # blank margin around the grid, in points
 window-padding-y = 0
 term = xterm-256color      # $TERM value advertised to programs
 osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
+bold-is-bright = true       # bold text uses the bright palette slot
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
 #        solarized-dark | solarized-light
@@ -156,7 +161,7 @@ impl AppConfig {
             .iter()
             .rev() // last wins
             .find(|(c, _)| *c == chord)
-            .map(|(_, a)| *a)
+            .map(|(_, a)| a.clone())
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -214,6 +219,12 @@ impl AppConfig {
                     "allow" | "true" | "yes" | "1" | "on" => cfg.osc52_write = true,
                     "deny" | "false" | "no" | "0" | "off" => cfg.osc52_write = false,
                     _ => errors.push(format!("line {}: bad osc52-write {value:?}", n + 1)),
+                },
+                "bold-is-bright" | "bold_is_bright"
+                | "draw-bold-text-with-bright-colors" => match value {
+                    "true" | "yes" | "1" | "on" => cfg.bold_is_bright = true,
+                    "false" | "no" | "0" | "off" => cfg.bold_is_bright = false,
+                    _ => errors.push(format!("line {}: bad bold-is-bright {value:?}", n + 1)),
                 },
                 "mouse-hide-while-typing" | "mouse_hide_while_typing" => match value {
                     "true" | "yes" | "1" | "on" => cfg.mouse_hide_typing = true,

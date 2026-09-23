@@ -25,6 +25,7 @@ use waterui::task::spawn_local;
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
+use waterui::drag_drop::DragData;
 use waterui::theme::color::{Accent, Background, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
@@ -931,13 +932,22 @@ impl View for PaneLeaf {
             .session
             .window_padding
             .map(|p: (f32, f32)| EdgeInsets::new(p.1, p.1, p.0, p.0));
-        let surface = SceneView::new(TermSurface::new(
+        let term_surface = TermSurface::new(
             self.session.clone(),
             self.state.clone(),
             self.state.palette,
             FontCollection::from_env(env),
-        ))
-        .padding_with(padding);
+        );
+        // Reactive IBeam/pointing-hand over Ctrl-hovered links.
+        let hover_cursor = term_surface.hover_cursor.clone();
+        let surface = SceneView::new(term_surface)
+            .cursor(hover_cursor)
+            // Drag-and-drop: a file dropped on the pane pastes its
+            // shell-quoted path into the PTY (Ghostty/kitty behaviour).
+            .drop_destination(|session: PaneSession, data: DragData| {
+                session.push_action(TermAction::DropText(data.as_str().to_string()));
+            })
+            .padding_with(padding);
         let surface = Frame::new(surface);
         let reporting = self.session.mouse_reporting.clone();
         // Paste-protection confirm: multi-line clipboard content waits in
@@ -960,7 +970,7 @@ impl View for PaneLeaf {
                         Str::from(format!("Paste {lines} lines? {first}…"))
                     })
                     .unwrap_or_else(|| Str::from("Paste?"));
-                Spacer::new(0.0).on_appear(move |State(manager): State<SnackbarManager>, s: PaneSession| {
+                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
                     *s.0.snackbar.borrow_mut() = Some(manager.clone());
                     manager.show(
                         Snackbar::new(preview)
@@ -1263,11 +1273,11 @@ impl AppState {
     pub fn run_palette_at(&self, i: usize) {
         let q = self.palette_query.get().to_string();
         let matches = palette_matches(&q);
-        let Some(&item) = matches.as_slice().get(i) else {
+        let Some(item) = matches.as_slice().get(i) else {
             self.palette_open.set(false);
             return;
         };
-        self.run_palette_action(item.action);
+        self.run_palette_action(item.action.clone());
     }
 
     /// Open/close the settings page (Ctrl+Shift+,). Opening snapshots

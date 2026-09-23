@@ -69,6 +69,11 @@ pub struct DrawContext<'a> {
     pub hints: &'a [HintSpan],
     /// Digits typed so far in hint mode — shown as a status chip.
     pub hint_digits: &'a str,
+    /// `bold-is-bright` config — bold cells lift to the bright slot.
+    pub bold_bright: bool,
+    /// Ctrl-hovered link span to underline: `(start col, end col
+    /// exclusive, viewport row)` per visible part (wrap-safe, like hints).
+    pub hover_link: &'a [(usize, usize, usize)],
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +220,7 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         let is_cursor =
             show_block && p.line == cursor.point.line && p.column == cursor.point.column;
 
-        let pair = palette.resolve(colors, cell.fg, cell.bg, cell.flags);
+        let pair = palette.resolve(colors, cell.fg, cell.bg, cell.flags, ctx.bold_bright);
         let (mut fg, mut bg) = (pair.fg, pair.bg);
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;
@@ -357,6 +362,22 @@ pub fn draw_term(
         for (start, end, style) in style_runs(row) {
             draw_text_run(scene, row, start, end, style, row_i, pad, baseline_y, ctx);
             draw_decorations(scene, start, end, style, row_i, pad, ch, baseline_y, ctx);
+        }
+    }
+
+    // -- Ctrl-hover link underline -------------------------------------------
+    if !ctx.hover_link.is_empty() {
+        let hover_line = Brush::Solid(peniko_alpha(palette.accent, 0.85));
+        for &(c0, c1, row) in ctx.hover_link {
+            let x = col_x(pad, cw, c0);
+            let y = row_y(pad, ch, row);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &hover_line,
+                None,
+                &rect(x, y + ch - 1.5, (c1 - c0) as f32 * cw, 1.5),
+            );
         }
     }
 

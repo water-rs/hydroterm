@@ -111,9 +111,22 @@ impl Palette {
     }
 
     /// Resolve a cell's fg/bg honoring INVERSE, BOLD-brightening and DIM,
-    /// consulting the terminal's runtime color overrides.
-    pub fn resolve(&self, colors: &Colors, fg: Color, bg: Color, flags: Flags) -> CellColors {
-        let mut fg = self.resolve_fg(colors, fg, flags.contains(Flags::BOLD), false);
+    /// consulting the terminal's runtime color overrides. `bold_bright`
+    /// is the `bold-is-bright` config — off keeps bold in the normal slot.
+    pub fn resolve(
+        &self,
+        colors: &Colors,
+        fg: Color,
+        bg: Color,
+        flags: Flags,
+        bold_bright: bool,
+    ) -> CellColors {
+        let mut fg = self.resolve_fg(
+            colors,
+            fg,
+            flags.contains(Flags::BOLD) && bold_bright,
+            false,
+        );
         let mut bg = self.lookup(colors, bg);
 
         if flags.contains(Flags::DIM) {
