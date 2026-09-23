@@ -42,6 +42,33 @@ const BLINK_HALF: Duration = Duration::from_millis(530);
 /// Bell flash decay time.
 const BELL_FLASH_SECS: f32 = 0.15;
 /// Time window for double/triple click detection.
+/// (start col, end col exclusive) of each `query` match in `text`.
+/// `marks` maps text byte offsets to grid columns — a wide char is one
+/// `char` in `text` but two cells, so string positions can't be used as
+/// columns directly.
+fn match_columns(
+    text: &str,
+    marks: &[(usize, usize)],
+    query: &str,
+    grid_cols: usize,
+) -> Vec<(usize, usize)> {
+    let cell_at = |byte: usize| -> usize {
+        match marks.binary_search_by_key(&byte, |&(b, _)| b) {
+            Ok(i) => marks[i].1,
+            Err(0) => 0,
+            Err(i) => marks[i - 1].1,
+        }
+    };
+    text.match_indices(query)
+        .map(|(idx, _)| {
+            let c0 = cell_at(idx);
+            let end = idx + query.len();
+            let c1 = if end >= text.len() { grid_cols } else { cell_at(end) };
+            (c0, c1.max(c0 + 1))
+        })
+        .collect()
+}
+
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Max cell distance for a multi-click to count as same-cell.
 const MULTI_CLICK_RANGE: usize = 1;
@@ -49,8 +76,9 @@ const MULTI_CLICK_RANGE: usize = 1;
 /// In-surface text search state (Ctrl+Shift+F).
 struct Search {
     query: String,
-    /// (col, grid line) — grid lines go negative into scrollback.
-    matches: Vec<(usize, i32)>,
+    /// (start col, end col exclusive, grid line) — grid lines go
+    /// negative into scrollback. A match's CJK/emoji cells span 2 cols.
+    matches: Vec<(usize, usize, i32)>,
     active: usize,
 }
 
@@ -324,7 +352,7 @@ impl TermSurface {
     /// (col, row) the active search match should scroll to center.
     fn search_scroll_target(&self) -> Option<i32> {
         let search = self.search.as_ref()?;
-        let &(_, line) = search.matches.get(search.active)?;
+        let &(_, _, line) = search.matches.get(search.active)?;
         // Target display_offset so the match sits mid-viewport.
         Some(-line + self.lines as i32 / 2)
     }
@@ -363,12 +391,25 @@ impl TermSurface {
         let top = -(grid.history_size() as i32);
         let bottom = grid.screen_lines() as i32 - 1;
         for line in top..=bottom {
-            let start = Point::new(Line(line), Column(0));
-            let end = Point::new(Line(line), grid.last_column());
-            let text = term.bounds_to_string(start, end).to_lowercase();
-            for (idx, _) in text.match_indices(&query) {
-                let col = text[..idx].chars().count();
-                search.matches.push((col, line));
+            let row = &grid[Line(line)];
+            // Byte offset -> cell col: wide chars occupy 2 cells but one
+            // `char` in the line text, so match positions must map through
+            // the cells, not `chars().count()`.
+            let mut text = String::new();
+            let mut marks: Vec<(usize, usize)> = Vec::new();
+            for (col, cell) in row[..].iter().enumerate() {
+                if cell
+                    .flags
+                    .intersects(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                marks.push((text.len(), col));
+                text.push_str(&crate::scene::cell_text(cell));
+            }
+            let text = text.to_lowercase();
+            for (c0, c1) in match_columns(&text, &marks, &query, grid.columns()) {
+                search.matches.push((c0, c1, line));
             }
         }
         search.active = 0;
@@ -593,12 +634,24 @@ impl TermSurface {
     fn palette_key(&mut self, key: &Key, mods: Modifiers) -> bool {
         match key {
             Key::Named(NamedKey::Enter) => {
+                let sel = self.app.palette_sel.get();
+                self.app.run_palette_at(sel);
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
                 let query = self.app.palette_query.get().to_string();
-                if let Some(item) = crate::app::palette_matches(&query).first() {
-                    self.app.run_palette_action(item.action);
-                } else {
-                    self.app.palette_open.set(false);
+                let n = crate::app::palette_matches(&query).len();
+                if n > 0 {
+                    self.app.palette_sel.with_mut(|s| {
+                        *s = (*s + 1).min(n - 1);
+                    });
                 }
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.app.palette_sel.with_mut(|s| {
+                    *s = s.saturating_sub(1);
+                });
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -609,6 +662,7 @@ impl TermSurface {
                 let mut q = self.app.palette_query.get().to_string();
                 q.pop();
                 self.app.palette_query.set_from(q);
+                self.app.palette_sel.set(0);
                 true
             }
             // Printable keys: consume here — the text itself arrives via
@@ -712,6 +766,7 @@ impl TermSurface {
             let mut q = self.app.palette_query.get().to_string();
             q.push_str(text);
             self.app.palette_query.set_from(q);
+            self.app.palette_sel.set(0);
             return;
         }
         if self.search.is_some() {
@@ -906,15 +961,15 @@ impl TermSurface {
 
     /// Draw the terminal into the frame's scene.
     fn build(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) {
-        let matches_view: Vec<(usize, usize)> = self
+        let matches_view: Vec<(usize, usize, usize)> = self
             .search
             .as_ref()
             .map(|s| {
                 let offset = self.session.terminal.term.lock().grid().display_offset() as i32;
                 s.matches
                     .iter()
-                    .map(|&(c, line)| (c, (line + offset) as usize))
-                    .filter(|&(_, r)| r < self.lines as usize)
+                    .map(|&(c0, c1, line)| (c0, c1, (line + offset) as usize))
+                    .filter(|&(_, _, r)| r < self.lines as usize)
                     .collect()
             })
             .unwrap_or_default();
@@ -922,7 +977,7 @@ impl TermSurface {
             let offset = self.session.terminal.term.lock().grid().display_offset() as i32;
             s.matches
                 .get(s.active)
-                .map(|&(c, line)| (c, (line + offset) as usize))
+                .map(|&(c0, c1, line)| (c0, c1, (line + offset) as usize))
         });
         let preedit = self.preedit.clone();
 
@@ -1243,5 +1298,21 @@ mod tests {
     fn url_at_second_of_two() {
         let row = chars("https://a.b/ and http://c.d/e");
         assert_eq!(url_at(&row, 22), Some("http://c.d/e".to_string()));
+    }
+
+    /// Marks map text byte offsets to grid cols; a CJK char is one char in
+    /// the text but two cells, so a match's highlight must span the cells,
+    /// not the char count.
+    #[test]
+    fn match_columns_spans_wide_chars() {
+        // "你好ab" — 你 at cells 0..2, 好 at 2..4, a at 4, b at 5.
+        let text = "你好ab";
+        let marks: Vec<(usize, usize)> = vec![(0, 0), (3, 2), (6, 4), (7, 5)];
+        assert_eq!(match_columns(text, &marks, "好", 6), vec![(2, 4)]);
+        assert_eq!(match_columns(text, &marks, "好a", 6), vec![(2, 5)]);
+        // Match to end of line covers to grid end.
+        assert_eq!(match_columns(text, &marks, "你好ab", 8), vec![(0, 8)]);
+        // ASCII inside a CJK line.
+        assert_eq!(match_columns(text, &marks, "ab", 6), vec![(4, 6)]);
     }
 }

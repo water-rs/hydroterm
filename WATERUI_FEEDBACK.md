@@ -20,7 +20,7 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
 
 7. **No resize event / presentation timestamp distinct from scene builds.** Terminal recomputes cols/rows from `build_scene`'s width/height each frame — works, at frame rather than event granularity. → **water-rs/waterui#1197** (Minor)
 
-8. **Transparent windows accept the flag but render no content.** `Window::background(Color..with_opacity(<1))` flips `window_requires_transparency` → winit `with_transparent(true)`, and the OS window does composite transparently — BUT the scene produces zero pixels: the whole window is see-through, with *no* view content at all (not even native `text!()`, so this is not a SceneView-specific path). Opaque windows render fine.
+8. **Transparent windows accept the flag but render no content.** → **water-rs/hydrolysis#96** `Window::background(Color..with_opacity(<1))` flips `window_requires_transparency` → winit `with_transparent(true)`, and the OS window does composite transparently — BUT the scene produces zero pixels: the whole window is see-through, with *no* view content at all (not even native `text!()`, so this is not a SceneView-specific path). Opaque windows render fine.
 
    Minimal repro (pins above, `hydrolysis` features `["winit"]`):
    ```rust
@@ -48,4 +48,10 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
 
 15. **parley/ICU4X logs `No segmentation model for complex script: Chinese/Japanese`** on every CJK run in the shared text stack (the packaged data set lacks the segmenter models). Glyphs still shape and render correctly — cell anchoring doesn't depend on line breaking — but each CJK frame writes error lines. → **water-rs/waterui#1204** (Minor)
 
-16. **`TextField` has no submit/focus API.** A mounted `field()` receives `TextInput` automatically once focused, but Enter/Escape produce no submit event and focus can't be requested programmatically — a search bar or command palette must intercept those keys on an adjacent input-receiving surface and route plain text into the field's binding manually (what both our search bar and palette do). Wish: an `on_submit` callback and `.focused(&binding)` on the field. Related: water-rs/hydrolysis#90. (Nice-to-have)
+16. **`TextField` has no submit event.** Programmatic focus exists now — `ViewExt::focused(&binding, equals)` — and we tried it on the palette field. It doesn't help yet in practice: hydrolysis delivers key events to the *embedded* input surface before a focused text field, so the field never sees the typing, and when it is focused Enter is swallowed by the single-line edit model (no submit callback exists) instead of reaching our handler — so the surface still owns the keys and writes the field's binding manually. A real `on_submit` callback would unlock the field-owned design. → **water-rs/waterui#1205** (Nice-to-have)
+
+17. **hydrolysis-m3 `picker` never draws its label.** `controls/picker.rs` builds no view from `config.label` (zero references) — `picker("Theme", items, &b)` shows only the value, so callers must compose their own label text and `.hide_label()`. (Minor)
+
+18. **hydrolysis-m3 `stepper` shows no current value.** `controls/stepper.rs` renders the label and −/+ buttons only — the bound value is invisible, so callers must compose `text(binding.map(..))` themselves. (Minor)
+
+19. **`.focused()` is TextField-only.** Hydrolysis's focused wiring asserts exactly one `TextField`/`SecureField` in the wrapped subtree — it cannot programmatically focus other views, so input-receiving surfaces (hydrolysis#90) still can't grab keyboard focus without a click. If `.focused` ever grows to cover arbitrary views, #1 is solved by the same API. (Informational — documents the scope)

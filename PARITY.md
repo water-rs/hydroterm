@@ -62,9 +62,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell int. | OSC 9/777 notifications | ✅ | bell flash + 🔔 badge on title until user input + freedesktop `notify-send` desktop notification where available (badge verified; notify-send spawned, best-effort) |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
 | Bell | Audible bell | ❌ | needs audio stack; low priority |
-| Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight in grid, Enter jumps to next |
-| Shell UI | Settings page | ✅ | Ctrl+Shift+, → WaterUI stepper/picker/toggle; Apply writes config file → hot reload |
-| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + filtered action list; Enter/click runs |
+| Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight the *full* match span (wide chars cover both cells, `match_columns`), Enter jumps to next |
+| Shell UI | Settings page | ✅ | Ctrl+Shift+, → opaque token panel over a dim mask; labeled theme picker, font-size value + stepper, toggle; Apply writes config file → hot reload |
+| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + full-width rows (name left, chord right); Up/Down selection (AccentContainer highlight), Enter/click runs, Esc closes |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies + `t=f` file medium (verified: PNG blitted in-grid, file-loaded PNG rendered); no unicode placements/z-layers/shared mediums/crops/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
@@ -81,6 +81,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Test | Result | Method |
 |------|--------|--------|
 | vttest | visual spot-check only (interactive suite, no automated score) | menu + "test of cursor movements" DECALN frame rendered correctly on 2026-09-22 run |
+| Line discipline | Prompt redraw / wide-char wrap | ✅ | OSC133 marks in injected PS1/PS0 wrapped in `\[ \]` (bash) / `%{ %}` (zsh) so readline counts zero prompt-width cells — unit tests `bash/zsh_prompt_marks_are_zero_width`; live: paste CJK+emoji long line, arrow keys, end-of-line wrap — no ghosts |
 | esctest | 57/559 pass (10%) | `esctest --expected-terminal xterm`, 2026-09-22; ~450 tests verify screen contents via DECRQCRA (CSI ... * y) which alacritty_terminal does not implement — those all timeout-fail. Real failures: winops reports (14t/18t resize-px), BS/wrap semantics, OSC4 color queries |
 | Throughput | 48.7MB in 4.53s (~10.8 MB/s, llvmpipe CPU render) | `time cat` of 800k-line file; pty backpressure = read+parse+render drain |
 | Input latency | ~72ms keypress→PTY byte (upper bound, includes X/xdotool dispatch; adds ≤1-2 render frames for echo) | raw-tty `os.read` timestamp vs send timestamp, same clock |

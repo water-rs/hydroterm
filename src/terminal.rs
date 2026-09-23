@@ -314,8 +314,8 @@ case ";$PROMPT_COMMAND;" in
   *__hydro_osc*) ;;
   *) PROMPT_COMMAND="__hydro_osc${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
-PS0='\e]133;C\e\\'
-PS1='\e]133;B\e\\'"$PS1"
+PS0='\[\e]133;C\e\\\]'
+PS1='\[\e]133;B\e\\\]'"$PS1"
 "#;
 
 /// Zsh `ZDOTDIR/.zshrc`: sources the user's real zshrc, then hooks
@@ -331,7 +331,7 @@ __hydro_precmd() {
 __hydro_preexec() { printf '\e]133;C\e\\' }
 precmd_functions+=(__hydro_precmd)
 preexec_functions+=(__hydro_preexec)
-PS1=$'\e]133;B\e\\'$PS1
+PS1=$'%{\e]133;B\e\\%}'$PS1
 "#;
 
 /// Fish `-C` init command: `fish_postexec`/`fish_preexec` events carry
@@ -495,5 +495,25 @@ impl EventedPty for TapPty {
 impl OnResize for TapPty {
     fn on_resize(&mut self, window_size: WindowSize) {
         self.inner.on_resize(window_size);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prompt-mark escapes injected into PS1/PS0 must be wrapped in the
+    /// shell's non-printing markers (`\[ \]` for bash, `%{ %}` for zsh) or
+    /// readline counts the OSC bytes toward prompt width and corrupts
+    /// multi-line redisplay (overwrites, stray cursor offsets).
+    #[test]
+    fn bash_prompt_marks_are_zero_width() {
+        assert!(BASH_INTEGRATION.contains(r#"PS1='\[\e]133;B\e\\\]'"#));
+        assert!(BASH_INTEGRATION.contains(r#"PS0='\[\e]133;C\e\\\]'"#));
+    }
+
+    #[test]
+    fn zsh_prompt_marks_are_zero_width() {
+        assert!(ZSH_INTEGRATION.contains("PS1=$'%{\\e]133;B\\e\\\\%}'"));
     }
 }

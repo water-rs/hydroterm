@@ -11,11 +11,13 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
+use waterui::impl_extractor;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
 use waterui::window::{Window, WindowState};
 use waterui_graphics::SceneView;
+use waterui::theme::color::{AccentContainer, Foreground, Surface};
 use waterui_graphics::color::Srgb;
 use waterui_text::FontCollection;
 
@@ -211,6 +213,9 @@ pub struct AppState {
     pub palette_open: Binding<bool>,
     /// Live palette query — bound to the WaterUI `TextField`.
     pub palette_query: Binding<Str>,
+    /// Index of the highlighted palette row (Up/Down navigation).
+    pub palette_sel: Binding<usize>,
+
     /// Settings page open (Ctrl+Shift+,).
     pub settings_open: Binding<bool>,
     /// Settings edits — snapshotted from the config each time the page
@@ -225,6 +230,10 @@ pub struct AppState {
     theme_wakes: Arc<Mutex<Vec<std::sync::Weak<Terminal>>>>,
     next_id: Arc<AtomicU64>,
 }
+
+// `.state(&app)` injection rows read the state back through a plain
+// `AppState` extractor parameter.
+impl_extractor!(AppState);
 
 impl AppState {
     /// Create with one running session.
@@ -254,6 +263,7 @@ impl AppState {
             env: Rc::new(std::cell::OnceCell::new()),
             palette_open: Binding::bool(false),
             palette_query: binding(Str::from("")),
+            palette_sel: Binding::usize(0),
             settings_open: Binding::bool(false),
             set_font: Binding::i32(13),
             set_theme: Binding::usize(0),
@@ -816,13 +826,27 @@ pub fn palette_matches(query: &str) -> Vec<&'static PaletteItem> {
 }
 
 impl AppState {
-    /// Open/close the palette (Ctrl+Shift+P). Opening clears the query.
+    /// Open/close the palette (Ctrl+Shift+P). Opening clears the query
+    /// and resets row selection to the first match.
     pub fn toggle_palette(&self) {
         let next = !self.palette_open.get();
         if next {
             self.palette_query.set_from("");
+            self.palette_sel.set(0);
         }
         self.palette_open.set(next);
+    }
+
+    /// Run the `i`-th match of the current query (Up/Down selection or
+    /// a row tap).
+    pub fn run_palette_at(&self, i: usize) {
+        let q = self.palette_query.get().to_string();
+        let matches = palette_matches(&q);
+        let Some(&item) = matches.as_slice().get(i) else {
+            self.palette_open.set(false);
+            return;
+        };
+        self.run_palette_action(item.action);
     }
 
     /// Open/close the settings page (Ctrl+Shift+,). Opening snapshots
@@ -882,33 +906,50 @@ impl AppState {
 }
 
 /// The palette overlay: a field + filtered action list, stacked over the
-/// tabs. Enter runs the top match (handled on the surface's key path);
-/// a row's button runs it directly.
+/// tabs and a dimming mask. Up/Down moves the selection (the surface's
+/// key path), Enter runs the selected match; a row tap runs it directly.
 fn palette_view(state: AppState) -> impl View {
     let query = state.palette_query.clone();
+    // Rows rebuild when the query or the selection moves — the list is
+    // small, so a nested `watch` is cheaper than debugging a stale row.
     let list = watch(query, {
         let state = state.clone();
         move |q: Str| {
-            let rows: Vec<AnyView> = palette_matches(q.as_str())
-                .into_iter()
-                .map(|item| {
-                    let app = state.clone();
-                    button(format!("{:<28} {}", item.name, item.chord))
-                        .action(move || app.run_palette_action(item.action))
-                        .anyview()
-                })
-                .collect();
-            rows.into_iter()
-                .collect::<VStack<_>>()
-                .spacing(2.0)
-                .anyview()
+            let items: Vec<&'static PaletteItem> = palette_matches(q.as_str());
+            watch(state.palette_sel.clone(), {
+                let state = state.clone();
+                move |sel: usize| {
+                    let rows: Vec<AnyView> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let name = item.name;
+                            let chord = item.chord;
+                            let bg = Color::from(AccentContainer)
+                                .with_opacity(f32::from(u8::from(sel == i)));
+                            hstack((
+                                text(name).foreground(Foreground),
+                                Spacer::flexible(),
+                                text(chord).muted(),
+                            ))
+                            .padding()
+                            .background(bg)
+                            .on_tap(move |app: AppState| app.run_palette_at(i))
+                            .state(&state)
+                            .anyview()
+                        })
+                        .collect();
+                    rows.into_iter().collect::<VStack<_>>().anyview()
+                }
+            })
+            .anyview()
         }
     });
     let panel = vstack((field("type a command", &state.palette_query), list))
-        .spacing(8.0)
+        .spacing(4.0)
         .padding()
-        .background(Srgb::from_hex("#1E222A").with_opacity(0.98));
-    vstack((panel, Spacer::flexible()))
+        .background(Surface);
+    vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }
 
 /// The settings page: font size stepper, theme picker, cursor-blink
@@ -920,11 +961,27 @@ fn settings_view(state: AppState) -> impl View {
         .enumerate()
         .map(|(i, name)| text(*name).tag(i))
         .collect();
+    // hydrolysis-m3's stepper draws label and buttons but no value, and
+    // its picker draws no label at all — label text + value are composed
+    // manually here.
     let panel = vstack((
-        text("Settings"),
-        stepper("Font size", &state.set_font),
-        picker("Theme", theme_items, &state.set_theme),
-        toggle("Cursor blink", &state.set_blink),
+        text("Settings").foreground(Foreground),
+        hstack((
+            text("Font size").foreground(Foreground),
+            Spacer::flexible(),
+            text!("{v}", v = state.set_font).muted(),
+            stepper("Font size", &state.set_font).hide_label(),
+        )),
+        hstack((
+            text("Theme").foreground(Foreground),
+            Spacer::flexible(),
+            picker("Theme", theme_items, &state.set_theme).hide_label(),
+        )),
+        hstack((
+            text("Cursor blink").foreground(Foreground),
+            Spacer::flexible(),
+            toggle("Cursor blink", &state.set_blink).hide_label(),
+        )),
         {
             let app = state.clone();
             button("Apply").action(move || app.apply_settings())
@@ -932,7 +989,6 @@ fn settings_view(state: AppState) -> impl View {
     ))
     .spacing(8.0)
     .padding()
-    .foreground(Srgb::WHITE)
-    .background(Srgb::from_hex("#1E222A").with_opacity(0.98));
-    vstack((panel, Spacer::flexible()))
+    .background(Surface);
+    vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }

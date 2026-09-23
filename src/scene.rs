@@ -44,9 +44,10 @@ pub struct DrawContext<'a> {
     /// Scrollback overlay data.
     pub scroll: ScrollInfo,
     /// Search match cells to highlight (col,row in viewport coords).
-    pub search_matches: &'a [(usize, usize)],
+    /// (start col, end col exclusive, row) per match.
+    pub search_matches: &'a [(usize, usize, usize)],
     /// Currently active search match.
-    pub search_active: Option<(usize, usize)>,
+    pub search_active: Option<(usize, usize, usize)>,
     /// Alpha for the bell flash overlay.
     pub bell_flash: f32,
     /// Alpha of the default background fill (window transparency; 1.0 =
@@ -106,7 +107,7 @@ struct CellData {
     style: StyleKey,
 }
 
-fn cell_text(cell: &Cell) -> String {
+pub(crate) fn cell_text(cell: &Cell) -> String {
     let mut s = String::with_capacity(8);
     if !cell
         .flags
@@ -305,8 +306,8 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
     }
 
     // -- Search highlights --------------------------------------------------
-    for &(c, r) in ctx.search_matches {
-        let active = ctx.search_active == Some((c, r));
+    for &(c0, c1, r) in ctx.search_matches {
+        let active = ctx.search_active == Some((c0, c1, r));
         let color = if active {
             Rgb { r: 0xff, g: 0xa5, b: 0x00 }
         } else {
@@ -317,7 +318,7 @@ pub fn draw_term(scene: &mut dyn Scene2D, term: &Term<EventProxy>, ctx: &mut Dra
             Affine::IDENTITY,
             &Brush::Solid(peniko_alpha(color, if active { 0.55 } else { 0.30 })),
             None,
-            &rect(col_x(pad, cw, c), row_y(pad, ch, r), cw, ch),
+            &rect(col_x(pad, cw, c0), row_y(pad, ch, r), (c1 - c0) as f32 * cw, ch),
         );
     }
 
