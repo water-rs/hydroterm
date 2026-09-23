@@ -2528,6 +2528,7 @@ dependencies = [
  "waterui-core",
  "waterui-graphics",
  "waterui-text",
+ "x11rb",
 ]
 
 [[package]]

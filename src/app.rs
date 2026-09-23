@@ -18,9 +18,12 @@ use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
-use waterui::window::{Window, WindowState};
+use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
+use waterui::window::WindowPresentation;
+use waterui::task::spawn_local;
+use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
-use waterui::theme::color::{Background, Foreground, Surface};
+use waterui::theme::color::{Accent, Background, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
 
@@ -33,6 +36,9 @@ use waterui::form::picker::picker;
 
 /// Default font size in points (the config file may override).
 pub const FONT_SIZE: f32 = 13.0;
+
+/// Fixed height of the tab strip at every window size.
+const TAB_STRIP_HEIGHT: f32 = 30.0;
 
 /// Shared per-session UI state: the bindings a pane surface reads, plus
 /// the owning `Terminal` (PTY + grid).
@@ -237,6 +243,25 @@ pub struct AppState {
     pub set_blink: Binding<bool>,
     /// The desktop color-scheme may have changed (gsettings monitor).
     pub theme_dirty: Arc<AtomicBool>,
+    /// Quick-terminal window state — the X11 global hotkey flips it
+    /// Closed ↔ Normal; `conditional_window` mounts/unmounts the window.
+    pub quick_state: Binding<WindowState>,
+    /// Presentation helper for the quick window (retained `presented` flag).
+    quick_presentation: WindowPresentation,
+    /// Lazily-created session set for the quick window — kept alive across
+    /// show/hide cycles so the drop-down keeps its shell + scrollback.
+    quick_app: RefCell<Option<Rc<AppState>>>,
+    /// The X11 grab listener spawn only happens once per process.
+    quick_listener_started: Rc<AtomicBool>,
+    /// Retained drain-future handle — dropping a spawned task cancels it.
+    quick_task: Rc<RefCell<Option<Box<dyn std::any::Any>>>>,
+    /// Frame binding of the live quick window (kept to re-dock after mount).
+    quick_frame: Rc<RefCell<Option<Binding<Rect>>>>,
+    /// Hotkey fires but grab failed (no X11) — surface it once.
+    pub quick_unavailable: RefCell<bool>,
+    /// True for the drop-down's own AppState: it neither hosts a quick
+    /// window itself nor spawns a second key grab.
+    is_quick: bool,
     /// Weak handles to live terminals so the theme monitor thread can
     /// request frames (dirty is only read inside `poll_config`).
     theme_wakes: Arc<Mutex<Vec<std::sync::Weak<Terminal>>>>,
@@ -262,6 +287,7 @@ impl AppState {
         let palette = Palette::from_theme(&watcher.config.resolve_theme());
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto);
+        let quick_binding = Binding::container(WindowState::Closed);
         let state = Self {
             sessions: Rc::new(RefCell::new(Vec::new())),
             tabs: NamiList::new(),
@@ -281,6 +307,14 @@ impl AppState {
             set_theme: Binding::usize(0),
             set_blink: Binding::bool(true),
             theme_dirty: Arc::new(AtomicBool::new(false)),
+            quick_state: quick_binding.clone(),
+            quick_presentation: WindowPresentation::new(&quick_binding),
+            quick_app: RefCell::new(None),
+            quick_listener_started: Rc::new(AtomicBool::new(false)),
+            quick_task: Rc::new(RefCell::new(None)),
+            quick_frame: Rc::new(RefCell::new(None)),
+            quick_unavailable: RefCell::new(false),
+            is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         };
@@ -363,6 +397,117 @@ impl AppState {
             _ => WindowState::Fullscreen,
         };
         self.window_state.set(next);
+    }
+
+    /// The drop-down's own session set — created once, kept across
+    /// show/hide cycles so the shell + scrollback persist.
+    fn quick_app(&self) -> Rc<AppState> {
+        if let Some(app) = self.quick_app.borrow().as_ref() {
+            return app.clone();
+        }
+        let mut app = AppState::new(Some(self.cfg.borrow().path.clone()), None);
+        app.is_quick = true;
+        let app = Rc::new(app);
+        *self.quick_app.borrow_mut() = Some(app.clone());
+        app
+    }
+
+    /// Flip the drop-down window open/closed (the X11 hotkey calls this).
+    pub fn toggle_quick(&self) {
+        if self.is_quick {
+            // The drop-down's own view should not host another quick window.
+            return;
+        }
+        let next = match self.quick_state.get() {
+            WindowState::Closed => WindowState::Normal,
+            _ => WindowState::Closed,
+        };
+        self.quick_state.set(next);
+    }
+
+    /// Start the X11 global-hotkey listener (idempotent, main window only).
+    /// The grab thread forwards F12 presses over a channel; this drains it
+    /// via `spawn_local` so the `WindowState` flip happens on the UI thread.
+    pub fn start_quick_listener(&self) {
+        if self.is_quick || self.quick_listener_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // One channel carries both the X11 hotkey press and the delayed
+        // frame re-dock (the position apply on a just-mapped X11 window can
+        // be lost; re-emitting the frame binding wakes the loop and re-runs
+        // `apply_properties` on the now-visible window).
+        #[derive(Clone)]
+        enum QuickEvent {
+            Hotkey,
+            Dock,
+        }
+        let (tx, rx) = async_channel::unbounded::<QuickEvent>();
+        match crate::quickterm::spawn_hotkey(tx.clone(), crate::quickterm::XK_F12, QuickEvent::Hotkey) {
+            Some(_) => {
+                let app = self.clone();
+                let task = spawn_local(async move {
+                    while let Ok(event) = rx.recv().await {
+                        while rx.try_recv().is_ok() {}
+                        match event {
+                            QuickEvent::Hotkey => {
+                                app.toggle_quick();
+                                if app.quick_state.get() != WindowState::Closed {
+                                    let dock_tx = tx.clone();
+                                    std::thread::spawn(move || {
+                                        // The first mount is slow (renderer
+                                        // init + PTY spawn): poke at a few
+                                        // delays so one lands post-map.
+                                        for delay in [200u64, 700, 1500] {
+                                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                                            let _ = dock_tx.try_send(QuickEvent::Dock);
+                                        }
+                                    });
+                                }
+                            }
+                            QuickEvent::Dock => app.dock_quick_frame(),
+                        }
+                    }
+                });
+                *self.quick_task.borrow_mut() = Some(Box::new(task));
+            }
+            None => {
+                *self.quick_unavailable.borrow_mut() = true;
+            }
+        }
+    }
+
+    /// Re-apply the dock frame after the quick window has mapped — the
+    /// position applied while the X11 window was still invisible is lost
+    /// (the window manager picks its own placement), so poke the binding
+    /// once it exists on screen.
+    fn dock_quick_frame(&self) {
+        let Some(frame) = self.quick_frame.borrow().clone() else { return };
+        let Some((sw, sh)) = crate::quickterm::screen_size() else { return };
+        frame.set(Rect::new(
+            Point::new(0.0, 0.0),
+            Size::new(sw as f32, (sh * 0.45) as f32),
+        ));
+    }
+
+    /// Build the quick terminal's borderless top-docked window (mounted by
+    /// `conditional_window` when `quick_state` leaves `Closed`).
+    fn quick_window(&self, state: Binding<WindowState>) -> Window {
+        let app = self.quick_app();
+        let title = app.window_title.clone();
+        let w = Window::new(title, state, move || {
+            app_root((*app).clone())
+        })
+        .style(WindowStyle::Borderless)
+        .resizable(false);
+        // Dock: top of the primary screen, full width, 45% height.
+        if let Some((sw, sh)) = crate::quickterm::screen_size() {
+            w.frame.set(Rect::new(
+                Point::new(0.0, 0.0),
+                Size::new(sw as f32, (sh * 0.45) as f32),
+            ));
+        }
+        *self.quick_frame.borrow_mut() = Some(w.frame.clone());
+        w
     }
 
     /// Spawn a whole new OS window with a fresh session set (same config
@@ -739,6 +884,10 @@ fn tab_content(tab: PaneTab, app: AppState) -> impl View {
 /// `SceneView` or drops its keyboard focus (Principle 8: precise
 /// signals over `watch`). The active tab shows via `.visible`, which
 /// keeps the view mounted but undrawn and non-hittable.
+// `handler_captures_binding` would push the tab-tap binding through a
+// `State<Binding<u64>>` extractor — but extractor parameters in `.on_tap`
+// panic at click time (WATERUI_FEEDBACK #20), so the closure captures it.
+#[allow(handler_captures_binding)]
 pub fn tabs_view(state: AppState) -> impl View {
     let palette_overlay = when(state.palette_open.clone(), {
         let state = state.clone();
@@ -756,26 +905,34 @@ pub fn tabs_view(state: AppState) -> impl View {
         HStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
             let app = app.clone();
             let tab_id = tab.id;
-            let bg = signal_color(
-                app.selected
-                    .equal_to(tab_id)
-                    .select(Color::new(Surface), Color::new(Background)),
+            let active = app.selected.equal_to(tab_id);
+            // M3 primary-tab look: accent label + indicator bar when active.
+            let label_color = signal_color(
+                active.select(Color::new(Accent), Color::new(MutedForeground)),
+            );
+            let indicator_color = signal_color(
+                active.select(Color::new(Accent), Color::new(Background)),
             );
             let sel = app.selected.clone();
-            hstack((
-                text(tab.title.clone()),
-                text("×")
-                    .muted()
-                    .padding()
-                    .on_tap({
-                        let app = app.clone();
-                        move || app.close_tab(tab_id)
-                    }),
+            vstack((
+                hstack((
+                    text(tab.title.clone()).foreground(label_color),
+                    text("×")
+                        .muted()
+                        .padding_with([3.0, 0.0, 4.0, 4.0])
+                        .on_tap({
+                            let app = app.clone();
+                            move || app.close_tab(tab_id)
+                        }),
+                ))
+                .padding_with([4.0, 0.0, 8.0, 4.0]),
+                Frame::new(indicator_color).height(3.0),
             ))
-            .padding()
-            .background(bg)
-            .on_tap(move |State(sel): State<Binding<u64>>| sel.set(tab_id))
-            .state(&sel)
+            .spacing(0.0)
+            .height(TAB_STRIP_HEIGHT)
+            // Zero-arg closure — `.on_tap` with an extractor parameter
+            // panics on click (feedback #20).
+            .on_tap(move || sel.set(tab_id))
         })
     };
     let strip_bar = hstack((
@@ -801,10 +958,23 @@ pub fn tabs_view(state: AppState) -> impl View {
         .max_height(f32::INFINITY)
     };
 
+    // X11 global hotkey → quick terminal (F12). The listener spawns once
+    // per process; `conditional_window` mounts the drop-down whenever
+    // `quick_state` leaves Closed.
+    state.start_quick_listener();
+    let quick = {
+        let app = state.clone();
+        conditional_window(&state.quick_presentation, move |win_state| {
+            app.quick_window(win_state)
+        })
+        .anyview()
+    };
+
     zstack((
         vstack((strip_bar, content)).spacing(0.0),
         palette_overlay,
         settings_overlay,
+        quick,
     ))
 }
 

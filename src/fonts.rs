@@ -226,6 +226,11 @@ mod tests {
         );
         let mut clusters = 0usize;
         let mut glyph_clusters = 0usize;
+        // Identify the font the cluster actually resolved to: FontData
+        // carries the font file's raw bytes, so compare with the font files
+        // on this system to name the resolved face.
+        const NOTO_COLOR: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+        let mut resolved_noto = false;
         for line in layout.lines() {
             for item in line.items() {
                 let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
@@ -237,9 +242,21 @@ mod tests {
                         glyph_clusters += 1;
                     }
                 }
+                let run_font = gr.run().font().data.clone();
+                if let Ok(noto) = std::fs::read(NOTO_COLOR)
+                    && run_font.as_ref() == noto.as_slice()
+                {
+                    resolved_noto = true;
+                }
             }
         }
         assert!(glyph_clusters >= 1, "no glyphs shaped for the ZWJ cluster");
         assert!(clusters >= glyph_clusters);
+        if std::path::Path::new(NOTO_COLOR).exists() {
+            assert!(
+                resolved_noto,
+                "family ZWJ cluster did not resolve to Noto Color Emoji"
+            );
+        }
     }
 }

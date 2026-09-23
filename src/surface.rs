@@ -201,6 +201,11 @@ impl TermSurface {
     }
 
     fn write(&self, bytes: impl Into<std::borrow::Cow<'static, [u8]>>) {
+        let bytes = bytes.into();
+        if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+            let escaped = String::from_utf8_lossy(&bytes).escape_debug().to_string();
+            eprintln!("[pty-write {:?}] {} bytes: {escaped}", std::time::Instant::now(), bytes.len());
+        }
         self.session.terminal.write(bytes);
     }
 

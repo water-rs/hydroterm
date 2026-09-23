@@ -21,6 +21,8 @@ peniko = "0.6"
 kurbo = "0.13"
 keyboard-types = "0.8"
 async-channel = "2.5"
+# X11 global hotkey for the quick terminal (already in the tree via winit).
+x11rb = "0.13"
 pollster = "1.0"
 png = "0.17"
 tracing = "0.1"

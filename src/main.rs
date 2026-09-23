@@ -22,6 +22,7 @@ mod kitty;
 mod osctap;
 mod mouse;
 mod palette;
+mod quickterm;
 mod scene;
 mod surface;
 mod terminal;
