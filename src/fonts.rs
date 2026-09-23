@@ -60,24 +60,62 @@ pub struct TermFonts {
 
 impl TermFonts {
     /// Resolve the primary family in `collection` and measure the cell.
-    pub fn load(collection: FontCollection, size_pt: f32) -> Self {
+    /// `pref` is the configured `font-family`: when it names an installed
+    /// family it wins over the built-in preference list (a comma list of
+    /// names works — the first installed one is taken). Generic aliases
+    /// like `monospace`/`serif` map to their generic family.
+    pub fn load(collection: FontCollection, size_pt: f32, pref: &str) -> Self {
         let (family, family_name) = collection.use_fonts(|fonts| {
-            let primary = PRIMARY_FAMILIES.iter().copied().find(|name| {
-                *name != "monospace" && fonts.collection.family_by_name(name).is_some()
+            let prefer = pref
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .find_map(|name| {
+                    let generic = match name.to_ascii_lowercase().as_str() {
+                        "monospace" => Some(GenericFamily::Monospace),
+                        "sans-serif" | "sans" => Some(GenericFamily::SansSerif),
+                        "serif" => Some(GenericFamily::Serif),
+                        "cursive" => Some(GenericFamily::Cursive),
+                        "fantasy" => Some(GenericFamily::Fantasy),
+                        "system-ui" | "ui" => Some(GenericFamily::SystemUi),
+                        "emoji" => Some(GenericFamily::Emoji),
+                        "math" => Some(GenericFamily::Math),
+                        _ => None,
+                    };
+                    if let generic @ Some(_) = generic {
+                        return generic.map(|g| {
+                            (FontFamilyName::Generic(g), name.to_string())
+                        });
+                    }
+                    fonts
+                        .collection
+                        .family_by_name(name)
+                        .map(|_| (FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())), name.to_string()))
+                });
+            let (primary, family_name) = prefer.unwrap_or_else(|| {
+                // Ordered stack: the preferred monospace first, then the
+                // generic emoji family so clustered emoji (ZWJ sequences,
+                // keycaps, flags) resolve to the color emoji font instead
+                // of a monochrome symbols fallback.
+                let name = PRIMARY_FAMILIES.iter().copied().find(|name| {
+                    *name != "monospace" && fonts.collection.family_by_name(name).is_some()
+                });
+                match name {
+                    Some(name) => (
+                        FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())),
+                        name.to_string(),
+                    ),
+                    None => (
+                        FontFamilyName::Generic(GenericFamily::Monospace),
+                        "monospace".to_string(),
+                    ),
+                }
             });
-            // Ordered stack: the preferred monospace first, then the generic
-            // emoji family so clustered emoji (ZWJ sequences, keycaps, flags)
-            // resolve to the color emoji font instead of a monochrome
-            // symbols fallback fontique might otherwise pick first.
-            let primary = match primary {
-                Some(name) => FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())),
-                None => FontFamilyName::Generic(GenericFamily::Monospace),
-            };
             let list: Vec<FontFamilyName> =
                 vec![primary, FontFamilyName::Generic(GenericFamily::Emoji)];
             (
                 FontFamily::List(std::borrow::Cow::Owned(list)),
-                "mono+emoji".to_string(),
+                family_name,
             )
         });
         tracing::info!(family = %family_name, "terminal primary font");
@@ -97,6 +135,14 @@ impl TermFonts {
     pub fn resize(&mut self, size_pt: f32) {
         self.size_px = size_pt;
         self.metrics = self.probe_metrics();
+    }
+
+    /// Re-resolve the primary family after `font-family` changed (hot
+    /// reload): re-run the preference cascade and re-measure the cell.
+    pub fn reload_family(&mut self, pref: &str) {
+        let fresh = Self::load(self.collection.clone(), self.size_px, pref);
+        self.family = fresh.family;
+        self.metrics = fresh.metrics;
     }
 
     /// Shape `text` as one terminal line: single line, left aligned, with the
@@ -200,7 +246,7 @@ mod tests {
     /// emoji font over a monochrome symbols fallback.
     #[test]
     fn family_stack_prefers_color_emoji() {
-        let fonts = TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0);
+        let fonts = TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0, "");
         let FontFamily::List(list) = &fonts.family else {
             panic!("family is not a fallback stack");
         };
@@ -218,7 +264,7 @@ mod tests {
     #[test]
     fn zwj_cluster_shapes_as_one_ligature() {
         let mut fonts =
-            TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0);
+            TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0, "");
         let layout = fonts.shape_run(
             "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
             false,

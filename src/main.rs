@@ -27,6 +27,7 @@ mod scene;
 mod surface;
 mod terminal;
 mod theme;
+mod xcursor;
 
 use waterui::app::App;
 use waterui::prelude::*;

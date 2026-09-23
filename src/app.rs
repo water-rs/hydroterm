@@ -73,6 +73,19 @@ pub struct Session {
     /// 1006) — while on, secondary clicks belong to it and the context
     /// menu is suppressed (signal-driven `.context_menu` items).
     pub mouse_reporting: Binding<bool>,
+    /// Configured `font-family` preference — hot-reload re-resolves the
+    /// shaping stack when it changes.
+    pub font_family: Binding<Str>,
+    /// Clipboard text awaiting paste-protection confirmation.
+    pub pending_paste: Binding<Option<Str>>,
+    /// Live scrollback limit (the alacritty field is private — tracked
+    /// here so config hot-reload can compare and `set_options`).
+    pub scrollback: std::sync::Mutex<usize>,
+    /// Cursor style the session spawned with — preserved across
+    /// `set_options` live reloads.
+    pub cursor_style: CursorStyle,
+    /// Current kitty-keyboard flag state source (kept for set_options).
+    pub kitty_keyboard: bool,
 }
 
 impl Session {
@@ -102,7 +115,7 @@ impl Session {
                 .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
         };
         // A reasonable initial grid; the surface resizes on its first frame.
-        let terminal = Terminal::spawn(config, 120, 32, (9, 18), cwd, shell)
+        let terminal = Terminal::spawn(config.clone(), 120, 32, (9, 18), cwd, shell)
             .expect("failed to spawn PTY — is a shell available?");
         Self {
             id,
@@ -119,6 +132,11 @@ impl Session {
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
             mouse_reporting: Binding::bool(false),
+            font_family: binding(Str::from(cfg.font_family.clone())),
+            pending_paste: binding(None),
+            scrollback: std::sync::Mutex::new(cfg.scrollback),
+            cursor_style: config.default_cursor_style,
+            kitty_keyboard: config.kitty_keyboard,
         }
     }
 }
@@ -448,6 +466,20 @@ impl AppState {
         *self.palette.borrow_mut() = Palette::from_theme(&config.resolve_theme());
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
+            s.font_family.set_from(Str::from(config.font_family.clone()));
+            // Live scrollback-limit change — `set_options` is alacritty's
+            // own live-reconfigure path. Rebuild the Config exactly as
+            // spawn does so kitty-keyboard / cursor style survive intact.
+            if *s.scrollback.lock().unwrap() != config.scrollback {
+                let mut term = s.terminal.term.lock();
+                term.set_options(alacritty_terminal::term::Config {
+                    scrolling_history: config.scrollback,
+                    kitty_keyboard: s.kitty_keyboard,
+                    default_cursor_style: s.cursor_style,
+                    ..Default::default()
+                });
+                *s.scrollback.lock().unwrap() = config.scrollback;
+            }
         }
     }
 
@@ -883,7 +915,36 @@ impl View for PaneLeaf {
             FontCollection::from_env(env),
         )));
         let reporting = self.session.mouse_reporting.clone();
+        // Paste-protection confirm: multi-line clipboard content waits in
+        // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
+        let pending = self.session.pending_paste.clone();
         let session = PaneSession(self.session); // `.state` stores a clone
+        let paste_overlay = when(
+            pending.map(|p| p.is_some()).computed(),
+            move || {
+                let preview: Str = pending
+                    .get()
+                    .map(|t| {
+                        let lines = t.lines().count();
+                        let first: String = t.lines().next().unwrap_or_default().chars().take(60).collect();
+                        Str::from(format!("Paste {lines} lines? {first}…"))
+                    })
+                    .unwrap_or_else(|| Str::from("Paste?"));
+                let panel = vstack((
+                    text(preview).foreground(Foreground),
+                    hstack((
+                        button("Paste").action(|s: PaneSession| s.push_action(TermAction::PasteConfirm)),
+                        button("Cancel").action(|s: PaneSession| s.push_action(TermAction::PasteCancel)),
+                    ))
+                    .spacing(12.0),
+                ))
+                .spacing(8.0)
+                .padding()
+                .background(Surface);
+                vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
+            },
+        )
+        .anyview();
         let bar = when(open, move || {
             hstack((
                 field("find in buffer", &query),
@@ -915,8 +976,7 @@ impl View for PaneLeaf {
                 }
             })
             .computed();
-        vstack((bar, surface))
-            .spacing(0.0)
+        zstack((vstack((bar, surface)).spacing(0.0), paste_overlay))
             .context_menu(menu)
             .state(&session)
     }

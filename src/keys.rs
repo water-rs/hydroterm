@@ -467,6 +467,10 @@ pub enum TermAction {
     /// URL hint mode: number the visible links, type digits + Enter to
     /// open one without the mouse.
     UrlHints,
+    /// Paste-protection overlay answers: write the stashed clipboard
+    /// text (confirm) or drop it (cancel).
+    PasteConfirm,
+    PasteCancel,
     /// Copy the output of the last finished (or running) command — the
     /// rows between its OSC 133 `C` and `D` marks.
     CopyLastOutput,

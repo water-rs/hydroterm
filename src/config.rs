@@ -50,6 +50,13 @@ pub struct AppConfig {
     /// transparent when this starts below 1.0 — raising it live works;
     /// dropping it on an opaque-start window just darkens.
     pub background_opacity: f32,
+    /// Guard multi-line clipboard pastes behind a confirmation overlay
+    /// (Ghostty `clipboard-paste-protection`). Bracketed-paste-armed
+    /// programs skip the guard — wrapped text can't execute mid-paste.
+    pub paste_protection: bool,
+    /// Hide the pointer while typing; it returns on the next move
+    /// (Ghostty `mouse-hide-while-typing`). X11 only — XFixes HideCursor.
+    pub mouse_hide_typing: bool,
 }
 
 impl Default for AppConfig {
@@ -67,6 +74,8 @@ impl Default for AppConfig {
             keybinds: Vec::new(),
             audible_bell: true,
             background_opacity: 1.0,
+            paste_protection: true,
+            mouse_hide_typing: true,
         }
     }
 }
@@ -162,6 +171,16 @@ impl AppConfig {
                 "background-opacity" | "background_opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
                     _ => errors.push(format!("line {}: bad background-opacity {value:?}", n + 1)),
+                },
+                "paste-protection" | "clipboard-paste-protection" => match value {
+                    "true" | "yes" | "1" | "on" => cfg.paste_protection = true,
+                    "false" | "no" | "0" | "off" => cfg.paste_protection = false,
+                    _ => errors.push(format!("line {}: bad paste-protection {value:?}", n + 1)),
+                },
+                "mouse-hide-while-typing" | "mouse_hide_while_typing" => match value {
+                    "true" | "yes" | "1" | "on" => cfg.mouse_hide_typing = true,
+                    "false" | "no" | "0" | "off" => cfg.mouse_hide_typing = false,
+                    _ => errors.push(format!("line {}: bad mouse-hide-while-typing {value:?}", n + 1)),
                 },
                 "theme" => {
                     if value.eq_ignore_ascii_case("auto") {

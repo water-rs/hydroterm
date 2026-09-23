@@ -240,6 +240,9 @@ pub struct TermSurface {
     /// Shared palette — swapped on theme reload.
     palette: Rc<RefCell<Palette>>,
     font_size_pt: f32,
+    /// The `font-family` pref the shaping stack was built for — compared
+    /// against `session.font_family` each frame (hot reload).
+    family_pref: String,
 
     // geometry (grid size in cells, logical units at draw time)
     cols: u16,
@@ -278,6 +281,10 @@ pub struct TermSurface {
     /// URL hint mode state — chips over every visible link + digits typed.
     hints: Option<HintState>,
     clipboard: Option<waterkit_clipboard::Clipboard>,
+    /// X11 pointer-hide for `mouse-hide-while-typing` (None off-X11).
+    cursor_hider: Option<crate::xcursor::CursorHider>,
+    /// Set when the hider was attempted — avoid reconnecting per frame.
+    cursor_hider_tried: bool,
 }
 
 impl TermSurface {
@@ -290,13 +297,15 @@ impl TermSurface {
         fonts: FontCollection,
     ) -> Self {
         let font_size = session.font_size.get();
+        let family_pref = session.font_family.get().to_string();
         app.register_theme_wake(&session.terminal);
         Self {
             session,
             app,
-            fonts: TermFonts::load(fonts, font_size),
+            fonts: TermFonts::load(fonts, font_size, &family_pref),
             palette,
             font_size_pt: font_size,
+            family_pref,
             cols: 0,
             lines: 0,
             invalidator: None,
@@ -317,6 +326,8 @@ impl TermSurface {
             search: None,
             hints: None,
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
+            cursor_hider: None,
+            cursor_hider_tried: false,
         }
     }
 
@@ -356,22 +367,47 @@ impl TermSurface {
     }
 
     /// Clipboard text → PTY, with bracketed-paste markers when armed.
+    /// Multi-line pastes route through the paste-protection confirm
+    /// overlay (Ghostty `clipboard-paste-protection`) unless the program
+    /// armed bracketed paste — wrapped text can't execute mid-paste.
     fn paste_clipboard(&mut self) {
         let Some(clip) = &self.clipboard else { return };
         if let Ok(Some(text)) = pollster::block_on(clip.text()) {
             let bracketed =
                 self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-            let mut out = String::with_capacity(text.len() + 12);
-            if bracketed {
-                out.push_str("\x1b[200~");
+            let unsafe_text = text.contains('\n') || text.contains('\r');
+            if unsafe_text && !bracketed && self.app.config(|c| c.paste_protection) {
+                self.session.pending_paste.set_from(Some(text.into()));
+                return;
             }
-            // A literal ESC would let the pasted text escape the bracket.
-            out.push_str(&text.replace('\x1b', ""));
-            if bracketed {
-                out.push_str("\x1b[201~");
-            }
-            self.write(out.into_bytes());
-            self.snap_to_bottom_if_scrolled();
+            self.paste_text(&text, bracketed);
+        }
+    }
+
+    /// Write `text` to the PTY as a (possibly bracketed) paste.
+    fn paste_text(&mut self, text: &str, bracketed: bool) {
+        let mut out = String::with_capacity(text.len() + 12);
+        if bracketed {
+            out.push_str("\x1b[200~");
+        }
+        // A literal ESC would let the pasted text escape the bracket.
+        out.push_str(&text.replace('\x1b', ""));
+        if bracketed {
+            out.push_str("\x1b[201~");
+        }
+        self.write(out.into_bytes());
+        self.snap_to_bottom_if_scrolled();
+    }
+
+    /// Paste-protection overlay answer: write the stashed text
+    /// (Enter/[Paste]) or drop it (Escape/[Cancel]).
+    fn paste_confirm(&mut self, accept: bool) {
+        let text = self.session.pending_paste.get().map(|t| t.to_string());
+        self.session.pending_paste.set(None);
+        if accept && let Some(text) = text {
+            let bracketed =
+                self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+            self.paste_text(&text, bracketed);
         }
     }
 
@@ -412,6 +448,8 @@ impl TermSurface {
         match action {
             TermAction::Copy => self.copy_selection(),
             TermAction::Paste => self.paste_clipboard(),
+            TermAction::PasteConfirm => self.paste_confirm(true),
+            TermAction::PasteCancel => self.paste_confirm(false),
             TermAction::NewTab => {
                 self.app.new_tab();
             }
@@ -729,8 +767,13 @@ impl TermSurface {
         }
     }
 
-    /// Re-measure fonts when the size changes.
+    /// Re-measure fonts when size or family changes (hot reload).
     fn sync_fonts(&mut self) {
+        let pref = self.session.font_family.get().to_string();
+        if pref != self.family_pref {
+            self.family_pref = pref.clone();
+            self.fonts.reload_family(&pref);
+        }
         let want = self.session.font_size.get();
         if (want - self.font_size_pt).abs() > f32::EPSILON {
             self.font_size_pt = want;
@@ -803,6 +846,21 @@ impl TermSurface {
         if pressed && self.search.is_some() && self.search_key(key, mods) {
             return true;
         }
+        // Paste-protection overlay captures Enter/Escape; other keys
+        // fall through so the pending paste can't swallow input.
+        if pressed && self.session.pending_paste.get().is_some() {
+            match key {
+                Key::Named(NamedKey::Enter) => {
+                    self.paste_confirm(true);
+                    return true;
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.paste_confirm(false);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         // URL hint mode captures keys: digits/Backspace feed the buffer,
         // Enter opens, Escape cancels — everything else cancels and falls
         // through to normal handling.
@@ -826,6 +884,7 @@ impl TermSurface {
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
                 self.write(bytes);
+                self.hide_cursor_on_typing();
                 return self.snap_to_bottom_if_scrolled();
             }
             false
@@ -968,6 +1027,21 @@ impl TermSurface {
         }
     }
 
+    /// `mouse-hide-while-typing`: hide the pointer on real typed input.
+    /// The hider connects lazily (X11 only) and the toggle is live.
+    fn hide_cursor_on_typing(&mut self) {
+        if !self.app.config(|c| c.mouse_hide_typing) {
+            return;
+        }
+        if !self.cursor_hider_tried {
+            self.cursor_hider_tried = true;
+            self.cursor_hider = crate::xcursor::CursorHider::new();
+        }
+        if let Some(h) = &mut self.cursor_hider {
+            h.hide();
+        }
+    }
+
     /// Append typed text — palette query while open, search query when
     /// searching, else PTY. Returns true when the text changed scene or
     /// UI state (needs a frame); PTY passthrough returns false.
@@ -989,12 +1063,18 @@ impl TermSurface {
             self.session.search_query.set_from(q);
             return true;
         }
+        // Text arriving while a paste is pending is the user's real
+        // input — the overlay is modal on the paste, not on typing.
+        if self.session.pending_paste.get().is_some() {
+            return true;
+        }
         // Hint-mode digits are already consumed by `hint_key`'s Character
         // arm — swallow the paired TextInput so nothing reaches the PTY.
         if self.hints.is_some() {
             return true;
         }
         self.write(text.as_bytes().to_vec());
+        self.hide_cursor_on_typing();
         self.snap_to_bottom_if_scrolled()
     }
 
@@ -1629,10 +1709,16 @@ impl SceneContent for TermSurface {
                 false
             }
             SurfaceInputEvent::PointerMove { position } => {
+                if let Some(h) = &mut self.cursor_hider {
+                    h.show();
+                }
                 self.on_pointer_move(position.x, position.y);
                 true
             }
             SurfaceInputEvent::PointerButton { pressed, button, position } => {
+                if let Some(h) = &mut self.cursor_hider {
+                    h.show();
+                }
                 self.on_pointer_button(*pressed, *button, position.x, position.y);
                 true
             }
