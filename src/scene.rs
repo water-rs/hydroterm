@@ -28,6 +28,19 @@ pub struct ScrollInfo {
     pub screen_lines: usize,
 }
 
+/// One numbered URL-hint chip over a row span (URL hint mode).
+#[derive(Clone)]
+pub struct HintSpan {
+    /// Start column (exclusive end in `col1`), viewport row, 1-based label.
+    pub col0: usize,
+    /// End column (exclusive).
+    pub col1: usize,
+    /// Viewport row.
+    pub row: usize,
+    /// 1-based hint number the user types to open this link.
+    pub label: usize,
+}
+
 /// Runtime state the scene pass needs beyond the term's renderable content.
 pub struct DrawContext<'a> {
     pub palette: &'a Palette,
@@ -53,6 +66,10 @@ pub struct DrawContext<'a> {
     /// Alpha of the default background fill (window transparency; 1.0 =
     /// opaque). Cells with explicit (non-default) backgrounds stay opaque.
     pub bg_opacity: f32,
+    /// URL hint chips over link spans (empty = hint mode off).
+    pub hints: &'a [HintSpan],
+    /// Digits typed so far in hint mode — shown as a status chip.
+    pub hint_digits: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +361,43 @@ pub fn draw_term(
         }
     }
 
-    // -- Hovered link --------------------------------------------------------
-    // (links already draw underlined via DECO_UNDERLINE; hover changes color)
+    // -- URL hints ------------------------------------------------------------
+    if !ctx.hints.is_empty() || !ctx.hint_digits.is_empty() {
+        let chip_bg = palette.selection_bg;
+        for h in ctx.hints {
+            let x = col_x(pad, cw, h.col0);
+            let w = (h.col1 - h.col0) as f32 * cw;
+            let y = row_y(pad, ch, h.row);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &Brush::Solid(peniko_alpha(chip_bg, 0.9)),
+                None,
+                &rect(x, y, w, ch),
+            );
+            draw_chip_text(
+                scene,
+                &h.label.to_string(),
+                x,
+                y + m.baseline,
+                palette.background,
+                ctx,
+            );
+        }
+        if !ctx.hint_digits.is_empty() {
+            let label = format!("open: {}", ctx.hint_digits);
+            let y = ctx.height - ch - 4.0;
+            let w = label.chars().count() as f32 * cw;
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &Brush::Solid(peniko_alpha(chip_bg, 0.95)),
+                None,
+                &rect(4.0, y, w, ch),
+            );
+            draw_chip_text(scene, &label, 4.0, y + m.baseline, palette.background, ctx);
+        }
+    }
 
     // -- Cursor --------------------------------------------------------------
     draw_cursor(scene, &grid, &cursor, ctx, mode);
@@ -690,6 +742,61 @@ fn draw_preedit(
     p.move_to((x0 as f64, (baseline_y + m.underline_pos) as f64));
     p.line_to(((x0 + w) as f64, (baseline_y + m.underline_pos) as f64));
     scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, &brush, None, &p);
+}
+
+/// Small text drawn inside a chip — same `shape_run` + `GlyphRun` path
+/// as the IME preedit, without the underline stroke.
+fn draw_chip_text(
+    scene: &mut dyn Scene2D,
+    text: &str,
+    x0: f32,
+    baseline_y: f32,
+    color: Rgb,
+    ctx: &mut DrawContext<'_>,
+) {
+    let layout = ctx.fonts.shape_run(text, false, false);
+    let brush = Brush::Solid(peniko(color));
+    let mut pen = 0.0f32;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    for line in layout.lines() {
+        for item in line.items() {
+            let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                continue;
+            };
+            let start = glyphs.len();
+            for g in gr.glyphs() {
+                glyphs.push(Glyph {
+                    id: g.id,
+                    x: x0 + pen + g.x,
+                    y: g.y,
+                });
+                pen += g.advance;
+            }
+            runs.push((start, glyphs.len()));
+        }
+    }
+    let mut idx = 0usize;
+    for line in layout.lines() {
+        for item in line.items() {
+            let parley::PositionedLayoutItem::GlyphRun(gr) = item else {
+                continue;
+            };
+            let (start, end) = runs[idx];
+            idx += 1;
+            let run = gr.run();
+            scene.draw_glyph_run(&GlyphRun {
+                font: run.font(),
+                font_size: run.font_size(),
+                normalized_coords: run.normalized_coords(),
+                transform: Affine::translate((0.0, baseline_y as f64)),
+                brush: &brush,
+                brush_alpha: 1.0,
+                style: StyleRef::Fill(Fill::NonZero),
+                glyphs: &glyphs[start..end],
+            });
+        }
+    }
 }
 
 /// Thin scrollbar at the right edge when scrollback exists.

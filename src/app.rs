@@ -12,7 +12,7 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::collection::List as NamiList;
 use nami::{Binding, binding};
-use waterui::impl_extractor;
+use waterui::state;
 use waterui::Identifiable;
 use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
@@ -72,6 +72,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// Queue an action the surface drains on its next frame — shared by
+    /// the command palette and the pane's context menu.
+    pub fn push_action(&self, action: TermAction) {
+        self.pending_actions.borrow_mut().push(action);
+        self.terminal.proxy.request_frame();
+    }
+
     fn spawn(id: u64, cwd: Option<std::path::PathBuf>, cfg: &AppConfig) -> Self {
         let config = Config {
             scrolling_history: cfg.scrollback,
@@ -201,6 +208,7 @@ pub struct PaneTab {
 
 /// Everything tabs and surfaces share.
 #[derive(Clone)]
+#[state]
 pub struct AppState {
     /// Session list — panes index into it.
     sessions: Rc<RefCell<Vec<Rc<Session>>>>,
@@ -255,8 +263,6 @@ pub struct AppState {
     quick_listener_started: Rc<AtomicBool>,
     /// Retained drain-future handle — dropping a spawned task cancels it.
     quick_task: Rc<RefCell<Option<Box<dyn std::any::Any>>>>,
-    /// Frame binding of the live quick window (kept to re-dock after mount).
-    quick_frame: Rc<RefCell<Option<Binding<Rect>>>>,
     /// Hotkey fires but grab failed (no X11) — surface it once.
     pub quick_unavailable: RefCell<bool>,
     /// True for the drop-down's own AppState: it neither hosts a quick
@@ -270,7 +276,22 @@ pub struct AppState {
 
 // `.state(&app)` injection rows read the state back through a plain
 // `AppState` extractor parameter.
-impl_extractor!(AppState);
+
+
+/// Extractor key for a pane's session — a local newtype because the
+/// orphan rule won't let `Extractor` (foreign) be implemented for
+/// `Rc<Session>` (also foreign). Per-pane `.state(&PaneSession(..))` lets
+/// context-menu items and bar buttons take the session from the env.
+#[state]
+#[derive(Clone)]
+pub struct PaneSession(pub Rc<Session>);
+
+impl std::ops::Deref for PaneSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.0
+    }
+}
 
 impl AppState {
     /// Create with one running session.
@@ -312,7 +333,6 @@ impl AppState {
             quick_app: RefCell::new(None),
             quick_listener_started: Rc::new(AtomicBool::new(false)),
             quick_task: Rc::new(RefCell::new(None)),
-            quick_frame: Rc::new(RefCell::new(None)),
             quick_unavailable: RefCell::new(false),
             is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
@@ -432,40 +452,14 @@ impl AppState {
         if self.is_quick || self.quick_listener_started.swap(true, Ordering::SeqCst) {
             return;
         }
-        // One channel carries both the X11 hotkey press and the delayed
-        // frame re-dock (the position apply on a just-mapped X11 window can
-        // be lost; re-emitting the frame binding wakes the loop and re-runs
-        // `apply_properties` on the now-visible window).
-        #[derive(Clone)]
-        enum QuickEvent {
-            Hotkey,
-            Dock,
-        }
-        let (tx, rx) = async_channel::unbounded::<QuickEvent>();
-        match crate::quickterm::spawn_hotkey(tx.clone(), crate::quickterm::XK_F12, QuickEvent::Hotkey) {
+        let (tx, rx) = async_channel::unbounded::<()>();
+        match crate::quickterm::spawn_hotkey(tx, crate::quickterm::XK_F12, ()) {
             Some(_) => {
                 let app = self.clone();
                 let task = spawn_local(async move {
-                    while let Ok(event) = rx.recv().await {
+                    while let Ok(()) = rx.recv().await {
                         while rx.try_recv().is_ok() {}
-                        match event {
-                            QuickEvent::Hotkey => {
-                                app.toggle_quick();
-                                if app.quick_state.get() != WindowState::Closed {
-                                    let dock_tx = tx.clone();
-                                    std::thread::spawn(move || {
-                                        // The first mount is slow (renderer
-                                        // init + PTY spawn): poke at a few
-                                        // delays so one lands post-map.
-                                        for delay in [200u64, 700, 1500] {
-                                            std::thread::sleep(std::time::Duration::from_millis(delay));
-                                            let _ = dock_tx.try_send(QuickEvent::Dock);
-                                        }
-                                    });
-                                }
-                            }
-                            QuickEvent::Dock => app.dock_quick_frame(),
-                        }
+                        app.toggle_quick();
                     }
                 });
                 *self.quick_task.borrow_mut() = Some(Box::new(task));
@@ -474,19 +468,6 @@ impl AppState {
                 *self.quick_unavailable.borrow_mut() = true;
             }
         }
-    }
-
-    /// Re-apply the dock frame after the quick window has mapped — the
-    /// position applied while the X11 window was still invisible is lost
-    /// (the window manager picks its own placement), so poke the binding
-    /// once it exists on screen.
-    fn dock_quick_frame(&self) {
-        let Some(frame) = self.quick_frame.borrow().clone() else { return };
-        let Some((sw, sh)) = crate::quickterm::screen_size() else { return };
-        frame.set(Rect::new(
-            Point::new(0.0, 0.0),
-            Size::new(sw as f32, (sh * 0.45) as f32),
-        ));
     }
 
     /// Build the quick terminal's borderless top-docked window (mounted by
@@ -499,14 +480,18 @@ impl AppState {
         })
         .style(WindowStyle::Borderless)
         .resizable(false);
-        // Dock: top of the primary screen, full width, 45% height.
+        // Dock: top of the primary screen, full width, 45% height. The
+        // initial frame is requested up front — position applied while the
+        // X11 window is still invisible is currently dropped by the WM
+        // (hydrolysis#105), so the drop-down may land wherever the window
+        // manager places it until that fix lands. No timed re-emit: racing
+        // the WM is forbidden workaround, not a fix.
         if let Some((sw, sh)) = crate::quickterm::screen_size() {
             w.frame.set(Rect::new(
                 Point::new(0.0, 0.0),
                 Size::new(sw as f32, (sh * 0.45) as f32),
             ));
         }
-        *self.quick_frame.borrow_mut() = Some(w.frame.clone());
         w
     }
 
@@ -795,20 +780,39 @@ impl View for PaneLeaf {
         let status = self.session.search_status.clone();
         let open = self.session.search_open.clone();
         let surface = Frame::new(SceneView::new(TermSurface::new(
-            self.session,
+            self.session.clone(),
             self.state.clone(),
             self.state.palette,
             FontCollection::from_env(env),
         )));
+        let session = PaneSession(self.session); // `.state` stores a clone
+        let bar_session = session.clone();
         let bar = when(open, move || {
             hstack((
                 text("/ "),
                 field("find in buffer", &query),
                 text(status.clone()),
+                text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchPrev)),
+                text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchNext)),
             ))
+            // Lazily-built subtrees capture their construction env, so
+            // extractors need the state injected inside the `when` body.
+            .state(&bar_session)
         })
         .anyview();
-        vstack((bar, surface)).spacing(0.0)
+        vstack((bar, surface))
+            .spacing(0.0)
+            .context_menu(vec![
+                "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)),
+                "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)),
+                "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)),
+                "Find in Buffer".action(|s: PaneSession| s.push_action(TermAction::Search)),
+                "Split Right".action(|s: PaneSession| s.push_action(TermAction::SplitRight)),
+                "Split Down".action(|s: PaneSession| s.push_action(TermAction::SplitDown)),
+                "Toggle Pane Zoom".action(|s: PaneSession| s.push_action(TermAction::PaneZoom)),
+                "Close Pane".action(|s: PaneSession| s.push_action(TermAction::CloseTab)),
+            ])
+            .state(&session)
     }
 }
 
@@ -884,19 +888,23 @@ fn tab_content(tab: PaneTab, app: AppState) -> impl View {
 /// `SceneView` or drops its keyboard focus (Principle 8: precise
 /// signals over `watch`). The active tab shows via `.visible`, which
 /// keeps the view mounted but undrawn and non-hittable.
-// `handler_captures_binding` would push the tab-tap binding through a
-// `State<Binding<u64>>` extractor — but extractor parameters in `.on_tap`
-// panic at click time (WATERUI_FEEDBACK #20), so the closure captures it.
-#[allow(handler_captures_binding)]
+/// `AppState` is injected once at the root (`.state(&state)`); every
+/// handler below takes it back as an `AppState` extractor parameter —
+/// the natural shape now that missing injections are a fail-fast panic,
+/// not something to route around.
 pub fn tabs_view(state: AppState) -> impl View {
     let palette_overlay = when(state.palette_open.clone(), {
         let state = state.clone();
-        move || palette_view(state.clone())
+        let inject = state.clone();
+        // Lazy builders don't see `.state` applied to ancestors — inject
+        // inside so extractor handlers find AppState.
+        move || palette_view(state.clone()).state(&inject)
     })
     .anyview();
     let settings_overlay = when(state.settings_open.clone(), {
         let state = state.clone();
-        move || settings_view(state.clone())
+        let inject = state.clone();
+        move || settings_view(state.clone()).state(&inject)
     })
     .anyview();
 
@@ -913,26 +921,21 @@ pub fn tabs_view(state: AppState) -> impl View {
             let indicator_color = signal_color(
                 active.select(Color::new(Accent), Color::new(Background)),
             );
-            let sel = app.selected.clone();
             vstack((
                 hstack((
                     text(tab.title.clone()).foreground(label_color),
                     text("×")
                         .muted()
                         .padding_with([3.0, 0.0, 4.0, 4.0])
-                        .on_tap({
-                            let app = app.clone();
-                            move || app.close_tab(tab_id)
-                        }),
+                        .on_tap(move |app: AppState| app.close_tab(tab_id)),
                 ))
                 .padding_with([4.0, 0.0, 8.0, 4.0]),
                 Frame::new(indicator_color).height(3.0),
             ))
             .spacing(0.0)
             .height(TAB_STRIP_HEIGHT)
-            // Zero-arg closure — `.on_tap` with an extractor parameter
-            // panics on click (feedback #20).
-            .on_tap(move || sel.set(tab_id))
+            .on_tap(move |app: AppState| app.selected.set(tab_id))
+            .state(&app)
         })
     };
     let strip_bar = hstack((
@@ -940,10 +943,7 @@ pub fn tabs_view(state: AppState) -> impl View {
         text("+")
             .muted()
             .padding()
-            .on_tap({
-                let state = state.clone();
-                move || _ = state.new_tab()
-            }),
+            .on_tap(|app: AppState| _ = app.new_tab()),
     ))
     .spacing(4.0)
     .padding();
@@ -952,7 +952,9 @@ pub fn tabs_view(state: AppState) -> impl View {
         let app = state.clone();
         Frame::new(ZStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
             let app = app.clone();
-            tab_content(tab.clone(), app.clone()).visible(app.selected.equal_to(tab.id))
+            tab_content(tab.clone(), app.clone())
+                .visible(app.selected.equal_to(tab.id))
+                .state(&app)
         }))
         .max_width(f32::INFINITY)
         .max_height(f32::INFINITY)
@@ -976,6 +978,7 @@ pub fn tabs_view(state: AppState) -> impl View {
         settings_overlay,
         quick,
     ))
+    .state(&state)
 }
 
 /// A command-palette row: display name, chord hint, action.
@@ -1006,8 +1009,12 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
     PaletteItem { name: "Jump to Previous Prompt", chord: "ctrl+shift+up", action: TermAction::PromptPrev },
     PaletteItem { name: "Jump to Next Prompt", chord: "ctrl+shift+down", action: TermAction::PromptNext },
-    PaletteItem { name: "Scroll to Top", chord: "", action: TermAction::ScrollToTop },
-    PaletteItem { name: "Scroll to Bottom", chord: "", action: TermAction::ScrollToBottom },
+    PaletteItem { name: "Scroll to Top", chord: "ctrl+shift+home", action: TermAction::ScrollToTop },
+    PaletteItem { name: "Scroll to Bottom", chord: "ctrl+shift+end", action: TermAction::ScrollToBottom },
+    PaletteItem { name: "Scroll Page Up", chord: "shift+pageup", action: TermAction::ScrollPageUp },
+    PaletteItem { name: "Scroll Page Down", chord: "shift+pagedown", action: TermAction::ScrollPageDown },
+    PaletteItem { name: "URL Hints (open link by number)", chord: "ctrl+shift+u", action: TermAction::UrlHints },
+    PaletteItem { name: "Copy Last Command Output", chord: "ctrl+shift+o", action: TermAction::CopyLastOutput },
     PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
     PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
     PaletteItem { name: "Toggle Fullscreen", chord: "ctrl+shift+f11", action: TermAction::Fullscreen },
@@ -1141,14 +1148,20 @@ fn palette_view(state: AppState) -> impl View {
                 move |i: SelfId<usize>| {
                     let i = *i;
                     let item = items[i];
-                    let row = hstack((
-                        text(item.name).foreground(Foreground),
-                        Spacer::flexible(),
-                        text(item.chord).muted(),
-                    ))
-                    .padding()
-                    .on_tap(move |app: AppState| app.run_palette_at(i))
-                    .state(&state);
+                    // Rows activate through `button` — the List puts
+                    // ButtonStyle::Plain + ListRowChrome into the row env, so a
+                    // row tap is the framework's own button path (a bare
+                    // `.on_tap` on row content does not fire).
+                    let row = button(Label::new(item.name, {
+                        let name = item.name;
+                        let chord = item.chord;
+                        move || hstack((
+                            text(name).foreground(Foreground),
+                            Spacer::flexible(),
+                            text(chord).muted(),
+                        ))
+                    }))
+                    .action(move |app: AppState| app.run_palette_at(i));
                     ListItem::new(row).selected(state.palette_sel.equal_to(i))
                 }
             })
@@ -1189,10 +1202,7 @@ fn settings_view(state: AppState) -> impl View {
             Spacer::flexible(),
             toggle("Cursor blink", &state.set_blink).hide_label(),
         )),
-        {
-            let app = state.clone();
-            button("Apply").action(move || app.apply_settings())
-        },
+        button("Apply").action(|app: AppState| app.apply_settings()),
     ))
     .spacing(8.0)
     .padding()

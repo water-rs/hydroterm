@@ -290,6 +290,22 @@ fn kitty_csi_u(codepoint: u32, mods: Modifiers, release: bool) -> Vec<u8> {
 /// Returns the action name so the caller can run it instead of writing to
 /// the PTY.
 pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
+    // Shift-only PageUp/PageDown scroll one page — the xterm/alacritty
+    // convention (Ctrl+Shift+PageUp/Down stays bound to tab cycling).
+    if mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::CONTROL)
+        && !mods.contains(Modifiers::ALT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::PageUp => Some(TermAction::ScrollPageUp),
+                NamedKey::PageDown => Some(TermAction::ScrollPageDown),
+                _ => None,
+            };
+        }
+        return None;
+    }
     if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
         return None;
     }
@@ -297,6 +313,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         return Some(match named {
             NamedKey::ArrowUp => TermAction::PromptPrev,
             NamedKey::ArrowDown => TermAction::PromptNext,
+            NamedKey::Home => TermAction::ScrollToTop,
+            NamedKey::End => TermAction::ScrollToBottom,
             NamedKey::F11 => TermAction::Fullscreen,
             _ => return None,
         });
@@ -318,6 +336,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "-" | "_" => TermAction::FontSmaller,
         "0" | ")" => TermAction::FontReset,
         "k" => TermAction::ClearScrollback,
+        "o" => TermAction::CopyLastOutput,
+        "u" => TermAction::UrlHints,
         "f" => TermAction::Search,
         "p" => TermAction::Palette,
         "," | "<" => TermAction::Settings,
@@ -385,6 +405,18 @@ pub enum TermAction {
     /// Scroll the viewport to the top of scrollback / the bottom.
     ScrollToTop,
     ScrollToBottom,
+    /// Scroll one page up/down through scrollback (Shift+PageUp/Down).
+    ScrollPageUp,
+    ScrollPageDown,
+    /// URL hint mode: number the visible links, type digits + Enter to
+    /// open one without the mouse.
+    UrlHints,
+    /// Copy the output of the last finished (or running) command — the
+    /// rows between its OSC 133 `C` and `D` marks.
+    CopyLastOutput,
+    /// Step the search match cursor forward / back.
+    SearchNext,
+    SearchPrev,
     /// Shut down all sessions and exit.
     Quit,
     /// Split the focused pane right/down (new pane takes half its slot).

@@ -32,6 +32,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Input | Mouse: X10/normal/SGR + UTF8 + all-motion + focus events | ✅ | `vim` mouse mode, `htop` clicks |
 | Input | Bracketed paste | ✅ | paste into `cat -v` shows \x1b[200~ wrap |
 | Input | Alternate scroll (wheel → arrows in alt screen) | ✅ | scroll in `less` |
+| Input | Keyboard scrolling | ✅ | Shift+PageUp/PageDown scrolls a page, Ctrl+Shift+Home/End jumps to scrollback top/bottom (verified live) |
 | Clipboard | Copy selection (primary + clipboard) | ✅ | drag + Ctrl+Shift+C, `xclip -o` verify |
 | Clipboard | Paste via Ctrl+Shift+V / middle-click (bracketed) | ✅ | paste `hello` at prompt |
 | Clipboard | OSC 52 write + read | ✅ | `printf '\e]52;c;aGVsbG8=\a'` → `xclip -o` = hello |
@@ -39,13 +40,14 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Selection | Copy-on-select | ✅ | `copy-on-select = true` in config |
 | Links | OSC 8 hyperlink render + Ctrl+click open | ✅ | `printf '\e]8;;https://example.com\e\\link\e]8;;\e\\'` |
 | Links | Plain-text URL detect + open | ✅ | scheme-scan over the clicked row's cells; Ctrl+click → xdg-open (verified: navigated Chrome) |
+| Links | URL hint mode | ✅ | Ctrl+Shift+U draws numbered chips over every visible link; typing the label + Enter opens it via xdg-open, digits/Backspace edit, Esc cancels (verified live) |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
 | Splits | Pane zoom toggle (tmux-style) | ✅ | Ctrl+Shift+Z → focused pane fills the tab (`PaneTab.zoomed: Binding<Option<u64>>`); toggling restores the split — verified live both ways |
 | Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #13 → water-rs/waterui#1203) |
 | Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#18; also #19 — keys keep routing to a hidden focused surface) |
 | Windows | Multi-window | ✅ | Ctrl+Shift+N → `Window::show(env)` via the runner's `WindowManager` mounts a real winit window with a fresh session set (verified live: `<2>` title, independent session) |
-| Quick terminal | Drop-down/global-hotkey terminal | ✅ | F12 via X11 `GrabKey` on root (4 lock-mask variants — `ModMask::ANY` conflicts with WM grabs; x11rb connection on a grab thread → channel → `spawn_local` drain → `WindowState` toggle). `conditional_window` mounts a `WindowStyle::Borderless` non-resizable window docked top / full-width / 45% height with its own persistent session set (verified live: toggle open/close, scrollback + shell preserved across cycles, keys reach its surface after click-focus per #90). Position-apply on the invisible X11 window is dropped by the WM, so a delayed frame re-emit re-docks it (WATERUI_FEEDBACK #21) |
+| Quick terminal | Drop-down/global-hotkey terminal | ✅ | F12 via X11 `GrabKey` on root (4 lock-mask variants — `ModMask::ANY` conflicts with WM grabs; x11rb connection on a grab thread → channel → `spawn_local` drain → `WindowState` toggle). `conditional_window` mounts a `WindowStyle::Borderless` non-resizable window docked top / full-width / 45% height with its own persistent session set (verified live: toggle open/close, scrollback + shell preserved across cycles, keys reach its surface after click-focus per #90). Position applied while the X11 window is still invisible is dropped by the WM (hydrolysis#105) — NO app workaround by design: until the fix lands the drop-down may open wherever the window manager places it (size still applies; position may not). Verified live: toggles open/close, preserved session |
 | Config | `key = value` config file (~/.config/hydroterm/config) | ✅ | 8 parser unit tests; template auto-written |
 | Config | Hot reload on file change | ✅ | mtime poll (400ms); verified live font-size + theme swap |
 | Config | `keybind = chord=action` incl. unbind | ✅ | unit tests + live `ctrl+shift+q=quit` verified |
@@ -63,11 +65,14 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected integration for bash (--rcfile), zsh (ZDOTDIR), fish (-C): all emit A/B/C/D; verified live jump in zsh + fish |
 | Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
 | Shell int. | OSC 9/777 notifications | ✅ | bell flash + 🔔 badge on title until user input + freedesktop `notify-send` desktop notification where available (badge verified; notify-send spawned, best-effort) |
+| Shell int. | Copy last command output | ✅ | Ctrl+Shift+O copies the output region between the last OSC 133 A and D marks (`last_output` span recorded by the OSC tap) — verified live in xclip |
 | Bell | Visual bell (flash) | ✅ | Bell event → flash overlay |
 | Bell | Audible bell | ✅ | `audible-bell = true` rings the X11 keyboard bell via `xkbbell` (what xterm rings), 120 ms throttled — verified end-to-end with a logging shim |
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight the *full* match span (wide chars cover both cells, `match_columns`), Enter jumps to next |
+| Search | Prev/next match navigation | ✅ | Shift+Enter jumps to previous match; bar ↑/↓ buttons step up/down (`SearchNext`/`SearchPrev` actions, wrap-around via `rem_euclid`, scrolls match to mid-viewport) — verified live both directions |
 | Shell UI | Settings page | ✅ | Ctrl+Shift+, → opaque token panel over a dim mask; labeled theme picker, font-size value + stepper, toggle; Apply writes config file → hot reload |
-| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs, Esc closes |
+| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs (rows are `button`s — List styles them via the row env), Esc closes |
+| Shell UI | Context menu (right-click) | 🚫 | framework-blocked: a secondary click over an input-consuming `SceneView` is delivered to the embedded sink and returns before `.context_menu` targets are hit-tested — minimal repro in WATERUI_FEEDBACK #22 |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `i=`/`p=` image+placement ids + `\x1b_G…;OK` replies + `t=d` direct/`t=f` file/`t=s` shared-memory mediums + `x,y,w,h` source crop (verified: solid half drawn) + signed `z` z-index (`z<0` over cell bg, below text — verified with text over image) + `c`/`r` cell span + `a=d` delete with `d=a|i|p|z|c` selectors (verified live) + palette/grayscale/16-bit PNG normalize; no unicode placements/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |

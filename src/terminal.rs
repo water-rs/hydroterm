@@ -15,6 +15,10 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{ClipboardType, Config, Term};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
+
+/// Absolute-row span of a command's output: `(C-mark row, Option<D-mark
+/// row>)` — `None` end while the command is still running.
+type OutputSpan = Option<(i64, Option<i64>)>;
 use alacritty_terminal::vte::ansi::Rgb;
 use polling::{Event as PollingEvent, PollMode, Poller};
 
@@ -169,6 +173,11 @@ pub struct Terminal {
     /// Rows drift if scrollback overflows — the oldest lines drop without a
     /// hook to rebase stored marks.
     pub prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
+    /// Absolute rows of the last command's output: `Some((start, end))`
+    /// where `start` is the OSC 133 `C` (CommandStart) row and `end` is
+    /// the `D` (CommandEnd) row — `None` end while the command is still
+    /// running. Recorded on the reader thread like `prompt_marks`.
+    pub last_output: Arc<Mutex<OutputSpan>>,
     pub events: Mutex<Receiver<TermEvent>>,
     _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
 }
@@ -210,10 +219,12 @@ impl Terminal {
             0,
         )?;
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
+        let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
         let pty = TapPty::new(
             pty,
             term.clone(),
             prompt_marks.clone(),
+            last_output.clone(),
             proxy.inner.events.clone(),
         );
 
@@ -222,7 +233,7 @@ impl Terminal {
         proxy.inner.notifier.set(Notifier(io.clone())).ok();
         let join = event_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, events: Mutex::new(events_rx), _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, events: Mutex::new(events_rx), _join: join })
     }
 
     /// Write user input bytes to the PTY.
@@ -377,6 +388,7 @@ pub struct TapReader {
     /// Keeps the `Term` pointed to by `term` alive.
     _term: Arc<FairMutex<Term<EventProxy>>>,
     marks: Arc<std::sync::Mutex<Vec<i64>>>,
+    output: Arc<Mutex<OutputSpan>>,
     sink: Sender<TermEvent>,
 }
 
@@ -385,6 +397,7 @@ impl TapPty {
         pty: tty::Pty,
         term: Arc<FairMutex<Term<EventProxy>>>,
         marks: Arc<std::sync::Mutex<Vec<i64>>>,
+        output: Arc<Mutex<OutputSpan>>,
         sink: Sender<TermEvent>,
     ) -> Self {
         let term_ptr = {
@@ -401,6 +414,7 @@ impl TapPty {
             term: term_ptr,
             _term: term,
             marks,
+            output,
             sink,
         };
         Self { inner: pty, reader }
@@ -412,15 +426,33 @@ impl TapReader {
     /// position (this runs on the event-loop thread, with the `Term` only
     /// try-lockable — `lock` would deadlock against the reader's lease).
     fn dispatch(&mut self, ev: TapEvent) {
-        if matches!(ev, TapEvent::PromptStart) {
+        if matches!(
+            ev,
+            TapEvent::PromptStart | TapEvent::CommandStart | TapEvent::CommandEnd(_)
+        ) {
             // SAFETY: dereferenced on the event-loop thread only (see
             // `TermPtr`); the `Arc<FairMutex<Term>>` outlives the reader.
             let term = unsafe { &*self.term.0 };
             let abs = term.grid().history_size() as i64
                 + i64::from(term.grid().cursor.point.line.0);
-            let mut marks = self.marks.lock().unwrap();
-            if marks.last() != Some(&abs) {
-                marks.push(abs);
+            match ev {
+                TapEvent::PromptStart => {
+                    let mut marks = self.marks.lock().unwrap();
+                    if marks.last() != Some(&abs) {
+                        marks.push(abs);
+                    }
+                }
+                TapEvent::CommandStart => {
+                    *self.output.lock().unwrap() = Some((abs, None));
+                }
+                TapEvent::CommandEnd(_) => {
+                    let mut out = self.output.lock().unwrap();
+                    // A `D` with no pending `C` keeps the stale span.
+                    if let Some((start, None)) = *out {
+                        *out = Some((start, Some(abs)));
+                    }
+                }
+                _ => unreachable!(),
             }
         }
         if let TapEvent::Apc(payload) = ev {

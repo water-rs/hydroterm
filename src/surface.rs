@@ -12,6 +12,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
@@ -34,7 +36,7 @@ use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab
 use crate::mouse::{self, CellPos, MouseAction};
 use crate::osctap::TapEvent;
 use crate::palette::Palette;
-use crate::scene::{self, CursorInfo, DrawContext, PADDING, ScrollInfo, cursor_info};
+use crate::scene::{self, CursorInfo, DrawContext, HintSpan, PADDING, ScrollInfo, cursor_info};
 use crate::terminal::TermEvent;
 
 /// Blink half-period for the cursor.
@@ -93,6 +95,16 @@ struct Search {
     active: usize,
 }
 
+/// URL hint mode state — numbered link chips + the digits typed so far.
+struct HintState {
+    /// One chip per visible link, in reading order.
+    spans: Vec<HintSpan>,
+    /// Same order as `spans` — label `n` opens `urls[n - 1]`.
+    urls: Vec<String>,
+    /// Digits accumulated by `hint_key`.
+    digits: String,
+}
+
 /// One terminal surface — scene content + input owner for a session.
 pub struct TermSurface {
     session: Rc<Session>,
@@ -133,6 +145,8 @@ pub struct TermSurface {
     bell_ring_at: Option<Instant>,
     blink_epoch: Instant,
     search: Option<Search>,
+    /// URL hint mode state — chips over every visible link + digits typed.
+    hints: Option<HintState>,
     clipboard: Option<waterkit_clipboard::Clipboard>,
 }
 
@@ -170,6 +184,7 @@ impl TermSurface {
             bell_ring_at: None,
             blink_epoch: Instant::now(),
             search: None,
+            hints: None,
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
         }
     }
@@ -250,13 +265,7 @@ impl TermSurface {
         });
         drop(term);
         if let Some(uri) = uri {
-            // Detached open — we never wait on the launcher.
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&uri)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            open_url(&uri);
             return true;
         }
         false
@@ -318,6 +327,22 @@ impl TermSurface {
                     .lock()
                     .scroll_display(Scroll::Bottom);
             }
+            TermAction::ScrollPageUp => {
+                let mut term = self.session.terminal.term.lock();
+                // Positive delta moves the viewport up into scrollback —
+                // same sign convention as the wheel path.
+                let page = term.grid().screen_lines().saturating_sub(1) as i32;
+                term.scroll_display(Scroll::Delta(page));
+            }
+            TermAction::ScrollPageDown => {
+                let mut term = self.session.terminal.term.lock();
+                let page = term.grid().screen_lines().saturating_sub(1) as i32;
+                term.scroll_display(Scroll::Delta(-page));
+            }
+            TermAction::UrlHints => self.url_hints(),
+            TermAction::CopyLastOutput => self.copy_last_output(),
+            TermAction::SearchNext => self.search_step(1),
+            TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
             TermAction::SplitRight => {
                 self.app.split_pane(crate::app::SplitDir::Row, self.session.id);
@@ -611,20 +636,30 @@ impl TermSurface {
         }
     }
 
-    fn on_key(&mut self, pressed: bool, key: &Key, code: Code, mods: Modifiers) {
+    /// Returns true when the key changed scene or UI state and needs a
+    /// frame now (overlay/edit/action paths); a key that only writes bytes
+    /// to the PTY returns false — its visible effect is the echoed output,
+    /// which the wake pipe draws on arrival.
+    fn on_key(&mut self, pressed: bool, key: &Key, code: Code, mods: Modifiers) -> bool {
         if pressed {
             self.clear_notify_badge();
         }
         // Overlay pages capture keys first: palette query, settings
         // commit/close, then the search bar's query.
         if pressed && self.app.palette_open.get() && self.palette_key(key, mods) {
-            return;
+            return true;
         }
         if pressed && self.app.settings_open.get() && self.settings_key(key, mods) {
-            return;
+            return true;
         }
         if pressed && self.search.is_some() && self.search_key(key, mods) {
-            return;
+            return true;
+        }
+        // URL hint mode captures keys: digits/Backspace feed the buffer,
+        // Enter opens, Escape cancels — everything else cancels and falls
+        // through to normal handling.
+        if pressed && self.hints.is_some() && self.hint_key(key) {
+            return true;
         }
         let mode = *self.session.terminal.term.lock().mode();
         if pressed {
@@ -632,20 +667,24 @@ impl TermSurface {
             match self.app.config(|c| c.lookup_keybind(key, mods)) {
                 Some(Some(action)) => {
                     self.do_action(action);
-                    return;
+                    return true;
                 }
-                Some(None) => return, // explicitly disabled
+                Some(None) => return false, // explicitly disabled
                 None => {}
             }
             if let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods)) {
                 self.do_action(action);
-                return;
+                return true;
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
                 self.write(bytes);
             }
+            false
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
             self.write(bytes);
+            false
+        } else {
+            false
         }
     }
 
@@ -708,21 +747,11 @@ impl TermSurface {
     }
 
     /// Feed one key into search state. Returns true when consumed.
-    fn search_key(&mut self, key: &Key, _mods: Modifiers) -> bool {
+    fn search_key(&mut self, key: &Key, mods: Modifiers) -> bool {
         match key {
             Key::Named(NamedKey::Enter) => {
-                // Enter: jump to next match.
-                if let Some(s) = &mut self.search && !s.matches.is_empty() {
-                    s.active = (s.active + 1) % s.matches.len();
-                }
-                if let Some(target) = self.search_scroll_target() {
-                    let cur = self.session.terminal.term.lock().grid().display_offset() as i32;
-                    self.session
-                        .terminal
-                        .term
-                        .lock()
-                        .scroll_display(Scroll::Delta(target - cur));
-                }
+                // Enter: next match; Shift+Enter: previous.
+                self.search_step(if mods.contains(Modifiers::SHIFT) { -1 } else { 1 });
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -754,11 +783,15 @@ impl TermSurface {
             | Key::Named(NamedKey::F10)
             | Key::Named(NamedKey::F11)
             | Key::Named(NamedKey::F12) => false,
-            _ => {
-                // Printable keys append to the query — TextInput also arrives,
-                // so here we only consume to suppress the PTY path.
+            // Printable keys append to the query — TextInput also arrives,
+            // so here we only consume to suppress the PTY path. Mod-chords
+            // (Ctrl+Shift+P, Ctrl+C, …) fall through to the chord path.
+            Key::Character(_)
+                if !mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META) =>
+            {
                 true
             }
+            _ => false,
         }
     }
 
@@ -787,10 +820,11 @@ impl TermSurface {
     }
 
     /// Append typed text — palette query while open, search query when
-    /// searching, else PTY.
-    fn on_text(&mut self, text: &str) {
+    /// searching, else PTY. Returns true when the text changed scene or
+    /// UI state (needs a frame); PTY passthrough returns false.
+    fn on_text(&mut self, text: &str) -> bool {
         if self.app.settings_open.get() {
-            return;
+            return true;
         }
         if self.app.palette_open.get() {
             let mut q = self.app.palette_query.get().to_string();
@@ -798,15 +832,21 @@ impl TermSurface {
             self.app.palette_query.set_from(q);
             self.app.palette_sel.set(0);
             self.app.palette_scroll.scroll_to(0);
-            return;
+            return true;
         }
         if self.search.is_some() {
             let mut q = self.session.search_query.get().to_string();
             q.push_str(text);
             self.session.search_query.set_from(q);
-            return;
+            return true;
+        }
+        // Hint-mode digits are already consumed by `hint_key`'s Character
+        // arm — swallow the paired TextInput so nothing reaches the PTY.
+        if self.hints.is_some() {
+            return true;
         }
         self.write(text.as_bytes().to_vec());
+        false
     }
 
     fn on_pointer_move(&mut self, x: f64, y: f64) {
@@ -939,6 +979,132 @@ impl TermSurface {
         }
     }
 
+    /// URL hint mode — chips over every visible link, digits + Enter open.
+    ///
+    /// Numbered spans are collected at activation time; any further input
+    /// or scroll clears the mode (the grid may have moved).
+    fn url_hints(&mut self) {
+        let term = self.session.terminal.term.lock();
+        let lines = term.grid().screen_lines();
+        let offset = term.grid().display_offset() as i32;
+        let mut spans: Vec<HintSpan> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        for vis_row in 0..lines {
+            let line = Line(vis_row as i32 - offset);
+            let chars: Vec<char> = term.grid()[line]
+                .into_iter()
+                .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|c| c.c)
+                .collect();
+            for (c0, c1) in url_spans(&chars) {
+                urls.push(chars[c0..c1].iter().collect());
+                spans.push(HintSpan {
+                    col0: c0,
+                    col1: c1,
+                    row: vis_row,
+                    label: spans.len() + 1,
+                });
+                if spans.len() >= 99 {
+                    break;
+                }
+            }
+            if spans.len() >= 99 {
+                break;
+            }
+        }
+        drop(term);
+        if spans.is_empty() {
+            self.hints = None;
+        } else {
+            self.hints = Some(HintState { spans, urls, digits: String::new() });
+        }
+    }
+
+    /// Keys while hint mode is active. Returns false when the key should
+    /// fall through to normal handling (mode was cleared).
+    fn hint_key(&mut self, key: &Key) -> bool {
+        match key {
+            Key::Named(NamedKey::Escape) => self.hints = None,
+            Key::Named(NamedKey::Enter) => {
+                if let Some(h) = self.hints.take()
+                    && let Ok(n) = h.digits.parse::<usize>()
+                    && let Some(url) = h.urls.get(n.wrapping_sub(1))
+                    && n >= 1
+                {
+                    open_url(url);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(h) = &mut self.hints {
+                    h.digits.pop();
+                }
+            }
+            Key::Character(t) if t.chars().all(|c| c.is_ascii_digit()) => {
+                if let Some(h) = &mut self.hints {
+                    h.digits.push_str(t.as_str());
+                }
+            }
+            // Anything else cancels the mode and falls through.
+            _ => {
+                self.hints = None;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Copy the output of the last command — the rows between its
+    /// OSC 133 `C` and `D` marks (`last_output`, reader-thread recorded).
+    fn copy_last_output(&mut self) {
+        let span = *self.session.terminal.last_output.lock().unwrap();
+        let Some((start_abs, end_abs)) = span else { return };
+        let mut term = self.session.terminal.term.lock();
+        let history = term.grid().history_size() as i64;
+        // A still-running command has no `D` — copy to the live bottom.
+        let end_abs = end_abs.unwrap_or(history + term.grid().screen_lines() as i64 - 1);
+        if end_abs < start_abs {
+            return;
+        }
+        let saved = term.selection.take();
+        let start = Point::new(
+            Line((start_abs - history) as i32),
+            Column(0),
+        );
+        let last_col = term.grid().columns() - 1;
+        let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+        sel.update(
+            Point::new(Line((end_abs - history) as i32), Column(last_col)),
+            Side::Right,
+        );
+        term.selection = Some(sel);
+        let text = term.selection_to_string();
+        term.selection = saved;
+        drop(term);
+        if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut())
+            && !text.is_empty()
+        {
+            let _ = clip.set_text(&text);
+        }
+    }
+
+    /// Step the search-match cursor by `dir` (+1 next, -1 prev), wrapping.
+    fn search_step(&mut self, dir: i32) {
+        if let Some(s) = &mut self.search
+            && !s.matches.is_empty()
+        {
+            let len = s.matches.len() as i32;
+            s.active = ((s.active as i32 + dir).rem_euclid(len)) as usize;
+        }
+        if let Some(target) = self.search_scroll_target() {
+            let cur = self.session.terminal.term.lock().grid().display_offset() as i32;
+            self.session
+                .terminal
+                .term
+                .lock()
+                .scroll_display(Scroll::Delta(target - cur));
+        }
+    }
+
     fn on_scroll(&mut self, x: f64, y: f64, _dx: f64, dy: f64, unit: ScrollUnit) {
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
@@ -984,6 +1150,7 @@ impl TermSurface {
             return;
         }
 
+        self.hints = None; // viewport moved — stale chips would mislead
         let mut term = self.session.terminal.term.lock();
         term.scroll_display(Scroll::Delta(lines_delta as i32));
     }
@@ -1025,6 +1192,16 @@ impl TermSurface {
             .map(|t| (1.0 - t.elapsed().as_secs_f32() / BELL_FLASH_SECS).max(0.0) * 0.18)
             .unwrap_or(0.0);
 
+        let hint_spans: Vec<HintSpan> = self
+            .hints
+            .as_ref()
+            .map(|h| h.spans.clone())
+            .unwrap_or_default();
+        let hint_digits = self
+            .hints
+            .as_ref()
+            .map(|h| h.digits.clone())
+            .unwrap_or_default();
         let blink_on = self.blink_on();
         let focused = self.focused;
         let bg_opacity = self.app.config(|c| c.background_opacity);
@@ -1041,6 +1218,8 @@ impl TermSurface {
             search_active: active,
             bell_flash: bell_alpha,
             bg_opacity,
+            hints: &hint_spans,
+            hint_digits: &hint_digits,
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
@@ -1099,8 +1278,26 @@ impl Drop for TermSurface {
     }
 }
 
+/// Input-throughput instrumentation, enabled by `HYDROTERM_INPUT_STATS=1`.
+/// Counts `SurfaceInputEvent` deliveries and `Key` deliveries between
+/// consecutive `build_scene` calls, per-key inter-arrival gaps, and draw
+/// duration — the three numbers needed to attribute event-thread stalls
+/// to the app or to the framework's redraw scheduling.
+fn input_stats() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| std::env::var_os("HYDROTERM_INPUT_STATS").is_some())
+}
+
+/// Events delivered since the last draw (any `SurfaceInputEvent`).
+static STAT_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Key presses delivered since the last draw.
+static STAT_KEYS: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of the previous key delivery, for inter-key gaps.
+static LAST_KEY_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
 impl SceneContent for TermSurface {
     fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
+        let draw_start = Instant::now();
         self.app.poll_config();
         self.drain_events();
         // Rejoin ZWJ-split scalars before the frame is measured or drawn.
@@ -1117,6 +1314,13 @@ impl SceneContent for TermSurface {
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(BELL_FLASH_SECS));
 
         self.build(scene, width, height);
+
+        if input_stats() {
+            let keys = STAT_KEYS.swap(0, Ordering::Relaxed);
+            let events = STAT_EVENTS.swap(0, Ordering::Relaxed);
+            let ms = draw_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("istats draw keys={keys} events={events} draw_ms={ms:.1}");
+        }
 
         cursor_blinking || bell_live || self.search.is_some()
     }
@@ -1173,40 +1377,69 @@ impl SceneContent for TermSurface {
         if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
             eprintln!("[input] {event:?}");
         }
-        match event {
-            SurfaceInputEvent::Focus(gained) => self.on_focus(*gained),
-            SurfaceInputEvent::Modifiers(mods) => self.modifiers = *mods,
+        if input_stats() {
+            STAT_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if let SurfaceInputEvent::Key { pressed: true, .. } = event {
+                let n = STAT_KEYS.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = Instant::now();
+                if let Some(prev) = LAST_KEY_AT.lock().unwrap().replace(now) {
+                    let gap = (now - prev).as_secs_f64() * 1000.0;
+                    eprintln!("istats key #{n} gap_ms={gap:.1}");
+                }
+            }
+        }
+        // A frame is only requested when the handler changed what the
+        // scene draws. Keystrokes that just write bytes to the PTY need
+        // no invalidation — the echoed output repaints through the wake
+        // pipe anyway, and invalidating here used to cost a whole frame
+        // per keystroke on the single winit event thread before the echo
+        // even arrived.
+        let needs_frame = match event {
+            SurfaceInputEvent::Focus(gained) => {
+                self.on_focus(*gained);
+                true
+            }
+            SurfaceInputEvent::Modifiers(mods) => {
+                self.modifiers = *mods;
+                false
+            }
             SurfaceInputEvent::PointerMove { position } => {
                 self.on_pointer_move(position.x, position.y);
+                true
             }
             SurfaceInputEvent::PointerButton { pressed, button, position } => {
                 self.on_pointer_button(*pressed, *button, position.x, position.y);
+                true
             }
             SurfaceInputEvent::Scroll { position, delta_x, delta_y, unit, .. } => {
                 self.on_scroll(position.x, position.y, *delta_x, *delta_y, *unit);
+                true
             }
             SurfaceInputEvent::Key { pressed, key, code, modifiers, repeat: _ } => {
-                self.on_key(*pressed, key, *code, *modifiers);
+                self.on_key(*pressed, key, *code, *modifiers)
             }
             SurfaceInputEvent::TextInput(text) => self.on_text(text.as_str()),
             SurfaceInputEvent::CompositionStart => {
                 self.preedit = Some((String::new(), 0));
+                true
             }
             SurfaceInputEvent::CompositionUpdate { text, caret } => {
                 self.preedit = Some((text.to_string(), caret.unwrap_or(text.len())));
+                true
             }
             SurfaceInputEvent::CompositionCommit(text) => {
                 self.preedit = None;
-                self.on_text(text.as_str());
+                let _ = self.on_text(text.as_str());
+                true
             }
             SurfaceInputEvent::CompositionCancel => {
                 self.preedit = None;
+                true
             }
-        }
-        // Delivering an event does not schedule a frame — anything the
-        // handler changed (selection, scroll offset, focus, preedit) paints
-        // on the next requested one.
-        if let Some(invalidator) = &self.invalidator {
+        };
+        if needs_frame
+            && let Some(invalidator) = &self.invalidator
+        {
             invalidator();
         }
     }
@@ -1289,6 +1522,43 @@ fn is_url_char(c: char) -> bool {
         )
 }
 
+/// Every scheme:// run in `chars` as `(start, end-exclusive)` column pairs.
+/// Same scan as `url_at` without the column filter — powers URL hint mode.
+fn url_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for scheme in URL_SCHEMES {
+        let sc: Vec<char> = scheme.chars().collect();
+        let mut off = 0;
+        while off + sc.len() <= chars.len() {
+            if chars[off..off + sc.len()] == sc[..] {
+                let mut end = off + sc.len();
+                while end < chars.len() && is_url_char(chars[end]) {
+                    end += 1;
+                }
+                while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                    end -= 1;
+                }
+                spans.push((off, end));
+                off = end;
+            } else {
+                off += 1;
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans
+}
+
+/// Detached `xdg-open` — never wait on the launcher.
+fn open_url(uri: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(uri)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// OSC 9/777 → a freedesktop desktop notification via `notify-send` when
 /// the desktop provides it; a missing binary or session bus just leaves
 /// the in-app bell/badge path to carry the notification.
@@ -1334,6 +1604,15 @@ mod tests {
         let row = chars("[x](https://a.b/?q=(r)) ");
         // Click inside the link: parens stop the scan.
         assert_eq!(url_at(&row, 8), Some("https://a.b/?q=".to_string()));
+    }
+
+    #[test]
+    fn url_spans_finds_both_links() {
+        let s = chars("open https://a.io/x then https://b.dev/y.");
+        let spans = url_spans(&s);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(s[spans[0].0..spans[0].1].iter().collect::<String>(), "https://a.io/x");
+        assert_eq!(s[spans[1].0..spans[1].1].iter().collect::<String>(), "https://b.dev/y");
     }
 
     #[test]
