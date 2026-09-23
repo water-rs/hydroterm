@@ -12,12 +12,13 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::{Binding, binding};
 use waterui::impl_extractor;
+use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
 use waterui::window::{Window, WindowState};
 use waterui_graphics::SceneView;
-use waterui::theme::color::{AccentContainer, Foreground, Surface};
+use waterui::theme::color::{Foreground, Surface};
 use waterui_graphics::color::Srgb;
 use waterui_text::FontCollection;
 
@@ -181,6 +182,9 @@ pub struct PaneTab {
     pub tree: Binding<SplitNode>,
     /// Focused session id inside `tree`.
     pub focused: Binding<u64>,
+    /// Zoomed pane: `Some(id)` renders only that leaf (it fills the tab);
+    /// `None` = normal split layout. tmux zoom / kitty overlay semantics.
+    pub zoomed: Binding<Option<u64>>,
 }
 
 /// Everything tabs and surfaces share.
@@ -215,6 +219,9 @@ pub struct AppState {
     pub palette_query: Binding<Str>,
     /// Index of the highlighted palette row (Up/Down navigation).
     pub palette_sel: Binding<usize>,
+    /// List scroll controller — `scroll_to(sel)` keeps the highlighted
+    /// row visible while navigating.
+    pub palette_scroll: ScrollController<usize>,
 
     /// Settings page open (Ctrl+Shift+,).
     pub settings_open: Binding<bool>,
@@ -264,6 +271,7 @@ impl AppState {
             palette_open: Binding::bool(false),
             palette_query: binding(Str::from("")),
             palette_sel: Binding::usize(0),
+            palette_scroll: ScrollController::new(0),
             settings_open: Binding::bool(false),
             set_font: Binding::i32(13),
             set_theme: Binding::usize(0),
@@ -427,6 +435,7 @@ impl AppState {
             title: session.title.clone(),
             tree: binding(SplitNode::Leaf(session.id)),
             focused: Binding::u64(session.id),
+            zoomed: Binding::default(),
         });
         self.session_tab
             .lock()
@@ -534,6 +543,24 @@ impl AppState {
             .unwrap_or(0) as isize;
         let next = (pos + dir).rem_euclid(leaves.len() as isize) as usize;
         self.focus_pane(leaves[next]);
+    }
+
+    /// Toggle pane zoom on the selected tab: the focused pane fills the
+    /// whole tab; toggling again (or re-focusing then toggling) restores
+    /// the split layout.
+    pub fn toggle_pane_zoom(&self) {
+        let tab_id = self.selected.get();
+        let Some(tab) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.id == tab_id)
+            .cloned()
+        else {
+            return;
+        };
+        let focused = tab.focused.get();
+        tab.zoomed.with_mut(|z| *z = z.take().is_none().then_some(focused));
     }
 
     /// Close a pane; when it's the tab's last pane, close the tab.
@@ -739,10 +766,22 @@ pub fn tabs_view(state: AppState) -> impl View {
             .map(|tab| {
                 let app = state.clone();
                 let tree = tab.tree.clone();
+                let zoomed = tab.zoomed.clone();
                 Tab::container(tab.id, tab.title.clone(), move || {
-                    watch(tree.clone(), {
+                    watch(zoomed.clone(), {
                         let app = app.clone();
-                        move |node: SplitNode| pane_view(&node, &app)
+                        let tree = tree.clone();
+                        move |z: Option<u64>| {
+                            if let Some(z) = z.filter(|z| app.session(*z).is_some()) {
+                                pane_view(&SplitNode::Leaf(z), &app)
+                            } else {
+                                watch(tree.clone(), {
+                                    let app = app.clone();
+                                    move |node: SplitNode| pane_view(&node, &app)
+                                })
+                                .anyview()
+                            }
+                        }
                     })
                 })
             })
@@ -774,6 +813,7 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Close Pane / Tab", chord: "ctrl+shift+w", action: TermAction::CloseTab },
     PaletteItem { name: "Split Right", chord: "ctrl+shift+e", action: TermAction::SplitRight },
     PaletteItem { name: "Split Down", chord: "ctrl+shift+d", action: TermAction::SplitDown },
+    PaletteItem { name: "Toggle Pane Zoom", chord: "ctrl+shift+z", action: TermAction::PaneZoom },
     PaletteItem { name: "Focus Next Pane", chord: "ctrl+shift+]", action: TermAction::FocusNextPane },
     PaletteItem { name: "Focus Previous Pane", chord: "ctrl+shift+[", action: TermAction::FocusPrevPane },
     PaletteItem { name: "Copy", chord: "ctrl+shift+c", action: TermAction::Copy },
@@ -833,6 +873,7 @@ impl AppState {
         if next {
             self.palette_query.set_from("");
             self.palette_sel.set(0);
+            self.palette_scroll.scroll_to(0);
         }
         self.palette_open.set(next);
     }
@@ -910,44 +951,36 @@ impl AppState {
 /// key path), Enter runs the selected match; a row tap runs it directly.
 fn palette_view(state: AppState) -> impl View {
     let query = state.palette_query.clone();
-    // Rows rebuild when the query or the selection moves — the list is
-    // small, so a nested `watch` is cheaper than debugging a stale row.
     let list = watch(query, {
         let state = state.clone();
         move |q: Str| {
             let items: Vec<&'static PaletteItem> = palette_matches(q.as_str());
-            watch(state.palette_sel.clone(), {
+            let indices: Vec<SelfId<usize>> = (0..items.len()).map(SelfId::new).collect();
+            List::for_each(indices, {
                 let state = state.clone();
-                move |sel: usize| {
-                    let rows: Vec<AnyView> = items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| {
-                            let name = item.name;
-                            let chord = item.chord;
-                            let bg = Color::from(AccentContainer)
-                                .with_opacity(f32::from(u8::from(sel == i)));
-                            hstack((
-                                text(name).foreground(Foreground),
-                                Spacer::flexible(),
-                                text(chord).muted(),
-                            ))
-                            .padding()
-                            .background(bg)
-                            .on_tap(move |app: AppState| app.run_palette_at(i))
-                            .state(&state)
-                            .anyview()
-                        })
-                        .collect();
-                    rows.into_iter().collect::<VStack<_>>().anyview()
+                let items = items.clone();
+                move |i: SelfId<usize>| {
+                    let i = *i;
+                    let item = items[i];
+                    let row = hstack((
+                        text(item.name).foreground(Foreground),
+                        Spacer::flexible(),
+                        text(item.chord).muted(),
+                    ))
+                    .padding()
+                    .on_tap(move |app: AppState| app.run_palette_at(i))
+                    .state(&state);
+                    ListItem::new(row).selected(state.palette_sel.equal_to(i))
                 }
             })
+            .scroll_controller(&state.palette_scroll)
             .anyview()
         }
     });
     let panel = vstack((field("type a command", &state.palette_query), list))
         .spacing(4.0)
         .padding()
+        .max_height(430.0)
         .background(Surface);
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }
@@ -966,12 +999,7 @@ fn settings_view(state: AppState) -> impl View {
     // manually here.
     let panel = vstack((
         text("Settings").foreground(Foreground),
-        hstack((
-            text("Font size").foreground(Foreground),
-            Spacer::flexible(),
-            text!("{v}", v = state.set_font).muted(),
-            stepper("Font size", &state.set_font).hide_label(),
-        )),
+        stepper(text!("Font size  {v}", v = state.set_font), &state.set_font),
         hstack((
             text("Theme").foreground(Foreground),
             Spacer::flexible(),

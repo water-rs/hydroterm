@@ -311,6 +311,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "a" => TermAction::SelectAll,
         "e" => TermAction::SplitRight,
         "d" => TermAction::SplitDown,
+        "z" => TermAction::PaneZoom,
         "]" | "}" => TermAction::FocusNextPane,
         "[" | "{" => TermAction::FocusPrevPane,
         "+" | "=" => TermAction::FontBigger,
@@ -389,6 +390,8 @@ pub enum TermAction {
     /// Split the focused pane right/down (new pane takes half its slot).
     SplitRight,
     SplitDown,
+    /// Toggle: the focused pane fills the whole tab (tmux zoom).
+    PaneZoom,
     /// Cycle pane focus within the tab.
     FocusNextPane,
     FocusPrevPane,

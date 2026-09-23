@@ -306,6 +306,7 @@ impl TermSurface {
             TermAction::SplitDown => {
                 self.app.split_pane(crate::app::SplitDir::Column, self.session.id);
             }
+            TermAction::PaneZoom => self.app.toggle_pane_zoom(),
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
@@ -645,6 +646,9 @@ impl TermSurface {
                     self.app.palette_sel.with_mut(|s| {
                         *s = (*s + 1).min(n - 1);
                     });
+                    self.app
+                        .palette_scroll
+                        .scroll_to(self.app.palette_sel.get());
                 }
                 true
             }
@@ -652,6 +656,9 @@ impl TermSurface {
                 self.app.palette_sel.with_mut(|s| {
                     *s = s.saturating_sub(1);
                 });
+                self.app
+                    .palette_scroll
+                    .scroll_to(self.app.palette_sel.get());
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -663,6 +670,7 @@ impl TermSurface {
                 q.pop();
                 self.app.palette_query.set_from(q);
                 self.app.palette_sel.set(0);
+                self.app.palette_scroll.scroll_to(0);
                 true
             }
             // Printable keys: consume here — the text itself arrives via
@@ -767,6 +775,7 @@ impl TermSurface {
             q.push_str(text);
             self.app.palette_query.set_from(q);
             self.app.palette_sel.set(0);
+            self.app.palette_scroll.scroll_to(0);
             return;
         }
         if self.search.is_some() {

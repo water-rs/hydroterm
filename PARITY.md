@@ -22,6 +22,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 |------|---------|--------|--------------------|
 | Core | PTY + VT100/xterm emulation (alacritty_terminal 0.26) | ✅ | run `vim`, `less`, `htop` — alt screen, scroll region, DECAWM |
 | Core | True color + 256/indexed + named palette | ✅ | `printf '\e[38;2;200;100;50mcolored\e[0m\n'` screenshot |
+| Core | Underline variants + strikethrough + SGR 58 | ✅ | `\e[4:1..5m` single/double/curly/dotted/dashed + `\e[9m` strike + `\e[58;2;..m` colored underline — all verified in one live screenshot |
 | Core | Scrollback buffer + scrollbar | ✅ | `seq 1 500`, wheel scroll; HISTORY_LINES cap |
 | Core | Synchronized output (mode 2026) | ✅ | alacritty parser buffers frames; no wakeup mid-sync |
 | Core | Text reflow on resize | ❌ | alacritty grid is fixed-width — upstream gap |
@@ -40,6 +41,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Links | Plain-text URL detect + open | ✅ | scheme-scan over the clicked row's cells; Ctrl+click → xdg-open (verified: navigated Chrome) |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
+| Splits | Pane zoom toggle (tmux-style) | ✅ | Ctrl+Shift+Z → focused pane fills the tab (`PaneTab.zoomed: Binding<Option<u64>>`); toggling restores the split — verified live both ways |
 | Splits | Pane resize (drag divider) | 🚫 | equal splits via HStack/VStack — no resizable-divider view in WaterUI (feedback #18) |
 | Splits | Focus nav: click + cycle keybinds | 🟡 | click focuses ✓; Ctrl+Shift+[ / ] cycle the focused-pane record but hydrolysis has no programmatic focus (feedback #1/#16) |
 | Windows | Multi-window | ✅ | Ctrl+Shift+N → `Window::show(env)` via the runner's `WindowManager` mounts a real winit window with a fresh session set (verified live: `<2>` title, independent session) |
@@ -50,9 +52,10 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Theme | Built-in themes (hydroterm-dark/light, solarized-dark/light) | ✅ | `theme =` config; live swap verified |
 | Theme | `theme = auto` follows desktop color-scheme | ✅ | gsettings get at resolve + `gsettings monitor` subscription re-resolves palette live (KDE box lacks GNOME schemas — dark fallback verified; monitor spawn is no-op there) |
 | Cursor | `cursor-shape`/`cursor-blink` config | ✅ | spawn-time (alacritty has no config setter) |
+| Cursor | DECSCUSR escape-driven shape (`\e[N q`) | ✅ | `\e[6 q` → steady bar cursor verified live (block/beam/underline/hollow all drawn) |
 | Font | Fallback chain (fontconfig) | ✅ | 中文カタ rendered via Noto CJK fallback (screenshot-verified) |
 | Font | Ligatures | ✅ | `->`, `=>`, `!=`, `ffi`, `fl` shape to ligature glyphs (screenshot-verified) |
-| Font | Emoji + grapheme clusters (ZWJ, VS16) | 🟡 | single emoji ✅, regional-indicator flag merges ✅, combining é ✅; ZWJ family renders as separate heads (no cross-cell merge) |
+| Font | Emoji + grapheme clusters (ZWJ, VS16) | ✅ | single emoji ✅, flag merges ✅, combining é ✅, ZWJ family merges to ONE glyph cell (fontique cluster shaping); rendered monochrome when the composed glyph is absent from Noto Color Emoji |
 | Font | Synthetic bold/italic | ✅ | stroke emboss / skew — `\e[1m`/`\e[3m` visually distinct |
 | Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
 | Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
@@ -64,7 +67,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Bell | Audible bell | ❌ | needs audio stack; low priority |
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight the *full* match span (wide chars cover both cells, `match_columns`), Enter jumps to next |
 | Shell UI | Settings page | ✅ | Ctrl+Shift+, → opaque token panel over a dim mask; labeled theme picker, font-size value + stepper, toggle; Apply writes config file → hot reload |
-| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + full-width rows (name left, chord right); Up/Down selection (AccentContainer highlight), Enter/click runs, Esc closes |
+| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs, Esc closes |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `a=d` delete + `i=` ids + `\x1b_G…;OK` replies + `t=f` file medium (verified: PNG blitted in-grid, file-loaded PNG rendered); no unicode placements/z-layers/shared mediums/crops/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |
