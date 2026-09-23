@@ -475,7 +475,8 @@ impl TermSurface {
             TermAction::NewTab => {
                 self.app.new_tab();
             }
-            TermAction::CloseTab => self.app.close_pane(self.session.id),
+            TermAction::CloseTab => self.app.try_close_pane(self.session.id),
+            TermAction::CloseConfirm => self.app.confirm_close(self.session.id),
             TermAction::NewWindow => self.app.new_window(),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
@@ -553,6 +554,9 @@ impl TermSurface {
             TermAction::MoveTabRight => self.app.move_tab(1),
             TermAction::FocusPaneDir { horizontal, forward } => {
                 self.app.focus_pane_dir(horizontal, forward);
+            }
+            TermAction::ResizePane { horizontal, forward } => {
+                self.app.resize_pane_dir(horizontal, forward);
             }
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
@@ -896,6 +900,17 @@ impl TermSurface {
                 _ => {}
             }
         }
+        // `confirm-close` snackbar: Enter closes, Escape cancels —
+        // swallow everything while it waits so no stray byte hits the
+        // program we're about to kill.
+        if pressed && self.session.pending_close.get().is_some() {
+            match key {
+                Key::Named(NamedKey::Enter) => self.app.confirm_close(self.session.id),
+                Key::Named(NamedKey::Escape) => self.app.cancel_close_prompt(self.session.id),
+                _ => {}
+            }
+            return true;
+        }
         // URL hint mode captures keys: digits/Backspace feed the buffer,
         // Enter opens, Escape cancels — everything else cancels and falls
         // through to normal handling.
@@ -1100,7 +1115,9 @@ impl TermSurface {
         }
         // Text arriving while a paste is pending is the user's real
         // input — the overlay is modal on the paste, not on typing.
-        if self.session.pending_paste.get().is_some() {
+        if self.session.pending_paste.get().is_some()
+            || self.session.pending_close.get().is_some()
+        {
             return true;
         }
         // Hint-mode digits are already consumed by `hint_key`'s Character
@@ -1531,7 +1548,7 @@ impl TermSurface {
                 self.scroll_accum_px -= lines * h;
                 lines
             }
-        };
+        } * f64::from(self.app.config(|c| c.mouse_scroll_multiplier));
 
         if mode.intersects(TermMode::MOUSE_MODE) {
             if let Some((btn, count)) = mouse::wheel_button(lines_delta) {
@@ -1725,7 +1742,7 @@ impl Drop for TermSurface {
 /// consecutive `build_scene` calls, per-key inter-arrival gaps, and draw
 /// duration — the three numbers needed to attribute event-thread stalls
 /// to the app or to the framework's redraw scheduling.
-fn input_stats() -> bool {
+pub(crate) fn input_stats() -> bool {
     static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ONCE.get_or_init(|| std::env::var_os("HYDROTERM_INPUT_STATS").is_some())
 }
@@ -1747,6 +1764,7 @@ impl SceneContent for TermSurface {
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);
+        self.session.pane_px.set((width, height));
 
         // A blinking cursor or live bell flash needs the next frame anyway;
         // the wake pipe covers PTY output between frames.

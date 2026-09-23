@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use alacritty_terminal::vte::ansi::CursorShape;
+use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use keyboard_types::{Key, Modifiers, NamedKey};
 
 use crate::keys::TermAction;
@@ -82,6 +82,22 @@ pub struct AppConfig {
     /// (Ghostty `focus-follows-mouse`). App-level record only —
     /// GUI key focus still needs a press until hydrolysis#126.
     pub focus_follows_mouse: bool,
+    /// Theme color overrides (Ghostty `foreground` / `background` /
+    /// `cursor-color` / `selection-color` / `palette = N=#rgb`);
+    /// applied on top of the resolved theme, live-reloaded.
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub cursor_color: Option<Rgb>,
+    /// Selection text color — `selection-color` sets the ink; the
+    /// highlight fill stays the theme's `selection_bg`.
+    pub selection_color: Option<Rgb>,
+    /// `palette = 1=#ff0000` — indexed 0-255 slot overrides.
+    pub palette_overrides: Vec<(u8, Rgb)>,
+    /// Wheel scroll speed multiplier (Ghostty `mouse-scroll-multiplier`).
+    pub mouse_scroll_multiplier: f32,
+    /// Ask before closing a pane/tab whose PTY foreground is a program
+    /// other than the shell (Ghostty `confirm-close-surface`).
+    pub confirm_close: bool,
 }
 
 impl Default for AppConfig {
@@ -110,6 +126,13 @@ impl Default for AppConfig {
             unfocused_split_opacity: 1.0,
             resize_overlay: true,
             focus_follows_mouse: false,
+            foreground: None,
+            background: None,
+            cursor_color: None,
+            selection_color: None,
+            palette_overrides: Vec::new(),
+            mouse_scroll_multiplier: 1.0,
+            confirm_close: true,
         }
     }
 }
@@ -151,6 +174,17 @@ cursor-blink = true
 copy-on-select = false
 audible-bell = true       # ring the X11 keyboard bell on BEL
 # shell = /bin/bash
+
+# Colors: overrides on top of the resolved theme
+# (Ghostty foreground / background / palette).
+# foreground = #ddeeff
+# background = #101418
+# cursor-color = #ffcc00
+# selection-color = #ffffff
+# palette = 1=#e06c75   # indexed slot 0-255
+
+mouse-scroll-multiplier = 1.0   # wheel scroll speed
+confirm-close = true       # ask before closing a running program
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
 # chords: ctrl+shift+c, alt+enter, ...  actions: copy, paste,
@@ -237,6 +271,49 @@ impl AppConfig {
                     _ => errors.push(format!("line {}: bad window-padding {value:?}", n + 1)),
                 },
                 "term" => cfg.term = value.to_string(),
+                "foreground" => match parse_rgb(value) {
+                    Some(c) => cfg.foreground = Some(c),
+                    None => errors.push(format!("line {}: bad foreground {value:?}", n + 1)),
+                },
+                "background" => match parse_rgb(value) {
+                    Some(c) => cfg.background = Some(c),
+                    None => errors.push(format!("line {}: bad background {value:?}", n + 1)),
+                },
+                "cursor-color" | "cursor_color" => match parse_rgb(value) {
+                    Some(c) => cfg.cursor_color = Some(c),
+                    None => errors.push(format!("line {}: bad cursor-color {value:?}", n + 1)),
+                },
+                "selection-color" | "selection_color" | "selection-foreground" => {
+                    match parse_rgb(value) {
+                        Some(c) => cfg.selection_color = Some(c),
+                        None => {
+                            errors.push(format!("line {}: bad selection-color {value:?}", n + 1))
+                        }
+                    }
+                }
+                "palette" => match value.split_once('=').and_then(|(i, c)| {
+                    i.trim().parse::<u8>().ok().zip(parse_rgb(c.trim()))
+                }) {
+                    Some(pair) => cfg.palette_overrides.push(pair),
+                    None => errors.push(format!(
+                        "line {}: bad palette {value:?} (want N=#rrggbb)",
+                        n + 1
+                    )),
+                },
+                "mouse-scroll-multiplier" | "mouse_scroll_multiplier" => {
+                    match value.parse::<f32>() {
+                        Ok(v) if (0.1..=100.0).contains(&v) => {
+                            cfg.mouse_scroll_multiplier = v;
+                        }
+                        _ => errors.push(format!(
+                            "line {}: bad mouse-scroll-multiplier {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "confirm-close" | "confirm-close-surface" | "confirm_close" => {
+                    cfg.confirm_close = bool_value(value, n, &mut errors);
+                }
                 "osc52-write" | "clipboard-write" => match value {
                     "allow" | "true" | "yes" | "1" | "on" => cfg.osc52_write = true,
                     "deny" | "false" | "no" | "0" | "off" => cfg.osc52_write = false,
@@ -337,6 +414,30 @@ fn expand_home(value: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(value)
+}
+
+/// `#rgb` / `#rrggbb` / `0xrrggbb` → a terminal RGB. No names,
+/// no alpha — those live in the theme, not the override keys.
+fn parse_rgb(value: &str) -> Option<Rgb> {
+    let hex = value
+        .strip_prefix('#')
+        .or_else(|| value.strip_prefix("0x"))
+        .or_else(|| value.strip_prefix("0X"))?;
+    let u32_from_hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    match hex.len() {
+        3 => u32_from_hex(hex).map(|v| {
+            let r = ((v >> 8) & 0xf) as u8;
+            let g = ((v >> 4) & 0xf) as u8;
+            let b = (v & 0xf) as u8;
+            Rgb { r: r * 17, g: g * 17, b: b * 17 }
+        }),
+        6 => u32_from_hex(hex).map(|v| Rgb {
+            r: ((v >> 16) & 0xff) as u8,
+            g: ((v >> 8) & 0xff) as u8,
+            b: (v & 0xff) as u8,
+        }),
+        _ => None,
+    }
 }
 
 fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
@@ -703,6 +804,45 @@ mod tests {
         // mtime granularity may tie; poll must still see the new mtime.
         assert!(w.poll() || w.config.font_size == 20.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn color_overrides_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "foreground = #ddeeff\nbackground = #101418\n\
+             cursor-color = #fc0\nselection-color = 0xffffff\n\
+             palette = 1=#e06c75\npalette = 0=#000\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.foreground, Some(Rgb { r: 0xdd, g: 0xee, b: 0xff }));
+        assert_eq!(cfg.background, Some(Rgb { r: 0x10, g: 0x14, b: 0x18 }));
+        assert_eq!(cfg.cursor_color, Some(Rgb { r: 0xff, g: 0xcc, b: 0x00 }));
+        assert_eq!(cfg.selection_color, Some(Rgb { r: 0xff, g: 0xff, b: 0xff }));
+        assert_eq!(
+            cfg.palette_overrides,
+            vec![
+                (1, Rgb { r: 0xe0, g: 0x6c, b: 0x75 }),
+                (0, Rgb { r: 0x00, g: 0x00, b: 0x00 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn scroll_multiplier_and_confirm_close() {
+        let (cfg, errs) = AppConfig::parse("mouse-scroll-multiplier = 3.5\nconfirm-close = no");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!((cfg.mouse_scroll_multiplier - 3.5).abs() < f32::EPSILON);
+        assert!(!cfg.confirm_close);
+        let (_, errs) = AppConfig::parse("mouse-scroll-multiplier = 0");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn bad_colors_report() {
+        let (_, errs) = AppConfig::parse(
+            "foreground = red\nbackground = #12345\npalette = x=#fff\npalette = 300=#fff\n",
+        );
+        assert_eq!(errs.len(), 4, "{errs:?}");
     }
 
     #[test]

@@ -98,6 +98,30 @@ impl Palette {
         palette
     }
 
+    /// Theme plus the config's explicit overrides — `foreground` /
+    /// `background` / `cursor-color` / `selection-color` / `palette = N=#rgb`
+    /// (Ghostty naming). The theme gives every slot a default; these keys
+    /// replace exactly what they name and nothing else.
+    pub fn for_config(cfg: &crate::config::AppConfig) -> Self {
+        let mut palette = Self::from_theme(&cfg.resolve_theme());
+        if let Some(c) = cfg.foreground {
+            palette.foreground = c;
+        }
+        if let Some(c) = cfg.background {
+            palette.background = c;
+        }
+        if let Some(c) = cfg.cursor_color {
+            palette.cursor = c;
+        }
+        if let Some(c) = cfg.selection_color {
+            palette.selection_fg = Some(c);
+        }
+        for (i, c) in &cfg.palette_overrides {
+            palette.indexed[*i as usize] = *c;
+        }
+        palette
+    }
+
     /// Static lookup by index (for `ColorRequest` replies): 0-255 indexed,
     /// 256 foreground, 257 background, 258 cursor, else foreground.
     pub fn at(&self, index: usize) -> Rgb {

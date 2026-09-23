@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -179,6 +180,12 @@ pub struct Terminal {
     /// running. Recorded on the reader thread like `prompt_marks`.
     pub last_output: Arc<Mutex<OutputSpan>>,
     pub events: Mutex<Receiver<TermEvent>>,
+    /// Duplicated master fd — `tcgetpgrp` answers the slave's foreground
+    /// pgroup without taking the reader's term lock.
+    pty_file: std::fs::File,
+    /// PID of the spawned child == its process group (the shell is the
+    /// foreground job when nothing else runs).
+    shell_pid: i32,
     _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
 }
 
@@ -218,6 +225,11 @@ impl Terminal {
             },
             0,
         )?;
+        // Grab a duplicated master fd + the child's pid before the Pty
+        // moves into the tap wrapper — `confirm-close` later asks
+        // `tcgetpgrp(master) != shell pgroup`.
+        let pty_file = pty.file().try_clone()?;
+        let shell_pid = pty.child().id() as i32;
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
         let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
         let pty = TapPty::new(
@@ -233,7 +245,24 @@ impl Terminal {
         proxy.inner.notifier.set(Notifier(io.clone())).ok();
         let join = event_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, events: Mutex::new(events_rx), _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
+    }
+
+    /// The program holding the PTY's foreground process group, or `None`
+    /// when the shell itself is foreground (i.e. sitting at the prompt).
+    /// `confirm-close` gates on this: a running program wants an OK first.
+    pub fn foreground_program(&self) -> Option<String> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: tcgetpgrp on a live pty master fd is a plain query.
+        let pgid = unsafe { libc::tcgetpgrp(self.pty_file.as_raw_fd()) };
+        if pgid <= 0 || pgid == self.shell_pid {
+            return None;
+        }
+        std::fs::read_to_string(format!("/proc/{pgid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(format!("process {pgid}")))
     }
 
     /// Write user input bytes to the PTY.
@@ -472,20 +501,75 @@ impl TapReader {
 impl Read for TapReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            let t = std::time::Instant::now();
             let (n, events) = self.scanner.take(buf);
+            stat_add(&STAT_TAKE_NS, t.elapsed().as_nanos() as u64);
             for ev in events {
                 self.dispatch(ev);
             }
             if n > 0 {
                 return Ok(n);
             }
+            let t = std::time::Instant::now();
             let got = self.file.read(&mut self.scratch)?;
+            stat_add(&STAT_READ_NS, t.elapsed().as_nanos() as u64);
             if got == 0 {
                 return Ok(0);
             }
+            stat_add(&STAT_BYTES, got as u64);
+            let t = std::time::Instant::now();
             self.scanner.feed(&self.scratch[..got]);
+            stat_add(&STAT_FEED_NS, t.elapsed().as_nanos() as u64);
+            report_reader_stats();
         }
     }
+}
+
+static STAT_FEED_NS: AtomicU64 = AtomicU64::new(0);
+static STAT_TAKE_NS: AtomicU64 = AtomicU64::new(0);
+static STAT_READ_NS: AtomicU64 = AtomicU64::new(0);
+static STAT_BYTES: AtomicU64 = AtomicU64::new(0);
+static STAT_LAST: AtomicU64 = AtomicU64::new(0);
+
+fn stat_add(slot: &AtomicU64, v: u64) {
+    slot.fetch_add(v, Ordering::Relaxed);
+}
+
+/// With `HYDROTERM_INPUT_STATS`, dump the reader-stage breakdown once per
+/// second while bytes flow — the split between scanning and the syscall.
+fn report_reader_stats() {
+    if !crate::surface::input_stats() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = STAT_LAST.load(Ordering::Relaxed);
+    if prev != 0 && now - prev < 1000 {
+        return;
+    }
+    if STAT_LAST
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    if prev == 0 {
+        return;
+    }
+    let (feed, take, rd, by) = (
+        STAT_FEED_NS.swap(0, Ordering::Relaxed),
+        STAT_TAKE_NS.swap(0, Ordering::Relaxed),
+        STAT_READ_NS.swap(0, Ordering::Relaxed),
+        STAT_BYTES.swap(0, Ordering::Relaxed),
+    );
+    eprintln!(
+        "rstats bytes={by} feed_ms={:.1} take_ms={:.1} read_ms={:.1}",
+        feed as f64 / 1e6,
+        take as f64 / 1e6,
+        rd as f64 / 1e6
+    );
 }
 
 impl EventedReadWrite for TapPty {
@@ -698,6 +782,70 @@ mod tests {
     fn feed(term: &mut Term<VoidListener>, bytes: &str) {
         let mut p: Processor = Processor::new();
         p.advance(term, bytes.as_bytes());
+    }
+
+    /// Split bench for the reader-thread pipeline (r16): the same 50 MB
+    /// payload through (a) alacritty `Processor::advance` alone, (b) the
+    /// `OscScanner` feed/take alone, (c) the combined pipeline — at the
+    /// real grid size and 64 KiB chunks, no rendering anywhere. Run with
+    /// `--release --nocapture`; debug numbers are reported separately.
+    #[test]
+    fn bench_parse_pipeline() {
+        use crate::osctap::OscScanner;
+        use std::time::Instant;
+
+        const BYTES: usize = 50 * 1024 * 1024;
+        let line = b"log payload xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
+        let mut data = Vec::with_capacity(BYTES + line.len());
+        while data.len() < BYTES {
+            data.extend_from_slice(line);
+        }
+        data.truncate(BYTES);
+        let mb = || BYTES as f64 / 1e6;
+
+        // (a) advance alone.
+        let mut term = Term::new(Config::default(), &Sz(26, 69), VoidListener);
+        let mut p: Processor = Processor::new();
+        let t = Instant::now();
+        for chunk in data.chunks(65536) {
+            p.advance(&mut term, chunk);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("[bench] advance-only  {dt:6.2}s = {:7.1} MB/s", mb() / dt);
+
+        // (b) scanner feed+take alone.
+        let mut s = OscScanner::new();
+        let mut out = vec![0u8; 65536];
+        let t = Instant::now();
+        for chunk in data.chunks(65536) {
+            s.feed(chunk);
+            loop {
+                let (n, _) = s.take(&mut out);
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("[bench] scanner-only  {dt:6.2}s = {:7.1} MB/s", mb() / dt);
+
+        // (c) the combined reader pipeline: scan -> take -> advance.
+        let mut term = Term::new(Config::default(), &Sz(26, 69), VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut s = OscScanner::new();
+        let t = Instant::now();
+        for chunk in data.chunks(65536) {
+            s.feed(chunk);
+            loop {
+                let (n, _) = s.take(&mut out);
+                if n == 0 {
+                    break;
+                }
+                p.advance(&mut term, &out[..n]);
+            }
+        }
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("[bench] pipeline      {dt:6.2}s = {:7.1} MB/s", mb() / dt);
     }
 
     /// Row text reconstructed as the renderer sees it: each cell's base char

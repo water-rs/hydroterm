@@ -345,6 +345,37 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         }
         return None;
     }
+    // Ctrl+Alt+Shift+Arrow: move the divider beside the focused pane —
+    // the keyboard half of split resizing (pointer half is the divider
+    // drag handle).
+    if mods.contains(Modifiers::CONTROL)
+        && mods.contains(Modifiers::ALT)
+        && mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::ArrowLeft => Some(TermAction::ResizePane {
+                    horizontal: true,
+                    forward: false,
+                }),
+                NamedKey::ArrowRight => Some(TermAction::ResizePane {
+                    horizontal: true,
+                    forward: true,
+                }),
+                NamedKey::ArrowUp => Some(TermAction::ResizePane {
+                    horizontal: false,
+                    forward: false,
+                }),
+                NamedKey::ArrowDown => Some(TermAction::ResizePane {
+                    horizontal: false,
+                    forward: true,
+                }),
+                _ => None,
+            };
+        }
+        return None;
+    }
     if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
         return None;
     }
@@ -464,6 +495,14 @@ pub enum TermAction {
         /// Right/down when true, left/up when false.
         forward: bool,
     },
+    /// Move the divider beside the focused pane in a direction
+    /// (Ctrl+Alt+Shift+Arrow) — keyboard split resize.
+    ResizePane {
+        /// Left/right (Row splits) when true, up/down (Column) when false.
+        horizontal: bool,
+        /// Right/down when true, left/up when false.
+        forward: bool,
+    },
     /// URL hint mode: number the visible links, type digits + Enter to
     /// open one without the mouse.
     UrlHints,
@@ -471,6 +510,9 @@ pub enum TermAction {
     /// Cancel is Escape on the surface, not an action — the snackbar
     /// has a single action slot.
     PasteConfirm,
+    /// `confirm-close`: the user approved closing a pane/tab that has a
+    /// program running in the foreground.
+    CloseConfirm,
     /// Drag-and-drop: paste the dropped item's path (shell-quoted).
     DropText(String),
     /// Copy the output of the last finished (or running) command — the

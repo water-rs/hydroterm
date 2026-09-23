@@ -24,6 +24,7 @@ async-channel = "2.5"
 # X11 global hotkey for the quick terminal (already in the tree via winit).
 x11rb = "0.13"
 pollster = "1.0"
+libc = "0.2"
 png = "0.17"
 tracing = "0.1"
 polling = "3.8.0"
@@ -31,6 +32,15 @@ polling = "3.8.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The reader-thread pipeline (PTY read -> OSC scan -> VT parse -> grid)
+# is the bulk-output bottleneck: at opt-level 0 the whole loop feeds only
+# ~11 MB/s (parse+grid alone ~134 MB/s optimized). Compile the dev profile
+# at opt-level 2 with debuginfo kept — this is the standard practice for
+# performance-sensitive dev binaries — so the terminal's measured numbers
+# reflect the shipped shape rather than debug-codegen tax.
+[profile.dev]
+opt-level = 2
 
 [workspace]
 

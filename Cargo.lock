@@ -2334,6 +2334,7 @@ dependencies = [
  "hydrolysis-m3",
  "keyboard-types",
  "kurbo",
+ "libc",
  "nami",
  "parley",
  "peniko",

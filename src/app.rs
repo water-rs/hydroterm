@@ -102,6 +102,12 @@ pub struct Session {
     /// cols×rows text while resizing (Ghostty `resize-overlay`);
     /// `None` when no recent size change.
     pub resize_label: Binding<Option<Str>>,
+    /// Last logical size (points) the scene builder handed this pane —
+    /// feeds the split-divider drag, which needs real pixel extents.
+    pub pane_px: Binding<(f32, f32)>,
+    /// `confirm-close` prompt: `Some((program_label, whole_tab))` while
+    /// the snackbar asks before killing a busy pane/tab.
+    pub pending_close: Binding<Option<(Str, bool)>>,
 }
 
 impl Session {
@@ -157,6 +163,8 @@ impl Session {
             kitty_keyboard: config.kitty_keyboard,
             snackbar: RefCell::new(None),
             window_padding: binding((cfg.window_padding_x, cfg.window_padding_y)),
+            pane_px: Binding::default(),
+            pending_close: Binding::default(),
         }
     }
 }
@@ -176,25 +184,33 @@ pub enum SplitNode {
     Split {
         dir: SplitDir,
         children: Vec<SplitNode>,
+        /// Per-child main-axis sizes in points. Seeded from measured pane
+        /// rects on first layout and kept by the divider drag; a
+        /// `Binding` (not plain data) so the drag resizes the layout
+        /// reactively without rewriting the watched tree mid-gesture.
+        sizes: Binding<Vec<f32>>,
     },
 }
 
 impl SplitNode {
     /// Replace leaf `target` with a `dir` split containing
     /// `[target, new_leaf]` — the new pane takes half the target's slot,
-    /// like tmux/iTerm pane splits.
-    fn split(&mut self, dir: SplitDir, target: u64, new_id: u64) -> bool {
+    /// like tmux/iTerm pane splits. `slot_px` is the target leaf's
+    /// main-axis extent in points — both children start at half of it.
+    fn split(&mut self, dir: SplitDir, target: u64, new_id: u64, slot_px: f32) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
+                let half = slot_px / 2.0;
                 *self = Self::Split {
                     dir,
                     children: vec![Self::Leaf(target), Self::Leaf(new_id)],
+                    sizes: binding(vec![half, half]),
                 };
                 true
             }
             Self::Leaf(_) => false,
             Self::Split { children, .. } => {
-                children.iter_mut().any(|c| c.split(dir, target, new_id))
+                children.iter_mut().any(|c| c.split(dir, target, new_id, slot_px))
             }
         }
     }
@@ -205,17 +221,27 @@ impl SplitNode {
         match self {
             Self::Leaf(id) if *id == sid => None,
             Self::Leaf(id) => Some(Self::Leaf(*id)),
-            Self::Split { dir, children } => {
-                let kept: Vec<SplitNode> = children
+            Self::Split {
+                dir,
+                children,
+                sizes,
+            } => {
+                let recorded = sizes.get();
+                let kept: Vec<(f32, SplitNode)> = children
                     .iter()
-                    .filter_map(|c| c.remove(sid))
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        c.remove(sid)
+                            .map(|k| (recorded.as_slice().get(i).copied().unwrap_or(0.0), k))
+                    })
                     .collect();
                 match kept.as_slice() {
                     [] => None,
-                    [only] => Some(only.clone()),
+                    [(_, only)] => Some(only.clone()),
                     _ => Some(Self::Split {
                         dir: *dir,
-                        children: kept,
+                        children: kept.iter().map(|(_, c)| c.clone()).collect(),
+                        sizes: binding(kept.iter().map(|(s, _)| *s).collect::<Vec<f32>>()),
                     }),
                 }
             }
@@ -255,7 +281,7 @@ impl SplitNode {
     /// `None` at the layout's edge. `horizontal` selects left/right
     /// (`Row` splits), `forward` = right/down.
     fn neighbor(&self, focus: u64, horizontal: bool, forward: bool) -> Option<u64> {
-        let Self::Split { dir, children } = self else {
+        let Self::Split { dir, children, .. } = self else {
             return None;
         };
         let i = children.iter().position(|c| c.contains(focus))?;
@@ -271,6 +297,43 @@ impl SplitNode {
             }
         }
         children[i].neighbor(focus, horizontal, forward)
+    }
+
+    /// Move the divider beside `focus` by `delta` main-axis points
+    /// (positive = right/down). Picks the boundary on the signed side of
+    /// the focused child — or its only boundary at an edge — and shifts
+    /// it, clamping both panes at `MIN_PANE_PX` while the pair total
+    /// stays constant. Recurses until a matching-axis split is found.
+    fn resize_focus(&self, focus: u64, horizontal: bool, delta: f32) -> bool {
+        let Self::Split {
+            dir,
+            children,
+            sizes,
+        } = self
+        else {
+            return false;
+        };
+        let Some(i) = children.iter().position(|c| c.contains(focus)) else {
+            return false;
+        };
+        if matches!(dir, SplitDir::Row) != horizontal {
+            return children[i].resize_focus(focus, horizontal, delta);
+        }
+        let mut v = sizes.get();
+        if v.len() != children.len() || !v.iter().all(|s| *s > 0.0) {
+            // Not seeded yet — nothing measured to redistribute.
+            return true;
+        }
+        let b = if delta > 0.0 {
+            i.min(children.len() - 2)
+        } else {
+            i.saturating_sub(1)
+        };
+        let pair = v[b] + v[b + 1];
+        v[b] = (v[b] + delta).clamp(MIN_PANE_PX, pair - MIN_PANE_PX);
+        v[b + 1] = pair - v[b];
+        sizes.set(v);
+        true
     }
 }
 
@@ -396,7 +459,7 @@ impl AppState {
         for e in &watcher.errors {
             eprintln!("hydroterm config: {e}");
         }
-        let palette = Palette::from_theme(&watcher.config.resolve_theme());
+        let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto);
         let quick_binding = Binding::container(WindowState::Closed);
@@ -478,8 +541,7 @@ impl AppState {
     pub fn poll_config(&self) {
         // Desktop color-scheme flip under `theme = auto`.
         if self.theme_dirty.swap(false, Ordering::Relaxed) {
-            *self.palette.borrow_mut() =
-                Palette::from_theme(&self.cfg.borrow().config.resolve_theme());
+            *self.palette.borrow_mut() = Palette::for_config(&self.cfg.borrow().config);
         }
         let (config, errors) = {
             let mut w = self.cfg.borrow_mut();
@@ -491,7 +553,7 @@ impl AppState {
         for e in &errors {
             eprintln!("hydroterm config: {e}");
         }
-        *self.palette.borrow_mut() = Palette::from_theme(&config.resolve_theme());
+        *self.palette.borrow_mut() = Palette::for_config(&config);
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
@@ -619,7 +681,8 @@ impl AppState {
         let state = AppState::new(Some(self.cfg.borrow().path.clone()), None);
         // Same launch-time transparency as the main window.
         let opacity = state.config(|c| c.background_opacity);
-        let bg = state.config(|c| c.resolve_theme().background);
+        // `background =` overrides the theme's fill (same as the grid).
+        let bg = state.palette.borrow().background;
         let window = Window::new(
             state.window_title.clone(),
             state.window_state.clone(),
@@ -726,9 +789,19 @@ impl AppState {
             .session(target)
             .and_then(|s| s.cwd.lock().unwrap().clone());
         let session = self.spawn_session(cwd);
+        let slot_px = self
+            .session(target)
+            .map(|s| {
+                let px = s.pane_px.get();
+                match dir {
+                    SplitDir::Row => px.0,
+                    SplitDir::Column => px.1,
+                }
+            })
+            .unwrap_or_default();
         let ok = tab
             .tree
-            .with_mut(|tree| tree.split(dir, target, session.id));
+            .with_mut(|tree| tree.split(dir, target, session.id, slot_px));
         if !ok {
             session.terminal.shutdown();
             self.sessions
@@ -819,6 +892,21 @@ impl AppState {
         }
     }
 
+    /// Move the divider beside the focused pane by ~2 cells (48pt) in
+    /// the chord's direction — the keyboard path for split resizing.
+    /// The drag handle (`.gesture` on the divider) is the pointer path.
+    pub fn resize_pane_dir(&self, horizontal: bool, forward: bool) {
+        let tab_id = self.selected.get();
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let delta = if forward { 48.0 } else { -48.0 };
+        let tree = tab.tree.get();
+        if tree.resize_focus(tab.focused.get(), horizontal, delta) {
+            tab.tree.set(tree);
+        }
+    }
+
     /// Move the selected tab `dir` slots (wraps at both ends).
     pub fn move_tab(&self, dir: isize) {
         let cur = self.selected.get();
@@ -850,6 +938,95 @@ impl AppState {
         };
         let focused = tab.focused.get();
         tab.zoomed.with_mut(|z| *z = z.take().is_none().then_some(focused));
+    }
+
+    /// `confirm-close` gate on `close_pane`: when the pane's PTY has a
+    /// program in its foreground process group, prompt via the snackbar
+    /// first (Enter/“Close” confirms, Escape cancels). An idle shell
+    /// (or `confirm-close = false`) closes immediately.
+    pub fn try_close_pane(&self, session_id: u64) {
+        let prompted = if self.config(|c| c.confirm_close) {
+            let sessions = self.sessions.borrow();
+            sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .and_then(|s| {
+                    s.terminal
+                        .foreground_program()
+                        .map(|prog| (Str::from(prog), s.pending_close.clone()))
+                })
+        } else {
+            None
+        };
+        if let Some((label, pending)) = prompted {
+            pending.set(Some((label, false)));
+            return;
+        }
+        self.close_pane(session_id);
+    }
+
+    /// `confirm-close` gate on `close_tab` — any busy leaf prompts on
+    /// the focused pane's snackbar; confirming closes the whole tab.
+    pub fn try_close_tab(&self, tab_id: u64) {
+        let prompted = if self.config(|c| c.confirm_close)
+            && let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id)
+        {
+            let sessions = self.sessions.borrow();
+            let busy = tab
+                .tree
+                .get()
+                .leaves()
+                .iter()
+                .filter_map(|sid| sessions.iter().find(|s| s.id == *sid))
+                .find_map(|s| s.terminal.foreground_program().map(|p| (p, s)));
+            let focus = tab.focused.get();
+            busy.map(|(prog, _)| {
+                let pending = sessions
+                    .iter()
+                    .find(|s| s.id == focus)
+                    .map(|s| s.pending_close.clone());
+                (Str::from(prog), pending)
+            })
+        } else {
+            None
+        };
+        if let Some((label, Some(pending))) = prompted {
+            pending.set(Some((label, true)));
+            return;
+        }
+        self.close_tab(tab_id);
+    }
+
+    /// The user approved the `confirm-close` snackbar (Enter or its
+    /// “Close” button) — performs the stashed pane/tab close.
+    pub fn confirm_close(&self, session_id: u64) {
+        let decision = {
+            let sessions = self.sessions.borrow();
+            sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| s.pending_close.get().map(|(_, whole)| whole))
+        };
+        let Some(whole_tab) = decision.flatten() else { return };
+        self.cancel_close_prompt(session_id);
+        if whole_tab {
+            if let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied() {
+                self.close_tab(tab_id);
+            }
+        } else {
+            self.close_pane(session_id);
+        }
+    }
+
+    /// Clear a `confirm-close` prompt without closing (Escape).
+    pub fn cancel_close_prompt(&self, session_id: u64) {
+        let sessions = self.sessions.borrow();
+        if let Some(s) = sessions.iter().find(|s| s.id == session_id) {
+            s.pending_close.set(None);
+            if let Some(manager) = s.snackbar.borrow().as_ref() {
+                manager.dismiss();
+            }
+        }
     }
 
     /// Close a pane; when it's the tab's last pane, close the tab.
@@ -1013,6 +1190,35 @@ impl View for PaneLeaf {
             },
         )
         .anyview();
+        // `confirm-close`: closing a pane/tab whose PTY runs a program
+        // asks via the snackbar — “Close”/Enter confirms, Escape cancels
+        // (the snackbar's single action slot; the surface gate does Esc).
+        let pending_close = session.0.pending_close.clone();
+        let close_overlay = when(
+            pending_close.is_some(),
+            move || {
+                let label: Str = pending_close
+                    .get()
+                    .map(|(prog, whole)| {
+                        let scope = match whole {
+                            true => "Close tab? ",
+                            false => "Close? ",
+                        };
+                        Str::from(format!("{scope}{prog} is still running"))
+                    })
+                    .unwrap_or_else(|| Str::from("Close?"));
+                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
+                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
+                    manager.show(
+                        Snackbar::new(label)
+                            .action("Close", |s: PaneSession| s.push_action(TermAction::CloseConfirm))
+                            .duration(Duration::ZERO)
+                            .state(&PaneSession(s.0.clone())),
+                    );
+                })
+            },
+        )
+        .anyview();
         let bar = when(open, move || {
             hstack((
                 field("find in buffer", &query),
@@ -1073,6 +1279,7 @@ impl View for PaneLeaf {
         zstack((
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
+            close_overlay,
             resize_badge,
         ))
         .context_menu(menu)
@@ -1095,11 +1302,62 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyV
                 None => text("pane closed").anyview(),
             }
         }
-        SplitNode::Split { dir, children } => {
-            let views: Vec<AnyView> = children
-                .iter()
-                .map(|child| pane_view(child, focused, state))
-                .collect();
+        SplitNode::Split {
+            dir,
+            children,
+            sizes,
+        } => {
+            let k = children.len();
+            // Seed once from the measured layout so children keep the sizes
+            // the stack just gave them; later the divider drag owns it.
+            if sizes.get().len() != k {
+                let seeded: Vec<f32> = children
+                    .iter()
+                    .map(|c| subtree_px(c, state, *dir))
+                    .collect();
+                if seeded.iter().all(|s| *s > MIN_PANE_PX / 2.0) {
+                    sizes.set(seeded);
+                }
+            }
+            let sized = sizes.get().len() == k && sizes.get().iter().all(|s| *s > 0.0);
+            let mut views: Vec<AnyView> = Vec::with_capacity(2 * k - 1);
+            for (j, child) in children.iter().enumerate() {
+                if j > 0 {
+                    views.push(
+                        divider_handle(*dir, j, children, sizes, state.clone()).anyview(),
+                    );
+                }
+                let framed = when(
+                    sized,
+                    {
+                        let sz = sizes.clone();
+                        let extent = sz
+                            .map(move |v: Vec<f32>| v.as_slice().get(j).copied().unwrap_or(0.0));
+                        let child = child.clone();
+                        let foc = focused.clone();
+                        let st = state.clone();
+                        let d = *dir;
+                        move || {
+                            let child_view = pane_view(&child, &foc, &st);
+                            let ext = extent.clone();
+                            let frame = Frame::new(child_view);
+                            match d {
+                                SplitDir::Row => frame.width(ext),
+                                SplitDir::Column => frame.height(ext),
+                            }
+                        }
+                    },
+                )
+                .otherwise({
+                    let child = child.clone();
+                    let foc = focused.clone();
+                    let st = state.clone();
+                    // No measured extent yet — let the stack share space
+                    // equally until the seed lands.
+                    move || pane_view(&child, &foc, &st)
+                });
+                views.push(framed.anyview());
+            }
             // Vec<AnyView> collects straight into a stack — no ForEach ids.
             match dir {
                 SplitDir::Row => views.into_iter().collect::<HStack<_>>().spacing(0.0).anyview(),
@@ -1107,6 +1365,136 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyV
             }
         }
     }
+}
+
+/// Smallest pane extent the divider drag honors, in points.
+const MIN_PANE_PX: f32 = 48.0;
+/// Main-axis points one divider claims from its split (1pt line + 2×3pt
+/// grab padding).
+const DIVIDER_PX: f32 = 7.0;
+
+/// The main-axis extent `node` actually rendered last frame, in points —
+/// measured leaf rects rolled up the split tree. `along` is the axis of
+/// the split that contains `node` (its parent's direction).
+fn subtree_px(node: &SplitNode, state: &AppState, along: SplitDir) -> f32 {
+    match node {
+        SplitNode::Leaf(id) => {
+            let px = state
+                .session(*id)
+                .map(|s| s.pane_px.get())
+                .unwrap_or_default();
+            match along {
+                SplitDir::Row => px.0,
+                SplitDir::Column => px.1,
+            }
+        }
+        SplitNode::Split {
+            dir,
+            children,
+            sizes: _,
+        } if dir == &along => {
+            children
+                .iter()
+                .map(|c| subtree_px(c, state, along))
+                .sum::<f32>()
+                + DIVIDER_PX * (children.len().saturating_sub(1) as f32)
+        }
+        SplitNode::Split { children, .. } => children
+            .first()
+            .map(|c| subtree_px(c, state, along))
+            .unwrap_or_default(),
+    }
+}
+
+/// A 1pt theme-Border line padded to a 7pt grab zone that drags the two
+/// panes it separates — `children[j-1]` against `children[j]`.
+fn divider_handle(
+    dir: SplitDir,
+    j: usize,
+    children: &[SplitNode],
+    sizes: &Binding<Vec<f32>>,
+    state: AppState,
+) -> impl View {
+    use waterui::cursor::CursorStyle;
+    use waterui::gesture::{DragEvent, DragGesture, GesturePhase};
+    use waterui_core::extract::{State, Use};
+
+    let left = children[j - 1].clone();
+    let right = children[j].clone();
+    // (left, right) extents measured when the drag begins — re-seeded so a
+    // stale `sizes` (e.g. after a window resize) can't make the panes jump.
+    let grab = Binding::<Option<(f32, f32)>>::default();
+    let sizes = sizes.clone();
+    let app = state.clone();
+    let cursor = match dir {
+        SplitDir::Row => CursorStyle::ResizeLeftRight,
+        SplitDir::Column => CursorStyle::ResizeUpDown,
+    };
+    // A 1pt theme-Border line centred inside a 7pt grab zone. The explicit
+    // `Color::new(BorderColor)` keeps the geometry deterministic — the
+    // `Divider` component resolves its orientation from the stack's env,
+    // which does not survive the gesture/cursor wrappers here.
+    let line = match dir {
+        SplitDir::Row => Frame::new(Color::new(BorderColor))
+            .width(1.0)
+            .max_height(f32::INFINITY),
+        SplitDir::Column => Frame::new(Color::new(BorderColor))
+            .height(1.0)
+            .max_width(f32::INFINITY),
+    };
+    let handle = match dir {
+        SplitDir::Row => Frame::new(line)
+            .width(DIVIDER_PX)
+            .max_height(f32::INFINITY),
+        SplitDir::Column => Frame::new(line)
+            .height(DIVIDER_PX)
+            .max_width(f32::INFINITY),
+    };
+    handle
+        .cursor(cursor)
+        .state(&sizes)
+        .state(&grab)
+        .gesture(
+            DragGesture::new(0.0),
+            move |event: Option<Use<DragEvent>>,
+                  State(sizes): State<Binding<Vec<f32>>>,
+                  State(grab): State<Binding<Option<(f32, f32)>>>| {
+                if std::env::var_os("HYDROTERM_DEBUG_GESTURE").is_some() {
+                    eprintln!("[divider {:?}] fired: present={}", dir, event.is_some());
+                }
+                let Some(event) = event.map(|e| e.0) else { return };
+                if std::env::var_os("HYDROTERM_DEBUG_GESTURE").is_some() {
+                    eprintln!("[divider {:?}] phase={:?} t=({:.1},{:.1})", dir, event.phase, event.translation.x, event.translation.y);
+                }
+                match event.phase {
+                    GesturePhase::Started => {
+                        grab.set(Some((
+                            subtree_px(&left, &app, dir),
+                            subtree_px(&right, &app, dir),
+                        )));
+                    }
+                    GesturePhase::Updated => {
+                        let Some((l, r)) = grab.get() else { return };
+                        let delta = match dir {
+                            SplitDir::Row => event.translation.x,
+                            SplitDir::Column => event.translation.y,
+                        };
+                        // Clamp at the smaller pane's minimum: keep the
+                        // pair's total constant so neighbours don't shift.
+                        let clamped = delta.clamp(MIN_PANE_PX - l, r - MIN_PANE_PX);
+                        let mut v = sizes.get();
+                        if j < v.len() {
+                            v[j - 1] = l + clamped;
+                            v[j] = r - clamped;
+                            sizes.set(v);
+                        }
+                    }
+                    GesturePhase::Ended | GesturePhase::Cancelled => {
+                        grab.set(None);
+                    }
+                }
+            },
+        )
 }
 
 /// Root of every hydroterm window: `body` runs inside the environment, so
@@ -1190,7 +1578,7 @@ pub fn tabs_view(state: AppState) -> impl View {
                     text("×")
                         .muted()
                         .padding_with([3.0, 0.0, 4.0, 4.0])
-                        .on_tap(move |app: AppState| app.close_tab(tab_id)),
+                        .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
                 ))
                 .padding_with([4.0, 0.0, 8.0, 4.0]),
                 Frame::new(indicator_color).height(3.0),
@@ -1485,8 +1873,8 @@ mod tests {
     /// [0 | 1] split side-by-side, then 1 split down → [0 | {1 / 2}].
     fn nested() -> SplitNode {
         let mut t = SplitNode::Leaf(0);
-        assert!(t.split(SplitDir::Row, 0, 1));
-        assert!(t.split(SplitDir::Column, 1, 2));
+        assert!(t.split(SplitDir::Row, 0, 1, 800.0));
+        assert!(t.split(SplitDir::Column, 1, 2, 400.0));
         t
     }
 
@@ -1505,5 +1893,26 @@ mod tests {
         // Edges: past the right/bottom of the layout there is no neighbor.
         assert_eq!(t.neighbor(2, true, true), None);
         assert_eq!(t.neighbor(2, false, true), None);
+    }
+
+    /// A split seeds both children at half the parent's measured slot;
+    /// `remove` reseeds the surviving subtree's own sizes.
+    #[test]
+    fn split_seeds_and_remove_reseeds_sizes() {
+        let mut t = SplitNode::Leaf(0);
+        assert!(t.split(SplitDir::Row, 0, 1, 800.0));
+        let SplitNode::Split { children, sizes, .. } = &t else {
+            panic!("not a split");
+        };
+        assert_eq!(sizes.get().as_slice(), &[400.0, 400.0]);
+        assert_eq!(children.len(), 2);
+        // Nested split inside child 1 reseeds its own slot to halves.
+        assert!(t.split(SplitDir::Column, 1, 2, 400.0));
+        let rest = t.remove(0).expect("tree survives removing leaf 0");
+        let SplitNode::Split { sizes, children, .. } = &rest else {
+            panic!("expected the nested column split to remain");
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(sizes.get().as_slice(), &[200.0, 200.0]);
     }
 }
