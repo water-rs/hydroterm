@@ -404,6 +404,9 @@ impl TermSurface {
     fn paste_confirm(&mut self, accept: bool) {
         let text = self.session.pending_paste.get().map(|t| t.to_string());
         self.session.pending_paste.set(None);
+        if let Some(manager) = self.session.snackbar.borrow().as_ref() {
+            manager.dismiss();
+        }
         if accept && let Some(text) = text {
             let bracketed =
                 self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
@@ -449,7 +452,6 @@ impl TermSurface {
             TermAction::Copy => self.copy_selection(),
             TermAction::Paste => self.paste_clipboard(),
             TermAction::PasteConfirm => self.paste_confirm(true),
-            TermAction::PasteCancel => self.paste_confirm(false),
             TermAction::NewTab => {
                 self.app.new_tab();
             }
@@ -688,7 +690,11 @@ impl TermSurface {
                     }
                 }
                 TermEvent::ClipboardStore(_ty, text) => {
-                    if let Some(clip) = self.clipboard.as_mut() {
+                    // `osc52-write` config (Ghostty clipboard-write): deny
+                    // drops program-initiated clipboard writes.
+                    if self.app.config(|c| c.osc52_write)
+                        && let Some(clip) = self.clipboard.as_mut()
+                    {
                         let _ = clip.set_text(&text);
                     }
                 }

@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::Duration;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ use waterui::window::WindowPresentation;
 use waterui::task::spawn_local;
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
+use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::theme::color::{Accent, Background, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
@@ -83,9 +85,15 @@ pub struct Session {
     pub scrollback: std::sync::Mutex<usize>,
     /// Cursor style the session spawned with — preserved across
     /// `set_options` live reloads.
-    pub cursor_style: CursorStyle,
+    pub cursor_style: std::sync::Mutex<CursorStyle>,
     /// Current kitty-keyboard flag state source (kept for set_options).
     pub kitty_keyboard: bool,
+    /// The window's snackbar manager, captured by the pane's `on_appear` —
+    /// used to show (and dismiss) the paste-protection confirmation.
+    pub snackbar: RefCell<Option<SnackbarManager>>,
+    /// `window-padding-x`/`window-padding-y` in points — drives the
+    /// `.padding_with` around each pane's surface, live-reloadable.
+    pub window_padding: Binding<(f32, f32)>,
 }
 
 impl Session {
@@ -115,7 +123,7 @@ impl Session {
                 .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
         };
         // A reasonable initial grid; the surface resizes on its first frame.
-        let terminal = Terminal::spawn(config.clone(), 120, 32, (9, 18), cwd, shell)
+        let terminal = Terminal::spawn(config.clone(), 120, 32, (9, 18), cwd, shell, &cfg.term)
             .expect("failed to spawn PTY — is a shell available?");
         Self {
             id,
@@ -133,10 +141,12 @@ impl Session {
             pending_actions: Rc::new(RefCell::new(Vec::new())),
             mouse_reporting: Binding::bool(false),
             font_family: binding(Str::from(cfg.font_family.clone())),
-            pending_paste: binding(None),
+            pending_paste: Binding::default(),
             scrollback: std::sync::Mutex::new(cfg.scrollback),
-            cursor_style: config.default_cursor_style,
+            cursor_style: std::sync::Mutex::new(config.default_cursor_style),
             kitty_keyboard: config.kitty_keyboard,
+            snackbar: RefCell::new(None),
+            window_padding: binding((cfg.window_padding_x, cfg.window_padding_y)),
         }
     }
 }
@@ -467,18 +477,27 @@ impl AppState {
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
-            // Live scrollback-limit change — `set_options` is alacritty's
-            // own live-reconfigure path. Rebuild the Config exactly as
-            // spawn does so kitty-keyboard / cursor style survive intact.
-            if *s.scrollback.lock().unwrap() != config.scrollback {
+            s.window_padding
+                .set_from((config.window_padding_x, config.window_padding_y));
+            // Live scrollback-limit / cursor-style change — `set_options`
+            // is alacritty's own live-reconfigure path. Rebuild the Config
+            // exactly as spawn does so kitty-keyboard survives intact.
+            let cursor_style = CursorStyle {
+                shape: config.cursor_shape,
+                blinking: config.cursor_blink,
+            };
+            if *s.scrollback.lock().unwrap() != config.scrollback
+                || *s.cursor_style.lock().unwrap() != cursor_style
+            {
                 let mut term = s.terminal.term.lock();
                 term.set_options(alacritty_terminal::term::Config {
                     scrolling_history: config.scrollback,
                     kitty_keyboard: s.kitty_keyboard,
-                    default_cursor_style: s.cursor_style,
+                    default_cursor_style: cursor_style,
                     ..Default::default()
                 });
                 *s.scrollback.lock().unwrap() = config.scrollback;
+                *s.cursor_style.lock().unwrap() = cursor_style;
             }
         }
     }
@@ -908,19 +927,30 @@ impl View for PaneLeaf {
         let query = self.session.search_query.clone();
         let status = self.session.search_status.clone();
         let open = self.session.search_open.clone();
-        let surface = Frame::new(SceneView::new(TermSurface::new(
+        let padding = self
+            .session
+            .window_padding
+            .map(|p: (f32, f32)| EdgeInsets::new(p.1, p.1, p.0, p.0));
+        let surface = SceneView::new(TermSurface::new(
             self.session.clone(),
             self.state.clone(),
             self.state.palette,
             FontCollection::from_env(env),
-        )));
+        ))
+        .padding_with(padding);
+        let surface = Frame::new(surface);
         let reporting = self.session.mouse_reporting.clone();
         // Paste-protection confirm: multi-line clipboard content waits in
         // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
         let pending = self.session.pending_paste.clone();
         let session = PaneSession(self.session); // `.state` stores a clone
+        // Paste-protection confirmation rides the framework's own snackbar
+        // overlay (mounted by `Window::new`), so it layers above the pane
+        // correctly. The `when` gate mounts a zero-size trigger whose
+        // `on_appear` presents the Snackbar; `pending_paste` still gates
+        // keystrokes (Enter = Paste, Escape = Cancel) on the surface side.
         let paste_overlay = when(
-            pending.map(|p| p.is_some()).computed(),
+            pending.is_some(),
             move || {
                 let preview: Str = pending
                     .get()
@@ -930,18 +960,15 @@ impl View for PaneLeaf {
                         Str::from(format!("Paste {lines} lines? {first}…"))
                     })
                     .unwrap_or_else(|| Str::from("Paste?"));
-                let panel = vstack((
-                    text(preview).foreground(Foreground),
-                    hstack((
-                        button("Paste").action(|s: PaneSession| s.push_action(TermAction::PasteConfirm)),
-                        button("Cancel").action(|s: PaneSession| s.push_action(TermAction::PasteCancel)),
-                    ))
-                    .spacing(12.0),
-                ))
-                .spacing(8.0)
-                .padding()
-                .background(Surface);
-                vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
+                Spacer::new(0.0).on_appear(move |State(manager): State<SnackbarManager>, s: PaneSession| {
+                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
+                    manager.show(
+                        Snackbar::new(preview)
+                            .action("Paste", |s: PaneSession| s.push_action(TermAction::PasteConfirm))
+                            .duration(Duration::ZERO)
+                            .state(&PaneSession(s.0.clone())),
+                    );
+                })
             },
         )
         .anyview();

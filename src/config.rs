@@ -57,6 +57,15 @@ pub struct AppConfig {
     /// Hide the pointer while typing; it returns on the next move
     /// (Ghostty `mouse-hide-while-typing`). X11 only — XFixes HideCursor.
     pub mouse_hide_typing: bool,
+    /// Blank space around the cell grid in points (Ghostty
+    /// `window-padding-x` / `window-padding-y`); live-reloaded.
+    pub window_padding_x: f32,
+    pub window_padding_y: f32,
+    /// `$TERM` the PTY advertises (Ghostty `term`).
+    pub term: String,
+    /// Whether programs may write the clipboard through OSC 52
+    /// (Ghostty `clipboard-write` allow/deny).
+    pub osc52_write: bool,
 }
 
 impl Default for AppConfig {
@@ -76,6 +85,10 @@ impl Default for AppConfig {
             background_opacity: 1.0,
             paste_protection: true,
             mouse_hide_typing: true,
+            window_padding_x: 0.0,
+            window_padding_y: 0.0,
+            term: "xterm-256color".to_string(),
+            osc52_write: true,
         }
     }
 }
@@ -97,6 +110,10 @@ const TEMPLATE: &str = "\
 font-size = 13
 font-family = monospace
 scrollback = 10000
+window-padding-x = 0       # blank margin around the grid, in points
+window-padding-y = 0
+term = xterm-256color      # $TERM value advertised to programs
+osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
 #        solarized-dark | solarized-light
@@ -176,6 +193,27 @@ impl AppConfig {
                     "true" | "yes" | "1" | "on" => cfg.paste_protection = true,
                     "false" | "no" | "0" | "off" => cfg.paste_protection = false,
                     _ => errors.push(format!("line {}: bad paste-protection {value:?}", n + 1)),
+                },
+                "window-padding-x" | "window_padding_x" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=200.0).contains(&v) => cfg.window_padding_x = v,
+                    _ => errors.push(format!("line {}: bad window-padding-x {value:?}", n + 1)),
+                },
+                "window-padding-y" | "window_padding_y" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=200.0).contains(&v) => cfg.window_padding_y = v,
+                    _ => errors.push(format!("line {}: bad window-padding-y {value:?}", n + 1)),
+                },
+                "window-padding" | "window_padding" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=200.0).contains(&v) => {
+                        cfg.window_padding_x = v;
+                        cfg.window_padding_y = v;
+                    }
+                    _ => errors.push(format!("line {}: bad window-padding {value:?}", n + 1)),
+                },
+                "term" => cfg.term = value.to_string(),
+                "osc52-write" | "clipboard-write" => match value {
+                    "allow" | "true" | "yes" | "1" | "on" => cfg.osc52_write = true,
+                    "deny" | "false" | "no" | "0" | "off" => cfg.osc52_write = false,
+                    _ => errors.push(format!("line {}: bad osc52-write {value:?}", n + 1)),
                 },
                 "mouse-hide-while-typing" | "mouse_hide_while_typing" => match value {
                     "true" | "yes" | "1" | "on" => cfg.mouse_hide_typing = true,

@@ -185,7 +185,7 @@ pub struct Terminal {
 impl Terminal {
     /// Spawn a shell on a PTY and start parsing. `shell` overrides the
     /// auto-injected shell integration (used by `shell =` config and `-e`).
-    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>, shell: Option<Shell>) -> io::Result<Self> {
+    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>, shell: Option<Shell>, term_name: &str) -> io::Result<Self> {
         let (proxy, events_rx) = EventProxy::new();
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -195,7 +195,7 @@ impl Terminal {
             None => shell_with_integration(),
         };
         let mut env: HashMap<String, String> = [
-            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("TERM".to_owned(), term_name.to_owned()),
             ("COLORTERM".to_owned(), "truecolor".to_owned()),
             ("TERM_PROGRAM".to_owned(), "hydroterm".to_owned()),
         ]
