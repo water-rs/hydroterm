@@ -45,6 +45,8 @@ use crate::terminal::TermEvent;
 const BLINK_HALF: Duration = Duration::from_millis(530);
 /// Bell flash decay time.
 const BELL_FLASH_SECS: f32 = 0.15;
+/// How long the cols×rows resize badge stays after the last change.
+const RESIZE_LABEL_MS: Duration = Duration::from_millis(900);
 /// Peak overlay alpha of a bell flash, decaying linearly to 0 over
 /// `BELL_FLASH_SECS`.
 const BELL_FLASH_ALPHA: f32 = 0.18;
@@ -276,6 +278,8 @@ pub struct TermSurface {
     preedit: Option<(String, usize)>,
     scroll_accum_px: f64,
     bell_at: Option<Instant>,
+    /// Last grid-size change for the `resize-overlay` badge decay.
+    resize_at: Option<Instant>,
     /// Last time the X11 bell actually rang (throttle).
     bell_ring_at: Option<Instant>,
     blink_epoch: Instant,
@@ -332,6 +336,7 @@ impl TermSurface {
             preedit: None,
             scroll_accum_px: 0.0,
             bell_at: None,
+            resize_at: None,
             bell_ring_at: None,
             blink_epoch: Instant::now(),
             search: None,
@@ -816,6 +821,15 @@ impl TermSurface {
             self.session
                 .terminal
                 .resize(cols, lines, (m.cell_w as u16, m.cell_h as u16));
+            // `resize-overlay`: show the new grid size for a beat after
+            // the last change — the Instant decays inside build_scene,
+            // same pattern as the bell flash.
+            if self.app.config(|c| c.resize_overlay) {
+                self.resize_at = Some(Instant::now());
+                self.session
+                    .resize_label
+                    .set(Some(Str::from(format!("{cols}\u{00d7}{lines}"))));
+            }
         }
     }
 
@@ -1112,6 +1126,12 @@ impl TermSurface {
     }
 
     fn on_pointer_move(&mut self, x: f64, y: f64) {
+        // `focus-follows-mouse`: entering this pane records it as the
+        // tab's focused split (app-level record — GUI key focus still
+        // needs a press until hydrolysis#126).
+        if self.app.config(|c| c.focus_follows_mouse) {
+            self.app.focus_pane(self.session.id);
+        }
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
 
@@ -1734,6 +1754,15 @@ impl SceneContent for TermSurface {
         let bell_live = self
             .bell_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(BELL_FLASH_SECS));
+        // The resize badge stays up for RESIZE_LABEL_MS after the last
+        // size change, then clears itself.
+        let resize_live = self
+            .resize_at
+            .is_some_and(|t| t.elapsed() < RESIZE_LABEL_MS);
+        if !resize_live && self.resize_at.is_some() {
+            self.resize_at = None;
+            self.session.resize_label.set(None);
+        }
 
         self.build(scene, width, height);
 
@@ -1744,7 +1773,7 @@ impl SceneContent for TermSurface {
             eprintln!("istats draw keys={keys} events={events} draw_ms={ms:.1}");
         }
 
-        cursor_blinking || bell_live || self.search.is_some()
+        cursor_blinking || bell_live || resize_live || self.search.is_some()
     }
 
     fn set_invalidator(&mut self, invalidator: Option<SceneInvalidator>) {

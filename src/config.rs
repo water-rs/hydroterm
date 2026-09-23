@@ -69,6 +69,19 @@ pub struct AppConfig {
     /// Bold text renders with the bright palette slot
     /// (alacritty `draw_bold_text_with_bright_colors`, default true).
     pub bold_is_bright: bool,
+    /// Initial working directory when no OSC 7 cwd was reported
+    /// (Ghostty `working-directory`); `~` expands at load.
+    pub working_directory: Option<PathBuf>,
+    /// Alpha applied to a pane that is not the focused split
+    /// (Ghostty `unfocused-split-opacity`), clamped to 0.0..=1.0.
+    pub unfocused_split_opacity: f32,
+    /// Show a cols×rows badge while the window resizes
+    /// (Ghostty `resize-overlay`).
+    pub resize_overlay: bool,
+    /// Pointer entering a pane records it as the focused split
+    /// (Ghostty `focus-follows-mouse`). App-level record only —
+    /// GUI key focus still needs a press until hydrolysis#126.
+    pub focus_follows_mouse: bool,
 }
 
 impl Default for AppConfig {
@@ -93,6 +106,10 @@ impl Default for AppConfig {
             term: "xterm-256color".to_string(),
             osc52_write: true,
             bold_is_bright: true,
+            working_directory: None,
+            unfocused_split_opacity: 1.0,
+            resize_overlay: true,
+            focus_follows_mouse: false,
         }
     }
 }
@@ -119,6 +136,11 @@ window-padding-y = 0
 term = xterm-256color      # $TERM value advertised to programs
 osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
 bold-is-bright = true       # bold text uses the bright palette slot
+unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
+resize-overlay = true      # cols x rows badge while resizing
+focus-follows-mouse = false
+# command = tmux attach    # program for the initial session (`-e` wins)
+# working-directory = ~/projects   # initial cwd when no OSC 7 report
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
 #        solarized-dark | solarized-light
@@ -255,6 +277,31 @@ impl AppConfig {
                     _ => errors.push(format!("line {}: bad cursor-shape {value:?}", n + 1)),
                 },
                 "shell" => cfg.shell = (!value.is_empty()).then(|| value.to_string()),
+                "command" => {
+                    let argv: Vec<String> =
+                        value.split_whitespace().map(String::from).collect();
+                    cfg.command = (!argv.is_empty()).then_some(argv);
+                }
+                "working-directory" | "working_directory" | "working-dir" => {
+                    cfg.working_directory = (!value.is_empty()).then(|| expand_home(value));
+                }
+                "unfocused-split-opacity" | "unfocused_split_opacity" => {
+                    match value.parse::<f32>() {
+                        Ok(v) if (0.0..=1.0).contains(&v) => {
+                            cfg.unfocused_split_opacity = v;
+                        }
+                        _ => errors.push(format!(
+                            "line {}: bad unfocused-split-opacity {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "resize-overlay" | "resize_overlay" => {
+                    cfg.resize_overlay = bool_value(value, n, &mut errors);
+                }
+                "focus-follows-mouse" | "focus_follows_mouse" => {
+                    cfg.focus_follows_mouse = bool_value(value, n, &mut errors);
+                }
                 "keybind" => match parse_keybind(value) {
                     Ok((chord, action)) => cfg.keybinds.push((chord, action)),
                     Err(e) => errors.push(format!("line {}: {e}", n + 1)),
@@ -280,6 +327,16 @@ impl AppConfig {
             Err(e) => (Self::default(), vec![format!("reading {}: {e}", path.display())]),
         }
     }
+}
+
+/// `~/…` expands to `$HOME/…`; anything else passes through verbatim.
+fn expand_home(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(value)
 }
 
 fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {

@@ -12,6 +12,7 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::collection::List as NamiList;
+use nami::zip::zip;
 use nami::{Binding, binding};
 use waterui::state;
 use waterui::Identifiable;
@@ -95,6 +96,12 @@ pub struct Session {
     /// `window-padding-x`/`window-padding-y` in points — drives the
     /// `.padding_with` around each pane's surface, live-reloadable.
     pub window_padding: Binding<(f32, f32)>,
+    /// `unfocused-split-opacity` — alpha applied when this pane is not
+    /// the tab's focused split; live-reloaded via `poll_config`.
+    pub unfocused_opacity: Binding<f32>,
+    /// cols×rows text while resizing (Ghostty `resize-overlay`);
+    /// `None` when no recent size change.
+    pub resize_label: Binding<Option<Str>>,
 }
 
 impl Session {
@@ -144,6 +151,8 @@ impl Session {
             font_family: binding(Str::from(cfg.font_family.clone())),
             pending_paste: Binding::default(),
             scrollback: std::sync::Mutex::new(cfg.scrollback),
+            unfocused_opacity: Binding::f32(cfg.unfocused_split_opacity),
+            resize_label: Binding::default(),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
             kitty_keyboard: config.kitty_keyboard,
             snackbar: RefCell::new(None),
@@ -342,6 +351,9 @@ pub struct AppState {
     pub quick_unavailable: RefCell<bool>,
     /// True for the drop-down's own AppState: it neither hosts a quick
     /// window itself nor spawns a second key grab.
+    /// True after the first `spawn_session` — `command` is consumed as
+    /// initial-surface-only and never re-applied by a hot reload.
+    initial_spawn: std::cell::Cell<bool>,
     is_quick: bool,
     /// Weak handles to live terminals so the theme monitor thread can
     /// request frames (dirty is only read inside `poll_config`).
@@ -376,7 +388,11 @@ impl AppState {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(config_path: Option<std::path::PathBuf>, command: Option<Vec<String>>) -> Self {
         let mut watcher = ConfigWatcher::new(config_path);
-        watcher.config.command = command;
+        if command.is_some() {
+            // `-e` wins over a config-file `command =`; neither survives
+            // past the first session (initial-surface semantics).
+            watcher.config.command = command;
+        }
         for e in &watcher.errors {
             eprintln!("hydroterm config: {e}");
         }
@@ -409,6 +425,7 @@ impl AppState {
             quick_listener_started: Rc::new(AtomicBool::new(false)),
             quick_task: Rc::new(RefCell::new(None)),
             quick_unavailable: RefCell::new(false),
+            initial_spawn: std::cell::Cell::new(false),
             is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -480,6 +497,7 @@ impl AppState {
             s.font_family.set_from(Str::from(config.font_family.clone()));
             s.window_padding
                 .set_from((config.window_padding_x, config.window_padding_y));
+            s.unfocused_opacity.set(config.unfocused_split_opacity);
             // Live scrollback-limit / cursor-style change — `set_options`
             // is alacritty's own live-reconfigure path. Rebuild the Config
             // exactly as spawn does so kitty-keyboard survives intact.
@@ -646,7 +664,14 @@ impl AppState {
 
     fn spawn_session(&self, cwd: Option<std::path::PathBuf>) -> Rc<Session> {
         let id = self.alloc_id();
-        let cfg = self.cfg.borrow().config.clone();
+        let mut cfg = self.cfg.borrow().config.clone();
+        // `command` (config file or `-e`) is initial-surface only — a
+        // hot reload re-populating it must not hijack later spawns.
+        if self.initial_spawn.replace(true) {
+            cfg.command = None;
+        }
+        // `working-directory` fills in when no OSC 7 cwd was inherited.
+        let cwd = cwd.or_else(|| cfg.working_directory.clone());
         let session = Rc::new(Session::spawn(id, cwd, &cfg));
         self.sessions.borrow_mut().push(session.clone());
         session
@@ -730,6 +755,9 @@ impl AppState {
         else {
             return;
         };
+        if tab.focused.get() == session_id {
+            return;
+        }
         tab.focused.set(session_id);
         if let Some(s) = self.session(session_id) {
             tab.title.set(s.title.get());
@@ -918,6 +946,9 @@ impl AppState {
 struct PaneLeaf {
     session: Rc<Session>,
     state: AppState,
+    /// The owning tab's focused-pane id — the unfocused-dim computed
+    /// compares this pane's session id against it.
+    focused: Binding<u64>,
 }
 
 impl View for PaneLeaf {
@@ -1013,14 +1044,44 @@ impl View for PaneLeaf {
                 }
             })
             .computed();
-        zstack((vstack((bar, surface)).spacing(0.0), paste_overlay))
-            .context_menu(menu)
-            .state(&session)
+        // `unfocused-split-opacity`: the focused pane stays opaque, every
+        // other leaf in this tab fades to the configured alpha — a
+        // signal-driven dim like Ghostty's.
+        let session_id = session.0.id;
+        let pane_alpha = zip(
+            self.focused.equal_to(session_id),
+            session.0.unfocused_opacity.clone(),
+        )
+        .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
+        // `resize-overlay`: a cols×rows chip at the pane's bottom edge
+        // while the terminal resizes; `resize_label` is Some only in
+        // the display window. A Spacer above the `when` pushes the chip
+        // to the pane's bottom edge.
+        let resize_label = session.0.resize_label.clone();
+        let show_resize = resize_label.is_some();
+        let resize_badge = vstack((
+            Spacer::flexible(),
+            when(show_resize, move || {
+                text(resize_label.unwrap_or_default().computed())
+                    .foreground(Foreground)
+                    .padding_horizontal(10.0)
+                    .padding_vertical(4.0)
+                    .background(Surface)
+            })
+            .padding_vertical(8.0),
+        ));
+        zstack((
+            vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
+            paste_overlay,
+            resize_badge,
+        ))
+        .context_menu(menu)
+        .state(&session)
     }
 }
 
 /// Render one pane node as WaterUI views.
-fn pane_view(node: &SplitNode, state: &AppState) -> AnyView {
+fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyView {
     match node {
         SplitNode::Leaf(sid) => {
             let session = state.session(*sid);
@@ -1028,6 +1089,7 @@ fn pane_view(node: &SplitNode, state: &AppState) -> AnyView {
                 Some(session) => PaneLeaf {
                     session,
                     state: state.clone(),
+                    focused: focused.clone(),
                 }
                 .anyview(),
                 None => text("pane closed").anyview(),
@@ -1036,7 +1098,7 @@ fn pane_view(node: &SplitNode, state: &AppState) -> AnyView {
         SplitNode::Split { dir, children } => {
             let views: Vec<AnyView> = children
                 .iter()
-                .map(|child| pane_view(child, state))
+                .map(|child| pane_view(child, focused, state))
                 .collect();
             // Vec<AnyView> collects straight into a stack — no ForEach ids.
             match dir {
@@ -1070,13 +1132,15 @@ fn tab_content(tab: PaneTab, app: AppState) -> impl View {
     watch(tab.zoomed.clone(), {
         let app = app.clone();
         let tree = tab.tree.clone();
+        let tab_focused = tab.focused.clone();
         move |z: Option<u64>| {
             if let Some(z) = z.filter(|z| app.session(*z).is_some()) {
-                pane_view(&SplitNode::Leaf(z), &app)
+                pane_view(&SplitNode::Leaf(z), &tab_focused, &app)
             } else {
                 watch(tree.clone(), {
                     let app = app.clone();
-                    move |node: SplitNode| pane_view(&node, &app)
+                    let tab_focused = tab_focused.clone();
+                    move |node: SplitNode| pane_view(&node, &tab_focused, &app)
                 })
                 .anyview()
             }
