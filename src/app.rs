@@ -22,7 +22,7 @@ use waterui::prelude::*;
 use waterui::widget::condition::when;
 use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
 use waterui::window::WindowPresentation;
-use waterui::task::spawn_local;
+use waterui::task::{sleep, spawn_local};
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
@@ -137,7 +137,18 @@ impl Session {
                 .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
         };
         // A reasonable initial grid; the surface resizes on its first frame.
-        let terminal = Terminal::spawn(config.clone(), 120, 32, (9, 18), cwd, shell, &cfg.term)
+        let terminal = Terminal::spawn(
+            config.clone(),
+            120,
+            32,
+            (9, 18),
+            crate::terminal::SpawnOpts {
+                cwd,
+                shell,
+                term_name: &cfg.term,
+                env_extra: &cfg.env,
+            },
+        )
             .expect("failed to spawn PTY — is a shell available?");
         Self {
             id,
@@ -372,6 +383,10 @@ pub struct AppState {
     /// Window state binding — normal/minimized/fullscreen/closed.
     /// Owned by us so keybinds can toggle fullscreen.
     pub window_state: Binding<WindowState>,
+    /// The main window's `frame` binding (hydrolysis writes live geometry
+    /// back on Moved/Resize) — captured in `main` so the save-state poller
+    /// can persist it.
+    pub window_frame: Rc<RefCell<Option<Binding<Rect>>>>,
     /// Config file state (parsed values + mtime watch).
     pub cfg: Rc<RefCell<ConfigWatcher>>,
     /// The active palette — swapped wholesale on theme reload.
@@ -470,6 +485,7 @@ impl AppState {
             selected: Binding::u64(0),
             window_title: binding(Str::from("hydroterm")),
             window_state: binding(WindowState::Normal),
+            window_frame: Rc::new(RefCell::new(None)),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
             env: Rc::new(std::cell::OnceCell::new()),
@@ -1417,6 +1433,7 @@ fn divider_handle(
 ) -> impl View {
     use waterui::cursor::CursorStyle;
     use waterui::gesture::{DragEvent, DragGesture, GesturePhase};
+    use waterui::widget::Divider;
     use waterui_core::extract::{State, Use};
 
     let left = children[j - 1].clone();
@@ -1430,23 +1447,16 @@ fn divider_handle(
         SplitDir::Row => CursorStyle::ResizeLeftRight,
         SplitDir::Column => CursorStyle::ResizeUpDown,
     };
-    // A 1pt theme-Border line centred inside a 7pt grab zone. The explicit
-    // `Color::new(BorderColor)` keeps the geometry deterministic — the
-    // `Divider` component resolves its orientation from the stack's env,
-    // which does not survive the gesture/cursor wrappers here.
-    let line = match dir {
-        SplitDir::Row => Frame::new(Color::new(BorderColor))
-            .width(1.0)
-            .max_height(f32::INFINITY),
-        SplitDir::Column => Frame::new(Color::new(BorderColor))
-            .height(1.0)
-            .max_width(f32::INFINITY),
-    };
+    // The framework `Divider` resolves its orientation from the stack's
+    // `Axis` env — probed: the env survives the Frame/cursor/gesture/state
+    // wrappers here, so inside an HStack child it renders a vertical 1pt
+    // `BorderColor` line (horizontal inside a VStack). The Frame widens the
+    // hit zone to 7pt around the centred line.
     let handle = match dir {
-        SplitDir::Row => Frame::new(line)
+        SplitDir::Row => Frame::new(Divider)
             .width(DIVIDER_PX)
             .max_height(f32::INFINITY),
-        SplitDir::Column => Frame::new(line)
+        SplitDir::Column => Frame::new(Divider)
             .height(DIVIDER_PX)
             .max_width(f32::INFINITY),
     };
@@ -1506,8 +1516,55 @@ struct AppRoot {
 impl View for AppRoot {
     fn body(self, env: &Environment) -> impl View {
         let _ = self.state.env.set(env.clone());
+        // `window-save-state`: persist the live frame whenever it changes.
+        // hydrolysis writes real Moved/Resize geometry back into this
+        // binding, so a 1s poll sees every user resize/move.
+        if self.state.config(|c| c.window_save_state)
+            && let Some(frame) = self.state.window_frame.borrow().clone()
+        {
+            spawn_local(async move {
+                let mut last = Rect::new(Point::new(f32::NAN, f32::NAN), Size::zero());
+                loop {
+                    sleep(std::time::Duration::from_millis(500)).await;
+                    let f = frame.get();
+                    if f != last {
+                        last = f;
+                        save_window_state(f);
+                    }
+                }
+            })
+            .detach();
+        }
         tabs_view(self.state)
     }
+}
+
+/// `~/.config/hydroterm/window-state` — sibling of the config file,
+/// `x y w h` in points on one line.
+fn window_state_path() -> std::path::PathBuf {
+    crate::config::default_path()
+        .parent()
+        .map(|d| d.join("window-state"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/hydroterm-window-state"))
+}
+
+/// Read a persisted window frame; anything malformed yields `None`.
+pub fn load_window_state() -> Option<Rect> {
+    let text = std::fs::read_to_string(window_state_path()).ok()?;
+    let mut it = text.split_whitespace().map(|t| t.parse::<f32>().ok());
+    let (x, y, w, h) = (it.next()??, it.next()??, it.next()??, it.next()??);
+    (w >= 100.0 && h >= 100.0)
+        .then(|| Rect::new(Point::new(x, y), Size::new(w, h)))
+}
+
+fn save_window_state(frame: Rect) {
+    let path = window_state_path();
+    let o = frame.origin();
+    let s = frame.size();
+    let _ = std::fs::write(
+        path,
+        format!("{} {} {} {}\n", o.x, o.y, s.width, s.height),
+    );
 }
 
 /// Window content — used for both the main window and spawned ones.

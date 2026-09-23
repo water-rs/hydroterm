@@ -144,6 +144,7 @@ impl Palette {
         bg: Color,
         flags: Flags,
         bold_bright: bool,
+        min_contrast: f32,
     ) -> CellColors {
         let mut fg = self.resolve_fg(
             colors,
@@ -158,6 +159,9 @@ impl Palette {
         }
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
+        }
+        if min_contrast > 1.0 {
+            fg = enforce_contrast(fg, bg, min_contrast);
         }
         CellColors { fg, bg }
     }
@@ -231,4 +235,93 @@ pub fn peniko_alpha(rgb: Rgb, a: f32) -> peniko::Color {
         rgb.b as f32 / 255.0,
         a,
     ])
+}
+
+
+// ---------------------------------------------------------------------------
+// `minimum-contrast`: WCAG-ratio floor on cell foreground vs background
+// ---------------------------------------------------------------------------
+
+/// Relative luminance of one sRGB channel (IEC 61966-2-1 linearization).
+fn channel_luminance(c: u8) -> f64 {
+    let v = f64::from(c) / 255.0;
+    if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// WCAG 2.x relative luminance of an sRGB triple.
+fn luminance(c: Rgb) -> f64 {
+    0.2126 * channel_luminance(c.r)
+        + 0.7152 * channel_luminance(c.g)
+        + 0.0722 * channel_luminance(c.b)
+}
+
+fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
+    let (l1, l2) = (luminance(a), luminance(b));
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Lift `fg` toward the extreme (black or white) that has more contrast
+/// against `bg` until the WCAG ratio reaches `min`, binary-searching the
+/// blend factor. Mirrors Ghostty's `minimum-contrast` adjustment.
+pub fn enforce_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
+    if contrast_ratio(fg, bg) >= min as f64 {
+        return fg;
+    }
+    // Blend toward black or white — the WCAG `+0.05` offsets make the
+    // ratio asymmetric, so pick whichever extreme actually scores higher
+    // rather than comparing luminance to a midpoint.
+    let white = Rgb { r: 255, g: 255, b: 255 };
+    let black = Rgb { r: 0, g: 0, b: 0 };
+    let target = if contrast_ratio(white, bg) >= contrast_ratio(black, bg) {
+        white
+    } else {
+        black
+    };
+    let blend = |t: f32| Rgb {
+        r: (f32::from(fg.r) + t * (f32::from(target.r) - f32::from(fg.r))).round() as u8,
+        g: (f32::from(fg.g) + t * (f32::from(target.g) - f32::from(fg.g))).round() as u8,
+        b: (f32::from(fg.b) + t * (f32::from(target.b) - f32::from(fg.b))).round() as u8,
+    };
+    // If even the extreme cannot reach `min`, take the extreme outright.
+    if contrast_ratio(target, bg) < min as f64 {
+        return target;
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..12 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(blend(mid), bg) >= min as f64 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    blend(hi)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contrast_enforcement_reaches_the_ratio_floor() {
+        // Grey-on-grey (~1.1:1) must lift to >= 4.5.
+        let fg = Rgb { r: 128, g: 128, b: 128 };
+        let bg = Rgb { r: 120, g: 120, b: 120 };
+        let out = enforce_contrast(fg, bg, 4.5);
+        assert!(contrast_ratio(out, bg) >= 4.5 - 1e-6, "{out:?}");
+        // Already-sufficient colors pass through untouched.
+        let fg2 = Rgb { r: 250, g: 250, b: 250 };
+        let bg2 = Rgb { r: 10, g: 10, b: 10 };
+        assert_eq!(enforce_contrast(fg2, bg2, 4.5), fg2);
+        // White-on-white: the extreme wins and the blend stops at the
+        // ratio floor — dark, and >= 4.5, not necessarily pure black.
+        let out = enforce_contrast(Rgb{r:255,g:255,b:255}, Rgb{r:255,g:255,b:255}, 4.5);
+        assert!(contrast_ratio(out, Rgb{r:255,g:255,b:255}) >= 4.5 - 1e-6, "{out:?}");
+        // Unreachable floor: max ratio vs a grey ~120 is 4.75 (black),
+        // so a 21.0 request must still return the best possible = black.
+        let out = enforce_contrast(Rgb{r:128,g:128,b:128}, Rgb{r:120,g:120,b:120}, 21.0);
+        assert_eq!(out, Rgb { r: 0, g: 0, b: 0 });
+    }
 }

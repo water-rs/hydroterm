@@ -71,6 +71,9 @@ pub struct DrawContext<'a> {
     pub hint_digits: &'a str,
     /// `bold-is-bright` config — bold cells lift to the bright slot.
     pub bold_bright: bool,
+    /// `minimum-contrast` — WCAG ratio floor applied to each cell's
+    /// resolved fg against its bg (1.0 = off).
+    pub min_contrast: f32,
     /// Ctrl-hovered link span to underline: `(start col, end col
     /// exclusive, viewport row)` per visible part (wrap-safe, like hints).
     pub hover_link: &'a [(usize, usize, usize)],
@@ -220,7 +223,7 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         let is_cursor =
             show_block && p.line == cursor.point.line && p.column == cursor.point.column;
 
-        let pair = palette.resolve(colors, cell.fg, cell.bg, cell.flags, ctx.bold_bright);
+        let pair = palette.resolve(colors, cell.fg, cell.bg, cell.flags, ctx.bold_bright, ctx.min_contrast);
         let (mut fg, mut bg) = (pair.fg, pair.bg);
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;

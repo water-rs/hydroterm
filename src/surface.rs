@@ -809,6 +809,10 @@ impl TermSurface {
             self.font_size_pt = want;
             self.fonts.resize(want);
         }
+        let (aw, ah) = self
+            .app
+            .config(|c| (c.cell_width_adjust, c.cell_height_adjust));
+        self.fonts.set_cell_adjust(aw, ah);
     }
 
     /// Recompute the grid from the logical frame size and propagate resizes.
@@ -1678,6 +1682,7 @@ impl TermSurface {
             hints: &hint_spans,
             hint_digits: &hint_digits,
             bold_bright: self.app.config(|c| c.bold_is_bright),
+            min_contrast: self.app.config(|c| c.minimum_contrast),
             hover_link: &self.hover_link,
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;

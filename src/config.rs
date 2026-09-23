@@ -98,6 +98,22 @@ pub struct AppConfig {
     /// Ask before closing a pane/tab whose PTY foreground is a program
     /// other than the shell (Ghostty `confirm-close-surface`).
     pub confirm_close: bool,
+    /// Initial window content size in points; 0 = framework default.
+    /// Applied once at launch (Ghostty `window-width`/`window-height`).
+    pub window_width: f32,
+    pub window_height: f32,
+    /// Restore the last window geometry on launch and save it as the
+    /// window moves/resizes (Ghostty `window-save-state`).
+    pub window_save_state: bool,
+    /// `env = NAME=VALUE` lines injected into spawned shells' environment.
+    pub env: Vec<(String, String)>,
+    /// Extra spacing per cell: `adjust-cell-width`/`adjust-cell-height`
+    /// accept `N%` (of the measured cell) or `Npx` (absolute points).
+    pub cell_width_adjust: CellAdjust,
+    pub cell_height_adjust: CellAdjust,
+    /// Minimum WCAG contrast ratio between cell foreground and background
+    /// (Ghostty `minimum-contrast`); 1.0 = off (no enforcement).
+    pub minimum_contrast: f32,
 }
 
 impl Default for AppConfig {
@@ -133,6 +149,13 @@ impl Default for AppConfig {
             palette_overrides: Vec::new(),
             mouse_scroll_multiplier: 1.0,
             confirm_close: true,
+            window_width: 0.0,
+            window_height: 0.0,
+            window_save_state: false,
+            env: Vec::new(),
+            cell_width_adjust: CellAdjust::None,
+            cell_height_adjust: CellAdjust::None,
+            minimum_contrast: 1.0,
         }
     }
 }
@@ -185,6 +208,13 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
 confirm-close = true       # ask before closing a running program
+# window-width = 800       # initial window size in points (0 = default)
+# window-height = 600
+# window-save-state = true # remember window geometry across launches
+# adjust-cell-width = 10%  # widen cells: N% or Npx
+# adjust-cell-height = 2px
+# minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
+# env = EDITOR=vim         # repeat to inject into spawned shells
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
 # chords: ctrl+shift+c, alt+enter, ...  actions: copy, paste,
@@ -379,6 +409,47 @@ impl AppConfig {
                 "focus-follows-mouse" | "focus_follows_mouse" => {
                     cfg.focus_follows_mouse = bool_value(value, n, &mut errors);
                 }
+                "window-width" | "window_width" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_width = v,
+                    _ => errors.push(format!("line {}: bad window-width {value:?}", n + 1)),
+                },
+                "window-height" | "window_height" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_height = v,
+                    _ => errors.push(format!("line {}: bad window-height {value:?}", n + 1)),
+                },
+                "window-save-state" | "window_save_state" => {
+                    cfg.window_save_state = bool_value(value, n, &mut errors);
+                }
+                "env" => match value.split_once('=') {
+                    Some((name, val)) if !name.trim().is_empty() => {
+                        cfg.env.push((name.trim().to_string(), val.to_string()));
+                    }
+                    _ => errors.push(format!(
+                        "line {}: bad env {value:?} (want NAME=VALUE)",
+                        n + 1
+                    )),
+                },
+                "adjust-cell-width" | "cell-width" => match parse_cell_adjust(value) {
+                    Some(pct) => cfg.cell_width_adjust = pct,
+                    None => errors.push(format!(
+                        "line {}: bad adjust-cell-width {value:?} (want N% or Npx)",
+                        n + 1
+                    )),
+                },
+                "adjust-cell-height" | "cell-height" => match parse_cell_adjust(value) {
+                    Some(pct) => cfg.cell_height_adjust = pct,
+                    None => errors.push(format!(
+                        "line {}: bad adjust-cell-height {value:?} (want N% or Npx)",
+                        n + 1
+                    )),
+                },
+                "minimum-contrast" | "minimum_contrast" => match value.parse::<f32>() {
+                    Ok(v) if (1.0..=21.0).contains(&v) => cfg.minimum_contrast = v,
+                    _ => errors.push(format!(
+                        "line {}: bad minimum-contrast {value:?} (want 1.0-21.0)",
+                        n + 1
+                    )),
+                },
                 "keybind" => match parse_keybind(value) {
                     Ok((chord, action)) => cfg.keybinds.push((chord, action)),
                     Err(e) => errors.push(format!("line {}: {e}", n + 1)),
@@ -404,6 +475,44 @@ impl AppConfig {
             Err(e) => (Self::default(), vec![format!("reading {}: {e}", path.display())]),
         }
     }
+}
+
+/// Per-cell spacing adjustment: `N%` of the measured cell or `Npx`
+/// absolute points (bare numbers read as percent, matching Ghostty).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CellAdjust {
+    /// No adjustment.
+    #[default]
+    None,
+    /// Fraction of the measured cell extent (0.20 = +20%).
+    Fraction(f32),
+    /// Absolute points added to the cell extent.
+    Points(f32),
+}
+
+impl CellAdjust {
+    /// Apply the adjustment to a measured extent.
+    pub fn apply(self, base: f32) -> f32 {
+        match self {
+            Self::None => base,
+            Self::Fraction(p) => base * (1.0 + p),
+            Self::Points(px) => base + px,
+        }
+    }
+}
+
+fn parse_cell_adjust(value: &str) -> Option<CellAdjust> {
+    let v = value.trim();
+    if let Some(p) = v.strip_suffix('%') {
+        let f: f32 = p.trim().parse().ok()?;
+        return (-50.0..=100.0).contains(&f).then_some(CellAdjust::Fraction(f / 100.0));
+    }
+    if let Some(p) = v.strip_suffix("px") {
+        let f: f32 = p.trim().parse().ok()?;
+        return (-100.0..=200.0).contains(&f).then_some(CellAdjust::Points(f));
+    }
+    let f: f32 = v.parse().ok()?;
+    (-50.0..=100.0).contains(&f).then_some(CellAdjust::Fraction(f / 100.0))
 }
 
 /// `~/…` expands to `$HOME/…`; anything else passes through verbatim.
@@ -860,5 +969,59 @@ mod tests {
         assert!(text.contains("cursor-blink = true"));
         assert!(!text.contains("theme = auto"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_geometry_and_save_state_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "window-width = 1024\nwindow-height = 768\nwindow-save-state = true\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!((cfg.window_width - 1024.0).abs() < f32::EPSILON);
+        assert!((cfg.window_height - 768.0).abs() < f32::EPSILON);
+        assert!(cfg.window_save_state);
+    }
+
+    #[test]
+    fn env_lines_collect_name_value_pairs() {
+        let (cfg, errs) = AppConfig::parse(
+            "env = EDITOR=vim\nenv = A=B=C\nenv = =x\n",
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}"); // `=x` has an empty name
+        assert_eq!(
+            cfg.env,
+            vec![
+                ("EDITOR".to_string(), "vim".to_string()),
+                ("A".to_string(), "B=C".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cell_adjust_parses_percent_and_px() {
+        let (cfg, errs) = AppConfig::parse(
+            "adjust-cell-width = 20%\nadjust-cell-height = 4px\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.cell_width_adjust, CellAdjust::Fraction(0.2));
+        assert_eq!(cfg.cell_height_adjust, CellAdjust::Points(4.0));
+        // Bare number = percent; bad input reports.
+        let (_, errs) = AppConfig::parse("adjust-cell-width = wide");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(
+            CellAdjust::Fraction(0.5).apply(10.0),
+            15.0
+        );
+        assert_eq!(CellAdjust::Points(3.0).apply(10.0), 13.0);
+        assert_eq!(CellAdjust::None.apply(10.0), 10.0);
+    }
+
+    #[test]
+    fn minimum_contrast_parses_in_range() {
+        let (cfg, errs) = AppConfig::parse("minimum-contrast = 4.5\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!((cfg.minimum_contrast - 4.5).abs() < f32::EPSILON);
+        let (_, errs) = AppConfig::parse("minimum-contrast = 0.5");
+        assert_eq!(errs.len(), 1);
     }
 }

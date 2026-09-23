@@ -55,6 +55,9 @@ pub struct TermFonts {
     /// when one of the preferences is installed, generic monospace otherwise.
     family: FontFamily<'static>,
     size_px: f32,
+    /// `adjust-cell-width`/`adjust-cell-height` — spacing added to the
+    /// measured cell (fraction of the cell or absolute points).
+    cell_adjust: (crate::config::CellAdjust, crate::config::CellAdjust),
     pub metrics: CellMetrics,
 }
 
@@ -125,6 +128,7 @@ impl TermFonts {
             layout_cx: LayoutContext::new(),
             family,
             size_px: size_pt,
+            cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
@@ -142,7 +146,19 @@ impl TermFonts {
     pub fn reload_family(&mut self, pref: &str) {
         let fresh = Self::load(self.collection.clone(), self.size_px, pref);
         self.family = fresh.family;
-        self.metrics = fresh.metrics;
+        self.metrics = self.probe_metrics();
+    }
+
+    /// Hot-reload `adjust-cell-width`/`adjust-cell-height` and re-measure.
+    pub fn set_cell_adjust(
+        &mut self,
+        w: crate::config::CellAdjust,
+        h: crate::config::CellAdjust,
+    ) {
+        if self.cell_adjust != (w, h) {
+            self.cell_adjust = (w, h);
+            self.metrics = self.probe_metrics();
+        }
     }
 
     /// Shape `text` as one terminal line: single line, left aligned, with the
@@ -192,6 +208,13 @@ impl TermFonts {
                 metrics.strikeout_pos = (m.ascent * 0.32).round();
             }
         }
+        let (aw, ah) = self.cell_adjust;
+        let dw = aw.apply(metrics.cell_w) - metrics.cell_w;
+        let dh = ah.apply(metrics.cell_h) - metrics.cell_h;
+        metrics.cell_w = (metrics.cell_w + dw).max(1.0);
+        metrics.cell_h = (metrics.cell_h + dh).max(1.0);
+        // Extra height centres the glyph in the taller cell.
+        metrics.baseline += dh / 2.0;
         metrics.finish();
         metrics
     }

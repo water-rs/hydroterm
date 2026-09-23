@@ -189,29 +189,55 @@ pub struct Terminal {
     _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
 }
 
+/// Process-side inputs to [`Terminal::spawn`] — everything the child
+/// inherits that is not part of the grid.
+pub struct SpawnOpts<'a> {
+    /// Working directory (`None` = inherit the process cwd).
+    pub cwd: Option<std::path::PathBuf>,
+    /// Shell override — bypasses shell-integration injection
+    /// (`shell =` config and `-e`).
+    pub shell: Option<Shell>,
+    /// `$TERM` value (`term` config).
+    pub term_name: &'a str,
+    /// `env = NAME=VALUE` config lines, applied last so a user entry can
+    /// override even defaults and integration vars.
+    pub env_extra: &'a [(String, String)],
+}
+
 impl Terminal {
     /// Spawn a shell on a PTY and start parsing. `shell` overrides the
     /// auto-injected shell integration (used by `shell =` config and `-e`).
-    pub fn spawn(config: Config, cols: usize, lines: usize, cell_px: (u16, u16), cwd: Option<std::path::PathBuf>, shell: Option<Shell>, term_name: &str) -> io::Result<Self> {
+    pub fn spawn(
+        config: Config,
+        cols: usize,
+        lines: usize,
+        cell_px: (u16, u16),
+        opts: SpawnOpts<'_>,
+    ) -> io::Result<Self> {
         let (proxy, events_rx) = EventProxy::new();
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let (shell, extra_env) = match shell {
+        let (shell, extra_env) = match opts.shell {
             Some(s) => (s, HashMap::new()),
             None => shell_with_integration(),
         };
         let mut env: HashMap<String, String> = [
-            ("TERM".to_owned(), term_name.to_owned()),
+            ("TERM".to_owned(), opts.term_name.to_owned()),
             ("COLORTERM".to_owned(), "truecolor".to_owned()),
             ("TERM_PROGRAM".to_owned(), "hydroterm".to_owned()),
         ]
         .into_iter()
         .collect();
         env.extend(extra_env);
+        // `env = NAME=VALUE` config lines — applied last so a user entry
+        // can override even the defaults and integration vars above.
+        for (k, v) in opts.env_extra {
+            env.insert(k.clone(), v.clone());
+        }
         let options = Options {
             shell: Some(shell),
-            working_directory: cwd,
+            working_directory: opts.cwd,
             drain_on_exit: false,
             env,
         };
