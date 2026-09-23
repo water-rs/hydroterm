@@ -803,8 +803,7 @@ impl View for PaneLeaf {
         let session = PaneSession(self.session); // `.state` stores a clone
         let bar = when(open, move || {
             hstack((
-                text("/").muted(),
-                field("find in buffer", &query),
+                field("find in buffer", &query).max_width(f32::INFINITY),
                 text(status.clone()).muted(),
                 text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchPrev)),
                 text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchNext)),
