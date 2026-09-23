@@ -12,6 +12,10 @@ pub struct Theme {
     pub selection_bg: Rgb,
     /// `None` keeps the cell's own fg under selection.
     pub selection_fg: Option<Rgb>,
+    /// Badge/chip background (URL hints, toasts) — the accent slot.
+    pub accent: Rgb,
+    /// Text drawn on `accent` — chosen for contrast against it.
+    pub accent_fg: Rgb,
     /// ANSI colors 0-15 (normal 0-7, bright 8-15).
     pub ansi: [Rgb; 16],
 }
@@ -49,6 +53,8 @@ impl Theme {
             dim_foreground: rgb(0x62, 0x64, 0x63),
             selection_bg: rgb(0x37, 0x3b, 0x41),
             selection_fg: None,
+            accent: rgb(0x81, 0xa2, 0xbe),
+            accent_fg: rgb(0x1d, 0x1f, 0x21),
             ansi: [
                 rgb(0x1d, 0x1f, 0x21),
                 rgb(0xcc, 0x66, 0x66),
@@ -79,6 +85,8 @@ impl Theme {
             dim_foreground: rgb(0x8e, 0x90, 0x8c),
             selection_bg: rgb(0xd6, 0xd6, 0xd6),
             selection_fg: None,
+            accent: rgb(0x42, 0x71, 0xae),
+            accent_fg: rgb(0xff, 0xff, 0xff),
             ansi: [
                 rgb(0x00, 0x00, 0x00),
                 rgb(0xc8, 0x28, 0x29),
@@ -109,6 +117,8 @@ impl Theme {
             dim_foreground: rgb(0x58, 0x6e, 0x75),
             selection_bg: rgb(0x07, 0x36, 0x42),
             selection_fg: Some(rgb(0x93, 0xa1, 0xa1)),
+            accent: rgb(0x26, 0x8b, 0xd2),
+            accent_fg: rgb(0xfd, 0xf6, 0xe3),
             ansi: [
                 rgb(0x07, 0x36, 0x42),
                 rgb(0xdc, 0x32, 0x2f),
@@ -139,6 +149,8 @@ impl Theme {
             dim_foreground: rgb(0x93, 0xa1, 0xa1),
             selection_bg: rgb(0xee, 0xe8, 0xd5),
             selection_fg: Some(rgb(0x58, 0x6e, 0x75)),
+            accent: rgb(0x26, 0x8b, 0xd2),
+            accent_fg: rgb(0xfd, 0xf6, 0xe3),
             ansi: [
                 rgb(0x07, 0x36, 0x42),
                 rgb(0xdc, 0x32, 0x2f),

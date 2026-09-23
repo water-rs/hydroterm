@@ -240,6 +240,7 @@ impl TermSurface {
                 out.push_str("\x1b[201~");
             }
             self.write(out.into_bytes());
+            self.snap_to_bottom_if_scrolled();
         }
     }
 
@@ -341,6 +342,7 @@ impl TermSurface {
             }
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
+            TermAction::OpenScrollbackEditor => self.open_scrollback_editor(),
             TermAction::SearchNext => self.search_step(1),
             TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
@@ -678,6 +680,7 @@ impl TermSurface {
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
                 self.write(bytes);
+                return self.snap_to_bottom_if_scrolled();
             }
             false
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
@@ -846,7 +849,19 @@ impl TermSurface {
             return true;
         }
         self.write(text.as_bytes().to_vec());
-        false
+        self.snap_to_bottom_if_scrolled()
+    }
+
+    /// Keyboard input bound for the PTY snaps the viewport back to the
+    /// live edge — the alacritty/kitty convention. Returns true when the
+    /// viewport moved (needs a frame).
+    fn snap_to_bottom_if_scrolled(&mut self) -> bool {
+        let mut term = self.session.terminal.term.lock();
+        if term.grid().display_offset() == 0 {
+            return false;
+        }
+        term.scroll_display(Scroll::Bottom);
+        true
     }
 
     fn on_pointer_move(&mut self, x: f64, y: f64) {
@@ -1085,6 +1100,37 @@ impl TermSurface {
         {
             let _ = clip.set_text(&text);
         }
+    }
+
+    /// Dump scrollback + screen to a temp file and open `$VISUAL`/`$EDITOR`
+    /// on it in a fresh tab (kitty `scrollback_pager`/WezTerm parity).
+    fn open_scrollback_editor(&mut self) {
+        let text = {
+            let term = self.session.terminal.term.lock();
+            let grid = term.grid();
+            let history = grid.history_size() as i32;
+            term.bounds_to_string(
+                Point::new(Line(-history), Column(0)),
+                Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
+            )
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "hydroterm-scrollback-{}-{}.txt",
+            std::process::id(),
+            self.session.id
+        ));
+        if std::fs::write(&path, text).is_err() {
+            return;
+        }
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let mut cmd: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
+        cmd.push(path.to_string_lossy().into_owned());
+        self.app.new_tab_command(cmd);
     }
 
     /// Step the search-match cursor by `dir` (+1 next, -1 prev), wrapping.

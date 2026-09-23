@@ -362,27 +362,29 @@ pub fn draw_term(
     }
 
     // -- URL hints ------------------------------------------------------------
+    // Each hint is a small opaque badge over the URL's first cell(s) —
+    // theme accent background + accent foreground — the URL text itself
+    // stays fully readable (no wash over the span).
     if !ctx.hints.is_empty() || !ctx.hint_digits.is_empty() {
-        let chip_bg = palette.selection_bg;
+        let chip_bg = Brush::Solid(peniko_alpha(palette.accent, 1.0));
+        let span_line = Brush::Solid(peniko_alpha(palette.accent, 0.6));
         for h in ctx.hints {
+            let label = h.label.to_string();
+            let w = label.chars().count() as f32 * cw;
             let x = col_x(pad, cw, h.col0);
-            let w = (h.col1 - h.col0) as f32 * cw;
             let y = row_y(pad, ch, h.row);
+            // Accent underline under the whole URL span ties the badge to
+            // its link without washing out the text.
+            let span_w = (h.col1 - h.col0) as f32 * cw;
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
-                &Brush::Solid(peniko_alpha(chip_bg, 0.9)),
+                &span_line,
                 None,
-                &rect(x, y, w, ch),
+                &rect(x, y + ch - 1.5, span_w, 1.5),
             );
-            draw_chip_text(
-                scene,
-                &h.label.to_string(),
-                x,
-                y + m.baseline,
-                palette.background,
-                ctx,
-            );
+            scene.fill(Fill::NonZero, Affine::IDENTITY, &chip_bg, None, &rect(x, y, w, ch));
+            draw_chip_text(scene, &label, x, y + m.baseline, palette.accent_fg, ctx);
         }
         if !ctx.hint_digits.is_empty() {
             let label = format!("open: {}", ctx.hint_digits);
@@ -391,11 +393,11 @@ pub fn draw_term(
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
-                &Brush::Solid(peniko_alpha(chip_bg, 0.95)),
+                &chip_bg,
                 None,
                 &rect(4.0, y, w, ch),
             );
-            draw_chip_text(scene, &label, 4.0, y + m.baseline, palette.background, ctx);
+            draw_chip_text(scene, &label, 4.0, y + m.baseline, palette.accent_fg, ctx);
         }
     }
 

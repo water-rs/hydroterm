@@ -33,14 +33,15 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Input | Bracketed paste | ✅ | paste into `cat -v` shows \x1b[200~ wrap |
 | Input | Alternate scroll (wheel → arrows in alt screen) | ✅ | scroll in `less` |
 | Input | Keyboard scrolling | ✅ | Shift+PageUp/PageDown scrolls a page, Ctrl+Shift+Home/End jumps to scrollback top/bottom (verified live) |
+| Input | Snap to bottom on keyboard input | ✅ | a key that writes bytes to the PTY (`key_to_bytes` path) snaps the viewport to the live edge — the alacritty/kitty convention (verified live: scroll into scrollback, type, viewport jumps to bottom) |
 | Clipboard | Copy selection (primary + clipboard) | ✅ | drag + Ctrl+Shift+C, `xclip -o` verify |
-| Clipboard | Paste via Ctrl+Shift+V / middle-click (bracketed) | ✅ | paste `hello` at prompt |
+| Clipboard | Paste via Ctrl+Shift+V / Shift+Insert / middle-click (bracketed) | ✅ | paste `hello` at prompt |
 | Clipboard | OSC 52 write + read | ✅ | `printf '\e]52;c;aGVsbG8=\a'` → `xclip -o` = hello |
 | Selection | Click-drag / word (dbl) / line (triple), right-click extend | ✅ | drag/select; timing multi-click |
 | Selection | Copy-on-select | ✅ | `copy-on-select = true` in config |
 | Links | OSC 8 hyperlink render + Ctrl+click open | ✅ | `printf '\e]8;;https://example.com\e\\link\e]8;;\e\\'` |
 | Links | Plain-text URL detect + open | ✅ | scheme-scan over the clicked row's cells; Ctrl+click → xdg-open (verified: navigated Chrome) |
-| Links | URL hint mode | ✅ | Ctrl+Shift+U draws numbered chips over every visible link; typing the label + Enter opens it via xdg-open, digits/Backspace edit, Esc cancels (verified live) |
+| Links | URL hint mode | ✅ | Ctrl+Shift+U draws opaque Accent badges (AccentContainer chip, AccentForeground label) at each link's start + an Accent underline over the URL span — link text stays readable; typing the label + Enter opens it via xdg-open, digits/Backspace edit, Esc cancels (verified live) |
 | Tabs | New/close/select/cycle tabs | ✅ | Ctrl+Shift+T / Ctrl+Shift+W / Ctrl+1..8 |
 | Splits | Horizontal/vertical split, close pane | ✅ | Ctrl+Shift+E / Ctrl+Shift+D; verified live (nested split per-pane, close collapses) |
 | Splits | Pane zoom toggle (tmux-style) | ✅ | Ctrl+Shift+Z → focused pane fills the tab (`PaneTab.zoomed: Binding<Option<u64>>`); toggling restores the split — verified live both ways |
@@ -60,7 +61,9 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Font | Emoji + grapheme clusters (ZWJ, VS16) | ✅ | single emoji ✅, flag merges ✅, combining é ✅; 👨‍👩‍👧‍👦 occupies **exactly 2 cells** (app-side `fixup_graphemes` merges ZWJ-split scalar cells into one cluster cell; `zwj_cluster_occupies_two_cells` test). **Color attribution proven (r8 item 1)**: (a) Chrome on this VM renders `A👨‍👩‍👧‍👦B 🇫🇷C` as `AB C` — zero glyphs, no color anywhere; (b) `fc-match -s 'emoji'` resolves every scalar to `/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf`, whose GSUB maps the family sequence to `glyph02113` — its extracted CBDT bitmap is a **monochrome boxed pictograph by the font's own design**; (c) `zwj_cluster_shapes_as_one_ligature` test byte-compares the shaped run's font data to NotoColorEmoji.ttf — equal. Our fallback uses the same font Chrome would; the monochrome artwork is the font's own, not a fallback bug |
 | Font | Synthetic bold/italic | ✅ | stroke emboss / skew — `\e[1m`/`\e[3m` visually distinct |
 | Font | Color emoji (CBDT) | ✅ | Noto Color Emoji bitmaps rasterize in color (screenshot-verified) |
-| Font | Zoom in/out/reset | ✅ | Ctrl+Shift +/- and 0 |
+| Font | Zoom in/out/reset | ✅ | Ctrl+Shift+`=`/`+` up, Ctrl+Shift+`-` down, Ctrl+Shift+`0` reset — verified live |
+| Scrollback | Clear scrollback | ✅ | Ctrl+Shift+K — `grid().clear_history()` + snap to bottom (verified live) |
+| Scrollback | Open scrollback in editor | ✅ | Ctrl+Shift+G — dumps scrollback + screen via `bounds_to_string` to a temp file, opens `$VISUAL`/`$EDITOR` (fallback `vi`) on it in a new tab (verified live) |
 | Shell int. | zsh/fish integration auto-inject | ✅ | bash `--rcfile`, zsh `ZDOTDIR` env, fish `-C` init — all emit OSC 133 A/B/C/D + OSC 7 (verified live) |
 | Shell int. | OSC 133 prompt marks + jump prev/next prompt (Ctrl+Shift+Up/Down) | ✅ | auto-injected integration for bash (--rcfile), zsh (ZDOTDIR), fish (-C): all emit A/B/C/D; verified live jump in zsh + fish |
 | Shell int. | OSC 7 cwd → new tab inherits cwd | ✅ | all three shells report cwd; verified: fish tab title shows cwd, new bash tab spawns in /tmp |
@@ -71,8 +74,8 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Search | Scrollback search + highlight + jump | ✅ | Ctrl+Shift+F opens a WaterUI `TextField` bar (query bound via nami); matches live-highlight the *full* match span (wide chars cover both cells, `match_columns`), Enter jumps to next |
 | Search | Prev/next match navigation | ✅ | Shift+Enter jumps to previous match; bar ↑/↓ buttons step up/down (`SearchNext`/`SearchPrev` actions, wrap-around via `rem_euclid`, scrolls match to mid-viewport) — verified live both directions |
 | Shell UI | Settings page | ✅ | Ctrl+Shift+, → opaque token panel over a dim mask; labeled theme picker, font-size value + stepper, toggle; Apply writes config file → hot reload |
-| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs (rows are `button`s — List styles them via the row env), Esc closes |
-| Shell UI | Context menu (right-click) | 🚫 | framework-blocked: a secondary click over an input-consuming `SceneView` is delivered to the embedded sink and returns before `.context_menu` targets are hit-tested — minimal repro in WATERUI_FEEDBACK #22 |
+| Shell UI | Command palette | ✅ | Ctrl+Shift+P → WaterUI field + `List` rows (name left, chord right); panel `max_height` capped inside window, list scrolls internally with a scrollbar, `ScrollController<usize>` keeps the selected row visible on Up/Down, Enter/click runs (rows are `button`s — List styles them via the row env; `.on_tap` inside `List` rows never fires — water-rs/hydrolysis#111), Esc closes |
+| Shell UI | Context menu (right-click) | 🚫 | framework-blocked: a secondary click over an input-consuming `SceneView` is delivered to the embedded sink and returns before `.context_menu` targets are hit-tested — water-rs/hydrolysis#110 (minimal repro in WATERUI_FEEDBACK #22) |
 | A11y | Screen reader (accesskit) | 🚫 | GpuSurface can't emit a11y tree — WATERUI_FEEDBACK #10 |
 | Graphics | kitty image protocol | 🟡 | `a=T` PNG/RGB/RGBA + `m=` chunks + `i=`/`p=` image+placement ids + `\x1b_G…;OK` replies + `t=d` direct/`t=f` file/`t=s` shared-memory mediums + `x,y,w,h` source crop (verified: solid half drawn) + signed `z` z-index (`z<0` over cell bg, below text — verified with text over image) + `c`/`r` cell span + `a=d` delete with `d=a|i|p|z|c` selectors (verified live) + palette/grayscale/16-bit PNG normalize; no unicode placements/animation |
 | Graphics | sixel | 🚫 | None of Ghostty/kitty-ref/WezTerm treat sixel as core — skipped |

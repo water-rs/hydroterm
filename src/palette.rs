@@ -29,6 +29,10 @@ pub struct Palette {
     pub selection_bg: Rgb,
     /// Selection text color; `None` keeps the cell's own fg.
     pub selection_fg: Option<Rgb>,
+    /// Badge/chip background (URL hints) — the theme's accent slot.
+    pub accent: Rgb,
+    /// Text drawn on `accent`, chosen for contrast against it.
+    pub accent_fg: Rgb,
 }
 
 impl Default for Palette {
@@ -71,6 +75,8 @@ impl Default for Palette {
             dim_foreground: rgb(0x62, 0x64, 0x63),
             selection_bg: rgb(0x37, 0x3b, 0x41),
             selection_fg: None,
+            accent: rgb(0x81, 0xa2, 0xbe),
+            accent_fg: rgb(0x1d, 0x1f, 0x21),
         }
     }
 }
@@ -87,6 +93,8 @@ impl Palette {
         palette.dim_foreground = theme.dim_foreground;
         palette.selection_bg = theme.selection_bg;
         palette.selection_fg = theme.selection_fg;
+        palette.accent = theme.accent;
+        palette.accent_fg = theme.accent_fg;
         palette
     }
 

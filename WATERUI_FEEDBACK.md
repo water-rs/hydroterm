@@ -73,7 +73,7 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
 
 21. **Window position applied while the X11 window is still invisible is lost.** → **water-rs/hydrolysis#105** `Window::frame`'s binding drives `set_outer_position` inside `apply_properties`, which runs at mount — but the runner creates the winit window `with_visible(false)` and only calls `set_visible(true)` after the mount completes. On X11 the position set on an unmapped window is ignored: the window manager applies its own placement when the window maps, so a caller-specified position (our quick-terminal top dock) is silently overridden. `apply_properties` does re-run later in `about_to_wait`, but only when events wake the loop — under `ControlFlow::Wait` an idle app never re-applies, so the wrong position can persist indefinitely. Fix direction: apply the frame position after `set_visible(true)` (or re-run `apply_properties` once the window reports mapped). hydroterm deliberately does NOT work around this — a delayed re-emit would be blind timing that races the window manager; until #105 lands the quick terminal lands wherever the WM places it, which PARITY records honestly. (Minor — affects any window that requests a non-default position; size applies correctly via `with_inner_size`)
 
-22. **`.context_menu` never opens over an input-consuming `SceneView`/`GpuView`.** `hit_test.rs`'s pointer-down path calls `embedded_target_wins_at(...)` and, when the embedded sink wins, delivers the button to the surface and `return`s — before the `PointerButton::Secondary → topmost_context_menu_target_at_point` branch is ever reached. So a `context_menu` wrapped around a view that receives input events is dead code: the secondary click always goes to the embedded sink. `SceneContent::input` also returns `()`, giving the content no way to say "not handled, let the tree fall through". Minimal repro:
+22. **`.context_menu` never opens over an input-consuming `SceneView`/`GpuView`.** → **water-rs/hydrolysis#110** `hit_test.rs`'s pointer-down path calls `embedded_target_wins_at(...)` and, when the embedded sink wins, delivers the button to the surface and `return`s — before the `PointerButton::Secondary → topmost_context_menu_target_at_point` branch is ever reached. So a `context_menu` wrapped around a view that receives input events is dead code: the secondary click always goes to the embedded sink. `SceneContent::input` also returns `()`, giving the content no way to say "not handled, let the tree fall through". Minimal repro:
 
     ```rust
     Frame::new(SceneView::new(MyScene)) // wants_input_events() -> true
@@ -82,4 +82,32 @@ Pins under test: waterui `c8a78fe8`, hydrolysis `12175f8c`.
 
     (Important — every interactive canvas: terminals, editors, video players, canvases that want a WaterUI right-click menu. Possible fixes: evaluate the context-menu target before the embedded sink on secondary clicks, or let `SceneContent::input` report handled-ness so an unconsumed secondary click falls through to the wrapper.)
 
-23. **`.on_tap` on `List` row content never fires.** A `hstack(...).on_tap(...)` inside `List::for_each` rows receives nothing — no panic, no callback (verified live: clicking a row with an `eprintln` probe produced nothing). Row activation only works through `button(...)`: the List injects `ButtonStyle::Plain` + `ListRowChrome` into each row's environment, which is clearly the intended contract — but a tap gesture that silently dies is a footgun for callers reaching for `on_tap` first. `.on_tap` does work on content outside `List` (our search-bar and tab-strip buttons fire correctly). App-side we now use `button(Label::new(name, || row_view)).action(...)` for palette rows. (Informational — either intended (then worth a doc line on `List`) or a gesture-routing gap between row hit-testing and content gestures.)
+23. **`.on_tap` on `List` row content never fires.** → **water-rs/hydrolysis#111** A `hstack(...).on_tap(...)` inside `List::for_each` rows receives nothing — no panic, no callback (verified live: clicking a row with an `eprintln` probe produced nothing). Row activation only works through `button(...)`: the List injects `ButtonStyle::Plain` + `ListRowChrome` into each row's environment, which is clearly the intended contract — but a tap gesture that silently dies is a footgun for callers reaching for `on_tap` first. `.on_tap` does work on content outside `List` (our search-bar and tab-strip buttons fire correctly, and `ListItem::new(hstack(..).on_tap(..))` tapped at row centre fires on dev per the issue's own repro). The exact shape that failed in hydroterm — extractor-parameter action, `.state` re-injected on the row, inside `watch`-rebuilt `List::for_each`, inside a `when(...)` overlay with a dim mask:
+
+    ```rust
+    // when(state.palette_open, || palette_view(state))
+    //   palette_view: vstack((panel, Spacer::flexible()))
+    //                   .background(Srgb::BLACK.with_opacity(0.45))
+    //   panel: vstack((field("type a command", &q), list))
+    //            .max_height(430.0).background(Surface)
+    let list = watch(query, move |q: Str| {
+        List::for_each(indices, move |i: SelfId<usize>| {
+            let item = items[*i];
+            let row = hstack((
+                    text(item.name).foreground(Foreground),
+                    Spacer::flexible(),
+                    text(item.chord).muted(),
+                ))
+                .padding()
+                .on_tap(move |app: AppState| app.run_palette_at(i))
+                .state(&state);          // env re-injected for the extractor
+            ListItem::new(row).selected(state.palette_sel.equal_to(i))
+        })
+        .scroll_controller(&state.palette_scroll)
+        .anyview()
+    });
+    ```
+
+    Differences from the passing repro worth bisecting: (a) the action took an `Extractor` parameter (`AppState`) with `.state(&state)` injected on the row, (b) the List was built inside `watch(...)` (Dynamic rebuild) and mounted inside a `when(...)` overlay, (c) `.scroll_controller` + `.anyview()` on the List. No panic — the tap simply produced no callback. App-side we now use `button(Label::new(name, || row_view)).action(...)` for palette rows — the idiomatic shape. (Informational — either intended (then worth a doc line on `List`) or a gesture-routing gap between row hit-testing and content gestures in one of the layers above.)
+
+24. **NOT A BUG — the ancestor environment DOES reach `when`/`for_each`/`watch` builder content.** hydroterm earlier claimed `.state(&x)` had to be re-injected inside lazy builders because the ancestor env did not reach them. Proven wrong live (r10): a 20-line probe app with `.state(&ProbeState)` injected only at the root had all of `when`-body `button.action(|s: ProbeState|)`, a direct `text().on_tap(|s: ProbeState|)`, and `HStack::for_each` row `button`/`text().on_tap` extractors fire correctly — 4/4 clicks, zero extraction panics. `DynamicHostNode` captures the scoped env at build and rebuilds dynamic children under it (`nodes.rs` ~900; `window.rs` `patch()` documents "a rebuild uses the node's own captured environment"). hydroterm's redundant inner `.state` re-injections were removed; the app still works (palette row click inside `when` runs `AppState` actions with no inner injection). (Informational — recorded so the earlier claim isn't propagated further.)

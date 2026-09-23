@@ -301,6 +301,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             return match named {
                 NamedKey::PageUp => Some(TermAction::ScrollPageUp),
                 NamedKey::PageDown => Some(TermAction::ScrollPageDown),
+                // Shift+Insert pastes — the xterm/VTE convention.
+                NamedKey::Insert => Some(TermAction::Paste),
                 _ => None,
             };
         }
@@ -338,6 +340,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "k" => TermAction::ClearScrollback,
         "o" => TermAction::CopyLastOutput,
         "u" => TermAction::UrlHints,
+        "g" => TermAction::OpenScrollbackEditor,
         "f" => TermAction::Search,
         "p" => TermAction::Palette,
         "," | "<" => TermAction::Settings,
@@ -414,6 +417,9 @@ pub enum TermAction {
     /// Copy the output of the last finished (or running) command — the
     /// rows between its OSC 133 `C` and `D` marks.
     CopyLastOutput,
+    /// Dump the scrollback + screen to a temp file and open it in
+    /// `$VISUAL`/`$EDITOR` inside a new tab (kitty/WezTerm style).
+    OpenScrollbackEditor,
     /// Step the search match cursor forward / back.
     SearchNext,
     SearchPrev,

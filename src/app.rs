@@ -561,6 +561,21 @@ impl AppState {
             .focused_session()
             .and_then(|s| s.cwd.lock().unwrap().clone());
         let session = self.spawn_session(cwd);
+        self.adopt_tab(session)
+    }
+
+    /// A new tab running an explicit command instead of the shell —
+    /// scrollback-in-editor uses it for `$EDITOR <file>`.
+    pub fn new_tab_command(&self, cmd: Vec<String>) -> u64 {
+        let mut cfg = self.cfg.borrow().config.clone();
+        cfg.command = Some(cmd);
+        let id = self.alloc_id();
+        let session = Rc::new(Session::spawn(id, None, &cfg));
+        self.sessions.borrow_mut().push(session.clone());
+        self.adopt_tab(session)
+    }
+
+    fn adopt_tab(&self, session: Rc<Session>) -> u64 {
         let tab = PaneTab {
             id: self.alloc_id(),
             title: session.title.clone(),
@@ -786,18 +801,17 @@ impl View for PaneLeaf {
             FontCollection::from_env(env),
         )));
         let session = PaneSession(self.session); // `.state` stores a clone
-        let bar_session = session.clone();
         let bar = when(open, move || {
             hstack((
-                text("/ "),
+                text("/").muted(),
                 field("find in buffer", &query),
-                text(status.clone()),
+                text(status.clone()).muted(),
                 text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchPrev)),
                 text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchNext)),
             ))
-            // Lazily-built subtrees capture their construction env, so
-            // extractors need the state injected inside the `when` body.
-            .state(&bar_session)
+            .spacing(6.0)
+            .padding_horizontal(8.0)
+            .padding_vertical(4.0)
         })
         .anyview();
         vstack((bar, surface))
@@ -895,16 +909,12 @@ fn tab_content(tab: PaneTab, app: AppState) -> impl View {
 pub fn tabs_view(state: AppState) -> impl View {
     let palette_overlay = when(state.palette_open.clone(), {
         let state = state.clone();
-        let inject = state.clone();
-        // Lazy builders don't see `.state` applied to ancestors — inject
-        // inside so extractor handlers find AppState.
-        move || palette_view(state.clone()).state(&inject)
+        move || palette_view(state.clone())
     })
     .anyview();
     let settings_overlay = when(state.settings_open.clone(), {
         let state = state.clone();
-        let inject = state.clone();
-        move || settings_view(state.clone()).state(&inject)
+        move || settings_view(state.clone())
     })
     .anyview();
 
@@ -935,7 +945,6 @@ pub fn tabs_view(state: AppState) -> impl View {
             .spacing(0.0)
             .height(TAB_STRIP_HEIGHT)
             .on_tap(move |app: AppState| app.selected.set(tab_id))
-            .state(&app)
         })
     };
     let strip_bar = hstack((
@@ -952,9 +961,7 @@ pub fn tabs_view(state: AppState) -> impl View {
         let app = state.clone();
         Frame::new(ZStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
             let app = app.clone();
-            tab_content(tab.clone(), app.clone())
-                .visible(app.selected.equal_to(tab.id))
-                .state(&app)
+            tab_content(tab.clone(), app.clone()).visible(app.selected.equal_to(tab.id))
         }))
         .max_width(f32::INFINITY)
         .max_height(f32::INFINITY)
