@@ -88,6 +88,9 @@ pub struct Session {
     /// Live scrollback limit (the alacritty field is private — tracked
     /// here so config hot-reload can compare and `set_options`).
     pub scrollback: std::sync::Mutex<usize>,
+    /// `word-select-chars` the session spawned with — same
+    /// compare-and-`set_options` live-reload path as scrollback.
+    pub word_chars: std::sync::Mutex<String>,
     /// Cursor style the session spawned with — preserved across
     /// `set_options` live reloads.
     pub cursor_style: std::sync::Mutex<CursorStyle>,
@@ -140,6 +143,9 @@ impl Session {
                 shape: cfg.cursor_shape,
                 blinking: cfg.cursor_blink,
             },
+            // `word-select-chars` — double-click word separators
+            // (alacritty `semantic_escape_chars`).
+            semantic_escape_chars: cfg.word_select_chars.clone(),
             ..Default::default()
         };
         // `-e` > `shell =` > auto-injected shell integration.
@@ -182,6 +188,7 @@ impl Session {
             font_family: binding(Str::from(cfg.font_family.clone())),
             pending_paste: Binding::default(),
             scrollback: std::sync::Mutex::new(cfg.scrollback),
+            word_chars: std::sync::Mutex::new(cfg.word_select_chars.clone()),
             unfocused_opacity: Binding::f32(cfg.unfocused_split_opacity),
             resize_label: Binding::default(),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
@@ -396,6 +403,10 @@ pub struct PaneTab {
     /// Zoomed pane: `Some(id)` renders only that leaf (it fills the tab);
     /// `None` = normal split layout. tmux zoom / kitty overlay semantics.
     pub zoomed: Binding<Option<u64>>,
+    /// Unseen-output marker: set when a parser wake lands while this tab
+    /// is not selected; cleared when it becomes selected. kitty's
+    /// `tab_activity_symbol`.
+    pub activity: Binding<bool>,
 }
 
 /// Everything tabs and surfaces share.
@@ -412,6 +423,12 @@ pub struct AppState {
     session_tab: Arc<Mutex<HashMap<u64, u64>>>,
     /// Selected tab id.
     pub selected: Binding<u64>,
+    /// Current tab count — kept in sync at push/remove so the strip can
+    /// gate on `tab-bar-min-tabs` reactively (NamiList itself is not a
+    /// signal).
+    pub tab_count: Binding<usize>,
+    /// Live-applied `tab-bar-min-tabs` config value.
+    pub tab_bar_min: Binding<usize>,
     /// `(tab_id, session_id)` of the pane holding embedded key focus —
     /// the single source `.focused` modifiers consume. `None` while no
     /// pane is focused (e.g. focus on the search field). Written back by
@@ -438,7 +455,7 @@ pub struct AppState {
     /// Live palette query — bound to the WaterUI `TextField`.
     pub palette_query: Binding<Str>,
     /// Index of the highlighted palette row (Up/Down navigation).
-    pub palette_sel: Binding<usize>,
+    pub palette_sel: Binding<Option<usize>>,
     /// List scroll controller — `scroll_to(sel)` keeps the highlighted
     /// row visible while navigating.
     pub palette_scroll: ScrollController<usize>,
@@ -522,6 +539,8 @@ impl AppState {
             tabs: NamiList::new(),
             session_tab: Arc::new(Mutex::new(HashMap::new())),
             selected: Binding::u64(0),
+            tab_count: Binding::usize(0),
+            tab_bar_min: Binding::usize(watcher.config.tab_bar_min_tabs),
             focus_owner: Binding::default(),
             window_title: binding(Str::from("hydroterm")),
             window_state: binding(WindowState::Normal),
@@ -531,7 +550,7 @@ impl AppState {
             env: Rc::new(std::cell::OnceCell::new()),
             palette_open: Binding::bool(false),
             palette_query: binding(Str::from("")),
-            palette_sel: Binding::usize(0),
+            palette_sel: Binding::container(Some(0)),
             palette_scroll: ScrollController::new(0),
             settings_open: Binding::bool(false),
             set_font: Binding::i32(13),
@@ -657,6 +676,7 @@ impl AppState {
     /// (mtime watcher) and `reload_config` (the manual action).
     fn apply_config(&self, config: &AppConfig) {
         *self.palette.borrow_mut() = Palette::for_config(config);
+        self.tab_bar_min.set(config.tab_bar_min_tabs);
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
@@ -672,6 +692,7 @@ impl AppState {
             };
             if *s.scrollback.lock().unwrap() != config.scrollback
                 || *s.cursor_style.lock().unwrap() != cursor_style
+                || *s.word_chars.lock().unwrap() != config.word_select_chars
             {
                 let mut term = s.terminal.term.lock();
                 term.set_options(alacritty_terminal::term::Config {
@@ -679,11 +700,29 @@ impl AppState {
                     scrolling_history: config.scrollback,
                     kitty_keyboard: s.kitty_keyboard,
                     default_cursor_style: cursor_style,
+                    semantic_escape_chars: config.word_select_chars.clone(),
                     ..Default::default()
                 });
                 *s.scrollback.lock().unwrap() = config.scrollback;
                 *s.cursor_style.lock().unwrap() = cursor_style;
+                *s.word_chars.lock().unwrap() = config.word_select_chars.clone();
             }
+        }
+    }
+
+    /// Mark the tab owning `session_id` as having unseen output — the
+    /// tab strip dots it until the tab is selected again. Called from
+    /// each surface's parser-wake (which fires on new output).
+    pub fn note_activity(&self, session_id: u64) {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
+        else {
+            return;
+        };
+        if self.selected.get() == tab_id {
+            return;
+        }
+        if let Some(t) = self.tabs.iter().find(|t| t.id == tab_id) {
+            t.activity.set(true);
         }
     }
 
@@ -883,6 +922,7 @@ impl AppState {
             tree: binding(SplitNode::Leaf(session.id)),
             focused: Binding::u64(session.id),
             zoomed: Binding::default(),
+            activity: Binding::bool(false),
         };
         self.session_tab
             .lock()
@@ -890,6 +930,7 @@ impl AppState {
             .insert(session.id, tab.id);
         let tab_id = tab.id;
         self.tabs.push(tab);
+        self.tab_count.set(self.tabs.len());
         self.selected.set(tab_id);
         tab_id
     }
@@ -1201,6 +1242,7 @@ impl AppState {
         let tabs = self.tabs.snapshot();
         if let Some(pos) = tabs.iter().position(|t| t.id == tab_id) {
             let _ = self.tabs.remove(pos);
+            self.tab_count.set(self.tabs.len());
             if self.selected.get() == tab_id {
                 let remaining = self.tabs.snapshot();
                 let idx = pos.min(remaining.len().saturating_sub(1));
@@ -1776,44 +1818,60 @@ pub fn tabs_view(state: AppState) -> impl View {
     })
     .anyview();
 
-    let strip = {
-        let app = state.clone();
-        HStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
-            let app = app.clone();
-            let tab_id = tab.id;
-            let active = app.selected.equal_to(tab_id);
-            // M3 primary-tab look: accent label + indicator bar when active.
-            let label_color = signal_color(
-                active.select(Color::new(Accent), Color::new(MutedForeground)),
-            );
-            let indicator_color = signal_color(
-                active.select(Color::new(Accent), Color::new(Background)),
-            );
-            vstack((
-                hstack((
-                    text(tab.title.clone()).foreground(label_color),
-                    text("×")
-                        .muted()
-                        .padding_with([3.0, 0.0, 4.0, 4.0])
-                        .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
-                ))
-                .padding_with([4.0, 0.0, 8.0, 4.0]),
-                Frame::new(indicator_color).height(3.0),
+    // `tab-bar-min-tabs`: the strip is unmounted (space reclaimed) until
+    // the tab count reaches the configured floor — `visible(false)` would
+    // leave an empty band, so the whole bar sits behind `when`.
+    let show_strip = zip(state.tab_count.clone(), state.tab_bar_min.clone())
+        .map(|(count, min)| count >= min);
+    let strip_bar = when(show_strip, {
+        let state = state.clone();
+        move || {
+            let strip = {
+                let app = state.clone();
+                HStack::for_each(state.tabs.clone(), move |tab: PaneTab| {
+                    let app = app.clone();
+                    let tab_id = tab.id;
+                    let active = app.selected.equal_to(tab_id);
+                    // M3 primary-tab look: accent label + indicator bar when active.
+                    let label_color = signal_color(
+                        active.select(Color::new(Accent), Color::new(MutedForeground)),
+                    );
+                    let indicator_color = signal_color(
+                        active.select(Color::new(Accent), Color::new(Background)),
+                    );
+                    vstack((
+                        hstack((
+                            // `tab-activity` dot: parser output landed while
+                            // the tab was not selected (kitty
+                            // `tab_activity_symbol`).
+                            when(tab.activity.clone(), || {
+                                text("●").foreground(Accent)
+                            }),
+                            text(tab.title.clone()).foreground(label_color),
+                            text("×")
+                                .muted()
+                                .padding_with([3.0, 0.0, 4.0, 4.0])
+                                .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
+                        ))
+                        .padding_with([4.0, 0.0, 8.0, 4.0]),
+                        Frame::new(indicator_color).height(3.0),
+                    ))
+                    .spacing(0.0)
+                    .height(TAB_STRIP_HEIGHT)
+                    .on_tap(move |app: AppState| app.selected.set(tab_id))
+                })
+            };
+            hstack((
+                strip,
+                text("+")
+                    .muted()
+                    .padding()
+                    .on_tap(|app: AppState| _ = app.new_tab()),
             ))
-            .spacing(0.0)
-            .height(TAB_STRIP_HEIGHT)
-            .on_tap(move |app: AppState| app.selected.set(tab_id))
-        })
-    };
-    let strip_bar = hstack((
-        strip,
-        text("+")
-            .muted()
+            .spacing(4.0)
             .padding()
-            .on_tap(|app: AppState| _ = app.new_tab()),
-    ))
-    .spacing(4.0)
-    .padding();
+        }
+    });
 
     let content = {
         let app = state.clone();
@@ -1848,6 +1906,7 @@ pub fn tabs_view(state: AppState) -> impl View {
         let app = state.clone();
         move |sel: u64| {
             if let Some(t) = app.tabs.iter().find(|t| t.id == sel) {
+                t.activity.set(false);
                 app.focus_owner.set(Some((sel, t.focused.get())));
             }
         }
@@ -1911,10 +1970,10 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Scroll Line Down", chord: "shift+down", action: TermAction::ScrollLineDown },
     PaletteItem { name: "Move Tab Left", chord: "ctrl+shift+pageup", action: TermAction::MoveTabLeft },
     PaletteItem { name: "Move Tab Right", chord: "ctrl+shift+pagedown", action: TermAction::MoveTabRight },
-    PaletteItem { name: "Focus Pane Left", chord: "ctrl+alt+left", action: TermAction::FocusPaneDir { horizontal: true, forward: false } },
-    PaletteItem { name: "Focus Pane Right", chord: "ctrl+alt+right", action: TermAction::FocusPaneDir { horizontal: true, forward: true } },
-    PaletteItem { name: "Focus Pane Up", chord: "ctrl+alt+up", action: TermAction::FocusPaneDir { horizontal: false, forward: false } },
-    PaletteItem { name: "Focus Pane Down", chord: "ctrl+alt+down", action: TermAction::FocusPaneDir { horizontal: false, forward: true } },
+    PaletteItem { name: "Focus Pane Left", chord: "ctrl+shift+alt+left", action: TermAction::FocusPaneDir { horizontal: true, forward: false } },
+    PaletteItem { name: "Focus Pane Right", chord: "ctrl+shift+alt+right", action: TermAction::FocusPaneDir { horizontal: true, forward: true } },
+    PaletteItem { name: "Focus Pane Up", chord: "ctrl+shift+alt+up", action: TermAction::FocusPaneDir { horizontal: false, forward: false } },
+    PaletteItem { name: "Focus Pane Down", chord: "ctrl+shift+alt+down", action: TermAction::FocusPaneDir { horizontal: false, forward: true } },
     PaletteItem { name: "URL Hints (open link by number)", chord: "ctrl+shift+u", action: TermAction::UrlHints },
     PaletteItem { name: "Copy Last Command Output", chord: "ctrl+shift+o", action: TermAction::CopyLastOutput },
     PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
@@ -1960,7 +2019,7 @@ impl AppState {
         let next = !self.palette_open.get();
         if next {
             self.palette_query.set_from("");
-            self.palette_sel.set(0);
+            self.palette_sel.set(Some(0));
             self.palette_scroll.scroll_to(0);
         }
         self.palette_open.set(next);
@@ -2045,7 +2104,6 @@ fn palette_view(state: AppState) -> impl View {
             let items: Vec<&'static PaletteItem> = palette_matches(q.as_str());
             let indices: Vec<SelfId<usize>> = (0..items.len()).map(SelfId::new).collect();
             List::for_each(indices, {
-                let state = state.clone();
                 let items = items.clone();
                 move |i: SelfId<usize>| {
                     let i = *i;
@@ -2064,9 +2122,10 @@ fn palette_view(state: AppState) -> impl View {
                         ))
                     }))
                     .action(move |app: AppState| app.run_palette_at(i));
-                    ListItem::new(row).selected(state.palette_sel.equal_to(i))
+                    ListItem::new(row)
                 }
             })
+            .selection(&state.palette_sel)
             .scroll_controller(&state.palette_scroll)
             .anyview()
         }

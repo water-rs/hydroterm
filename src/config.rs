@@ -177,6 +177,21 @@ pub struct AppConfig {
     /// keys (Ghostty folds this into input snapping; ours gates the
     /// non-key-bytes paths; `scroll-on-input` covers key bytes).
     pub scroll_to_cursor: bool,
+    /// `tab-bar-min-tabs` — hide the tab strip while fewer than this many
+    /// tabs exist (Ghostty `window-show-tab-bar = auto` ⇔ 2). Default 1
+    /// = always show.
+    pub tab_bar_min_tabs: usize,
+    /// `word-select-chars` — characters that terminate a word for
+    /// double-click selection (alacritty `semantic_escape_chars`
+    /// semantics; literal `\t`/`\n` in the file expand to tab/newline).
+    pub word_select_chars: String,
+    /// `visual-bell` — flash the pane surface on BEL (default true).
+    /// `audible-bell` rings the X11 keyboard bell; both independent.
+    pub visual_bell: bool,
+    /// `open-link-with` — program run to open links. `{}` in an argument
+    /// is replaced by the URL; otherwise the URL is appended as the
+    /// last argument. Unset → `xdg-open`.
+    pub open_link_with: Option<String>,
 }
 
 /// `window-theme` values.
@@ -262,6 +277,10 @@ impl Default for AppConfig {
             background_image_fit: BgFit::Cover,
             background_image_repeat: false,
             scroll_to_cursor: true,
+            tab_bar_min_tabs: 1,
+            word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
+            visual_bell: true,
+            open_link_with: None,
         }
     }
 }
@@ -334,6 +353,10 @@ confirm-close = true       # ask before closing a running program
 # scroll_to_bottom, quit, split_right, split_down,
 # focus_next_pane, focus_prev_pane
 # keybind = ctrl+alt+a=select_all
+# tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
+# word-select-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
+# visual-bell = true      # flash the pane on BEL
+# open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
 
 # Alpha of the terminal background fill (0..1); set below 1.0 at launch
 # for a translucent window over the desktop.
@@ -668,6 +691,20 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "tab-bar-min-tabs" | "tab_bar_min_tabs" => match value.parse::<usize>() {
+                    Ok(v) if v <= 64 => cfg.tab_bar_min_tabs = v,
+                    _ => errors.push(format!("line {}: bad tab-bar-min-tabs {value:?}", n + 1)),
+                },
+                "word-select-chars" | "word_select_chars" => {
+                    cfg.word_select_chars =
+                        value.replace("\\t", "\t").replace("\\n", "\n");
+                }
+                "visual-bell" | "visual_bell" => {
+                    cfg.visual_bell = bool_value(value, n, &mut errors);
+                }
+                "open-link-with" | "open_link_with" => {
+                    cfg.open_link_with = (!value.is_empty()).then(|| value.to_string());
+                }
                 "keybind" => match parse_keybind(value) {
                     Ok((chord, action)) => cfg.keybinds.push((chord, action)),
                     Err(e) => errors.push(format!("line {}: {e}", n + 1)),

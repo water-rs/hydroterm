@@ -578,10 +578,40 @@ impl TermSurface {
         });
         drop(term);
         if let Some(uri) = uri {
-            open_url(&uri);
+            self.open_uri(&uri);
             return true;
         }
         false
+    }
+
+    /// Open `uri` via `open-link-with` (the configured program gets `{}`
+    /// substituted, or the URL appended as its last argument); falls
+    /// back to `xdg-open` when unset or the spawn fails.
+    fn open_uri(&self, uri: &str) {
+        if let Some(cmdline) = self.app.config(|c| c.open_link_with.clone()) {
+            let mut parts = cmdline.split_whitespace();
+            if let Some(prog) = parts.next() {
+                let mut args: Vec<String> = parts.map(str::to_string).collect();
+                if args.iter().any(|a| a.contains("{}")) {
+                    for a in &mut args {
+                        *a = a.replace("{}", uri);
+                    }
+                } else {
+                    args.push(uri.to_string());
+                }
+                if std::process::Command::new(prog)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+        open_url(uri);
     }
 
     /// Apply a chord action (copy/paste/tabs/font/search).
@@ -889,7 +919,9 @@ impl TermSurface {
                     self.write(fmt(ws).into_bytes());
                 }
                 TermEvent::Bell => {
-                    self.bell_at = Some(Instant::now());
+                    if self.app.config(|c| c.visual_bell) {
+                        self.bell_at = Some(Instant::now());
+                    }
                     if self.app.config(|c| c.audible_bell) {
                         ring_bell(&mut self.bell_ring_at);
                     }
@@ -927,7 +959,9 @@ impl TermSurface {
                     TapEvent::Notify(title, body) => {
                         // Bell flash + title badge, plus a freedesktop
                         // notification where `notify-send` exists.
-                        self.bell_at = Some(Instant::now());
+                        if self.app.config(|c| c.visual_bell) {
+                            self.bell_at = Some(Instant::now());
+                        }
                         notify_desktop(&title, &body);
                         let text = if title.is_empty() { body } else { format!("{title}: {body}") };
                         *self.session.notify_badge.lock().unwrap() = true;
@@ -1124,7 +1158,7 @@ impl TermSurface {
     fn palette_key(&mut self, key: &Key, mods: Modifiers) -> bool {
         match key {
             Key::Named(NamedKey::Enter) => {
-                let sel = self.app.palette_sel.get();
+                let sel = self.app.palette_sel.get().unwrap_or(0);
                 self.app.run_palette_at(sel);
                 true
             }
@@ -1133,21 +1167,23 @@ impl TermSurface {
                 let n = crate::app::palette_matches(&query).len();
                 if n > 0 {
                     self.app.palette_sel.with_mut(|s| {
-                        *s = (*s + 1).min(n - 1);
+                        let cur = s.unwrap_or(0);
+                        *s = Some((cur + 1).min(n - 1));
                     });
                     self.app
                         .palette_scroll
-                        .scroll_to(self.app.palette_sel.get());
+                        .scroll_to(self.app.palette_sel.get().unwrap_or(0));
                 }
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.app.palette_sel.with_mut(|s| {
-                    *s = s.saturating_sub(1);
+                    let cur = s.unwrap_or(0);
+                    *s = Some(cur.saturating_sub(1));
                 });
                 self.app
                     .palette_scroll
-                    .scroll_to(self.app.palette_sel.get());
+                    .scroll_to(self.app.palette_sel.get().unwrap_or(0));
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -1158,7 +1194,7 @@ impl TermSurface {
                 let mut q = self.app.palette_query.get().to_string();
                 q.pop();
                 self.app.palette_query.set_from(q);
-                self.app.palette_sel.set(0);
+                self.app.palette_sel.set(Some(0));
                 self.app.palette_scroll.scroll_to(0);
                 true
             }
@@ -1273,7 +1309,7 @@ impl TermSurface {
             let mut q = self.app.palette_query.get().to_string();
             q.push_str(text);
             self.app.palette_query.set_from(q);
-            self.app.palette_sel.set(0);
+            self.app.palette_sel.set(Some(0));
             self.app.palette_scroll.scroll_to(0);
             return true;
         }
@@ -1660,7 +1696,7 @@ impl TermSurface {
                     && let Some(url) = h.urls.get(n.wrapping_sub(1))
                     && n >= 1
                 {
-                    open_url(url);
+                    self.open_uri(url);
                 }
             }
             Key::Named(NamedKey::Backspace) => {
@@ -2058,6 +2094,8 @@ impl SceneContent for TermSurface {
                 let _ = tx.try_send(());
                 let alive = Rc::clone(&self.wake_alive);
                 let content_gen = Rc::clone(&self.content_gen);
+                let app = self.app.clone();
+                let session_id = self.session.id;
                 self.wake_task = Some(Box::pin(spawn_local(async move {
                     while rx.recv().await.is_ok() {
                         if !alive.get() {
@@ -2066,6 +2104,9 @@ impl SceneContent for TermSurface {
                         // Coalesce bursts: one invalidation per batch.
                         while rx.try_recv().is_ok() {}
                         content_gen.set(content_gen.get() + 1);
+                        // `tab-activity`: a parser wake means new output —
+                        // dot the owning tab if it is not selected.
+                        app.note_activity(session_id);
                         invalidator();
                     }
                 })));

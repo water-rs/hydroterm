@@ -321,11 +321,13 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         }
         return None;
     }
-    // Ctrl+Alt+Arrow: directional pane focus (Ghostty's goto_split —
-    // super is reserved for the WM on Linux, so Ctrl+Alt is the binding).
+    // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
+    // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
+    // PageUp/PageDown in the same chord are Ghostty's goto_split
+    // previous/next.
     if mods.contains(Modifiers::CONTROL)
         && mods.contains(Modifiers::ALT)
-        && !mods.contains(Modifiers::SHIFT)
+        && mods.contains(Modifiers::SHIFT)
         && !mods.contains(Modifiers::META)
     {
         if let Key::Named(named) = key {
@@ -346,10 +348,26 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
                     horizontal: false,
                     forward: true,
                 }),
+                NamedKey::PageUp => Some(TermAction::FocusPrevPane),
+                NamedKey::PageDown => Some(TermAction::FocusNextPane),
                 _ => None,
             };
         }
-        // Ctrl+Alt+1..9: jump straight to the nth split.
+        return None;
+    }
+    // Ctrl+Alt+1..9: jump straight to the nth split. (Plain
+    // Ctrl+Alt+Arrow was the directional-focus chord until r23 — KDE and
+    // GNOME both grab it globally for workspace switching, so the app
+    // never sees it; directional focus now sits on Ghostty's own Linux
+    // default, Ctrl+Shift+Alt+Arrow.)
+    if mods.contains(Modifiers::CONTROL)
+        && mods.contains(Modifiers::ALT)
+        && !mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(_) = key {
+            return None;
+        }
         if let Key::Character(text) = key {
             return match text.as_str() {
                 "1" => Some(TermAction::GotoSplit(0)),
@@ -366,12 +384,14 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         }
         return None;
     }
-    // Ctrl+Alt+Shift+Arrow: move the divider beside the focused pane —
-    // the keyboard half of split resizing (pointer half is the divider
-    // drag handle).
-    if mods.contains(Modifiers::CONTROL)
-        && mods.contains(Modifiers::ALT)
+    // Alt+Shift+Arrow: move the divider beside the focused pane — the
+    // keyboard half of split resizing (pointer half is the divider drag
+    // handle). Ctrl+Alt+Shift+Arrow was the chord until r23 but GNOME
+    // grabs it globally (move window to workspace); no common desktop
+    // binds Alt+Shift+Arrow.
+    if mods.contains(Modifiers::ALT)
         && mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::CONTROL)
         && !mods.contains(Modifiers::META)
     {
         if let Key::Named(named) = key {
