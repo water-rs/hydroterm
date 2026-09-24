@@ -578,6 +578,13 @@ pub enum TermAction {
     /// Dump the scrollback + screen to a temp file and open it in
     /// `$VISUAL`/`$EDITOR` inside a new tab (kitty/WezTerm style).
     OpenScrollbackEditor,
+    /// `write_screen_file` / `write_scrollback_file` /
+    /// `write_selection_file` (Ghostty actions): dump the visible
+    /// viewport / full scrollback+screen / current selection to a temp
+    /// file and open it in `$VISUAL`/`$EDITOR` in a new tab.
+    WriteScreenFile,
+    WriteScrollbackFile,
+    WriteSelectionFile,
     /// Step the search match cursor forward / back.
     SearchNext,
     SearchPrev,

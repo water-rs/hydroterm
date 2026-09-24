@@ -2256,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis?rev=396505924200ecb759d9e7ee2c675ed653712c2c#396505924200ecb759d9e7ee2c675ed653712c2c"
+source = "git+https://github.com/water-rs/hydrolysis?rev=2e6f401af45be5d91479aeab11ad16db9279a5bd#2e6f401af45be5d91479aeab11ad16db9279a5bd"
 dependencies = [
  "accesskit",
  "accesskit_winit",

@@ -91,6 +91,9 @@ pub struct DrawContext<'a> {
     /// between the theme base fill and the cell backgrounds so unstyled
     /// cells show the image (Ghostty `background-image`).
     pub bg_image: Option<(peniko::ImageBrush, kurbo::Affine)>,
+    /// `unfocused-split-fill` — replaces the pane's default background
+    /// while it is unfocused (cells with explicit backgrounds keep them).
+    pub unfocused_fill: Option<Rgb>,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +344,15 @@ pub fn draw_term(
     let palette = ctx.palette;
 
     // -- Background fill ---------------------------------------------------
-    let default_bg = palette.background;
+    // `unfocused-split-fill` swaps only the pane's base fill; the
+    // cell-skip compare stays against the theme background so unstyled
+    // cells still let the unfocused fill show through.
+    let theme_bg = palette.background;
+    let default_bg = if !ctx.focused {
+        ctx.unfocused_fill.unwrap_or(theme_bg)
+    } else {
+        theme_bg
+    };
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
@@ -371,7 +382,7 @@ pub fn draw_term(
         for (start, end, style) in style_runs(row) {
             // Cells on the default bg are covered by the base fill — skipping
             // them keeps explicit backgrounds opaque over a translucent base.
-            if style.bg == default_bg {
+            if style.bg == theme_bg {
                 continue;
             }
             let x = col_x(pad, cw, start);
@@ -494,11 +505,13 @@ pub fn draw_term(
     draw_scrollbar(scene, ctx);
 
     // -- Bell flash -----------------------------------------------------------
+    // Full-pane step flash in the theme's foreground colour — visible on
+    // light and dark palettes alike (kitty `visual_bell` shape).
     if ctx.bell_flash > 0.0 {
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
-            &Brush::Solid(Color::new([1.0, 1.0, 1.0, ctx.bell_flash.min(0.15)])),
+            &Brush::Solid(peniko_alpha(ctx.palette.foreground, ctx.bell_flash)),
             None,
             &rect(0.0, 0.0, ctx.width, ctx.height),
         );

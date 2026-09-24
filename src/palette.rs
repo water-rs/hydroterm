@@ -116,6 +116,9 @@ impl Palette {
         if let Some(c) = cfg.selection_color {
             palette.selection_fg = Some(c);
         }
+        if let Some(c) = cfg.selection_background {
+            palette.selection_bg = c;
+        }
         for (i, c) in &cfg.palette_overrides {
             palette.indexed[*i as usize] = *c;
         }

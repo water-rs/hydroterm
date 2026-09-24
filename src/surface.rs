@@ -47,15 +47,19 @@ const BLINK_HALF: Duration = Duration::from_millis(530);
 const BELL_FLASH_SECS: f32 = 0.15;
 /// How long the cols×rows resize badge stays after the last change.
 const RESIZE_LABEL_MS: Duration = Duration::from_millis(900);
-/// Peak overlay alpha of a bell flash, decaying linearly to 0 over
-/// `BELL_FLASH_SECS`.
-const BELL_FLASH_ALPHA: f32 = 0.18;
+/// Overlay alpha of a bell flash: a step flash at full strength for the
+/// whole `BELL_FLASH_SECS` duration — kitty's `visual_bell` semantics,
+/// clearly visible rather than a faint decaying hint.
+const BELL_FLASH_ALPHA: f32 = 0.35;
 
 fn bell_flash_alpha(bell_at: Option<Instant>, now: Instant) -> f32 {
     bell_at
         .map(|t| {
-            (1.0 - now.duration_since(t).as_secs_f32() / BELL_FLASH_SECS).max(0.0)
-                * BELL_FLASH_ALPHA
+            if now.duration_since(t).as_secs_f32() < BELL_FLASH_SECS {
+                BELL_FLASH_ALPHA
+            } else {
+                0.0
+            }
         })
         .unwrap_or(0.0)
 }
@@ -714,6 +718,9 @@ impl TermSurface {
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
             TermAction::OpenScrollbackEditor => self.open_scrollback_editor(),
+            TermAction::WriteScreenFile => self.write_screen_file(),
+            TermAction::WriteScrollbackFile => self.write_scrollback_file(),
+            TermAction::WriteSelectionFile => self.write_selection_file(),
             TermAction::SearchNext => self.search_step(1),
             TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
@@ -1764,11 +1771,48 @@ impl TermSurface {
                 Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
             )
         };
+        self.write_buffer_to_editor(text, "scrollback");
+    }
+
+    /// `write_screen_file` — the visible viewport only (no scrollback).
+    fn write_screen_file(&mut self) {
+        let text = {
+            let term = self.session.terminal.term.lock();
+            let grid = term.grid();
+            term.bounds_to_string(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
+            )
+        };
+        self.write_buffer_to_editor(text, "screen");
+    }
+
+    /// `write_scrollback_file` — scrollback + screen (same region as the
+    /// scrollback editor; Ghostty keeps the editor-less name).
+    fn write_scrollback_file(&mut self) {
+        self.open_scrollback_editor();
+    }
+
+    /// `write_selection_file` — the current selection's text.
+    fn write_selection_file(&mut self) {
+        let text = self
+            .session
+            .terminal
+            .term
+            .lock()
+            .selection_to_string()
+            .unwrap_or_default();
+        self.write_buffer_to_editor(text, "selection");
+    }
+
+    /// Dump `text` to a temp file and open it in `$VISUAL`/`$EDITOR`
+    /// inside a new tab (kitty/Ghostty write-file shape).
+    fn write_buffer_to_editor(&mut self, text: String, kind: &str) {
         if text.trim().is_empty() {
             return;
         }
         let path = std::env::temp_dir().join(format!(
-            "hydroterm-scrollback-{}-{}.txt",
+            "hydroterm-{kind}-{}-{}.txt",
             std::process::id(),
             self.session.id
         ));
@@ -1953,6 +1997,7 @@ impl TermSurface {
             selection_invert: self.app.config(|c| c.selection_invert),
             hover_link: &self.hover_link,
             bg_image,
+            unfocused_fill: self.app.config(|c| c.unfocused_split_fill),
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
@@ -2471,12 +2516,13 @@ mod tests {
     }
 
     #[test]
-    fn bell_flash_decays_to_zero() {
+    fn bell_flash_holds_then_clears() {
         let t0 = Instant::now();
         assert!((bell_flash_alpha(Some(t0), t0) - BELL_FLASH_ALPHA).abs() < 1e-6);
         let mid = t0 + Duration::from_secs_f32(BELL_FLASH_SECS / 2.0);
-        let a = bell_flash_alpha(Some(t0), mid);
-        assert!((a - BELL_FLASH_ALPHA / 2.0).abs() < 1e-5, "{a}");
+        assert!(
+            (bell_flash_alpha(Some(t0), mid) - BELL_FLASH_ALPHA).abs() < 1e-6
+        );
         let past = t0 + Duration::from_secs_f32(BELL_FLASH_SECS + 0.05);
         assert_eq!(bell_flash_alpha(Some(t0), past), 0.0);
         assert_eq!(bell_flash_alpha(None, t0), 0.0);

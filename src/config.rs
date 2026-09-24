@@ -140,6 +140,18 @@ pub struct AppConfig {
     /// Glyph color under the block cursor (Ghostty `cursor-text`);
     /// `None` = the inverted cell color.
     pub cursor_text: Option<Rgb>,
+    /// `split-divider-color` — pane separator color; `None` = theme
+    /// Border token.
+    pub split_divider_color: Option<Rgb>,
+    /// `selection-background` — selection highlight fill (Ghostty
+    /// `selection-background`); `None` = theme's `selection_bg`.
+    pub selection_background: Option<Rgb>,
+    /// `unfocused-split-fill` — background color painted under an
+    /// unfocused split's cells (Ghostty `unfocused-split-fill`).
+    pub unfocused_split_fill: Option<Rgb>,
+    /// `title` — initial window/tab title; programs can still override
+    /// it via OSC 0/1/2 (Ghostty `title`).
+    pub title: Option<String>,
     /// Snap to the live edge when a key writes bytes to the PTY
     /// (Ghostty `scroll-on-input`-style; default on).
     pub scroll_on_input: bool,
@@ -263,6 +275,10 @@ impl Default for AppConfig {
             window_fullscreen: false,
             wait_after_command: false,
             quit_after_last_window_closed: true,
+            split_divider_color: None,
+            selection_background: None,
+            unfocused_split_fill: None,
+            title: None,
             cursor_text: None,
             scroll_on_input: true,
             cursor_opacity: 1.0,
@@ -332,6 +348,10 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 # background = #101418
 # cursor-color = #ffcc00
 # selection-color = #ffffff
+# selection-background = #3b4d5a   # selection highlight fill
+# split-divider-color = #888888    # pane separator (default: theme Border)
+# unfocused-split-fill = #2a2a2a   # bg of unfocused splits
+# title = my-terminal              # initial window title (OSC can override)
 # palette = 1=#e06c75   # indexed slot 0-255
 
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
@@ -452,6 +472,34 @@ impl AppConfig {
                         None => {
                             errors.push(format!("line {}: bad selection-color {value:?}", n + 1))
                         }
+                    }
+                }
+                "selection-background" | "selection_background" => {
+                    match parse_rgb(value) {
+                        Some(c) => cfg.selection_background = Some(c),
+                        None => errors
+                            .push(format!("line {}: bad selection-background {value:?}", n + 1)),
+                    }
+                }
+                "split-divider-color" | "split_divider_color" => {
+                    match parse_rgb(value) {
+                        Some(c) => cfg.split_divider_color = Some(c),
+                        None => errors
+                            .push(format!("line {}: bad split-divider-color {value:?}", n + 1)),
+                    }
+                }
+                "unfocused-split-fill" | "unfocused_split_fill" => {
+                    match parse_rgb(value) {
+                        Some(c) => cfg.unfocused_split_fill = Some(c),
+                        None => errors
+                            .push(format!("line {}: bad unfocused-split-fill {value:?}", n + 1)),
+                    }
+                }
+                "title" => {
+                    if value.is_empty() {
+                        cfg.title = None;
+                    } else {
+                        cfg.title = Some(value.to_string());
                     }
                 }
                 "palette" => match value.split_once('=').and_then(|(i, c)| {
@@ -922,6 +970,9 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "fullscreen" => TermAction::Fullscreen,
         "palette" | "command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
+        "write_screen_file" => TermAction::WriteScreenFile,
+        "write_scrollback_file" => TermAction::WriteScrollbackFile,
+        "write_selection_file" => TermAction::WriteSelectionFile,
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)

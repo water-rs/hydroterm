@@ -173,8 +173,10 @@ impl Session {
         Self {
             id,
             terminal: Arc::new(terminal),
-            title: binding(Str::from("Shell")),
-            base_title: std::sync::Mutex::new(Str::from("Shell")),
+            title: binding(Str::from(cfg.title.clone().unwrap_or_else(|| "Shell".into()))),
+            base_title: std::sync::Mutex::new(Str::from(
+                cfg.title.clone().unwrap_or_else(|| "Shell".into()),
+            )),
             notify_badge: std::sync::Mutex::new(false),
             font_size: Binding::f32(cfg.font_size),
             exited: Binding::bool(false),
@@ -542,7 +544,9 @@ impl AppState {
             tab_count: Binding::usize(0),
             tab_bar_min: Binding::usize(watcher.config.tab_bar_min_tabs),
             focus_owner: Binding::default(),
-            window_title: binding(Str::from("hydroterm")),
+            window_title: binding(Str::from(
+                watcher.config.title.clone().unwrap_or_else(|| "hydroterm".into()),
+            )),
             window_state: binding(WindowState::Normal),
             window_frame: Rc::new(RefCell::new(None)),
             cfg: Rc::new(RefCell::new(watcher)),
@@ -1652,14 +1656,26 @@ fn divider_handle(
     // `Axis` env — probed: the env survives the Frame/cursor/gesture/state
     // wrappers here, so inside an HStack child it renders a vertical 1pt
     // `BorderColor` line (horizontal inside a VStack). The Frame widens the
-    // hit zone to 7pt around the centred line.
-    let handle = match dir {
-        SplitDir::Row => Frame::new(Divider)
+    // hit zone to 7pt around the centred line. `split-divider-color` swaps
+    // the token line for a flat custom-colour fill.
+    let custom = app.config(|c| c.split_divider_color);
+    let handle = match (dir, custom) {
+        (SplitDir::Row, Some(c)) => Frame::new(Color::srgb(c.r, c.g, c.b))
             .width(DIVIDER_PX)
-            .max_height(f32::INFINITY),
-        SplitDir::Column => Frame::new(Divider)
+            .max_height(f32::INFINITY)
+            .anyview(),
+        (SplitDir::Row, None) => Frame::new(Divider)
+            .width(DIVIDER_PX)
+            .max_height(f32::INFINITY)
+            .anyview(),
+        (SplitDir::Column, Some(c)) => Frame::new(Color::srgb(c.r, c.g, c.b))
             .height(DIVIDER_PX)
-            .max_width(f32::INFINITY),
+            .max_width(f32::INFINITY)
+            .anyview(),
+        (SplitDir::Column, None) => Frame::new(Divider)
+            .height(DIVIDER_PX)
+            .max_width(f32::INFINITY)
+            .anyview(),
     };
     handle
         .cursor(cursor)
@@ -1957,6 +1973,9 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Find in Buffer", chord: "ctrl+shift+f", action: TermAction::Search },
     PaletteItem { name: "Settings", chord: "ctrl+shift+,", action: TermAction::Settings },
     PaletteItem { name: "Clear Scrollback", chord: "ctrl+shift+k", action: TermAction::ClearScrollback },
+    PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile },
+    PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile },
+    PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile },
     PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::FontBigger },
     PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::FontSmaller },
     PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
