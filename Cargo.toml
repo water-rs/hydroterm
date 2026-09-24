@@ -66,7 +66,7 @@ glifo = { git = "https://github.com/lexoliu/vello", rev = "d68d9e9825bcd1ffee762
 # `0.3.0`, which is this package; a registry copy would be pre-freeze code
 # that no longer builds against the revision below. Drop the entry once
 # hydrolysis 0.3.0 ships.
-hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "1ec6cd4d9049d9463c212739afc4321d185eab08" }
+hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "4332751cffcdf4ec0a6dbc42e76f390cc11a70d5" }
 hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "233005c53d1e79ce408061bd30c2c8d21a3e24bd" }
 
 # water-rs/waterkit#91: Linux `PrimarySelection` (X11 + Wayland data-control),

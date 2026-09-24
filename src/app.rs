@@ -1707,8 +1707,6 @@ fn divider_handle(
     };
     handle
         .cursor(cursor)
-        .state(&sizes)
-        .state(&grab)
         .gesture(
             DragGesture::new(0.0),
             move |event: Option<Use<DragEvent>>,
@@ -1750,6 +1748,8 @@ fn divider_handle(
                 }
             },
         )
+        .state(&sizes)
+        .state(&grab)
 }
 
 /// Root of every hydroterm window: `body` runs inside the environment, so
