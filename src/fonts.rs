@@ -58,6 +58,9 @@ pub struct TermFonts {
     /// `adjust-cell-width`/`adjust-cell-height` — spacing added to the
     /// measured cell (fraction of the cell or absolute points).
     cell_adjust: (crate::config::CellAdjust, crate::config::CellAdjust),
+    /// `adjust-font-baseline` — offset applied to the baseline measured
+    /// from the cell bottom (positive moves text up).
+    baseline_adjust: crate::config::CellAdjust,
     pub metrics: CellMetrics,
 }
 
@@ -129,6 +132,7 @@ impl TermFonts {
             family,
             size_px: size_pt,
             cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
+            baseline_adjust: crate::config::CellAdjust::None,
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
@@ -157,6 +161,14 @@ impl TermFonts {
     ) {
         if self.cell_adjust != (w, h) {
             self.cell_adjust = (w, h);
+            self.metrics = self.probe_metrics();
+        }
+    }
+
+    /// Hot-reload `adjust-font-baseline` and re-measure.
+    pub fn set_baseline_adjust(&mut self, a: crate::config::CellAdjust) {
+        if self.baseline_adjust != a {
+            self.baseline_adjust = a;
             self.metrics = self.probe_metrics();
         }
     }
@@ -215,6 +227,10 @@ impl TermFonts {
         metrics.cell_h = (metrics.cell_h + dh).max(1.0);
         // Extra height centres the glyph in the taller cell.
         metrics.baseline += dh / 2.0;
+        // `adjust-font-baseline`: Ghostty measures the baseline as the
+        // distance up from the cell bottom — positive moves text up.
+        let dist = (metrics.cell_h - metrics.baseline).max(0.0);
+        metrics.baseline = (metrics.cell_h - self.baseline_adjust.apply(dist)).max(0.0);
         metrics.finish();
         metrics
     }

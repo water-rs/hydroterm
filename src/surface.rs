@@ -22,6 +22,7 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
+use alacritty_terminal::vte::ansi::Processor;
 use nami::{Binding, binding};
 use waterui::cursor::CursorStyle;
 use waterui::task::spawn_local;
@@ -643,9 +644,35 @@ impl TermSurface {
                 };
                 self.session.font_size.set(next);
             }
+            TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
+                let cur = self.session.font_size.get();
+                let delta = if matches!(action, TermAction::DecreaseFontSize(_)) {
+                    -pts as f32
+                } else {
+                    pts as f32
+                };
+                self.session.font_size.set((cur + delta).clamp(6.0, 96.0));
+            }
             TermAction::ClearScrollback => {
                 let mut term = self.session.terminal.term.lock();
                 term.grid_mut().clear_history();
+                term.scroll_display(Scroll::Bottom);
+            }
+            TermAction::ClearScreen => {
+                // Ghostty `clear_screen`: erase display + scrollback,
+                // cursor to origin — run through the VT parser so cell
+                // flags, damage and wrap state stay consistent.
+                let mut term = self.session.terminal.term.lock();
+                let mut p: Processor = Processor::new();
+                p.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
+                term.scroll_display(Scroll::Bottom);
+            }
+            TermAction::Reset => {
+                // Ghostty `reset` == RIS: reset every mode and erase
+                // screen + scrollback through the parser.
+                let mut term = self.session.terminal.term.lock();
+                let mut p: Processor = Processor::new();
+                p.advance(&mut *term, b"\x1bc");
                 term.scroll_display(Scroll::Bottom);
             }
             TermAction::Search => self.session.search_open.toggle(),
@@ -1007,10 +1034,15 @@ impl TermSurface {
             self.font_size_pt = want;
             self.fonts.resize(want);
         }
-        let (aw, ah) = self
-            .app
-            .config(|c| (c.cell_width_adjust, c.cell_height_adjust));
+        let (aw, ah, ab) = self.app.config(|c| {
+            (
+                c.cell_width_adjust,
+                c.cell_height_adjust,
+                c.font_baseline_adjust,
+            )
+        });
         self.fonts.set_cell_adjust(aw, ah);
+        self.fonts.set_baseline_adjust(ab);
     }
 
     /// Recompute the grid from the logical frame size and propagate resizes.

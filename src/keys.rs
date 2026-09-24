@@ -463,6 +463,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "f" => TermAction::Search,
         "p" => TermAction::Palette,
         "," | "<" => TermAction::ReloadConfig,
+        "l" => TermAction::ClearScreen,
         _ => return None,
     })
 }
@@ -523,7 +524,16 @@ pub enum TermAction {
     FontBigger,
     FontSmaller,
     FontReset,
+    /// Ghostty `increase_font_size:pt` / `decrease_font_size:pt` —
+    /// parameterized zoom steps (whole points).
+    IncreaseFontSize(i32),
+    DecreaseFontSize(i32),
     ClearScrollback,
+    /// Ghostty `clear_screen` — erase the display AND the scrollback,
+    /// cursor home (no mode reset).
+    ClearScreen,
+    /// Ghostty `reset` — RIS: reset modes + erase everything.
+    Reset,
     Search,
     /// Jump viewport to the previous/next OSC 133 prompt mark.
     PromptPrev,

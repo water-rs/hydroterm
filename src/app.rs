@@ -1092,6 +1092,34 @@ impl AppState {
         self.tabs.insert(j, tab);
     }
 
+    /// Drag-reorder: move tab `id` into the slot `target` occupies
+    /// (Chrome/kitty semantics — the dragged tab lands on the slot it
+    /// was dropped over).
+    pub fn move_tab_before(&self, id: u64, target: u64) {
+        if id == target {
+            return;
+        }
+        let tabs = self.tabs.snapshot();
+        let (Some(from), Some(to)) = (
+            tabs.iter().position(|t| t.id == id),
+            tabs.iter().position(|t| t.id == target),
+        ) else {
+            return;
+        };
+        let tab = tabs[from].clone();
+        let _ = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        // The chip press that began the drag moved interaction focus off
+        // the terminal surface; re-assert it on the selected tab's pane
+        // (toggling the value so the watcher re-schedules a frame).
+        let sel = self.selected.get();
+        if let Some(t) = self.tabs.iter().find(|t| t.id == sel) {
+            let f = t.focused.get();
+            self.focus_owner.set(None);
+            self.focus_owner.set(Some((sel, f)));
+        }
+    }
+
     /// Toggle pane zoom on the selected tab: the focused pane fills the
     /// whole tab; toggling again (or re-focusing then toggling) restores
     /// the split layout.
@@ -1875,6 +1903,20 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
                     .on_tap(move |app: AppState| app.selected.set(tab_id))
+                    // Drag-to-reorder: the chip carries its tab id as
+                    // text payload; every sibling chip is a drop slot.
+                    .draggable(drag_drop::DragData::text(format!(
+                        "hydroterm-tab:{tab_id}"
+                    )))
+                    .drop_destination(move |app: AppState, data: drag_drop::DragData| {
+                        if let Some(id) = data
+                            .as_str()
+                            .strip_prefix("hydroterm-tab:")
+                            .and_then(|s| s.parse::<u64>().ok())
+                        {
+                            app.move_tab_before(id, tab_id);
+                        }
+                    })
                 })
             };
             hstack((
@@ -1973,6 +2015,8 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Find in Buffer", chord: "ctrl+shift+f", action: TermAction::Search },
     PaletteItem { name: "Settings", chord: "ctrl+shift+,", action: TermAction::Settings },
     PaletteItem { name: "Clear Scrollback", chord: "ctrl+shift+k", action: TermAction::ClearScrollback },
+    PaletteItem { name: "Clear Screen", chord: "ctrl+shift+l", action: TermAction::ClearScreen },
+    PaletteItem { name: "Reset Terminal", chord: "", action: TermAction::Reset },
     PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile },
     PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile },
     PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile },

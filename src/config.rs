@@ -163,6 +163,10 @@ pub struct AppConfig {
     /// accept `N%` (of the measured cell) or `Npx` (absolute points).
     pub cell_width_adjust: CellAdjust,
     pub cell_height_adjust: CellAdjust,
+    /// `adjust-font-baseline`: shifts the text baseline, measured as the
+    /// distance from the cell bottom (`Npx` or `N%` of that distance).
+    /// Positive values move the baseline up (Ghostty semantics).
+    pub font_baseline_adjust: CellAdjust,
     /// Minimum WCAG contrast ratio between cell foreground and background
     /// (Ghostty `minimum-contrast`); 1.0 = off (no enforcement).
     pub minimum_contrast: f32,
@@ -285,6 +289,7 @@ impl Default for AppConfig {
             env: Vec::new(),
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
+            font_baseline_adjust: CellAdjust::None,
             minimum_contrast: 1.0,
             window_theme: WindowTheme::Auto,
             window_decoration: true,
@@ -362,6 +367,7 @@ confirm-close = true       # ask before closing a running program
 # window-save-state = true # remember window geometry across launches
 # adjust-cell-width = 10%  # widen cells: N% or Npx
 # adjust-cell-height = 2px
+# adjust-font-baseline = 0px   # +Npx raises the text baseline; N% or Npx
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
@@ -732,6 +738,13 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "adjust-font-baseline" | "font-baseline" => match parse_cell_adjust(value) {
+                    Some(pct) => cfg.font_baseline_adjust = pct,
+                    None => errors.push(format!(
+                        "line {}: bad adjust-font-baseline {value:?} (want N% or Npx)",
+                        n + 1
+                    )),
+                },
                 "minimum-contrast" | "minimum_contrast" => match value.parse::<f32>() {
                     Ok(v) if (1.0..=21.0).contains(&v) => cfg.minimum_contrast = v,
                     _ => errors.push(format!(
@@ -954,8 +967,28 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "prev_tab" => TermAction::PrevTab,
         "font_bigger" => TermAction::FontBigger,
         "font_smaller" => TermAction::FontSmaller,
-        "font_reset" => TermAction::FontReset,
+        "font_reset" | "reset_font_size" => TermAction::FontReset,
+        // Ghostty `increase_font_size:pt` / `decrease_font_size:pt`;
+        // a bare action name steps 1pt.
+        _ if name.strip_prefix("increase_font_size").is_some() => {
+            let pts = name["increase_font_size".len()..]
+                .strip_prefix(':')
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(1)
+                .clamp(1, 48);
+            TermAction::IncreaseFontSize(pts)
+        }
+        _ if name.strip_prefix("decrease_font_size").is_some() => {
+            let pts = name["decrease_font_size".len()..]
+                .strip_prefix(':')
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(1)
+                .clamp(1, 48);
+            TermAction::DecreaseFontSize(pts)
+        }
         "clear_scrollback" => TermAction::ClearScrollback,
+        "clear_screen" => TermAction::ClearScreen,
+        "reset" => TermAction::Reset,
         "search" => TermAction::Search,
         "prompt_prev" => TermAction::PromptPrev,
         "prompt_next" => TermAction::PromptNext,
