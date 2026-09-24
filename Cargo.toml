@@ -66,7 +66,7 @@ glifo = { git = "https://github.com/lexoliu/vello", rev = "d68d9e9825bcd1ffee762
 # `0.3.0`, which is this package; a registry copy would be pre-freeze code
 # that no longer builds against the revision below. Drop the entry once
 # hydrolysis 0.3.0 ships.
-hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "446bf7793bb56f2ac4b1ddf4a52e217a26b39fe8" }
+hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "c8a39201d60445e74cdc1d167b2068505d864d2e" }
 hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "94bde7b24339de77c2ea38b4df621e796f086109" }
 
 # water-rs/nami#26: `Signal::get` renamed to `snapshot`. Pinned to the nami dev

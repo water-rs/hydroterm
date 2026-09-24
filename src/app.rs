@@ -248,7 +248,10 @@ impl SplitNode {
     ) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
-                let half = slot_px / 2.0;
+                // The divider claims DIVIDER_PX of the slot; seed equal
+                // shares of what remains so the row's frames sum to
+                // exactly slot_px and report no overflow minimum.
+                let half = (slot_px - DIVIDER_PX) / 2.0;
                 let children = if before {
                     vec![Self::Leaf(new_id), Self::Leaf(target)]
                 } else {
@@ -2320,7 +2323,8 @@ mod tests {
         assert_eq!(t.neighbor(2, false, true), None);
     }
 
-    /// A split seeds both children at half the parent's measured slot;
+    /// A split seeds both children at half the parent's measured slot
+    /// minus the divider, so the row's frames sum to the slot;
     /// `remove` reseeds the surviving subtree's own sizes.
     #[test]
     fn split_seeds_and_remove_reseeds_sizes() {
@@ -2329,15 +2333,16 @@ mod tests {
         let SplitNode::Split { children, sizes, .. } = &t else {
             panic!("not a split");
         };
-        assert_eq!(sizes.snapshot().as_slice(), &[400.0, 400.0]);
+        assert_eq!(sizes.snapshot().as_slice(), &[396.5, 396.5]);
         assert_eq!(children.len(), 2);
-        // Nested split inside child 1 reseeds its own slot to halves.
+        // Nested split inside child 1 reseeds its own slot to halves
+        // minus the divider.
         assert!(t.split(SplitDir::Column, 1, 2, 400.0, false));
         let rest = t.remove(0).expect("tree survives removing leaf 0");
         let SplitNode::Split { sizes, children, .. } = &rest else {
             panic!("expected the nested column split to remain");
         };
         assert_eq!(children.len(), 2);
-        assert_eq!(sizes.snapshot().as_slice(), &[200.0, 200.0]);
+        assert_eq!(sizes.snapshot().as_slice(), &[196.5, 196.5]);
     }
 }
