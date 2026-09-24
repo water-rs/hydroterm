@@ -175,16 +175,23 @@ impl Theme {
     /// `theme = auto`: ask the desktop (freedesktop color-scheme via
     /// gsettings when present); fall back to the default dark theme.
     pub fn auto() -> Self {
-        let prefer_light = std::process::Command::new("gsettings")
-            .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("prefer-light"))
-            .unwrap_or(false);
-        if prefer_light {
+        if system_prefers_light() {
             Self::hydroterm_light()
         } else {
             Self::hydroterm_dark()
         }
     }
 }
+
+/// Freedesktop color-scheme probe (gsettings); false when absent — KDE
+/// and most minimal WMs have no `color-scheme` key, matching `Theme::auto`.
+pub fn system_prefers_light() -> bool {
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("prefer-light"))
+        .unwrap_or(false)
+}
+
+

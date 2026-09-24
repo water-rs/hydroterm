@@ -154,6 +154,51 @@ pub struct AppConfig {
     /// Minimum WCAG contrast ratio between cell foreground and background
     /// (Ghostty `minimum-contrast`); 1.0 = off (no enforcement).
     pub minimum_contrast: f32,
+    /// Color scheme of the window chrome — tab strip, dialogs, buttons
+    /// (Ghostty `window-theme`): `auto` follows the desktop, `light`/`dark`
+    /// pin the Material scheme. The terminal palette stays on `theme =`.
+    pub window_theme: WindowTheme,
+    /// Window decorations (Ghostty `window-decoration`): `false`/`none`
+    /// maps the window borderless (title bar + frame removed).
+    pub window_decoration: bool,
+    /// Background image drawn under the grid (Ghostty `background-image`):
+    /// path (with `~` expansion); `None` = off.
+    pub background_image: Option<PathBuf>,
+    /// Opacity of `background-image` (0–1, Ghostty `background-image-opacity`).
+    pub background_image_opacity: f32,
+    /// Fit of `background-image` inside the surface rect (Ghostty
+    /// `background-image-fit`): contain/cover/stretch/tile.
+    pub background_image_fit: BgFit,
+    /// Repeat `background-image` instead of stretching one copy
+    /// (Ghostty `background-image-repeat`).
+    pub background_image_repeat: bool,
+    /// Snap the viewport to the cursor when an interaction that can move
+    /// it lands while scrolled back — paste, IME commit, program-input
+    /// keys (Ghostty folds this into input snapping; ours gates the
+    /// non-key-bytes paths; `scroll-on-input` covers key bytes).
+    pub scroll_to_cursor: bool,
+}
+
+/// `window-theme` values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowTheme {
+    /// Follow the desktop color-scheme (default).
+    Auto,
+    Light,
+    Dark,
+}
+
+/// `background-image-fit` values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BgFit {
+    /// Scale to fit inside, preserve aspect (letterboxed).
+    Contain,
+    /// Scale to fill, preserve aspect (cropped).
+    Cover,
+    /// Scale to fill, distorting aspect.
+    Stretch,
+    /// Native size, repeated to fill.
+    Tile,
 }
 
 impl Default for AppConfig {
@@ -210,6 +255,13 @@ impl Default for AppConfig {
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
             minimum_contrast: 1.0,
+            window_theme: WindowTheme::Auto,
+            window_decoration: true,
+            background_image: None,
+            background_image_opacity: 1.0,
+            background_image_fit: BgFit::Cover,
+            background_image_repeat: false,
+            scroll_to_cursor: true,
         }
     }
 }
@@ -520,6 +572,61 @@ impl AppConfig {
                 "quit-after-last-window-closed" | "quit_after_last_window_closed" => {
                     cfg.quit_after_last_window_closed = bool_value(value, n, &mut errors);
                 }
+                "window-theme" | "window_theme" => match value {
+                    "auto" | "system" => cfg.window_theme = WindowTheme::Auto,
+                    "light" => cfg.window_theme = WindowTheme::Light,
+                    "dark" => cfg.window_theme = WindowTheme::Dark,
+                    _ => errors.push(format!("line {}: bad window-theme {value:?}", n + 1)),
+                },
+                "window-decoration" | "window_decoration" => {
+                    cfg.window_decoration = match value {
+                        "false" | "none" => false,
+                        "true" | "auto" | "client" | "server" => true,
+                        _ => bool_value(value, n, &mut errors),
+                    };
+                }
+                "background-image" | "background_image" => {
+                    let p = value.trim();
+                    if p.is_empty() || p == "none" {
+                        cfg.background_image = None;
+                    } else {
+                        let expanded = if let Some(rest) = p.strip_prefix("~/") {
+                            std::env::var_os("HOME")
+                                .map(|h| PathBuf::from(h).join(rest))
+                                .unwrap_or_else(|| PathBuf::from(p))
+                        } else {
+                            PathBuf::from(p)
+                        };
+                        cfg.background_image = Some(expanded);
+                    }
+                }
+                "background-image-opacity" | "background_image_opacity" => {
+                    match value.parse::<f32>() {
+                        Ok(v) if (0.0..=1.0).contains(&v) => {
+                            cfg.background_image_opacity = v;
+                        }
+                        _ => errors.push(format!(
+                            "line {}: bad background-image-opacity {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "background-image-fit" | "background_image_fit" => match value {
+                    "contain" => cfg.background_image_fit = BgFit::Contain,
+                    "cover" => cfg.background_image_fit = BgFit::Cover,
+                    "stretch" => cfg.background_image_fit = BgFit::Stretch,
+                    "tile" => cfg.background_image_fit = BgFit::Tile,
+                    _ => errors.push(format!(
+                        "line {}: bad background-image-fit {value:?}",
+                        n + 1
+                    )),
+                },
+                "background-image-repeat" | "background_image_repeat" => {
+                    cfg.background_image_repeat = bool_value(value, n, &mut errors);
+                }
+                "scroll-to-cursor" | "scroll_to_cursor" => {
+                    cfg.scroll_to_cursor = bool_value(value, n, &mut errors);
+                }
                 "cursor-text" | "cursor_text" => match parse_rgb(value) {
                     Some(rgb) => cfg.cursor_text = Some(rgb),
                     None => errors.push(format!("line {}: bad cursor-text {value:?}", n + 1)),
@@ -781,6 +888,64 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)
+        }
+        // Ghostty `keybind = ...=new_split:right` — direction arg selects
+        // which side the new pane lands on (`auto` = right).
+        _ if name.strip_prefix("new_split:").is_some() => {
+            match &name["new_split:".len()..] {
+                "right" | "auto" => TermAction::SplitRight,
+                "down" => TermAction::SplitDown,
+                "left" => TermAction::SplitLeft,
+                "up" => TermAction::SplitUp,
+                _ => return None,
+            }
+        }
+        // Ghostty `keybind = ...=goto_split:left` — directional focus,
+        // previous/next cycle, top/bottom = first/last pane.
+        _ if name.strip_prefix("goto_split:").is_some() => {
+            match &name["goto_split:".len()..] {
+                "left" => TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false,
+                },
+                "right" => TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: true,
+                },
+                "up" => TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: false,
+                },
+                "down" => TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: true,
+                },
+                "previous" | "prev" => TermAction::FocusPrevPane,
+                "next" => TermAction::FocusNextPane,
+                "top" => TermAction::GotoSplit(0),
+                "bottom" => TermAction::GotoSplit(usize::MAX),
+                _ => return None,
+            }
+        }
+        // Ghostty `keybind = ...=resize_split:up[,10]` — optional `,px`
+        // amount; without one it uses the 48pt arrow-key step.
+        _ if name.strip_prefix("resize_split:").is_some() => {
+            let arg = &name["resize_split:".len()..];
+            let (dir, amount) = arg.split_once(',').map_or((arg, 48), |(d, a)| {
+                (d, a.trim().parse::<i32>().unwrap_or(48))
+            });
+            let (horizontal, forward) = match dir {
+                "left" => (true, false),
+                "right" => (true, true),
+                "up" => (false, false),
+                "down" => (false, true),
+                _ => return None,
+            };
+            TermAction::ResizePane {
+                horizontal,
+                forward,
+                px: amount,
+            }
         }
         _ => return None,
     })

@@ -33,6 +33,7 @@ use waterui::app::App;
 use waterui::prelude::*;
 use waterui::window::Window;
 use waterui::window::WindowState::Fullscreen;
+use waterui::window::WindowStyle::{Borderless, Titled};
 use waterui_core::layout::{Point, Rect, Size};
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...]`
@@ -72,6 +73,13 @@ fn main() {
             move || app::app_root(state.clone())
         },
     )
+    // `window-decoration = false` maps the window borderless (Ghostty
+    // `window-decoration`); the default keeps the titled frame.
+    .style(if state.config(|c| c.window_decoration) {
+        Titled
+    } else {
+        Borderless
+    })
     .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
     // Window geometry: `window-save-state` restores the persisted frame;
     // otherwise `window-width`/`window-height` adjust the seeded 800x600
@@ -115,6 +123,18 @@ fn main() {
     if state.config(|c| c.window_fullscreen) {
         state.window_state.set(Fullscreen);
     }
+    // `window-theme`: the M3 chrome (tab strip, cards, buttons) follows
+    // the style's color scheme — `auto` binds the framework's installed
+    // scheme signal, light/dark pin it statically. The terminal palette
+    // stays on `theme =`. The style object is per-run: a `window-theme`
+    // change applies at the next launch, not via hot reload.
+    let style = match state.config(|c| c.window_theme) {
+        crate::config::WindowTheme::Auto => hydrolysis_m3::Material3::defaults(),
+        crate::config::WindowTheme::Light => hydrolysis_m3::Material3::with_colors(
+            hydrolysis_m3::MaterialColorScheme::baseline_light(),
+        ),
+        crate::config::WindowTheme::Dark => hydrolysis_m3::Material3::dark(),
+    };
     let app = App::new_with_windows([window], Environment::new());
-    hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
+    hydrolysis::run(app, style);
 }

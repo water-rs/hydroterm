@@ -225,21 +225,35 @@ impl SplitNode {
     /// `[target, new_leaf]` — the new pane takes half the target's slot,
     /// like tmux/iTerm pane splits. `slot_px` is the target leaf's
     /// main-axis extent in points — both children start at half of it.
-    fn split(&mut self, dir: SplitDir, target: u64, new_id: u64, slot_px: f32) -> bool {
+    /// Split `target` along `dir`; `before` inserts the new leaf ahead of
+    /// the target (left/up) instead of after it (right/down).
+    fn split(
+        &mut self,
+        dir: SplitDir,
+        target: u64,
+        new_id: u64,
+        slot_px: f32,
+        before: bool,
+    ) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
                 let half = slot_px / 2.0;
+                let children = if before {
+                    vec![Self::Leaf(new_id), Self::Leaf(target)]
+                } else {
+                    vec![Self::Leaf(target), Self::Leaf(new_id)]
+                };
                 *self = Self::Split {
                     dir,
-                    children: vec![Self::Leaf(target), Self::Leaf(new_id)],
+                    children,
                     sizes: binding(vec![half, half]),
                 };
                 true
             }
             Self::Leaf(_) => false,
-            Self::Split { children, .. } => {
-                children.iter_mut().any(|c| c.split(dir, target, new_id, slot_px))
-            }
+            Self::Split { children, .. } => children
+                .iter_mut()
+                .any(|c| c.split(dir, target, new_id, slot_px, before)),
         }
     }
 
@@ -588,7 +602,8 @@ impl AppState {
     pub fn poll_config(&self) {
         // Desktop color-scheme flip under `theme = auto`.
         if self.theme_dirty.swap(false, Ordering::Relaxed) {
-            *self.palette.borrow_mut() = Palette::for_config(&self.cfg.borrow().config);
+            let config = &self.cfg.borrow().config;
+            *self.palette.borrow_mut() = Palette::for_config(config);
         }
         let (config, errors) = {
             let mut w = self.cfg.borrow_mut();
@@ -618,6 +633,7 @@ impl AppState {
     }
 
     /// Ghostty `goto_split`: focus the nth leaf of the selected tab.
+    /// `usize::MAX` is the last leaf (`goto_split:bottom`).
     pub fn goto_split(&self, index: usize) {
         let tab_id = self.selected.get();
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
@@ -626,7 +642,13 @@ impl AppState {
         let tree: SplitNode = tab.tree.get();
         // `.as_slice()` — nami's `Signal` blanket impl on `Vec` makes
         // `vec.get(i)` resolve to the 0-arg `Signal::get`.
-        if let Some(&sid) = tree.leaves().as_slice().get(index) {
+        let leaves = tree.leaves();
+        let index = if index == usize::MAX {
+            leaves.len().saturating_sub(1)
+        } else {
+            index
+        };
+        if let Some(&sid) = leaves.as_slice().get(index) {
             self.focus_pane(sid);
         }
     }
@@ -773,6 +795,12 @@ impl AppState {
                 move || app_root(state.clone())
             },
         )
+        // `window-decoration` applies to spawned windows too.
+        .style(if state.config(|c| c.window_decoration) {
+            WindowStyle::Titled
+        } else {
+            WindowStyle::Borderless
+        })
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
         if state.config(|c| c.window_fullscreen) {
             state
@@ -868,7 +896,8 @@ impl AppState {
 
     /// Split the pane `target` of the selected tab in `dir`; the new pane
     /// inherits the target's cwd.
-    pub fn split_pane(&self, dir: SplitDir, target: u64) -> Option<u64> {
+    /// `before` puts the new pane ahead of the target (left/up split).
+    pub fn split_pane(&self, dir: SplitDir, target: u64, before: bool) -> Option<u64> {
         let tab_id = self.selected.get();
         let tab = self
             .tabs.iter().find(|t| t.id == tab_id)?;
@@ -888,7 +917,7 @@ impl AppState {
             .unwrap_or_default();
         let ok = tab
             .tree
-            .with_mut(|tree| tree.split(dir, target, session.id, slot_px));
+            .with_mut(|tree| tree.split(dir, target, session.id, slot_px, before));
         if !ok {
             session.terminal.shutdown();
             self.sessions
@@ -985,12 +1014,14 @@ impl AppState {
     /// Move the divider beside the focused pane by ~2 cells (48pt) in
     /// the chord's direction — the keyboard path for split resizing.
     /// The drag handle (`.gesture` on the divider) is the pointer path.
-    pub fn resize_pane_dir(&self, horizontal: bool, forward: bool) {
+    /// `px` is the divider step in points (48 from the arrow chords,
+    /// configurable through `keybind = resize_split:dir,px`).
+    pub fn resize_pane_dir(&self, horizontal: bool, forward: bool, px: i32) {
         let tab_id = self.selected.get();
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
-        let delta = if forward { 48.0 } else { -48.0 };
+        let delta = if forward { px as f32 } else { -px as f32 };
         let tree = tab.tree.get();
         if tree.resize_focus(tab.focused.get(), horizontal, delta) {
             tab.tree.set(tree);
@@ -1311,27 +1342,28 @@ impl View for PaneLeaf {
         let clip_overlay = vstack((
             Spacer::flexible(),
             when(pending_clip, move || {
-                vstack((
-                    text("Program wants to read the clipboard"),
-                    hstack((
-                        button("Deny")
-                            .bordered()
-                            .action(|s: PaneSession| {
-                                s.push_action(TermAction::ClipboardReadDeny)
-                            }),
-                        button("Allow")
-                            .bordered_prominent()
-                            .action(|s: PaneSession| {
-                                s.push_action(TermAction::ClipboardReadConfirm)
-                            }),
+                Card::new(
+                    vstack((
+                        text("Program wants to read the clipboard"),
+                        hstack((
+                            button("Deny")
+                                .bordered()
+                                .action(|s: PaneSession| {
+                                    s.push_action(TermAction::ClipboardReadDeny)
+                                }),
+                            button("Allow")
+                                .bordered_prominent()
+                                .action(|s: PaneSession| {
+                                    s.push_action(TermAction::ClipboardReadConfirm)
+                                }),
+                        ))
+                        .spacing(8.0),
                     ))
                     .spacing(8.0),
-                ))
-                .spacing(8.0)
-                .padding()
-                .background(Surface)
+                )
+                .style(CardStyle::Elevated)
             })
-            .padding_vertical(8.0),
+            .padding_with(16.0),
         ))
         .anyview();
         let pending_close = session.0.pending_close.clone();
@@ -2087,8 +2119,8 @@ mod tests {
     /// [0 | 1] split side-by-side, then 1 split down → [0 | {1 / 2}].
     fn nested() -> SplitNode {
         let mut t = SplitNode::Leaf(0);
-        assert!(t.split(SplitDir::Row, 0, 1, 800.0));
-        assert!(t.split(SplitDir::Column, 1, 2, 400.0));
+        assert!(t.split(SplitDir::Row, 0, 1, 800.0, false));
+        assert!(t.split(SplitDir::Column, 1, 2, 400.0, false));
         t
     }
 
@@ -2114,14 +2146,14 @@ mod tests {
     #[test]
     fn split_seeds_and_remove_reseeds_sizes() {
         let mut t = SplitNode::Leaf(0);
-        assert!(t.split(SplitDir::Row, 0, 1, 800.0));
+        assert!(t.split(SplitDir::Row, 0, 1, 800.0, false));
         let SplitNode::Split { children, sizes, .. } = &t else {
             panic!("not a split");
         };
         assert_eq!(sizes.get().as_slice(), &[400.0, 400.0]);
         assert_eq!(children.len(), 2);
         // Nested split inside child 1 reseeds its own slot to halves.
-        assert!(t.split(SplitDir::Column, 1, 2, 400.0));
+        assert!(t.split(SplitDir::Column, 1, 2, 400.0, false));
         let rest = t.remove(0).expect("tree survives removing leaf 0");
         let SplitNode::Split { sizes, children, .. } = &rest else {
             panic!("expected the nested column split to remain");

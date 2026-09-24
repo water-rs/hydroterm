@@ -379,18 +379,22 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
                 NamedKey::ArrowLeft => Some(TermAction::ResizePane {
                     horizontal: true,
                     forward: false,
+                    px: 48,
                 }),
                 NamedKey::ArrowRight => Some(TermAction::ResizePane {
                     horizontal: true,
                     forward: true,
+                    px: 48,
                 }),
                 NamedKey::ArrowUp => Some(TermAction::ResizePane {
                     horizontal: false,
                     forward: false,
+                    px: 48,
                 }),
                 NamedKey::ArrowDown => Some(TermAction::ResizePane {
                     horizontal: false,
                     forward: true,
+                    px: 48,
                 }),
                 _ => None,
             };
@@ -526,12 +530,15 @@ pub enum TermAction {
         forward: bool,
     },
     /// Move the divider beside the focused pane in a direction
-    /// (Ctrl+Alt+Shift+Arrow) — keyboard split resize.
+    /// (Ctrl+Alt+Shift+Arrow / `keybind = resize_split:dir[,px]`) —
+    /// keyboard split resize; `px` is the step in points.
     ResizePane {
         /// Left/right (Row splits) when true, up/down (Column) when false.
         horizontal: bool,
         /// Right/down when true, left/up when false.
         forward: bool,
+        /// Main-axis points to move the divider by.
+        px: i32,
     },
     /// URL hint mode: number the visible links, type digits + Enter to
     /// open one without the mouse.
@@ -556,9 +563,13 @@ pub enum TermAction {
     SearchPrev,
     /// Shut down all sessions and exit.
     Quit,
-    /// Split the focused pane right/down (new pane takes half its slot).
+    /// Split the focused pane (new pane takes half its slot); Left/Up
+    /// insert the new pane ahead of the target like Ghostty's
+    /// `new_split:left`/`up`.
     SplitRight,
     SplitDown,
+    SplitLeft,
+    SplitUp,
     /// Toggle: the focused pane fills the whole tab (tmux zoom).
     PaneZoom,
     /// Focus the nth pane in the tab (Ghostty `goto_split`,

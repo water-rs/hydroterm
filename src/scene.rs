@@ -87,6 +87,10 @@ pub struct DrawContext<'a> {
     /// Ctrl-hovered link span to underline: `(start col, end col
     /// exclusive, viewport row)` per visible part (wrap-safe, like hints).
     pub hover_link: &'a [(usize, usize, usize)],
+    /// `background-image` brush + image-space→surface transform, drawn
+    /// between the theme base fill and the cell backgrounds so unstyled
+    /// cells show the image (Ghostty `background-image`).
+    pub bg_image: Option<(peniko::ImageBrush, kurbo::Affine)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +349,19 @@ pub fn draw_term(
         None,
         &rect(0.0, 0.0, ctx.width, ctx.height),
     );
+
+    // -- `background-image` under the grid --------------------------------
+    // Over the base fill, under cell backgrounds: cells on the default
+    // bg skip their own fill so the image shows through unstyled text.
+    if let Some((brush, transform)) = &ctx.bg_image {
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &Brush::Image(brush.clone()),
+            Some(*transform),
+            &rect(0.0, 0.0, ctx.width, ctx.height),
+        );
+    }
 
     for (row_i, row) in grid.rows.iter().enumerate() {
         if row.is_empty() {

@@ -298,9 +298,14 @@ impl KittyStore {
 }
 
 /// PNG → RGBA8. Kept small via the `png` crate.
-fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+///
+/// `EXPAND | ALPHA | STRIP_16` normalizes palette and low-depth sources,
+/// but the `png` crate keeps 8-bit grayscale sources as Gray/LA — those
+/// are expanded to Rgba8 by hand so the caller can always assume a
+/// 4-bytes-per-pixel buffer (vello `ImageData` is declared Rgba8; a
+/// shorter buffer aborts inside wgpu's `write_texture` validation).
+pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
-    // Normalize palette/grayscale/low-depth/16-bit PNGs to RGBA8.
     decoder.set_transformations(
         png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
     );
@@ -309,9 +314,29 @@ fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if out_size == 0 {
         return None;
     }
+    let color_type = reader.output_color_type().0;
     let mut buf = vec![0u8; out_size];
     let info = reader.next_frame(&mut buf).ok()?;
-    Some((buf[..info.buffer_size()].to_vec(), info.width, info.height))
+    let buf = &buf[..info.buffer_size()];
+    let (w, h) = (info.width as usize, info.height as usize);
+    let rgba = match color_type {
+        png::ColorType::Rgba => buf.to_vec(),
+        png::ColorType::Rgb => buf
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Grayscale => buf
+            .iter()
+            .flat_map(|&g| [g, g, g, 255])
+            .collect(),
+        _ => return None,
+    };
+    debug_assert_eq!(rgba.len(), w * h * 4);
+    Some((rgba, info.width, info.height))
 }
 
 /// Slice an RGBA8 buffer to `(x, y, w, h)`; bounds-checked.

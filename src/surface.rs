@@ -303,7 +303,14 @@ pub struct TermSurface {
     /// Drives `.cursor(...)` on the SceneView: IBeam over the grid,
     /// PointingHand over a Ctrl-hovered link.
     pub hover_cursor: Binding<CursorStyle>,
+    /// `background-image` decode cache: (config path, decoded brush+dims)
+    /// — `None` brush means the file failed to read/decode; the path is
+    /// still cached so a bad path is not re-read every frame.
+    bg_img: RefCell<BgImageCache>,
 }
+
+/// `background-image` decode cache: (config path, decoded brush + pixel dims).
+type BgImageCache = (Option<std::path::PathBuf>, Option<(peniko::ImageBrush, u32, u32)>);
 
 impl TermSurface {
     /// Scene content for one session — the host's shared font collection is
@@ -351,7 +358,68 @@ impl TermSurface {
             pointer_at: (0.0, 0.0),
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
+            bg_img: RefCell::new((None, None)),
         }
+    }
+
+    /// The `background-image` brush + its brush→rect transform for this
+    /// frame, or `None`. File bytes are decoded once per config path and
+    /// cached; opacity/fit/repeat are applied per frame (hot reload).
+    fn bg_image_draw(&self, w: f64, h: f64) -> Option<(peniko::ImageBrush, kurbo::Affine)> {
+        use crate::config::BgFit;
+        let (path, opacity, fit, repeat) = self.app.config(|c| {
+            (
+                c.background_image.clone(),
+                c.background_image_opacity,
+                c.background_image_fit,
+                c.background_image_repeat,
+            )
+        });
+        let path = path?;
+        let mut cache = self.bg_img.borrow_mut();
+        if cache.0.as_deref() != Some(path.as_path()) {
+            let loaded = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| crate::kitty::decode_png(&bytes))
+                .map(|(px, iw, ih)| {
+                    let image = peniko::ImageData {
+                        data: peniko::Blob::new(std::sync::Arc::new(px)),
+                        format: peniko::ImageFormat::Rgba8,
+                        alpha_type: peniko::ImageAlphaType::Alpha,
+                        width: iw,
+                        height: ih,
+                    };
+                    (peniko::ImageBrush::new(image), iw, ih)
+                });
+            *cache = (Some(path), loaded);
+        }
+        let (brush, iw, ih) = cache.1.clone()?;
+        let (iw, ih) = (f64::from(iw), f64::from(ih));
+        let tile = matches!(fit, BgFit::Tile) || repeat;
+        let ext = if tile {
+            peniko::Extend::Repeat
+        } else {
+            peniko::Extend::Pad
+        };
+        let brush = brush
+            .with_alpha(opacity)
+            .with_x_extend(ext)
+            .with_y_extend(ext);
+        // brush_transform maps image-pixel space into the surface rect.
+        let transform = match fit {
+            BgFit::Stretch => kurbo::Affine::scale_non_uniform(w / iw, h / ih),
+            BgFit::Tile => kurbo::Affine::IDENTITY,
+            BgFit::Contain | BgFit::Cover => {
+                let s = if matches!(fit, BgFit::Contain) {
+                    (w / iw).min(h / ih)
+                } else {
+                    (w / iw).max(h / ih)
+                };
+                kurbo::Affine::translate(((w - iw * s) / 2.0, (h - ih * s) / 2.0))
+                    * kurbo::Affine::scale(s)
+            }
+        };
+        Some((brush, transform))
     }
 
     /// Surface-local logical position → (col, row) in viewport coords.
@@ -448,7 +516,7 @@ impl TermSurface {
             out.push_str("\x1b[201~");
         }
         self.write(out.into_bytes());
-        self.snap_to_bottom_if_scrolled();
+        self.snap_to_cursor_if_scrolled();
     }
 
     /// Paste-protection overlay answer: write the stashed text
@@ -606,8 +674,12 @@ impl TermSurface {
             TermAction::FocusPaneDir { horizontal, forward } => {
                 self.app.focus_pane_dir(horizontal, forward);
             }
-            TermAction::ResizePane { horizontal, forward } => {
-                self.app.resize_pane_dir(horizontal, forward);
+            TermAction::ResizePane {
+                horizontal,
+                forward,
+                px,
+            } => {
+                self.app.resize_pane_dir(horizontal, forward, px);
             }
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
@@ -616,10 +688,18 @@ impl TermSurface {
             TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
             TermAction::SplitRight => {
-                self.app.split_pane(crate::app::SplitDir::Row, self.session.id);
+                self.app.split_pane(crate::app::SplitDir::Row, self.session.id, false);
             }
             TermAction::SplitDown => {
-                self.app.split_pane(crate::app::SplitDir::Column, self.session.id);
+                self.app
+                    .split_pane(crate::app::SplitDir::Column, self.session.id, false);
+            }
+            TermAction::SplitLeft => {
+                self.app.split_pane(crate::app::SplitDir::Row, self.session.id, true);
+            }
+            TermAction::SplitUp => {
+                self.app
+                    .split_pane(crate::app::SplitDir::Column, self.session.id, true);
             }
             TermAction::PaneZoom => self.app.toggle_pane_zoom(),
             TermAction::GotoSplit(index) => self.app.goto_split(index),
@@ -1228,6 +1308,23 @@ impl TermSurface {
         if !self.app.config(|c| c.scroll_on_input) {
             return false;
         }
+        self.snap_viewport_to_bottom()
+    }
+
+    /// Paste-like interactions (`paste_text` — menu paste, Shift+Insert,
+    /// middle-click PRIMARY, drop, confirmed paste) snap the viewport to
+    /// the cursor under `scroll-to-cursor` — a separate gate from
+    /// `scroll-on-input`, which covers key bytes only.
+    fn snap_to_cursor_if_scrolled(&mut self) -> bool {
+        if !self.app.config(|c| c.scroll_to_cursor) {
+            return false;
+        }
+        self.snap_viewport_to_bottom()
+    }
+
+    /// Shared snap: scroll to the live edge if the user has scrolled
+    /// back. Returns true when the viewport moved (needs a frame).
+    fn snap_viewport_to_bottom(&mut self) -> bool {
         let mut term = self.session.terminal.term.lock();
         if term.grid().display_offset() == 0 {
             return false;
@@ -1796,6 +1893,7 @@ impl TermSurface {
         let focused = self.focused;
         let cursor_invert_fg_bg = self.app.config(|c| c.cursor_invert_fg_bg);
         let bg_opacity = self.app.config(|c| c.background_opacity);
+        let bg_image = self.bg_image_draw(f64::from(width), f64::from(height));
         let mut ctx = DrawContext {
             palette: &palette,
             fonts: &mut self.fonts,
@@ -1818,6 +1916,7 @@ impl TermSurface {
             min_contrast: self.app.config(|c| c.minimum_contrast),
             selection_invert: self.app.config(|c| c.selection_invert),
             hover_link: &self.hover_link,
+            bg_image,
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
