@@ -290,6 +290,9 @@ pub struct TermSurface {
     search: Option<Search>,
     /// URL hint mode state — chips over every visible link + digits typed.
     hints: Option<HintState>,
+    /// Keyboard selection mode (`start_selection`): `(anchor, moving end)`;
+    /// `term.selection` is rebuilt from the pair on each move.
+    keysel: Option<(Point, Point)>,
     clipboard: Option<waterkit_clipboard::Clipboard>,
     /// X11 pointer-hide for `mouse-hide-while-typing` (None off-X11).
     cursor_hider: Option<crate::xcursor::CursorHider>,
@@ -356,6 +359,7 @@ impl TermSurface {
             blink_epoch: Instant::now(),
             search: None,
             hints: None,
+            keysel: None,
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
             cursor_hider: None,
             cursor_hider_tried: false,
@@ -662,6 +666,9 @@ impl TermSurface {
             TermAction::CloseConfirm => self.app.confirm_close(self.session.id),
             TermAction::NewWindow => self.app.new_window(),
             TermAction::ToggleQuickTerminal => self.app.toggle_quick(),
+            TermAction::LastTab => self.app.select_last_tab(),
+            TermAction::CloseWindow => self.app.close_window(),
+            TermAction::ToggleTabBar => self.app.toggle_tab_bar(),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),
@@ -719,6 +726,18 @@ impl TermSurface {
                 if let Some(sel) = &mut term.selection {
                     sel.update(end, Side::Right);
                 }
+            }
+            TermAction::StartSelection => {
+                // Keyboard selection mode: anchor at the cursor's cell;
+                // navigation keys extend, Enter copies, Escape cancels.
+                let mut term = self.session.terminal.term.lock();
+                let cur = term.grid().cursor.point;
+                term.selection = Some(Selection::new(SelectionType::Simple, cur, Side::Left));
+                if let Some(sel) = &mut term.selection {
+                    sel.update(cur, Side::Right);
+                }
+                drop(term);
+                self.keysel = Some((cur, cur));
             }
             TermAction::ScrollToTop => {
                 self.session
@@ -1076,6 +1095,8 @@ impl TermSurface {
         });
         self.fonts.set_cell_adjust(aw, ah);
         self.fonts.set_baseline_adjust(ab);
+        self.fonts
+            .set_features(&self.app.config(|c| c.font_features.clone()));
     }
 
     /// Recompute the grid from the logical frame size and propagate resizes.
@@ -1191,6 +1212,12 @@ impl TermSurface {
         // Enter opens, Escape cancels — everything else cancels and falls
         // through to normal handling.
         if pressed && self.hints.is_some() && self.hint_key(key) {
+            return true;
+        }
+        // Keyboard selection mode (`start_selection`): navigation keys
+        // extend the mark, Enter copies, Escape cancels; any other key
+        // exits and falls through to normal handling.
+        if pressed && self.keysel.is_some() && self.keysel_key(key) {
             return true;
         }
         let mode = *self.session.terminal.term.lock().mode();
@@ -1764,6 +1791,69 @@ impl TermSurface {
         } else {
             self.hints = Some(HintState { spans, urls, digits: String::new() });
         }
+    }
+
+    /// Keyboard selection mode (`start_selection`): arrows/Home/End/
+    /// PageUp/PageDown move the mark's end cell-wise; Enter copies and
+    /// clears; Escape cancels. Any other key exits mode and falls
+    /// through to normal key handling (returns false).
+    fn keysel_key(&mut self, key: &Key) -> bool {
+        let Some((anchor, mut cur)) = self.keysel else {
+            return false;
+        };
+        let mut term = self.session.terminal.term.lock();
+        let history = term.grid().history_size() as i32;
+        let rows = term.grid().screen_lines() as i32;
+        let cols = term.grid().columns();
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                term.selection = None;
+                self.keysel = None;
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                drop(term);
+                self.copy_selection();
+                self.session.terminal.term.lock().selection = None;
+                self.keysel = None;
+                return true;
+            }
+            Key::Named(NamedKey::ArrowLeft) => cur.column = Column(cur.column.0.saturating_sub(1)),
+            Key::Named(NamedKey::ArrowRight) => {
+                cur.column = Column((cur.column.0 + 1).min(cols - 1))
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                cur.line = Line((cur.line.0 - 1).max(-history))
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                cur.line = Line((cur.line.0 + 1).min(rows - 1))
+            }
+            Key::Named(NamedKey::Home) => cur.column = Column(0),
+            Key::Named(NamedKey::End) => cur.column = Column(cols - 1),
+            Key::Named(NamedKey::PageUp) => {
+                cur.line = Line((cur.line.0 - rows).max(-history))
+            }
+            Key::Named(NamedKey::PageDown) => {
+                cur.line = Line((cur.line.0 + rows).min(rows - 1))
+            }
+            // Any other key exits the mode and falls through.
+            _ => {
+                self.keysel = None;
+                return false;
+            }
+        }
+        // Rebuild each move like a pointer drag past the anchor: the
+        // earlier point is the left end, the later one the right end.
+        let (start, end) = if (cur.line.0, cur.column.0) < (anchor.line.0, anchor.column.0) {
+            (cur, anchor)
+        } else {
+            (anchor, cur)
+        };
+        let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+        sel.update(end, Side::Right);
+        term.selection = Some(sel);
+        self.keysel = Some((anchor, cur));
+        true
     }
 
     /// Keys while hint mode is active. Returns false when the key should

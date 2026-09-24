@@ -109,6 +109,16 @@ impl OscScanner {
         }
     }
 
+    /// Any staged bytes not yet emitted by `take`.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Count of staged bytes not yet emitted.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Emit the next pending segment into `out`; returns the byte count and
     /// the events to dispatch — attached to the segment that completes a
     /// tapped string, when the parser has consumed everything before it.

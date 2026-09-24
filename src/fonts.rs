@@ -8,9 +8,27 @@
 //! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
 
 use parley::fontique::Synthesis;
+use parley::style::{FontFeature, FontFeatures};
+use parley::setting::Tag;
 use parley::{Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle,
              FontWeight, Layout, LayoutContext, StyleProperty, style::GenericFamily};
 use waterui_text::FontCollection;
+
+/// Parse one `font-feature` entry: `-tag` disables, `+tag`/`tag`/`tag=N`
+/// sets the value; tags are 4-byte OpenType feature tags.
+pub fn parse_font_feature(spec: &str) -> Option<FontFeature> {
+    let spec = spec.trim();
+    let (value, body) = if let Some(rest) = spec.strip_prefix('-') {
+        (0, rest)
+    } else {
+        (1, spec.strip_prefix('+').unwrap_or(spec))
+    };
+    let (tag_s, value) = match body.split_once('=') {
+        Some((t, v)) => (t.trim(), v.trim().parse::<u16>().ok()?),
+        None => (body.trim(), value),
+    };
+    Some(FontFeature::new(Tag::parse(tag_s)?, value))
+}
 
 /// Families asked for first, in preference order. Everything they cannot
 /// cover — box drawing, CJK, emoji — falls back through fontique's own
@@ -61,6 +79,8 @@ pub struct TermFonts {
     /// `adjust-font-baseline` — offset applied to the baseline measured
     /// from the cell bottom (positive moves text up).
     baseline_adjust: crate::config::CellAdjust,
+    /// `font-feature` entries applied to every shaped run.
+    features: Vec<FontFeature>,
     pub metrics: CellMetrics,
 }
 
@@ -133,6 +153,7 @@ impl TermFonts {
             size_px: size_pt,
             cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
             baseline_adjust: crate::config::CellAdjust::None,
+            features: Vec::new(),
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
@@ -173,6 +194,17 @@ impl TermFonts {
         }
     }
 
+    /// Hot-reload `font-feature` entries and re-measure (a feature can
+    /// change advances — e.g. `-calt` rejoins ligatures into cells).
+    pub fn set_features(&mut self, specs: &[String]) {
+        let parsed: Vec<FontFeature> =
+            specs.iter().filter_map(|s| parse_font_feature(s)).collect();
+        if self.features != parsed {
+            self.features = parsed;
+            self.metrics = self.probe_metrics();
+        }
+    }
+
     /// Shape `text` as one terminal line: single line, left aligned, with the
     /// cell's style applied as the default run style. Fontique splits the
     /// result into one run per face the text actually needs, which is where
@@ -195,6 +227,11 @@ impl TermFonts {
             } else {
                 FontStyle::Normal
             }));
+            if !self.features.is_empty() {
+                builder.push_default(StyleProperty::FontFeatures(
+                    FontFeatures::List(std::borrow::Cow::Owned(self.features.clone())),
+                ));
+            }
             let mut layout = builder.build(text);
             layout.break_all_lines(None);
             layout.align(Alignment::Start, AlignmentOptions::default());

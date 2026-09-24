@@ -522,6 +522,15 @@ pub enum TermAction {
     /// `toggle_quick_terminal`; works as a window-local keybind and as
     /// the `global:` hotkey target).
     ToggleQuickTerminal,
+    /// Jump back to the previously-selected tab (kitty `goto_tab -1`,
+    /// tmux `last-window`).
+    LastTab,
+    /// Close every tab in this window (Ghostty `close_window`), with
+    /// `confirm-close` prompts where configured.
+    CloseWindow,
+    /// Show/hide the tab strip on demand, overriding `tab-bar-min-tabs`
+    /// until the next config reload (kitty `toggle_tab_bar`).
+    ToggleTabBar,
     NextTab,
     PrevTab,
     SelectTab(usize),
@@ -544,6 +553,10 @@ pub enum TermAction {
     PromptNext,
     /// Select the whole viewport.
     SelectAll,
+    /// Keyboard selection mode (Ghostty `start_selection`): anchor a
+    /// selection at the cursor, arrows/Home/End/PageUp/PageDown move its
+    /// end, Enter copies, Escape cancels; any other key exits.
+    StartSelection,
     /// Scroll the viewport to the top of scrollback / the bottom.
     ScrollToTop,
     ScrollToBottom,

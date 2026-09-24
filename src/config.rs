@@ -232,6 +232,10 @@ pub struct AppConfig {
     /// distance from the cell bottom (`Npx` or `N%` of that distance).
     /// Positive values move the baseline up (Ghostty semantics).
     pub font_baseline_adjust: CellAdjust,
+    /// OpenType feature toggles (kitty `font_features` / Ghostty
+    /// `font-feature`): `-tag` disables (e.g. `-calt` kills ligatures),
+    /// `+tag`/`tag`/`tag=N` sets a value. Repeatable.
+    pub font_features: Vec<String>,
     /// Minimum WCAG contrast ratio between cell foreground and background
     /// (Ghostty `minimum-contrast`); 1.0 = off (no enforcement).
     pub minimum_contrast: f32,
@@ -370,6 +374,7 @@ impl Default for AppConfig {
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
             font_baseline_adjust: CellAdjust::None,
+            font_features: Vec::new(),
             minimum_contrast: 1.0,
             window_theme: WindowTheme::Auto,
             window_decoration: true,
@@ -456,6 +461,7 @@ confirm-close = true       # ask before closing a running program
 # adjust-cell-width = 10%  # widen cells: N% or Npx
 # adjust-cell-height = 2px
 # adjust-font-baseline = 0px   # +Npx raises the text baseline; N% or Npx
+# font-feature = -calt         # OpenType toggle: -tag off, +tag/tag/tag=N on
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
@@ -910,6 +916,22 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "font-feature" | "font_feature" => {
+                    for spec in value.split(',') {
+                        let spec = spec.trim();
+                        if spec.is_empty() {
+                            continue;
+                        }
+                        if crate::fonts::parse_font_feature(spec).is_some() {
+                            cfg.font_features.push(spec.to_string());
+                        } else {
+                            errors.push(format!(
+                                "line {}: bad font-feature {spec:?} (want -tag, +tag, tag or tag=N)",
+                                n + 1
+                            ));
+                        }
+                    }
+                }
                 "minimum-contrast" | "minimum_contrast" => match value.parse::<f32>() {
                     Ok(v) if (1.0..=21.0).contains(&v) => cfg.minimum_contrast = v,
                     _ => errors.push(format!(
@@ -1038,7 +1060,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "font_bigger", "font_smaller", "font_reset",
     "increase_font_size[:pt]", "decrease_font_size[:pt]",
     "clear_scrollback", "clear_screen", "reset", "search", "search_next", "search_prev",
-    "prompt_prev", "prompt_next", "select_all",
+    "prompt_prev", "prompt_next", "select_all", "start_selection",
+    "last_tab", "close_window", "toggle_tab_bar",
     "scroll_to_top", "scroll_to_bottom", "scroll_page_up", "scroll_page_down",
     "scroll_line_up", "scroll_line_down",
     "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
@@ -1162,6 +1185,9 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "close_tab" => TermAction::CloseTab,
         "new_window" => TermAction::NewWindow,
         "toggle_quick_terminal" | "quick_terminal" => TermAction::ToggleQuickTerminal,
+        "last_tab" => TermAction::LastTab,
+        "close_window" => TermAction::CloseWindow,
+        "toggle_tab_bar" => TermAction::ToggleTabBar,
         "next_tab" => TermAction::NextTab,
         "prev_tab" => TermAction::PrevTab,
         "font_bigger" => TermAction::FontBigger,
@@ -1192,6 +1218,7 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "prompt_prev" => TermAction::PromptPrev,
         "prompt_next" => TermAction::PromptNext,
         "select_all" => TermAction::SelectAll,
+        "start_selection" => TermAction::StartSelection,
         "scroll_to_top" => TermAction::ScrollToTop,
         "scroll_to_bottom" => TermAction::ScrollToBottom,
         "scroll_page_up" => TermAction::ScrollPageUp,

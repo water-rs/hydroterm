@@ -51,7 +51,7 @@ type ClipboardReply = std::sync::Arc<dyn Fn(&str) -> String + Sync + Send>;
 
 pub struct Session {
     pub id: u64,
-    /// The terminal (Term + EventLoop + PTY channel).
+    /// The terminal (Term + I/O loop + PTY channel).
     pub terminal: Arc<Terminal>,
     /// OSC-set title (propagates to the tab when the pane is focused).
     pub title: Binding<Str>,
@@ -456,6 +456,11 @@ pub struct AppState {
     pub tab_count: Binding<usize>,
     /// Live-applied `tab-bar-min-tabs` config value.
     pub tab_bar_min: Binding<usize>,
+    /// `toggle_tab_bar` manual override: `Some(true)` forces the strip
+    /// visible, `Some(false)` hides it; `None` follows `tab-bar-min-tabs`.
+    pub tab_bar_forced: Binding<Option<bool>>,
+    /// Previously-selected tab id for `last_tab` (0 = none).
+    pub last_tab_id: Rc<std::cell::Cell<u64>>,
     /// `(tab_id, session_id)` of the pane holding embedded key focus —
     /// the single source `.focused` modifiers consume. `None` while no
     /// pane is focused (e.g. focus on the search field). Written back by
@@ -568,6 +573,8 @@ impl AppState {
             selected: Binding::u64(0),
             tab_count: Binding::usize(0),
             tab_bar_min: Binding::usize(watcher.config.tab_bar_min_tabs),
+            tab_bar_forced: Binding::default(),
+            last_tab_id: Rc::new(std::cell::Cell::new(0)),
             focus_owner: Binding::default(),
             window_title: binding(Str::from(
                 watcher.config.title.clone().unwrap_or_else(|| "hydroterm".into()),
@@ -1431,6 +1438,36 @@ impl AppState {
         }
     }
 
+    /// Jump back to the previously-selected tab (kitty `goto_tab -1` /
+    /// tmux `last-window`). No-op until a second tab was selected once.
+    pub fn select_last_tab(&self) {
+        let prev = self.last_tab_id.get();
+        if prev != 0 && self.tabs.iter().any(|t| t.id == prev) {
+            self.selected.set(prev);
+        }
+    }
+
+    /// `close_window`: close every tab in this window (each goes through
+    /// `confirm-close` where configured). Empty tab list quits via
+    /// `quit-after-last-window-closed`.
+    pub fn close_window(&self) {
+        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        for id in ids {
+            self.try_close_tab(id);
+        }
+    }
+
+    /// `toggle_tab_bar`: force the strip on/off until the next toggle;
+    /// `tab-bar-min-tabs` governs again once the override is unset
+    /// (the toggle flips relative to the strip's current visibility).
+    pub fn toggle_tab_bar(&self) {
+        let cur = self
+            .tab_bar_forced
+            .snapshot()
+            .unwrap_or_else(|| self.tab_count.snapshot() >= self.tab_bar_min.snapshot());
+        self.tab_bar_forced.set(Some(!cur));
+    }
+
     /// Cycle tabs by `dir` (+1/-1).
     pub fn cycle_tab(&self, dir: isize) {
         let tabs = self.tabs.snapshot();
@@ -2008,9 +2045,13 @@ pub fn tabs_view(state: AppState) -> impl View {
 
     // `tab-bar-min-tabs`: the strip is unmounted (space reclaimed) until
     // the tab count reaches the configured floor — `visible(false)` would
-    // leave an empty band, so the whole bar sits behind `when`.
-    let show_strip = zip(state.tab_count.clone(), state.tab_bar_min.clone())
-        .map(|(count, min)| count >= min);
+    // leave an empty band, so the whole bar sits behind `when`. A
+    // `toggle_tab_bar` override wins over the count rule.
+    let show_strip = zip(
+        zip(state.tab_count.clone(), state.tab_bar_min.clone()),
+        state.tab_bar_forced.clone(),
+    )
+    .map(|((count, min), forced)| forced.unwrap_or(count >= min));
     let strip_bar = when(show_strip, {
         let state = state.clone();
         move || {
@@ -2103,10 +2144,17 @@ pub fn tabs_view(state: AppState) -> impl View {
         settings_overlay,
         quick,
     ))
-    // Tab switch → grant embedded focus to that tab's remembered pane.
+    // Tab switch → grant embedded focus to that tab's remembered pane;
+    // also track the previously-selected tab for `last_tab`.
     .on_change(&state.selected, {
         let app = state.clone();
+        let prev_seen = Rc::new(std::cell::Cell::new(0u64));
         move |sel: u64| {
+            let prev = prev_seen.get();
+            if prev != sel {
+                app.last_tab_id.set(prev);
+                prev_seen.set(sel);
+            }
             if let Some(t) = app.tabs.iter().find(|t| t.id == sel) {
                 t.activity.set(false);
                 app.focus_owner.set(Some((sel, t.focused.snapshot())));
@@ -2186,6 +2234,10 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Copy Last Command Output", chord: "ctrl+shift+o", action: TermAction::CopyLastOutput },
     PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
     PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
+    PaletteItem { name: "Last Tab (previously selected)", chord: "", action: TermAction::LastTab },
+    PaletteItem { name: "Close Window (all tabs)", chord: "", action: TermAction::CloseWindow },
+    PaletteItem { name: "Toggle Tab Bar", chord: "", action: TermAction::ToggleTabBar },
+    PaletteItem { name: "Start Selection (keyboard select)", chord: "", action: TermAction::StartSelection },
     PaletteItem { name: "Toggle Fullscreen", chord: "f11", action: TermAction::Fullscreen },
     PaletteItem { name: "Quit", chord: "", action: TermAction::Quit },
 ];
@@ -2293,6 +2345,9 @@ impl AppState {
             }
             TermAction::NewWindow => self.new_window(),
             TermAction::ToggleQuickTerminal => self.toggle_quick(),
+            TermAction::LastTab => self.select_last_tab(),
+            TermAction::CloseWindow => self.close_window(),
+            TermAction::ToggleTabBar => self.toggle_tab_bar(),
             TermAction::NextTab => self.cycle_tab(1),
             TermAction::PrevTab => self.cycle_tab(-1),
             TermAction::Fullscreen => self.toggle_fullscreen(),

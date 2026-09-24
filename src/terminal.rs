@@ -1,20 +1,26 @@
-//! PTY + terminal emulation: alacritty_terminal's `Term` driven by its own
-//! `EventLoop` thread, with events funneled into a channel the renderer
-//! drains each frame.
+//! PTY + terminal emulation: alacritty_terminal's `Term` driven by
+//! hydroterm's own reader thread (replacing the crate's `EventLoop`, whose
+//! `pty_read` never let us interleave `&mut Term` work between parser
+//! advances). The reader feeds `vte::ansi::Processor` into `Term` under the
+//! lock, cutting the input at each OSC 133 string so the semantic state —
+//! prompt / input / output — is applied at the mark's exact byte position
+//! and tags the rows the cursor writes while it holds.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::io::{self, Read};
+use std::io::{self, ErrorKind, Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State};
+use alacritty_terminal::event_loop::Msg;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{ClipboardType, Config, Term};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
 /// Absolute-row span of a command's output: `(C-mark row, Option<D-mark
@@ -23,10 +29,27 @@ type OutputSpan = Option<(i64, Option<i64>)>;
 use alacritty_terminal::grid::{Grid, GridCell};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::vte::ansi::Rgb;
-use polling::{Event as PollingEvent, PollMode, Poller};
+use alacritty_terminal::vte::ansi::{self, Rgb};
+use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::osctap::{OscScanner, ShellRedraw, TapEvent};
+
+/// Max bytes staged in the scanner before the reader force-locks the term
+/// rather than keep buffering — same bound the upstream loop uses
+/// (`event_loop::READ_BUFFER_SIZE`, which is crate-private).
+const READ_BUFFER_SIZE: usize = 0x10_0000;
+
+/// Max bytes parsed while holding the term lock — the upstream
+/// `MAX_LOCKED_READ`.
+const MAX_LOCKED_READ: usize = u16::MAX as usize;
+
+/// Token the `Pty` registers its read/write fd under
+/// (`tty::PTY_READ_WRITE_TOKEN`, crate-private upstream).
+const PTY_READ_WRITE_TOKEN: usize = 0;
+
+/// Token the `Pty` registers its child-event pipe under
+/// (`tty::PTY_CHILD_EVENT_TOKEN`, crate-private upstream).
+const PTY_CHILD_EVENT_TOKEN: usize = 1;
 
 /// The semantic prompt-region mark, carried on cell `Flags` bit 15 — the
 /// only free bit. Reflow moves whole cells (`front_split_off`/`shrink`/
@@ -35,33 +58,9 @@ use crate::osctap::{OscScanner, ShellRedraw, TapEvent};
 /// reference terminal uses for its row-level `semantic_prompt` kind.
 const PROMPT_MARK: Flags = Flags::from_bits_retain(0b1000_0000_0000_0000);
 
-/// Which OSC 133 mark a [`PendingMark`] came from.
-#[derive(Clone, Copy)]
-enum MarkKind {
-    /// `133;A` — prompt start; flags that row and re-anchors the region.
-    A,
-    /// `133;B` — prompt end; flags `head..=row` (the whole prompt).
-    B,
-    /// `133;C` — command start; flags `head..=row` (prompt + input).
-    C,
-}
-
-/// An OSC 133 mark seen on the reader thread: the absolute row
-/// (`history_size + screen line`, scroll-stable) plus its kind. The
-/// reader only holds `*const Term`, so flags are queued here and applied
-/// at the one place `&mut Term` is held — [`Terminal::resize`], ahead of
-/// the reflow that must carry them.
-struct PendingMark {
-    abs: i64,
-    kind: MarkKind,
-}
-
-/// Queued marks plus the `A`-row anchor of the region being built.
-#[derive(Default)]
-struct MarkQueue {
-    events: Vec<PendingMark>,
-    head: Option<i64>,
-}
+/// Bit 15 is not upstream API: if a future `alacritty_terminal` claims it,
+/// this stops the build instead of silently colliding.
+const _: () = assert!(Flags::all().bits() & PROMPT_MARK.bits() == 0);
 
 /// Everything the render loop needs to know that isn't cell data.
 pub enum TermEvent {
@@ -115,7 +114,7 @@ pub struct EventProxy {
 
 struct ProxyInner {
     /// Where `PtyWrite` goes once the event loop channel exists.
-    notifier: OnceLock<Notifier>,
+    notifier: OnceLock<IoNotifier>,
     /// UI-thread queue for everything the renderer must act on.
     events: Sender<TermEvent>,
     /// Wakes the UI thread — plugged in by the scene content once it has
@@ -203,14 +202,14 @@ impl EventListener for EventProxy {
 /// the queue of events the renderer consumes.
 pub struct Terminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
-    // EventLoopSender wraps mpsc::SyncSender, which is !Sync — keep it behind
-    // a Mutex so Terminal stays Send+Sync.
-    io: Mutex<EventLoopSender>,
+    // IoSender wraps mpsc::Sender, which is !Sync — keep it behind a Mutex
+    // so Terminal stays Send+Sync.
+    io: Mutex<IoSender>,
     pub proxy: EventProxy,
     /// Absolute grid rows of OSC 133 prompt-start marks
-    /// (`history_size + screen line`, recorded on the reader thread).
-    /// Rows drift if scrollback overflows — the oldest lines drop without a
-    /// hook to rebase stored marks.
+    /// (`history_size + screen line`, recorded on the reader thread at the
+    /// mark's exact stream position). Rows drift if scrollback overflows —
+    /// the oldest lines drop without a hook to rebase stored marks.
     pub prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
     /// Absolute rows of the last command's output: `Some((start, end))`
     /// where `start` is the OSC 133 `C` (CommandStart) row and `end` is
@@ -222,11 +221,6 @@ pub struct Terminal {
     /// the reference terminal (a shell repaints its prompt until it says
     /// otherwise).
     shell_redraw: Arc<Mutex<ShellRedraw>>,
-    /// OSC 133 marks queued by the reader thread, applied to cell flags
-    /// inside `resize` ahead of reflow (abs rows are scroll-stable, so
-    /// they can safely wait there — reflow is the only row-mover, and it
-    /// only runs in `resize`).
-    pending_marks: Arc<Mutex<MarkQueue>>,
     pub events: Mutex<Receiver<TermEvent>>,
     /// Duplicated master fd — `tcgetpgrp` answers the slave's foreground
     /// pgroup without taking the reader's term lock.
@@ -234,7 +228,7 @@ pub struct Terminal {
     /// PID of the spawned child == its process group (the shell is the
     /// foreground job when nothing else runs).
     shell_pid: i32,
-    _join: std::thread::JoinHandle<(EventLoop<TapPty, EventProxy>, State)>,
+    _join: std::thread::JoinHandle<(IoLoop, IoState)>,
 }
 
 /// Process-side inputs to [`Terminal::spawn`] — everything the child
@@ -315,27 +309,25 @@ impl Terminal {
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
         let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
         let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
-        let pending_marks = Arc::new(Mutex::new(MarkQueue::default()));
-        let pty = TapPty::new(
-            pty,
-            term.clone(),
-            prompt_marks.clone(),
-            last_output.clone(),
-            shell_redraw.clone(),
-            pending_marks.clone(),
-            proxy.inner.events.clone(),
-        );
+        let marks = Marks {
+            sem: SemKind::Output,
+            top: 0,
+            prompt_marks: prompt_marks.clone(),
+            last_output: last_output.clone(),
+            redraw: shell_redraw.clone(),
+            sink: proxy.inner.events.clone(),
+        };
+        let pty = TapPty::new(pty);
 
-        // `drain_on_exit` is an EventLoop parameter, not an Options one:
-        // drain the PTY's last bytes on child exit so the final output
-        // isn't lost — `wait-after-command` (and any exit) shows the
-        // complete last frame.
-        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, true, false)?;
-        let io = event_loop.channel();
-        proxy.inner.notifier.set(Notifier(io.clone())).ok();
-        let join = event_loop.spawn();
+        // `drain_on_exit` is a loop parameter, not an Options one: drain
+        // the PTY's last bytes on child exit so the final output isn't
+        // lost — `wait-after-command` (and any exit) shows the complete
+        // last frame.
+        let (io_loop, io) = IoLoop::new(term.clone(), proxy.clone(), pty, true, marks)?;
+        proxy.inner.notifier.set(IoNotifier(io.clone())).ok();
+        let join = io_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, pending_marks, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
     }
 
     /// The program holding the PTY's foreground process group, or `None`
@@ -364,10 +356,8 @@ impl Terminal {
     pub fn resize(&self, cols: u16, lines: u16, cell_px: (u16, u16)) {
         {
             let mut term = self.term.lock();
-            // Queued OSC 133 marks land on cell flags BEFORE the reflow,
-            // so the reflow carries them with the rows they were recorded
-            // on — this is the only place `&mut Term` is held.
-            apply_pending_marks(&mut term, &mut self.pending_marks.lock().unwrap());
+            // Cell-flag marks were stamped at write time on the reader
+            // thread, so reflow carries them with the rows they belong to.
             term.resize(TermSize { cols: cols as usize, lines: lines as usize });
             clear_prompt_for_redraw(
                 &mut term,
@@ -389,53 +379,11 @@ impl Terminal {
     }
 }
 
-/// Flag every cell on the row whose absolute position is `abs`
-/// (`history_size + screen line`, scroll-stable; drops out silently once
-/// the scrollback limit evicts it).
-fn flag_row<T: EventListener>(grid: &mut Term<T>, abs: i64) {
-    let hist = grid.grid().history_size() as i64;
-    let l = (abs - hist) as i32;
-    if i64::from(l) < -hist || l as usize >= grid.grid().screen_lines() {
-        return;
-    }
-    for c in 0..grid.grid().columns() {
-        grid.grid_mut()[Line(l)][Column(c)].flags.insert(PROMPT_MARK);
-    }
-}
-
-/// Drain marks the reader queued since the last `&mut Term` window. Runs
-/// inside [`Terminal::resize`] ahead of reflow — reflow is the only row
-/// mover, so the recorded absolute rows are still exact here, and the
-/// flags it sets then travel with the cells.
-fn apply_pending_marks<T: EventListener>(term: &mut Term<T>, queue: &mut MarkQueue) {
-    for ev in queue.events.drain(..) {
-        match ev.kind {
-            MarkKind::A => {
-                flag_row(term, ev.abs);
-                queue.head = Some(ev.abs);
-            }
-            MarkKind::B | MarkKind::C => {
-                let head = queue.head.unwrap_or(ev.abs);
-                for abs in head..=ev.abs {
-                    flag_row(term, abs);
-                }
-            }
-        }
-    }
-}
-
 /// Does any cell on `line` still carry [`PROMPT_MARK`]? A rewrite or erase
 /// resets the cell's flags, so a rewritten row drops its mark — correct:
 /// the mark belongs to the write, like the reference's row kind.
 fn row_has_mark(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
     (0..cols).any(|c| grid[Line(line)][Column(c)].flags.contains(PROMPT_MARK))
-}
-
-/// A row carrying no text at all — what the shell's erase pass leaves on
-/// a stale fragment. (Checks `c` only; a row of styled blanks still
-/// counts as blank, matching how the erase itself looks.)
-fn row_blank(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
-    (0..cols).all(|c| grid[Line(line)][Column(c)].c == ' ')
 }
 
 /// Clear the prompt region after a resize-reflow so the shell's SIGWINCH
@@ -454,17 +402,13 @@ fn row_blank(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
 /// * With no flagged rows at all nothing is cleared either — matching
 ///   the reference for unintegrated shells.
 ///
-/// The region start is found by flag scan, not text: skip unmarked rows
-/// up from the cursor (typed input and prompt-continuation rows written
-/// after the last mark pass), then walk up through the contiguous flagged
-/// block — the current prompt's rows plus any stale generations reflow
-/// orphaned with their marks intact. A contiguous run of fully blank rows
-/// is crossed only when a flagged row caps it (an erased fragment of a
-/// marked region); a blank run ending in unflagged text or the grid top
-/// is real output and ends the walk, so earlier prompts and command
-/// output are never touched. Cells are blanked, never erased, and the
-/// WRAPLINE join into the cleared region is severed so the next reflow
-/// cannot splice stale rows back in.
+/// The prompt region is exactly the contiguous tagged rows ending at the
+/// cursor's row — the reader stamps `PROMPT_MARK` on every row the cursor
+/// touches while the semantic state is prompt or input, so no text matching
+/// or row guessing is needed. Stale generations reflow orphaned with their
+/// marks still join the contiguous block and are cleared with it. Cells are
+/// blanked, never erased, and the WRAPLINE join into the cleared region is
+/// severed so the next reflow cannot splice stale rows back in.
 fn clear_prompt_for_redraw<T: EventListener>(
     term: &mut Term<T>,
     output: &Mutex<OutputSpan>,
@@ -504,30 +448,14 @@ fn clear_prompt_for_redraw<T: EventListener>(
         // prompt lines are live text the shell never rewrites.
         ShellRedraw::Last => clear_rows(term, cursor),
         ShellRedraw::True => {
-            let mut start = cursor;
-            while start > 0 && !row_has_mark(grid, cols, start - 1) {
-                start -= 1;
-            }
-            if start == 0 && !row_has_mark(grid, cols, 0) {
+            // The region ends at the cursor's row; nothing tagged above
+            // an unmarked cursor row is this prompt's.
+            if !row_has_mark(grid, cols, cursor) {
                 return;
             }
-            while start > 0 {
-                if row_has_mark(grid, cols, start - 1) {
-                    start -= 1;
-                    continue;
-                }
-                if !row_blank(grid, cols, start - 1) {
-                    break;
-                }
-                let mut probe = start - 1;
-                while probe > 0 && row_blank(grid, cols, probe) {
-                    probe -= 1;
-                }
-                if row_has_mark(grid, cols, probe) {
-                    start = probe;
-                } else {
-                    break;
-                }
+            let mut start = cursor;
+            while start > 0 && row_has_mark(grid, cols, start - 1) {
+                start -= 1;
             }
             tracing::debug!(cursor, start, "resize prompt clear");
             clear_rows(term, start);
@@ -645,177 +573,66 @@ function fish_prompt; printf '\\e]133;A\\e\\\\'; __hydro_orig_fish_prompt; print
 
 // -- Byte-stream tap ---------------------------------------------------------
 
-/// PTY wrapper whose reader additionally feeds an `OscScanner`, so sequences
-/// vte's `osc_dispatch` drops (OSC 133, OSC 7, OSC 9/777, APC) still reach us.
-/// The scanner also segments reads at string boundaries, so the cursor
-/// position sampled when a string completes is exactly where its sender saw
-/// it — `EventLoop` locks the `Term` via `try_lock_unfair` while parsing,
-/// and never holds it during `read` itself.
+/// PTY wrapper whose reader feeds an `OscScanner`, so sequences vte's
+/// `osc_dispatch` drops (OSC 133, OSC 7, OSC 9/777, APC) still reach us.
+/// The scanner segments staged reads at string boundaries, so [`IoLoop`]
+/// can advance the parser right up to a mark and dispatch it with `&mut
+/// Term` in hand at the string's exact stream position.
 pub struct TapPty {
     inner: tty::Pty,
     reader: TapReader,
 }
 
-/// A `*const Term` dereferenced only on the event-loop thread. The
-/// `EventLoop`'s `terminal` Option keeps the `FairMutex` guard alive across
-/// the whole `pty_read`, so `try_lock_unfair` inside `read` always fails on
-/// the second iteration onward. `cursor.point` and `history_size` are only
-/// written on that same thread (resize is the sole exception — a torn read
-/// just yields a slightly stale mark), so a raw read on it is race-free.
-struct TermPtr(*const Term<EventProxy>);
-
-// SAFETY: the pointer is only dereferenced inside `TapReader::read`, which
-// runs exclusively on the event-loop thread.
-unsafe impl Send for TermPtr {}
-
-/// Reads the PTY and scans for the sequences the VT layer ignores.
+/// Reads the PTY and scans for the sequences the VT layer ignores. The I/O
+/// loop drives `stage` + `scanner.take` directly so tap events keep their
+/// segment pairing — each event is dispatched with `&mut Term` in hand at
+/// the mark's exact stream position.
 pub struct TapReader {
     file: std::fs::File,
     scanner: OscScanner,
     scratch: Vec<u8>,
-    term: TermPtr,
-    /// Keeps the `Term` pointed to by `term` alive.
-    _term: Arc<FairMutex<Term<EventProxy>>>,
-    marks: Arc<std::sync::Mutex<Vec<i64>>>,
-    output: Arc<Mutex<OutputSpan>>,
-    redraw: Arc<Mutex<ShellRedraw>>,
-    pending: Arc<Mutex<MarkQueue>>,
-    sink: Sender<TermEvent>,
 }
 
 impl TapPty {
-    fn new(
-        pty: tty::Pty,
-        term: Arc<FairMutex<Term<EventProxy>>>,
-        marks: Arc<std::sync::Mutex<Vec<i64>>>,
-        output: Arc<Mutex<OutputSpan>>,
-        redraw: Arc<Mutex<ShellRedraw>>,
-        pending: Arc<Mutex<MarkQueue>>,
-        sink: Sender<TermEvent>,
-    ) -> Self {
-        let term_ptr = {
-            let guard = term.lock();
-            TermPtr(&*guard as *const Term<EventProxy>)
-        };
+    fn new(pty: tty::Pty) -> Self {
         let reader = TapReader {
             // `try_clone` yields a second fd onto the same open file
             // description: the reader consumes the identical byte stream the
-            // event loop's `register()` polls on the inner file.
+            // poll registration watches on the inner file.
             file: pty.file().try_clone().expect("dup pty fd"),
             scanner: OscScanner::new(),
             scratch: vec![0; 65536],
-            term: term_ptr,
-            _term: term,
-            marks,
-            output,
-            redraw,
-            pending,
-            sink,
         };
         Self { inner: pty, reader }
     }
 }
 
 impl TapReader {
-    /// Route a completed tap event: prompt marks snapshot the cursor
-    /// position (this runs on the event-loop thread, with the `Term` only
-    /// try-lockable — `lock` would deadlock against the reader's lease).
-    fn dispatch(&mut self, ev: TapEvent) {
-        if let TapEvent::ShellRedraw(r) = ev {
-            *self.redraw.lock().unwrap() = r;
-            let _ = self.sink.send(TermEvent::Tap(ev));
-            return;
+    /// Stage more PTY bytes into the scanner; returns the raw read count.
+    fn stage(&mut self) -> io::Result<usize> {
+        let got = self.file.read(&mut self.scratch)?;
+        if got > 0 {
+            let t = Instant::now();
+            self.scanner.feed(&self.scratch[..got]);
+            stat_add(&STAT_FEED_NS, t.elapsed().as_nanos() as u64);
         }
-        if matches!(
-            ev,
-            TapEvent::PromptStart
-                | TapEvent::PromptEnd
-                | TapEvent::CommandStart
-                | TapEvent::CommandEnd(_)
-        ) {
-            // SAFETY: dereferenced on the event-loop thread only (see
-            // `TermPtr`); the `Arc<FairMutex<Term>>` outlives the reader.
-            let term = unsafe { &*self.term.0 };
-            let abs = term.grid().history_size() as i64
-                + i64::from(term.grid().cursor.point.line.0);
-            match ev {
-                // `A`: this row starts the prompt — re-anchor the region.
-                TapEvent::PromptStart => {
-                    self.pending
-                        .lock()
-                        .unwrap()
-                        .events
-                        .push(PendingMark { abs, kind: MarkKind::A });
-                    let mut marks = self.marks.lock().unwrap();
-                    if marks.last() != Some(&abs) {
-                        marks.push(abs);
-                    }
-                }
-                // `B`: prompt written — flag `head..=here`.
-                TapEvent::PromptEnd => self
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .events
-                    .push(PendingMark { abs, kind: MarkKind::B }),
-                // `C`: input ends — flag through to here, and remember the
-                // pending command so a resize mid-run never clears the
-                // prompt while output is still arriving.
-                TapEvent::CommandStart => {
-                    self.pending
-                        .lock()
-                        .unwrap()
-                        .events
-                        .push(PendingMark { abs, kind: MarkKind::C });
-                    *self.output.lock().unwrap() = Some((abs, None));
-                }
-                TapEvent::CommandEnd(_) => {
-                    let mut out = self.output.lock().unwrap();
-                    // A `D` with no pending `C` keeps the stale span.
-                    if let Some((start, None)) = *out {
-                        *out = Some((start, Some(abs)));
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        if let TapEvent::Apc(payload) = ev {
-            // SAFETY: same TermPtr read as marks — the cursor still sits at
-            // the placement position on the reader thread.
-            let term = unsafe { &*self.term.0 };
-            let abs = term.grid().history_size() as i64
-                + i64::from(term.grid().cursor.point.line.0);
-            let col = term.grid().cursor.point.column.0;
-            let _ = self.sink.send(TermEvent::Apc(payload, abs, col));
-            return;
-        }
-        let _ = self.sink.send(TermEvent::Tap(ev));
+        Ok(got)
     }
 }
 
 impl Read for TapReader {
+    /// `EventedReadWrite` requires an `io::Read` reader; the I/O loop never
+    /// calls this — it drives `stage`/`take` so tap events keep their
+    /// segment pairing (a plain `Read` would have to drop them).
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let t = std::time::Instant::now();
-            let (n, events) = self.scanner.take(buf);
-            stat_add(&STAT_TAKE_NS, t.elapsed().as_nanos() as u64);
-            for ev in events {
-                self.dispatch(ev);
-            }
+            let (n, _events) = self.scanner.take(buf);
             if n > 0 {
                 return Ok(n);
             }
-            let t = std::time::Instant::now();
-            let got = self.file.read(&mut self.scratch)?;
-            stat_add(&STAT_READ_NS, t.elapsed().as_nanos() as u64);
-            if got == 0 {
+            if self.stage()? == 0 {
                 return Ok(0);
             }
-            stat_add(&STAT_BYTES, got as u64);
-            let t = std::time::Instant::now();
-            self.scanner.feed(&self.scratch[..got]);
-            stat_add(&STAT_FEED_NS, t.elapsed().as_nanos() as u64);
-            report_reader_stats();
         }
     }
 }
@@ -906,6 +723,480 @@ impl EventedPty for TapPty {
 impl OnResize for TapPty {
     fn on_resize(&mut self, window_size: WindowSize) {
         self.inner.on_resize(window_size);
+    }
+}
+
+// -- Semantic prompt marks + the I/O loop -------------------------------------
+
+/// What the cursor is currently writing — the semantic state an OSC 133
+/// mark sets at its exact position in the stream (the reference terminal's
+/// `semantic_prompt` on the cursor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SemKind {
+    /// Ordinary command output — rows are never tagged.
+    Output,
+    /// Between `133;A` and `133;B` — the shell is drawing its prompt.
+    Prompt,
+    /// Between `133;B` and `133;C` — the user is editing the command line.
+    Input,
+}
+
+/// Reader-side semantic state: which kind the cursor writes, the top row of
+/// the current prompt/input span, and the shared recorders the rest of the
+/// app reads (`prompt_marks`, `last_output`, `redraw`).
+struct Marks {
+    sem: SemKind,
+    /// Screen row the current prompt/input span began at — re-anchored at
+    /// each `133;A` and lowered if the cursor ever backs above it.
+    top: i32,
+    prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
+    last_output: Arc<Mutex<OutputSpan>>,
+    redraw: Arc<Mutex<ShellRedraw>>,
+    sink: Sender<TermEvent>,
+}
+
+impl Marks {
+    /// Apply a tap event at its stream position — runs with `&mut Term` in
+    /// hand right after the parser consumed the sequence's bytes, so the
+    /// cursor position is exactly where the shell placed the mark.
+    fn dispatch<T: EventListener>(&mut self, term: &mut Term<T>, ev: &TapEvent) {
+        let abs = term.grid().history_size() as i64
+            + i64::from(term.grid().cursor.point.line.0);
+        match ev {
+            TapEvent::PromptStart => {
+                self.sem = SemKind::Prompt;
+                self.top = term.grid().cursor.point.line.0;
+                let mut marks = self.prompt_marks.lock().unwrap();
+                if marks.last() != Some(&abs) {
+                    marks.push(abs);
+                }
+            }
+            TapEvent::PromptEnd => self.sem = SemKind::Input,
+            TapEvent::CommandStart => {
+                self.sem = SemKind::Output;
+                *self.last_output.lock().unwrap() = Some((abs, None));
+            }
+            TapEvent::CommandEnd(_) => {
+                let mut out = self.last_output.lock().unwrap();
+                // A `D` with no pending `C` keeps the stale span.
+                if let Some((start, None)) = *out {
+                    *out = Some((start, Some(abs)));
+                }
+            }
+            TapEvent::ShellRedraw(r) => *self.redraw.lock().unwrap() = *r,
+            TapEvent::Apc(payload) => {
+                let col = term.grid().cursor.point.column.0;
+                let _ = self.sink.send(TermEvent::Apc(payload.clone(), abs, col));
+                return;
+            }
+            _ => (),
+        }
+        let _ = self.sink.send(TermEvent::Tap(ev.clone()));
+    }
+
+    /// Tag the rows the cursor occupies after a parser advance while the
+    /// semantic state is prompt or input — the write-time counterpart of
+    /// the reference's per-row `semantic_prompt` kind. Cell writes/erases
+    /// drop the flag, so a stale tag dies with its text; the alternate
+    /// screen is skipped since its rows never join reflow.
+    fn tag<T: EventListener>(&mut self, term: &mut Term<T>) {
+        if !matches!(self.sem, SemKind::Prompt | SemKind::Input)
+            || term.mode().contains(TermMode::ALT_SCREEN)
+        {
+            return;
+        }
+        let cur = term.grid().cursor.point.line.0;
+        self.top = self.top.min(cur);
+        let cols = term.grid().columns();
+        for l in self.top..=cur {
+            for c in 0..cols {
+                term.grid_mut()[Line(l)][Column(c)].flags.insert(PROMPT_MARK);
+            }
+        }
+    }
+}
+
+/// Channel endpoint handed to `Terminal` — mirrors the crate's
+/// `EventLoopSender`: send a `Msg`, then wake the poller.
+#[derive(Clone)]
+struct IoSender {
+    sender: Sender<Msg>,
+    poll: Arc<Poller>,
+}
+
+impl IoSender {
+    fn send(&self, msg: Msg) -> io::Result<()> {
+        self.sender
+            .send(msg)
+            .map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e.to_string()))?;
+        self.poll.notify()
+    }
+}
+
+/// `event::Notify` for `Event::PtyWrite` — the terminal asking to write
+/// bytes back to the child (DSR/DA/device-attribute replies).
+struct IoNotifier(IoSender);
+
+impl Notify for IoNotifier {
+    fn notify<B>(&self, bytes: B)
+    where
+        B: Into<Cow<'static, [u8]>>,
+    {
+        let bytes = bytes.into();
+        // Terminal hangs if we send 0 bytes through.
+        if bytes.is_empty() {
+            return;
+        }
+        let _ = self.0.send(Msg::Input(bytes));
+    }
+}
+
+/// Nonblocking channel receiver with a one-slot peek — mirrors the crate's
+/// `PeekableReceiver` (crate-private upstream).
+struct Peekable<T> {
+    rx: Receiver<T>,
+    peeked: Option<T>,
+}
+
+impl<T> Peekable<T> {
+    fn new(rx: Receiver<T>) -> Self {
+        Self { rx, peeked: None }
+    }
+
+    fn peek(&mut self) -> Option<&T> {
+        if self.peeked.is_none() {
+            self.peeked = self.rx.try_recv().ok();
+        }
+        self.peeked.as_ref()
+    }
+
+    fn recv(&mut self) -> Option<T> {
+        self.peeked.take().or_else(|| self.rx.try_recv().ok())
+    }
+}
+
+/// One buffered PTY write in flight (the upstream `Writing`).
+struct Writing {
+    source: Cow<'static, [u8]>,
+    written: usize,
+}
+
+impl Writing {
+    fn new(c: Cow<'static, [u8]>) -> Self {
+        Self { source: c, written: 0 }
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.written += n;
+    }
+
+    fn remaining_bytes(&self) -> &[u8] {
+        &self.source[self.written..]
+    }
+
+    fn finished(&self) -> bool {
+        self.written >= self.source.len()
+    }
+}
+
+/// Mutable I/O-loop state — the write queue (the upstream `State`, minus
+/// the parser, which lives on the stack so marks and advances interleave).
+#[derive(Default)]
+struct IoState {
+    write_list: VecDeque<Cow<'static, [u8]>>,
+    writing: Option<Writing>,
+}
+
+impl IoState {
+    fn ensure_next(&mut self) {
+        if self.writing.is_none() {
+            self.goto_next();
+        }
+    }
+
+    fn goto_next(&mut self) {
+        self.writing = self.write_list.pop_front().map(Writing::new);
+    }
+
+    fn take_current(&mut self) -> Option<Writing> {
+        self.writing.take()
+    }
+
+    fn needs_write(&self) -> bool {
+        self.writing.is_some() || !self.write_list.is_empty()
+    }
+
+    fn set_current(&mut self, new: Option<Writing>) {
+        self.writing = new;
+    }
+}
+
+/// The PTY I/O loop — a like-for-like port of `event_loop::EventLoop`'s
+/// spawn body (poll on pty read/write + channel wake, child-exit drain,
+/// sync-update timeout), with `pty_read` rewritten to feed the parser in
+/// OSC-string-aligned segments so [`Marks`] can interleave `&mut Term`
+/// work between advances.
+struct IoLoop {
+    poll: Arc<Poller>,
+    pty: TapPty,
+    rx: Peekable<Msg>,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    proxy: EventProxy,
+    drain_on_exit: bool,
+    marks: Marks,
+}
+
+impl IoLoop {
+    fn new(
+        terminal: Arc<FairMutex<Term<EventProxy>>>,
+        event_proxy: EventProxy,
+        pty: TapPty,
+        drain_on_exit: bool,
+        marks: Marks,
+    ) -> io::Result<(Self, IoSender)> {
+        let (tx, rx) = mpsc::channel();
+        let poll: Arc<Poller> = Poller::new()?.into();
+        let io = IoSender { sender: tx, poll: poll.clone() };
+        Ok((
+            Self {
+                poll,
+                pty,
+                rx: Peekable::new(rx),
+                term: terminal,
+                proxy: event_proxy,
+                drain_on_exit,
+                marks,
+            },
+            io,
+        ))
+    }
+
+    /// Drain the control channel; `false` on Shutdown (mirrors upstream).
+    fn drain_recv_channel(&mut self, state: &mut IoState) -> bool {
+        while let Some(msg) = self.rx.recv() {
+            match msg {
+                Msg::Input(input) => state.write_list.push_back(input),
+                Msg::Resize(window_size) => self.pty.on_resize(window_size),
+                Msg::Shutdown => return false,
+            }
+        }
+        true
+    }
+
+    /// Read+parse PTY output: stage raw bytes into the scanner, then advance
+    /// the parser segment by segment — a tap event is dispatched with the
+    /// lock held exactly where its string completed, and prompt/input rows
+    /// are tagged right after each advance. Mirrors upstream `pty_read`'s
+    /// lease + lock contention + wakeup accounting.
+    fn pty_read(&mut self, parser: &mut ansi::Processor, seg: &mut [u8]) -> io::Result<()> {
+        // Reserve the next terminal lock for PTY reading.
+        let _terminal_lease = Some(self.term.lease());
+        let mut terminal = None;
+        let mut processed = 0;
+
+        'fill: loop {
+            // Drain every complete segment the scanner has staged.
+            while self.pty.reader().scanner.has_pending() {
+                let term = match &mut terminal {
+                    Some(term) => term,
+                    None => terminal.insert(match self.term.try_lock_unfair() {
+                        // Past the buffered-bytes bound, block for the lock
+                        // instead of letting the queue grow (the fair lease
+                        // we hold makes the wait bounded).
+                        None if self.pty.reader().scanner.pending_len() >= READ_BUFFER_SIZE => {
+                            self.term.lock_unfair()
+                        },
+                        None => break 'fill,
+                        Some(term) => term,
+                    }),
+                };
+
+                let t = Instant::now();
+                let (n, events) = self.pty.reader().scanner.take(seg);
+                stat_add(&STAT_TAKE_NS, t.elapsed().as_nanos() as u64);
+                if n == 0 && events.is_empty() {
+                    break;
+                }
+                parser.advance(&mut **term, &seg[..n]);
+                for ev in &events {
+                    self.marks.dispatch(&mut *term, ev);
+                }
+                self.marks.tag(&mut *term);
+                processed += n;
+                if processed >= MAX_LOCKED_READ {
+                    break 'fill;
+                }
+            }
+
+            // Stage more raw bytes.
+            let t = Instant::now();
+            match self.pty.reader().stage() {
+                Ok(0) => break 'fill,
+                Ok(got) => {
+                    stat_add(&STAT_READ_NS, t.elapsed().as_nanos() as u64);
+                    stat_add(&STAT_BYTES, got as u64);
+                    report_reader_stats();
+                    continue 'fill;
+                },
+                Err(err) => match err.kind() {
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'fill,
+                    _ => return Err(err),
+                },
+            }
+        }
+
+        // Queue terminal redraw unless all processed bytes were synchronized.
+        if parser.sync_bytes_count() < processed && processed > 0 {
+            self.proxy.send_event(Event::Wakeup);
+        }
+
+        Ok(())
+    }
+
+    /// Flush queued PTY writes — verbatim port of upstream `pty_write`.
+    fn pty_write(&mut self, state: &mut IoState) -> io::Result<()> {
+        state.ensure_next();
+
+        'write_many: while let Some(mut current) = state.take_current() {
+            'write_one: loop {
+                match self.pty.writer().write(current.remaining_bytes()) {
+                    Ok(0) => {
+                        state.set_current(Some(current));
+                        break 'write_many;
+                    },
+                    Ok(n) => {
+                        current.advance(n);
+                        if current.finished() {
+                            state.goto_next();
+                            break 'write_one;
+                        }
+                    },
+                    Err(err) => {
+                        state.set_current(Some(current));
+                        match err.kind() {
+                            ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'write_many,
+                            _ => return Err(err),
+                        }
+                    },
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn spawn(mut self) -> std::thread::JoinHandle<(Self, IoState)> {
+        alacritty_terminal::thread::spawn_named("PTY reader", move || {
+            let mut state = IoState::default();
+            let mut parser = ansi::Processor::new();
+            let mut seg = [0u8; 65536];
+
+            let poll_opts = PollMode::Level;
+            let mut interest = PollingEvent::readable(0);
+
+            // Register TTY through EventedRW interface.
+            if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
+                tracing::error!("io loop registration error: {err}");
+                return (self, state);
+            }
+
+            let mut events = Events::with_capacity(NonZeroUsize::new(1024).unwrap());
+
+            'event_loop: loop {
+                // Wakeup the loop when a synchronized update timeout hits.
+                let handler: &ansi::StdSyncHandler = parser.sync_timeout();
+                let timeout = handler
+                    .sync_timeout()
+                    .map(|st| st.saturating_duration_since(Instant::now()));
+
+                events.clear();
+                if let Err(err) = self.poll.wait(&mut events, timeout) {
+                    match err.kind() {
+                        ErrorKind::Interrupted => continue,
+                        _ => {
+                            tracing::error!("io loop polling error: {err}");
+                            break 'event_loop;
+                        },
+                    }
+                }
+
+                // Handle synchronized update timeout.
+                if events.is_empty() && self.rx.peek().is_none() {
+                    parser.stop_sync(&mut *self.term.lock());
+                    self.proxy.send_event(Event::Wakeup);
+                    continue;
+                }
+
+                // Handle channel events, if there are any.
+                if !self.drain_recv_channel(&mut state) {
+                    break;
+                }
+
+                for event in events.iter() {
+                    match event.key {
+                        PTY_CHILD_EVENT_TOKEN => {
+                            if let Some(ChildEvent::Exited(status)) =
+                                self.pty.next_child_event()
+                            {
+                                if let Some(status) = status {
+                                    self.proxy.send_event(Event::ChildExit(status));
+                                }
+                                if self.drain_on_exit {
+                                    let _ = self.pty_read(&mut parser, &mut seg);
+                                }
+                                self.term.lock().exit();
+                                self.proxy.send_event(Event::Wakeup);
+                                break 'event_loop;
+                            }
+                        },
+                        PTY_READ_WRITE_TOKEN => {
+                            if event.is_interrupt() {
+                                // Don't try to do I/O on a dead PTY.
+                                continue;
+                            }
+
+                            if event.readable
+                                && let Err(err) = self.pty_read(&mut parser, &mut seg)
+                            {
+                                // On Linux, a `read` on the master side of a PTY can
+                                // fail with `EIO` if the client side hangs up. In
+                                // that case, just loop back round for the inevitable
+                                // `Exited` event.
+                                #[cfg(target_os = "linux")]
+                                if err.raw_os_error() == Some(libc::EIO) {
+                                    continue;
+                                }
+
+                                tracing::error!("pty read error: {err}");
+                                break 'event_loop;
+                            }
+
+                            if event.writable
+                                && let Err(err) = self.pty_write(&mut state)
+                            {
+                                tracing::error!("pty write error: {err}");
+                                break 'event_loop;
+                            }
+                        },
+                        _ => (),
+                    }
+                }
+
+                // Register write interest if necessary.
+                let needs_write = state.needs_write();
+                if needs_write != interest.writable {
+                    interest.writable = needs_write;
+
+                    // Re-register with new interest.
+                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                }
+            }
+
+            // The evented instances are not dropped here so deregister them explicitly.
+            let _ = self.pty.deregister(&self.poll);
+
+            (self, state)
+        })
     }
 }
 
@@ -1077,6 +1368,55 @@ mod tests {
     #[test]
     fn zsh_prompt_marks_are_zero_width() {
         assert!(ZSH_INTEGRATION.contains("PS1=$'%{\\e]133;B\\e\\\\%}'"));
+    }
+
+    // -- semantic marks ------------------------------------------------------
+
+    /// One read chunk carrying `out\r\n` + `133;A` + `PS1$ ` + `133;B` must
+    /// tag exactly the prompt row — the mark fires at the string's exact
+    /// stream position, with the `Term` already advanced past the bytes
+    /// that precede it in the same chunk (the r29 split-point property).
+    #[test]
+    fn prompt_mark_split_point() {
+        use crate::osctap::OscScanner;
+
+        let mut term = Term::new(Config::default(), &Sz(24, 80), VoidListener);
+        let (sink, _rx) = mpsc::channel();
+        let mut marks = Marks {
+            sem: SemKind::Output,
+            top: 0,
+            prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_output: Arc::new(Mutex::new(None)),
+            redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            sink,
+        };
+        let mut scanner = OscScanner::new();
+        let mut parser: Processor = Processor::new();
+        let mut seg = [0u8; 65536];
+
+        // A single read chunk: output line, the A mark, the prompt text,
+        // then the B mark — all in one PTY buffer.
+        scanner.feed(b"out\r\n\x1b]133;A\x07PS1$ \x1b]133;B\x07");
+        while scanner.has_pending() {
+            let (n, events) = scanner.take(&mut seg);
+            if n == 0 && events.is_empty() {
+                break;
+            }
+            parser.advance(&mut term, &seg[..n]);
+            for ev in &events {
+                marks.dispatch(&mut term, ev);
+            }
+            marks.tag(&mut term);
+        }
+
+        for c in 0..80 {
+            let col = Column(c);
+            assert!(!term.grid()[Line(0)][col].flags.contains(PROMPT_MARK));
+            assert!(term.grid()[Line(1)][col].flags.contains(PROMPT_MARK));
+            assert!(!term.grid()[Line(2)][col].flags.contains(PROMPT_MARK));
+        }
+        // The mark row recorded at A is the prompt row, not the stale cursor.
+        assert_eq!(marks.prompt_marks.lock().unwrap().as_slice(), &[1]);
     }
 
     // -- grapheme fixup -----------------------------------------------------
