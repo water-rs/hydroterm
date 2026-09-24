@@ -36,7 +36,7 @@ use waterui::window::WindowState::Fullscreen;
 use waterui::window::WindowStyle::{Borderless, Titled};
 use waterui_core::layout::{Point, Rect, Size};
 
-/// `hydroterm [--config PATH] [-e|-- COMMAND...]`
+/// `hydroterm [--config PATH] [-e|-- COMMAND...] [+ACTION]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
     let mut config_path = None;
     let mut command = None;
@@ -48,6 +48,7 @@ fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
                 command = Some(args.by_ref().collect::<Vec<String>>());
                 break;
             }
+            _ if arg.starts_with('+') => cli_action(&arg[1..], config_path.as_deref()),
             _ => {}
         }
     }
@@ -55,6 +56,45 @@ fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
         command = None;
     }
     (config_path, command)
+}
+
+/// Ghostty-style `+action` one-shots — print and exit.
+fn cli_action(name: &str, config_path: Option<&std::path::Path>) -> ! {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let code = match name {
+        "list-themes" => {
+            for t in crate::theme::THEMES {
+                let _ = writeln!(out, "{t}");
+            }
+            0
+        }
+        "list-actions" => {
+            for a in crate::config::ACTION_NAMES {
+                let _ = writeln!(out, "{a}");
+            }
+            0
+        }
+        "show-config" => {
+            let path = config_path
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(crate::config::default_path);
+            let (cfg, errs) = crate::config::AppConfig::load(&path);
+            let _ = writeln!(out, "# {}\n{cfg:#?}", path.display());
+            for e in errs {
+                eprintln!("{e}");
+            }
+            0
+        }
+        _ => {
+            eprintln!(
+                "hydroterm: unknown action '+{name}' — have: +list-themes, +list-actions, +show-config"
+            );
+            1
+        }
+    };
+    let _ = out.flush();
+    std::process::exit(code);
 }
 
 fn main() {
@@ -95,7 +135,7 @@ fn main() {
     } else {
         let (w, h) = state.config(|c| (c.window_width, c.window_height));
         if w > 0.0 || h > 0.0 {
-            let frame = window.frame.get();
+            let frame = window.frame.snapshot();
             let size = *frame.size();
             window.frame.set(Rect::new(
                 frame.origin(),
@@ -109,7 +149,7 @@ fn main() {
         // window-position support; KWin may still place the window).
         let (wx, wy) = state.config(|c| (c.window_x, c.window_y));
         if wx.is_some() || wy.is_some() {
-            let frame = window.frame.get();
+            let frame = window.frame.snapshot();
             let origin = frame.origin();
             window.frame.set(Rect::new(
                 Point::new(wx.unwrap_or(origin.x), wy.unwrap_or(origin.y)),

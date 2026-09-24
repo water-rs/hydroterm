@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, GridCell, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::Processor;
-use nami::{Binding, binding};
+use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::task::spawn_local;
 use waterui_core::Str;
@@ -312,6 +312,10 @@ pub struct TermSurface {
     /// — `None` brush means the file failed to read/decode; the path is
     /// still cached so a bad path is not re-read every frame.
     bg_img: RefCell<BgImageCache>,
+    /// Per-row content fingerprints from the previous frame — detects
+    /// linewrap continuations overwritten between resizes
+    /// (`sever_overwritten_wraps`).
+    wrap_fps: Vec<u64>,
 }
 
 /// `background-image` decode cache: (config path, decoded brush + pixel dims).
@@ -326,8 +330,8 @@ impl TermSurface {
         palette: Rc<RefCell<Palette>>,
         fonts: FontCollection,
     ) -> Self {
-        let font_size = session.font_size.get();
-        let family_pref = session.font_family.get().to_string();
+        let font_size = session.font_size.snapshot();
+        let family_pref = session.font_family.snapshot().to_string();
         app.register_theme_wake(&session.terminal);
         Self {
             session,
@@ -364,6 +368,7 @@ impl TermSurface {
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
             bg_img: RefCell::new((None, None)),
+            wrap_fps: Vec::new(),
         }
     }
 
@@ -527,7 +532,7 @@ impl TermSurface {
     /// Paste-protection overlay answer: write the stashed text
     /// (Enter/[Paste]) or drop it (Escape/[Cancel]).
     fn paste_confirm(&mut self, accept: bool) {
-        let text = self.session.pending_paste.get().map(|t| t.to_string());
+        let text = self.session.pending_paste.snapshot().map(|t| t.to_string());
         self.session.pending_paste.set(None);
         if let Some(manager) = self.session.snackbar.borrow().as_ref() {
             manager.dismiss();
@@ -539,23 +544,40 @@ impl TermSurface {
         }
     }
 
+    /// The explicit Copy action writes CLIPBOARD only — PRIMARY
+    /// continues to hold the last selection (kitty/xterm semantics).
     fn copy_selection(&mut self) {
+        let text = self.session.terminal.term.lock().selection_to_string();
+        if let Some(text) = text
+            && let Some(clip) = self.clipboard.as_mut()
+        {
+            let _ = clip.set_text(&text);
+        }
+    }
+
+    /// Selection-end copy: `copy-on-select = clipboard|primary|both`
+    /// routes the just-made selection (default `both`).
+    fn copy_on_select(&mut self, mode: crate::config::CopyOnSelect) {
+        use crate::config::CopyOnSelect as CoS;
         let text = self.session.terminal.term.lock().selection_to_string();
         if let Some(text) = text {
             if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                 eprintln!(
-                    "[copy_sel] text={text:?} clip={} primary={}",
+                    "[copy_sel] mode={mode:?} text={text:?} clip={} primary={}",
                     self.clipboard.is_some(),
                     self.primary.is_some()
                 );
             }
-            if let Some(clip) = self.clipboard.as_mut() {
+            if matches!(mode, CoS::Clipboard | CoS::Both)
+                && let Some(clip) = self.clipboard.as_mut()
+            {
                 let _ = clip.set_text(&text);
             }
-            // The selection is also PRIMARY — a middle click anywhere
-            // pastes what was last selected (xterm/Ghostty
-            // `copy-on-select = true` semantics).
-            if let Some(primary) = self.primary.as_mut() {
+            // PRIMARY tracks the last selection — a middle click
+            // anywhere pastes what was last selected.
+            if matches!(mode, CoS::Primary | CoS::Both)
+                && let Some(primary) = self.primary.as_mut()
+            {
                 let r = primary.set_text(&text);
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                     eprintln!("[copy_sel] primary.set_text={r:?}");
@@ -636,7 +658,7 @@ impl TermSurface {
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),
             TermAction::FontBigger | TermAction::FontSmaller | TermAction::FontReset => {
-                let cur = self.session.font_size.get();
+                let cur = self.session.font_size.snapshot();
                 let next = match action {
                     TermAction::FontBigger => (cur + 1.0).min(96.0),
                     TermAction::FontSmaller => (cur - 1.0).max(6.0),
@@ -645,7 +667,7 @@ impl TermSurface {
                 self.session.font_size.set(next);
             }
             TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
-                let cur = self.session.font_size.get();
+                let cur = self.session.font_size.snapshot();
                 let delta = if matches!(action, TermAction::DecreaseFontSize(_)) {
                     -pts as f32
                 } else {
@@ -766,6 +788,7 @@ impl TermSurface {
                     .split_pane(crate::app::SplitDir::Column, self.session.id, true);
             }
             TermAction::PaneZoom => self.app.toggle_pane_zoom(),
+            TermAction::EqualizeSplits => self.app.equalize_splits(),
             TermAction::GotoSplit(index) => self.app.goto_split(index),
             TermAction::ReloadConfig => self.app.reload_config(),
             TermAction::ClipboardReadConfirm => self.clipboard_read_confirm(true),
@@ -825,7 +848,7 @@ impl TermSurface {
     /// search bar owns open/close and the query text; the surface owns the
     /// match list and which match is active. Called every frame while open.
     fn sync_search(&mut self) {
-        let open = self.session.search_open.get();
+        let open = self.session.search_open.snapshot();
         if open != self.search.is_some() {
             self.search = open.then_some(Search {
                 query: String::new(),
@@ -835,7 +858,7 @@ impl TermSurface {
             });
         }
         let Some(s) = &self.search else { return };
-        let q = self.session.search_query.get().to_string();
+        let q = self.session.search_query.snapshot().to_string();
         if s.query != q {
             self.search.as_mut().unwrap().query = q;
             self.run_search();
@@ -991,12 +1014,14 @@ impl TermSurface {
                     TapEvent::PromptEnd | TapEvent::CommandStart => {}
                     TapEvent::CommandEnd(_code) => {}
                     TapEvent::Notify(title, body) => {
-                        // Bell flash + title badge, plus a freedesktop
-                        // notification where `notify-send` exists.
+                        // Bell flash + title badge; `desktop-notifications`
+                        // gates only the freedesktop notify-send hop.
                         if self.app.config(|c| c.visual_bell) {
                             self.bell_at = Some(Instant::now());
                         }
-                        notify_desktop(&title, &body);
+                        if self.app.config(|c| c.desktop_notifications) {
+                            notify_desktop(&title, &body);
+                        }
                         let text = if title.is_empty() { body } else { format!("{title}: {body}") };
                         *self.session.notify_badge.lock().unwrap() = true;
                         self.app
@@ -1024,12 +1049,12 @@ impl TermSurface {
 
     /// Re-measure fonts when size or family changes (hot reload).
     fn sync_fonts(&mut self) {
-        let pref = self.session.font_family.get().to_string();
+        let pref = self.session.font_family.snapshot().to_string();
         if pref != self.family_pref {
             self.family_pref = pref.clone();
             self.fonts.reload_family(&pref);
         }
-        let want = self.session.font_size.get();
+        let want = self.session.font_size.snapshot();
         if (want - self.font_size_pt).abs() > f32::EPSILON {
             self.font_size_pt = want;
             self.fonts.resize(want);
@@ -1067,6 +1092,53 @@ impl TermSurface {
                 self.session
                     .resize_label
                     .set(Some(Str::from(format!("{cols}\u{00d7}{lines}"))));
+            }
+        }
+    }
+
+    /// Drop stale linewrap joins: a row whose cells changed since the last
+    /// frame while its WRAPLINE-flagged predecessor stayed unchanged was
+    /// overwritten by output that no longer continues the row above (an
+    /// erase+redraw landing inside a wrapped block). Keeping that join
+    /// lets the next reflow merge the stale head row into the fresh row
+    /// and interleave fragments mid-line.
+    fn sever_overwritten_wraps(&mut self) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut term = self.session.terminal.term.lock();
+        let grid = term.grid_mut();
+        let lines = grid.screen_lines();
+        let cols = grid.columns();
+        if cols == 0 {
+            self.wrap_fps.clear();
+            return;
+        }
+        let mut fps = Vec::with_capacity(lines);
+        for l in 0..lines {
+            let mut h = DefaultHasher::new();
+            for c in 0..cols {
+                let ch = grid[Line(l as i32)][Column(c)].c;
+                if ch != '\0' {
+                    ch.hash(&mut h);
+                }
+            }
+            fps.push(h.finish());
+        }
+        let prev = std::mem::replace(&mut self.wrap_fps, fps.clone());
+        if prev.len() != fps.len() {
+            return;
+        }
+        for l in 1..lines {
+            if fps[l] != prev[l] && fps[l - 1] == prev[l - 1] {
+                let last = Column(cols - 1);
+                if grid[Line(l as i32 - 1)][last]
+                    .flags()
+                    .contains(Flags::WRAPLINE)
+                {
+                    grid[Line(l as i32 - 1)][last]
+                        .flags_mut()
+                        .remove(Flags::WRAPLINE);
+                }
             }
         }
     }
@@ -1110,10 +1182,10 @@ impl TermSurface {
         }
         // Overlay pages capture keys first: palette query, settings
         // commit/close, then the search bar's query.
-        if pressed && self.app.palette_open.get() && self.palette_key(key, mods) {
+        if pressed && self.app.palette_open.snapshot() && self.palette_key(key, mods) {
             return true;
         }
-        if pressed && self.app.settings_open.get() && self.settings_key(key, mods) {
+        if pressed && self.app.settings_open.snapshot() && self.settings_key(key, mods) {
             return true;
         }
         if pressed && self.search.is_some() && self.search_key(key, mods) {
@@ -1121,7 +1193,7 @@ impl TermSurface {
         }
         // Paste-protection overlay captures Enter/Escape; other keys
         // fall through so the pending paste can't swallow input.
-        if pressed && self.session.pending_paste.get().is_some() {
+        if pressed && self.session.pending_paste.snapshot().is_some() {
             match key {
                 Key::Named(NamedKey::Enter) => {
                     self.paste_confirm(true);
@@ -1135,7 +1207,7 @@ impl TermSurface {
             }
         }
         // `clipboard-read = ask` prompt: Enter allows, Escape denies.
-        if pressed && self.session.pending_clipboard_read.get() {
+        if pressed && self.session.pending_clipboard_read.snapshot() {
             match key {
                 Key::Named(NamedKey::Enter) => self.clipboard_read_confirm(true),
                 Key::Named(NamedKey::Escape) => self.clipboard_read_confirm(false),
@@ -1146,7 +1218,7 @@ impl TermSurface {
         // `confirm-close` snackbar: Enter closes, Escape cancels —
         // swallow everything while it waits so no stray byte hits the
         // program we're about to kill.
-        if pressed && self.session.pending_close.get().is_some() {
+        if pressed && self.session.pending_close.snapshot().is_some() {
             match key {
                 Key::Named(NamedKey::Enter) => self.app.confirm_close(self.session.id),
                 Key::Named(NamedKey::Escape) => self.app.cancel_close_prompt(self.session.id),
@@ -1197,12 +1269,12 @@ impl TermSurface {
     fn palette_key(&mut self, key: &Key, mods: Modifiers) -> bool {
         match key {
             Key::Named(NamedKey::Enter) => {
-                let sel = self.app.palette_sel.get().unwrap_or(0);
+                let sel = self.app.palette_sel.snapshot().unwrap_or(0);
                 self.app.run_palette_at(sel);
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                let query = self.app.palette_query.get().to_string();
+                let query = self.app.palette_query.snapshot().to_string();
                 let n = crate::app::palette_matches(&query).len();
                 if n > 0 {
                     self.app.palette_sel.with_mut(|s| {
@@ -1211,7 +1283,7 @@ impl TermSurface {
                     });
                     self.app
                         .palette_scroll
-                        .scroll_to(self.app.palette_sel.get().unwrap_or(0));
+                        .scroll_to(self.app.palette_sel.snapshot().unwrap_or(0));
                 }
                 true
             }
@@ -1222,7 +1294,7 @@ impl TermSurface {
                 });
                 self.app
                     .palette_scroll
-                    .scroll_to(self.app.palette_sel.get().unwrap_or(0));
+                    .scroll_to(self.app.palette_sel.snapshot().unwrap_or(0));
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -1230,7 +1302,7 @@ impl TermSurface {
                 true
             }
             Key::Named(NamedKey::Backspace) if mods.is_empty() => {
-                let mut q = self.app.palette_query.get().to_string();
+                let mut q = self.app.palette_query.snapshot().to_string();
                 q.pop();
                 self.app.palette_query.set_from(q);
                 self.app.palette_sel.set(Some(0));
@@ -1262,7 +1334,7 @@ impl TermSurface {
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                let mut q = self.session.search_query.get().to_string();
+                let mut q = self.session.search_query.snapshot().to_string();
                 q.pop();
                 self.session.search_query.set_from(q);
                 true
@@ -1341,11 +1413,11 @@ impl TermSurface {
     /// searching, else PTY. Returns true when the text changed scene or
     /// UI state (needs a frame); PTY passthrough returns false.
     fn on_text(&mut self, text: &str) -> bool {
-        if self.app.settings_open.get() {
+        if self.app.settings_open.snapshot() {
             return true;
         }
-        if self.app.palette_open.get() {
-            let mut q = self.app.palette_query.get().to_string();
+        if self.app.palette_open.snapshot() {
+            let mut q = self.app.palette_query.snapshot().to_string();
             q.push_str(text);
             self.app.palette_query.set_from(q);
             self.app.palette_sel.set(Some(0));
@@ -1353,15 +1425,15 @@ impl TermSurface {
             return true;
         }
         if self.search.is_some() {
-            let mut q = self.session.search_query.get().to_string();
+            let mut q = self.session.search_query.snapshot().to_string();
             q.push_str(text);
             self.session.search_query.set_from(q);
             return true;
         }
         // Text arriving while a paste is pending is the user's real
         // input — the overlay is modal on the paste, not on typing.
-        if self.session.pending_paste.get().is_some()
-            || self.session.pending_close.get().is_some()
+        if self.session.pending_paste.snapshot().is_some()
+            || self.session.pending_close.snapshot().is_some()
         {
             return true;
         }
@@ -1486,7 +1558,7 @@ impl TermSurface {
         } else {
             CursorStyle::PointingHand
         };
-        if self.hover_cursor.get() != cursor {
+        if self.hover_cursor.snapshot() != cursor {
             self.hover_cursor.set(cursor);
         }
     }
@@ -1665,9 +1737,12 @@ impl TermSurface {
             if term.selection.as_ref().is_some_and(|s| s.is_empty()) {
                 // Click without drag (tiny movement) clears the selection.
                 term.selection = None;
-            } else if self.app.config(|c| c.copy_on_select) {
-                drop(term);
-                self.copy_selection();
+            } else {
+                let mode = self.app.config(|c| c.copy_on_select);
+                if mode != crate::config::CopyOnSelect::Disabled {
+                    drop(term);
+                    self.copy_on_select(mode);
+                }
             }
         }
     }
@@ -1947,7 +2022,7 @@ impl TermSurface {
             );
             let reporting = term.mode().intersects(TermMode::MOUSE_MODE);
             drop(term);
-            if self.session.mouse_reporting.get() != reporting {
+            if self.session.mouse_reporting.snapshot() != reporting {
                 self.session.mouse_reporting.set(reporting);
             }
             if self.search.as_ref().is_some_and(|s| s.stamp != stamp) {
@@ -2115,6 +2190,7 @@ impl SceneContent for TermSurface {
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);
+        self.sever_overwritten_wraps();
         self.session.pane_px.set((width, height));
 
         // A blinking cursor or live bell flash needs the next frame anyway;

@@ -13,7 +13,7 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
 use nami::collection::{Collection, List as NamiList};
 use nami::zip::zip;
-use nami::{Binding, binding};
+use nami::{Binding, Signal, binding};
 use waterui::state;
 use waterui::Identifiable;
 use waterui_core::id::SelfId;
@@ -27,7 +27,7 @@ use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::drag_drop::DragData;
-use waterui::theme::color::{Accent, Background, Foreground, MutedForeground, Surface};
+use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
 
@@ -167,6 +167,7 @@ impl Session {
                 shell,
                 term_name: &cfg.term,
                 env_extra: &cfg.env,
+                shell_integration: cfg.shell_integration,
             },
         )
             .expect("failed to spawn PTY — is a shell available?");
@@ -277,7 +278,7 @@ impl SplitNode {
                 children,
                 sizes,
             } => {
-                let recorded = sizes.get();
+                let recorded = sizes.snapshot();
                 let kept: Vec<(f32, SplitNode)> = children
                     .iter()
                     .enumerate()
@@ -370,7 +371,7 @@ impl SplitNode {
         if matches!(dir, SplitDir::Row) != horizontal {
             return children[i].resize_focus(focus, horizontal, delta);
         }
-        let mut v = sizes.get();
+        let mut v = sizes.snapshot();
         if v.len() != children.len() || !v.iter().all(|s| *s > 0.0) {
             // Not seeded yet — nothing measured to redistribute.
             return true;
@@ -385,6 +386,26 @@ impl SplitNode {
         v[b + 1] = pair - v[b];
         sizes.set(v);
         true
+    }
+
+    /// Give every split's children equal shares of their measured total
+    /// (`equalize_splits` — tmux `select-layout -E`). Sizes are absolute
+    /// points, so equal shares = total / k; unseeded splits stay
+    /// untouched (they equalize by layout anyway).
+    fn equalize(&self) {
+        if let Self::Split {
+            children, sizes, ..
+        } = self
+        {
+            let v = sizes.snapshot();
+            if v.len() == children.len() && v.iter().all(|s| *s > 0.0) {
+                let each = v.iter().sum::<f32>() / v.len() as f32;
+                sizes.set(vec![each; v.len()]);
+            }
+            for c in children {
+                c.equalize();
+            }
+        }
     }
 }
 
@@ -576,7 +597,7 @@ impl AppState {
         // Seed the embedded-focus owner so `.focused` grants key focus to
         // the first pane at mount — the launch dead-keys fix (#29).
         if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
-            state.focus_owner.set(Some((first_tab, t.focused.get())));
+            state.focus_owner.set(Some((first_tab, t.focused.snapshot())));
         }
         // `-e` applies to the first session only (like xterm/kitty).
         state.cfg.borrow_mut().config.command = None;
@@ -658,11 +679,11 @@ impl AppState {
     /// Ghostty `goto_split`: focus the nth leaf of the selected tab.
     /// `usize::MAX` is the last leaf (`goto_split:bottom`).
     pub fn goto_split(&self, index: usize) {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
-        let tree: SplitNode = tab.tree.get();
+        let tree: SplitNode = tab.tree.snapshot();
         // `.as_slice()` — nami's `Signal` blanket impl on `Vec` makes
         // `vec.get(i)` resolve to the 0-arg `Signal::get`.
         let leaves = tree.leaves();
@@ -722,7 +743,7 @@ impl AppState {
         else {
             return;
         };
-        if self.selected.get() == tab_id {
+        if self.selected.snapshot() == tab_id {
             return;
         }
         if let Some(t) = self.tabs.iter().find(|t| t.id == tab_id) {
@@ -737,7 +758,7 @@ impl AppState {
 
     /// Toggle borderless fullscreen on the main window.
     pub fn toggle_fullscreen(&self) {
-        let next = match self.window_state.get() {
+        let next = match self.window_state.snapshot() {
             WindowState::Fullscreen => WindowState::Normal,
             _ => WindowState::Fullscreen,
         };
@@ -763,7 +784,7 @@ impl AppState {
             // The drop-down's own view should not host another quick window.
             return;
         }
-        let next = match self.quick_state.get() {
+        let next = match self.quick_state.snapshot() {
             WindowState::Closed => WindowState::Normal,
             _ => WindowState::Closed,
         };
@@ -876,10 +897,10 @@ impl AppState {
 
     /// The focused session of the selected tab, if any.
     pub fn focused_session(&self) -> Option<Rc<Session>> {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let focused = self
             .tabs.iter().find(|t| t.id == tab_id)
-            .map(|t| t.focused.get())?;
+            .map(|t| t.focused.snapshot())?;
         self.session(focused)
     }
 
@@ -943,7 +964,7 @@ impl AppState {
     /// inherits the target's cwd.
     /// `before` puts the new pane ahead of the target (left/up split).
     pub fn split_pane(&self, dir: SplitDir, target: u64, before: bool) -> Option<u64> {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let tab = self
             .tabs.iter().find(|t| t.id == tab_id)?;
         let cwd = self
@@ -953,7 +974,7 @@ impl AppState {
         let slot_px = self
             .session(target)
             .map(|s| {
-                let px = s.pane_px.get();
+                let px = s.pane_px.snapshot();
                 match dir {
                     SplitDir::Row => px.0,
                     SplitDir::Column => px.1,
@@ -989,15 +1010,15 @@ impl AppState {
         else {
             return;
         };
-        if tab.focused.get() == session_id {
+        if tab.focused.snapshot() == session_id {
             return;
         }
         tab.focused.set(session_id);
-        if self.selected.get() == tab_id {
+        if self.selected.snapshot() == tab_id {
             self.focus_owner.set(Some((tab_id, session_id)));
         }
         if let Some(s) = self.session(session_id) {
-            tab.title.set(s.title.get());
+            tab.title.set(s.title.snapshot());
         }
     }
 
@@ -1010,10 +1031,10 @@ impl AppState {
         if let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied()
             && let Some(tab) = self
                 .tabs.iter().find(|t| t.id == tab_id)
-                && tab.focused.get() == session_id
+                && tab.focused.snapshot() == session_id
             {
                 tab.title.set(title.clone());
-                if self.selected.get() == tab_id {
+                if self.selected.snapshot() == tab_id {
                     self.window_title.set(title);
                 }
             }
@@ -1021,19 +1042,19 @@ impl AppState {
 
     /// Cycle pane focus within the selected tab.
     pub fn cycle_pane(&self, dir: isize) {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let Some(tab) = self
             .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
-        let leaves = tab.tree.get().leaves();
+        let leaves = tab.tree.snapshot().leaves();
         if leaves.len() < 2 {
             return;
         }
         let pos = leaves
             .iter()
-            .position(|&s| s == tab.focused.get())
+            .position(|&s| s == tab.focused.snapshot())
             .unwrap_or(0) as isize;
         let next = (pos + dir).rem_euclid(leaves.len() as isize) as usize;
         self.focus_pane(leaves[next]);
@@ -1043,14 +1064,14 @@ impl AppState {
     /// goto_split): the nearest leaf across the matching-axis split.
     /// `horizontal` = left/right, `forward` = right/down.
     pub fn focus_pane_dir(&self, horizontal: bool, forward: bool) {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         if let Some(next) = tab
             .tree
-            .get()
-            .neighbor(tab.focused.get(), horizontal, forward)
+            .snapshot()
+            .neighbor(tab.focused.snapshot(), horizontal, forward)
         {
             self.focus_pane(next);
         }
@@ -1062,20 +1083,32 @@ impl AppState {
     /// `px` is the divider step in points (48 from the arrow chords,
     /// configurable through `keybind = resize_split:dir,px`).
     pub fn resize_pane_dir(&self, horizontal: bool, forward: bool, px: i32) {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         let delta = if forward { px as f32 } else { -px as f32 };
-        let tree = tab.tree.get();
-        if tree.resize_focus(tab.focused.get(), horizontal, delta) {
+        let tree = tab.tree.snapshot();
+        if tree.resize_focus(tab.focused.snapshot(), horizontal, delta) {
             tab.tree.set(tree);
         }
     }
 
+    /// Reset all splits in the selected tab to equal shares
+    /// (Ghostty `equalize_splits`).
+    pub fn equalize_splits(&self) {
+        let tab_id = self.selected.snapshot();
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let tree = tab.tree.snapshot();
+        tree.equalize();
+        tab.tree.set(tree);
+    }
+
     /// Move the selected tab `dir` slots (wraps at both ends).
     pub fn move_tab(&self, dir: isize) {
-        let cur = self.selected.get();
+        let cur = self.selected.snapshot();
         let tabs = self.tabs.snapshot();
         let Some(i) = tabs.iter().position(|t| t.id == cur) else {
             return;
@@ -1112,9 +1145,9 @@ impl AppState {
         // The chip press that began the drag moved interaction focus off
         // the terminal surface; re-assert it on the selected tab's pane
         // (toggling the value so the watcher re-schedules a frame).
-        let sel = self.selected.get();
+        let sel = self.selected.snapshot();
         if let Some(t) = self.tabs.iter().find(|t| t.id == sel) {
-            let f = t.focused.get();
+            let f = t.focused.snapshot();
             self.focus_owner.set(None);
             self.focus_owner.set(Some((sel, f)));
         }
@@ -1124,13 +1157,13 @@ impl AppState {
     /// whole tab; toggling again (or re-focusing then toggling) restores
     /// the split layout.
     pub fn toggle_pane_zoom(&self) {
-        let tab_id = self.selected.get();
+        let tab_id = self.selected.snapshot();
         let Some(tab) = self
             .tabs.iter().find(|t| t.id == tab_id)
         else {
             return;
         };
-        let focused = tab.focused.get();
+        let focused = tab.focused.snapshot();
         tab.zoomed.with_mut(|z| *z = z.take().is_none().then_some(focused));
     }
 
@@ -1168,12 +1201,12 @@ impl AppState {
             let sessions = self.sessions.borrow();
             let busy = tab
                 .tree
-                .get()
+                .snapshot()
                 .leaves()
                 .iter()
                 .filter_map(|sid| sessions.iter().find(|s| s.id == *sid))
                 .find_map(|s| s.terminal.foreground_program().map(|p| (p, s)));
-            let focus = tab.focused.get();
+            let focus = tab.focused.snapshot();
             busy.map(|(prog, _)| {
                 let pending = sessions
                     .iter()
@@ -1199,7 +1232,7 @@ impl AppState {
             sessions
                 .iter()
                 .find(|s| s.id == session_id)
-                .map(|s| s.pending_close.get().map(|(_, whole)| whole))
+                .map(|s| s.pending_close.snapshot().map(|(_, whole)| whole))
         };
         let Some(whole_tab) = decision.flatten() else { return };
         self.cancel_close_prompt(session_id);
@@ -1234,10 +1267,10 @@ impl AppState {
         else {
             return;
         };
-        match tab.tree.get().remove(session_id) {
+        match tab.tree.snapshot().remove(session_id) {
             Some(new_tree) => {
                 // Focus a remaining leaf when the closed pane had focus.
-                if tab.focused.get() == session_id
+                if tab.focused.snapshot() == session_id
                     && let Some(next) = new_tree.leaves().first()
                 {
                     self.focus_pane(*next);
@@ -1266,7 +1299,7 @@ impl AppState {
         else {
             return;
         };
-        let leaves = tab.tree.get().leaves();
+        let leaves = tab.tree.snapshot().leaves();
         for sid in &leaves {
             self.kill_session(*sid);
             self.session_tab.lock().unwrap().remove(sid);
@@ -1275,7 +1308,7 @@ impl AppState {
         if let Some(pos) = tabs.iter().position(|t| t.id == tab_id) {
             let _ = self.tabs.remove(pos);
             self.tab_count.set(self.tabs.len());
-            if self.selected.get() == tab_id {
+            if self.selected.snapshot() == tab_id {
                 let remaining = self.tabs.snapshot();
                 let idx = pos.min(remaining.len().saturating_sub(1));
                 if let Some(next) = remaining.as_slice().get(idx) {
@@ -1310,7 +1343,7 @@ impl AppState {
         if tabs.is_empty() {
             return;
         }
-        let cur = self.selected.get();
+        let cur = self.selected.snapshot();
         let pos = tabs.iter().position(|t| t.id == cur).unwrap_or(0) as isize;
         let next = (pos + dir).rem_euclid(tabs.len() as isize) as usize;
         self.selected.set(tabs[next].id);
@@ -1382,7 +1415,7 @@ impl View for PaneLeaf {
             pending.is_some(),
             move || {
                 let preview: Str = pending
-                    .get()
+                    .snapshot()
                     .map(|t| {
                         let lines = t.lines().count();
                         let first: String = t.lines().next().unwrap_or_default().chars().take(60).collect();
@@ -1445,7 +1478,7 @@ impl View for PaneLeaf {
             pending_close.is_some(),
             move || {
                 let label: Str = pending_close
-                    .get()
+                    .snapshot()
                     .map(|(prog, whole)| {
                         let scope = match whole {
                             true => "Close tab? ",
@@ -1559,7 +1592,7 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, tab_id: u64, state: &AppS
             let k = children.len();
             // Seed once from the measured layout so children keep the sizes
             // the stack just gave them; later the divider drag owns it.
-            if sizes.get().len() != k {
+            if sizes.snapshot().len() != k {
                 let seeded: Vec<f32> = children
                     .iter()
                     .map(|c| subtree_px(c, state, *dir))
@@ -1568,7 +1601,7 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, tab_id: u64, state: &AppS
                     sizes.set(seeded);
                 }
             }
-            let sized = sizes.get().len() == k && sizes.get().iter().all(|s| *s > 0.0);
+            let sized = sizes.snapshot().len() == k && sizes.snapshot().iter().all(|s| *s > 0.0);
             let mut views: Vec<AnyView> = Vec::with_capacity(2 * k - 1);
             for (j, child) in children.iter().enumerate() {
                 if j > 0 {
@@ -1630,7 +1663,7 @@ fn subtree_px(node: &SplitNode, state: &AppState, along: SplitDir) -> f32 {
         SplitNode::Leaf(id) => {
             let px = state
                 .session(*id)
-                .map(|s| s.pane_px.get())
+                .map(|s| s.pane_px.snapshot())
                 .unwrap_or_default();
             match along {
                 SplitDir::Row => px.0,
@@ -1666,7 +1699,6 @@ fn divider_handle(
 ) -> impl View {
     use waterui::cursor::CursorStyle;
     use waterui::gesture::{DragEvent, DragGesture, GesturePhase};
-    use waterui::widget::Divider;
     use waterui_core::extract::{State, Use};
 
     let left = children[j - 1].clone();
@@ -1680,30 +1712,42 @@ fn divider_handle(
         SplitDir::Row => CursorStyle::ResizeLeftRight,
         SplitDir::Column => CursorStyle::ResizeUpDown,
     };
-    // The framework `Divider` resolves its orientation from the stack's
-    // `Axis` env — probed: the env survives the Frame/cursor/gesture/state
-    // wrappers here, so inside an HStack child it renders a vertical 1pt
-    // `BorderColor` line (horizontal inside a VStack). The Frame widens the
-    // hit zone to 7pt around the centred line. `split-divider-color` swaps
-    // the token line for a flat custom-colour fill.
+    // Baseline: a 1pt `Border` token line centred in the 7pt grab zone —
+    // the M3 `Divider` primitive draws `outline_variant`, which is nearly
+    // invisible on light themes; the `Border` token (`outline`) is the
+    // theme's designated visible separator and resolves per-flush, so theme
+    // reloads restyle it. `split-divider-color` swaps the token line for a
+    // flat custom-colour fill covering the whole grab zone.
     let custom = app.config(|c| c.split_divider_color);
     let handle = match (dir, custom) {
         (SplitDir::Row, Some(c)) => Frame::new(Color::srgb(c.r, c.g, c.b))
             .width(DIVIDER_PX)
             .max_height(f32::INFINITY)
             .anyview(),
-        (SplitDir::Row, None) => Frame::new(Divider)
-            .width(DIVIDER_PX)
-            .max_height(f32::INFINITY)
-            .anyview(),
+        (SplitDir::Row, None) => Frame::new(hstack((
+            Spacer::flexible(),
+            Frame::new(Color::new(Border))
+                .width(1.0)
+                .max_height(f32::INFINITY),
+            Spacer::flexible(),
+        )))
+        .width(DIVIDER_PX)
+        .max_height(f32::INFINITY)
+        .anyview(),
         (SplitDir::Column, Some(c)) => Frame::new(Color::srgb(c.r, c.g, c.b))
             .height(DIVIDER_PX)
             .max_width(f32::INFINITY)
             .anyview(),
-        (SplitDir::Column, None) => Frame::new(Divider)
-            .height(DIVIDER_PX)
-            .max_width(f32::INFINITY)
-            .anyview(),
+        (SplitDir::Column, None) => Frame::new(vstack((
+            Spacer::flexible(),
+            Frame::new(Color::new(Border))
+                .height(1.0)
+                .max_width(f32::INFINITY),
+            Spacer::flexible(),
+        )))
+        .height(DIVIDER_PX)
+        .max_width(f32::INFINITY)
+        .anyview(),
     };
     handle
         .cursor(cursor)
@@ -1727,7 +1771,7 @@ fn divider_handle(
                         )));
                     }
                     GesturePhase::Updated => {
-                        let Some((l, r)) = grab.get() else { return };
+                        let Some((l, r)) = grab.snapshot() else { return };
                         let delta = match dir {
                             SplitDir::Row => event.translation.x,
                             SplitDir::Column => event.translation.y,
@@ -1735,7 +1779,7 @@ fn divider_handle(
                         // Clamp at the smaller pane's minimum: keep the
                         // pair's total constant so neighbours don't shift.
                         let clamped = delta.clamp(MIN_PANE_PX - l, r - MIN_PANE_PX);
-                        let mut v = sizes.get();
+                        let mut v = sizes.snapshot();
                         if j < v.len() {
                             v[j - 1] = l + clamped;
                             v[j] = r - clamped;
@@ -1771,7 +1815,7 @@ impl View for AppRoot {
                 let mut last = Rect::new(Point::new(f32::NAN, f32::NAN), Size::zero());
                 loop {
                     sleep(std::time::Duration::from_millis(500)).await;
-                    let f = frame.get();
+                    let f = frame.snapshot();
                     if f != last {
                         last = f;
                         save_window_state(f);
@@ -1965,7 +2009,7 @@ pub fn tabs_view(state: AppState) -> impl View {
         move |sel: u64| {
             if let Some(t) = app.tabs.iter().find(|t| t.id == sel) {
                 t.activity.set(false);
-                app.focus_owner.set(Some((sel, t.focused.get())));
+                app.focus_owner.set(Some((sel, t.focused.snapshot())));
             }
         }
     })
@@ -1980,10 +2024,10 @@ pub fn tabs_view(state: AppState) -> impl View {
             let Some(t) = app.tabs.iter().find(|t| t.id == tab_id) else {
                 return;
             };
-            if t.focused.get() != session_id {
+            if t.focused.snapshot() != session_id {
                 t.focused.set(session_id);
                 if let Some(s) = app.session(session_id) {
-                    t.title.set(s.title.get());
+                    t.title.set(s.title.snapshot());
                 }
             }
         }
@@ -2007,6 +2051,7 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Split Right", chord: "ctrl+shift+e", action: TermAction::SplitRight },
     PaletteItem { name: "Split Down", chord: "ctrl+shift+d", action: TermAction::SplitDown },
     PaletteItem { name: "Toggle Pane Zoom", chord: "ctrl+shift+z", action: TermAction::PaneZoom },
+    PaletteItem { name: "Equalize Splits", chord: "", action: TermAction::EqualizeSplits },
     PaletteItem { name: "Focus Next Pane", chord: "ctrl+shift+]", action: TermAction::FocusNextPane },
     PaletteItem { name: "Focus Previous Pane", chord: "ctrl+shift+[", action: TermAction::FocusPrevPane },
     PaletteItem { name: "Copy", chord: "ctrl+shift+c", action: TermAction::Copy },
@@ -2079,7 +2124,7 @@ impl AppState {
     /// Open/close the palette (Ctrl+Shift+P). Opening clears the query
     /// and resets row selection to the first match.
     pub fn toggle_palette(&self) {
-        let next = !self.palette_open.get();
+        let next = !self.palette_open.snapshot();
         if next {
             self.palette_query.set_from("");
             self.palette_sel.set(Some(0));
@@ -2091,7 +2136,7 @@ impl AppState {
     /// Run the `i`-th match of the current query (Up/Down selection or
     /// a row tap).
     pub fn run_palette_at(&self, i: usize) {
-        let q = self.palette_query.get().to_string();
+        let q = self.palette_query.snapshot().to_string();
         let matches = palette_matches(&q);
         let Some(item) = matches.as_slice().get(i) else {
             self.palette_open.set(false);
@@ -2103,7 +2148,7 @@ impl AppState {
     /// Open/close the settings page (Ctrl+Shift+,). Opening snapshots
     /// the live config into the edit bindings.
     pub fn toggle_settings(&self) {
-        let next = !self.settings_open.get();
+        let next = !self.settings_open.snapshot();
         if next {
             let (font, theme, blink) =
                 self.config(|c| (c.font_size as i32, theme_index(&c.theme), c.cursor_blink));
@@ -2120,9 +2165,9 @@ impl AppState {
     pub fn apply_settings(&self) {
         self.settings_open.set(false);
         let path = self.cfg.borrow().path.clone();
-        let theme = THEME_CHOICES[self.set_theme.get().min(THEME_CHOICES.len() - 1)];
-        let blink = self.set_blink.get();
-        crate::config::upsert_config_key(&path, "font-size", &self.set_font.get().to_string());
+        let theme = THEME_CHOICES[self.set_theme.snapshot().min(THEME_CHOICES.len() - 1)];
+        let blink = self.set_blink.snapshot();
+        crate::config::upsert_config_key(&path, "font-size", &self.set_font.snapshot().to_string());
         crate::config::upsert_config_key(&path, "theme", theme);
         crate::config::upsert_config_key(
             &path,
@@ -2237,6 +2282,7 @@ fn settings_view(state: AppState) -> impl View {
 #[cfg(test)]
 mod tests {
     use super::{SplitDir, SplitNode};
+    use nami::Signal;
 
     /// [0 | 1] split side-by-side, then 1 split down → [0 | {1 / 2}].
     fn nested() -> SplitNode {
@@ -2272,7 +2318,7 @@ mod tests {
         let SplitNode::Split { children, sizes, .. } = &t else {
             panic!("not a split");
         };
-        assert_eq!(sizes.get().as_slice(), &[400.0, 400.0]);
+        assert_eq!(sizes.snapshot().as_slice(), &[400.0, 400.0]);
         assert_eq!(children.len(), 2);
         // Nested split inside child 1 reseeds its own slot to halves.
         assert!(t.split(SplitDir::Column, 1, 2, 400.0, false));
@@ -2281,6 +2327,6 @@ mod tests {
             panic!("expected the nested column split to remain");
         };
         assert_eq!(children.len(), 2);
-        assert_eq!(sizes.get().as_slice(), &[200.0, 200.0]);
+        assert_eq!(sizes.snapshot().as_slice(), &[200.0, 200.0]);
     }
 }

@@ -20,6 +20,9 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Op
 /// Absolute-row span of a command's output: `(C-mark row, Option<D-mark
 /// row>)` — `None` end while the command is still running.
 type OutputSpan = Option<(i64, Option<i64>)>;
+use alacritty_terminal::grid::GridCell;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Rgb;
 use polling::{Event as PollingEvent, PollMode, Poller};
 
@@ -202,6 +205,8 @@ pub struct SpawnOpts<'a> {
     /// `env = NAME=VALUE` config lines, applied last so a user entry can
     /// override even defaults and integration vars.
     pub env_extra: &'a [(String, String)],
+    /// `shell-integration` — which shell gets the OSC 133/7 hooks.
+    pub shell_integration: crate::config::ShellIntegration,
 }
 
 impl Terminal {
@@ -220,7 +225,7 @@ impl Terminal {
 
         let (shell, extra_env) = match opts.shell {
             Some(s) => (s, HashMap::new()),
-            None => shell_with_integration(),
+            None => shell_with_integration(opts.shell_integration),
         };
         let mut env: HashMap<String, String> = [
             ("TERM".to_owned(), opts.term_name.to_owned()),
@@ -308,6 +313,7 @@ impl Terminal {
         {
             let mut term = self.term.lock();
             term.resize(TermSize { cols: cols as usize, lines: lines as usize });
+            sever_cursor_line_join(&mut term);
         }
         let _ = self.io.lock().unwrap().send(Msg::Resize(WindowSize {
             num_lines: lines,
@@ -323,13 +329,63 @@ impl Terminal {
     }
 }
 
+/// Reset the cursor's logical line after a resize-reflow: blank the head
+/// rows above the cursor row and sever the wrap joins.
+///
+/// Interactive line editors (readline) redraw the current line anchored at
+/// the cursor row and only erase the rows their *own* display model says
+/// the prompt occupied — never the extra rows reflow produced by wrapping
+/// the line. Those stale head rows keep their WRAPLINE joins, so the next
+/// reflow merges them into freshly rewritten rows and interleaves
+/// fragments mid-line. Blanking the head rows and severing the joins keeps
+/// each surviving row an ordinary, independently-wrapping line.
+fn sever_cursor_line_join<T: EventListener>(term: &mut Term<T>) {
+    let grid = term.grid_mut();
+    let cursor = grid.cursor.point.line.0;
+    let cols = grid.columns();
+    if cols == 0 || cursor <= 0 {
+        return;
+    }
+    // Walk to the head row of the logical line containing the cursor.
+    let last = Column(cols - 1);
+    let mut head = cursor;
+    while head > 0 && grid[Line(head - 1)][last].flags().contains(Flags::WRAPLINE) {
+        head -= 1;
+    }
+    if head == cursor {
+        return;
+    }
+    let template = grid.cursor.template.clone();
+    for line in head..cursor {
+        let row = &mut grid[Line(line)];
+        for col in 0..cols {
+            row[Column(col)] = template.clone();
+        }
+        row[last].flags_mut().remove(Flags::WRAPLINE);
+    }
+}
+
 /// The user's `$SHELL` plus args/env that inject shell integration where
 /// supported — bash gets `--rcfile <generated>`, zsh a `ZDOTDIR` with a
 /// chain-sourcing `.zshrc`, fish a `-C` init command. All emit OSC 133
-/// prompt marks and OSC 7 cwd.
-fn shell_with_integration() -> (Shell, HashMap<String, String>) {
+/// prompt marks and OSC 7 cwd. `shell-integration` limits injection to
+/// one shell (`none` disables it entirely, `detect` is all supported).
+fn shell_with_integration(
+    mode: crate::config::ShellIntegration,
+) -> (Shell, HashMap<String, String>) {
+    use crate::config::ShellIntegration as SI;
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let name = program.rsplit('/').next().unwrap_or("");
+    let wants = match mode {
+        SI::Detect => Some(name),
+        SI::Bash => Some("bash"),
+        SI::Zsh => Some("zsh"),
+        SI::Fish => Some("fish"),
+        SI::None => None,
+    };
+    if wants != Some(name) {
+        return (Shell::new(program, Vec::new()), HashMap::new());
+    }
     match name {
         "bash" => match bash_integration_rc() {
             Some(rc) => (Shell::new(program, vec!["--rcfile".into(), rc]), HashMap::new()),
@@ -950,6 +1006,7 @@ mod tests {
                 )),
                 term_name: "xterm-256color",
                 env_extra: &[],
+                shell_integration: crate::config::ShellIntegration::Detect,
             },
         )
         .unwrap();

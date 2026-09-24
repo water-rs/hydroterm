@@ -25,6 +25,28 @@ pub enum ThemeRef {
     Named(String),
 }
 
+/// `copy-on-select` routing — where a finished selection lands
+/// (kitty semantics; `true`/`both` writes clipboard and PRIMARY,
+/// `clipboard`/`primary` pick one, `false` disables).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOnSelect {
+    Disabled,
+    Clipboard,
+    Primary,
+    Both,
+}
+
+/// `shell-integration` — which spawned shell gets the auto-injected
+/// OSC 133/7 hooks (`detect` = bash/zsh/fish, `none` disables).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegration {
+    None,
+    Detect,
+    Bash,
+    Zsh,
+    Fish,
+}
+
 /// Fully-resolved settings — defaults plus file overrides.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -33,8 +55,13 @@ pub struct AppConfig {
     pub scrollback: usize,
     /// Resolved at load; `Auto` consults the desktop once per (re)load.
     pub theme: ThemeRef,
-    /// Copy the selection to the clipboard on mouse release.
-    pub copy_on_select: bool,
+    /// Where a finished selection is copied (Ghostty `copy-on-select`).
+    pub copy_on_select: CopyOnSelect,
+    /// `shell-integration` — which shell gets the injected hooks.
+    pub shell_integration: ShellIntegration,
+    /// `desktop-notifications` — OSC 9/777 also posts a freedesktop
+    /// notification via `notify-send` when available.
+    pub desktop_notifications: bool,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
     /// Shell program override; `None` = `$SHELL` with integration.
@@ -239,7 +266,9 @@ impl Default for AppConfig {
             font_family: "monospace".to_string(),
             scrollback: 10_000,
             theme: ThemeRef::Named("hydroterm-dark".into()),
-            copy_on_select: true,
+            copy_on_select: CopyOnSelect::Both,
+            shell_integration: ShellIntegration::Detect,
+            desktop_notifications: true,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             shell: None,
@@ -343,7 +372,9 @@ theme = hydroterm-dark
 
 cursor-shape = block        # block | beam | underline | hollow
 cursor-blink = true
-copy-on-select = false
+copy-on-select = both       # both | clipboard | primary | false
+shell-integration = detect  # detect | none | bash | zsh | fish
+desktop-notifications = true # OSC 9/777 also notify via notify-send
 audible-bell = true       # ring the X11 keyboard bell on BEL
 # shell = /bin/bash
 
@@ -572,7 +603,27 @@ impl AppConfig {
                         ));
                     }
                 }
-                "copy-on-select" => cfg.copy_on_select = bool_value(value, n, &mut errors),
+                "copy-on-select" => cfg.copy_on_select = match value {
+                    "true" | "yes" | "on" | "both" => CopyOnSelect::Both,
+                    "false" | "no" | "off" | "disabled" | "none" => CopyOnSelect::Disabled,
+                    "clipboard" => CopyOnSelect::Clipboard,
+                    "primary" => CopyOnSelect::Primary,
+                    _ => {
+                        errors.push(format!("line {}: bad copy-on-select {value:?}", n + 1));
+                        cfg.copy_on_select
+                    }
+                },
+                "shell-integration" => match value {
+                    "none" => cfg.shell_integration = ShellIntegration::None,
+                    "detect" => cfg.shell_integration = ShellIntegration::Detect,
+                    "bash" => cfg.shell_integration = ShellIntegration::Bash,
+                    "zsh" => cfg.shell_integration = ShellIntegration::Zsh,
+                    "fish" => cfg.shell_integration = ShellIntegration::Fish,
+                    _ => errors.push(format!("line {}: bad shell-integration {value:?}", n + 1)),
+                },
+                "desktop-notifications" => {
+                    cfg.desktop_notifications = bool_value(value, n, &mut errors);
+                }
                 "audible-bell" => cfg.audible_bell = bool_value(value, n, &mut errors),
                 "cursor-blink" => cfg.cursor_blink = bool_value(value, n, &mut errors),
                 "cursor-shape" => match value {
@@ -865,6 +916,29 @@ fn parse_rgb(value: &str) -> Option<Rgb> {
     }
 }
 
+/// Every action name the `keybind` parser accepts — printed by
+/// `+list-actions`. Parameterized forms show their argument shape.
+pub const ACTION_NAMES: &[&str] = &[
+    "copy", "paste", "new_tab", "close_tab", "new_window", "next_tab", "prev_tab",
+    "select_tab_<n>", "move_tab_left", "move_tab_right",
+    "font_bigger", "font_smaller", "font_reset",
+    "increase_font_size[:pt]", "decrease_font_size[:pt]",
+    "clear_scrollback", "clear_screen", "reset", "search", "search_next", "search_prev",
+    "prompt_prev", "prompt_next", "select_all",
+    "scroll_to_top", "scroll_to_bottom", "scroll_page_up", "scroll_page_down",
+    "scroll_line_up", "scroll_line_down",
+    "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
+    "write_screen_file", "write_scrollback_file", "write_selection_file",
+    "quit", "fullscreen", "palette", "settings",
+    "split_right", "split_down", "split_left", "split_up",
+    "new_split:<right|down|left|up|auto>",
+    "goto_split:<left|right|up|down|previous|next|top|bottom>",
+    "resize_split:<left|right|up|down>[,px]",
+    "focus_next_pane", "focus_prev_pane",
+    "toggle_split_zoom", "equalize_splits",
+    "none | unbind  (disable a chord)",
+];
+
 fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => true,
@@ -995,11 +1069,25 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "select_all" => TermAction::SelectAll,
         "scroll_to_top" => TermAction::ScrollToTop,
         "scroll_to_bottom" => TermAction::ScrollToBottom,
+        "scroll_page_up" => TermAction::ScrollPageUp,
+        "scroll_page_down" => TermAction::ScrollPageDown,
+        "scroll_line_up" => TermAction::ScrollLineUp,
+        "scroll_line_down" => TermAction::ScrollLineDown,
+        "move_tab_left" => TermAction::MoveTabLeft,
+        "move_tab_right" => TermAction::MoveTabRight,
+        "url_hints" => TermAction::UrlHints,
+        "copy_last_output" => TermAction::CopyLastOutput,
+        "open_scrollback_editor" => TermAction::OpenScrollbackEditor,
+        "search_next" => TermAction::SearchNext,
+        "search_prev" => TermAction::SearchPrev,
+        "reload_config" => TermAction::ReloadConfig,
+        "toggle_split_zoom" | "toggle_pane_zoom" => TermAction::PaneZoom,
         "quit" => TermAction::Quit,
         "split_right" => TermAction::SplitRight,
         "split_down" => TermAction::SplitDown,
         "focus_next_pane" => TermAction::FocusNextPane,
         "focus_prev_pane" => TermAction::FocusPrevPane,
+        "equalize_splits" | "equalise_splits" => TermAction::EqualizeSplits,
         "fullscreen" => TermAction::Fullscreen,
         "palette" | "command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
@@ -1270,7 +1358,7 @@ mod tests {
         assert_eq!(cfg.font_family, "JetBrains Mono");
         assert_eq!(cfg.scrollback, 5000);
         assert_eq!(cfg.theme, ThemeRef::Named("solarized-light".into()));
-        assert!(cfg.copy_on_select);
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Both);
         assert_eq!(cfg.cursor_shape, CursorShape::Beam);
         assert!(!cfg.cursor_blink);
         assert_eq!(cfg.shell.as_deref(), Some("/bin/zsh"));

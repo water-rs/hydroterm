@@ -625,6 +625,9 @@ pub enum TermAction {
     FocusPrevPane,
     /// Toggle borderless fullscreen.
     Fullscreen,
+    /// Reset every split in the tab to equal shares
+    /// (Ghostty `equalize_splits`, tmux `select-layout -E`).
+    EqualizeSplits,
     /// Open the command palette.
     Palette,
     /// Open the settings page.
