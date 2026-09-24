@@ -407,6 +407,28 @@ impl TermSurface {
         }
     }
 
+    /// Current CLIPBOARD contents (empty when the backend is absent).
+    fn clipboard_text(&self) -> String {
+        self.clipboard
+            .as_ref()
+            .and_then(|c| pollster::block_on(c.text()).ok().flatten())
+            .unwrap_or_default()
+    }
+
+    /// `clipboard-read = ask` answer: [Allow]/Enter replies with the
+    /// clipboard, Escape replies empty and drops the request.
+    fn clipboard_read_confirm(&mut self, accept: bool) {
+        let fmt = self.session.pending_clipboard_fmt.borrow_mut().take();
+        self.session.pending_clipboard_read.set(false);
+        if let Some(manager) = self.session.snackbar.borrow().as_ref() {
+            manager.dismiss();
+        }
+        if let Some(fmt) = fmt {
+            let text = if accept { self.clipboard_text() } else { String::new() };
+            self.write(fmt(&text).into_bytes());
+        }
+    }
+
     /// Write `text` to the PTY as a (possibly bracketed) paste.
     fn paste_text(&mut self, text: &str, bracketed: bool) {
         let mut out = String::with_capacity(text.len() + 12);
@@ -583,6 +605,9 @@ impl TermSurface {
                 self.app.split_pane(crate::app::SplitDir::Column, self.session.id);
             }
             TermAction::PaneZoom => self.app.toggle_pane_zoom(),
+            TermAction::GotoSplit(index) => self.app.goto_split(index),
+            TermAction::ReloadConfig => self.app.reload_config(),
+            TermAction::ClipboardReadConfirm => self.clipboard_read_confirm(true),
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
@@ -735,12 +760,22 @@ impl TermSurface {
                     }
                 }
                 TermEvent::ClipboardLoad(_ty, fmt) => {
-                    let text = self
-                        .clipboard
-                        .as_ref()
-                        .and_then(|c| pollster::block_on(c.text()).ok().flatten())
-                        .unwrap_or_default();
-                    self.write(fmt(&text).into_bytes());
+                    // `clipboard-read` (Ghostty): ask waits on the snackbar
+                    // Allow/Enter; deny answers empty so a program can't
+                    // slurp the clipboard silently.
+                    match self.app.config(|c| c.clipboard_read) {
+                        crate::config::ClipboardRead::Allow => {
+                            let text = self.clipboard_text();
+                            self.write(fmt(&text).into_bytes());
+                        }
+                        crate::config::ClipboardRead::Ask => {
+                            *self.session.pending_clipboard_fmt.borrow_mut() = Some(fmt);
+                            self.session.pending_clipboard_read.set(true);
+                        }
+                        crate::config::ClipboardRead::Deny => {
+                            self.write(fmt("").into_bytes());
+                        }
+                    }
                 }
                 TermEvent::ColorRequest(index, fmt) => {
                     let rgb = self.palette.borrow().at(index);
@@ -915,6 +950,15 @@ impl TermSurface {
                 }
                 _ => {}
             }
+        }
+        // `clipboard-read = ask` prompt: Enter allows, Escape denies.
+        if pressed && self.session.pending_clipboard_read.get() {
+            match key {
+                Key::Named(NamedKey::Enter) => self.clipboard_read_confirm(true),
+                Key::Named(NamedKey::Escape) => self.clipboard_read_confirm(false),
+                _ => {}
+            }
+            return true;
         }
         // `confirm-close` snackbar: Enter closes, Escape cancels —
         // swallow everything while it waits so no stray byte hits the
@@ -1168,7 +1212,12 @@ impl TermSurface {
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
 
-        if mode.intersects(TermMode::MOUSE_MODE) {
+        // `mouse-shift-override`: Shift+click/drag selects even while the
+        // program owns the mouse (Ghostty default true).
+        let shift_override =
+            self.modifiers.contains(Modifiers::SHIFT)
+                && self.app.config(|c| c.mouse_shift_override);
+        if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             // Drag while held, else any-cell motion tracking (1003) isn't in
             // TermMode — only report while a button is held (button-motion).
             if let Some(button) = self.held_button {
@@ -1301,7 +1350,12 @@ impl TermSurface {
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
 
-        if mode.intersects(TermMode::MOUSE_MODE) {
+        // `mouse-shift-override`: Shift+click/drag selects even while the
+        // program owns the mouse (Ghostty default true).
+        let shift_override =
+            self.modifiers.contains(Modifiers::SHIFT)
+                && self.app.config(|c| c.mouse_shift_override);
+        if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             let action = if pressed {
                 let b = mouse::press_button(button);
                 self.held_button = Some(b);
@@ -1692,6 +1746,7 @@ impl TermSurface {
             .unwrap_or_default();
         let blink_on = self.blink_on();
         let focused = self.focused;
+        let cursor_invert_fg_bg = self.app.config(|c| c.cursor_invert_fg_bg);
         let bg_opacity = self.app.config(|c| c.background_opacity);
         let mut ctx = DrawContext {
             palette: &palette,
@@ -1700,6 +1755,7 @@ impl TermSurface {
             height,
             blink_on,
             focused,
+            cursor_invert_fg_bg,
             preedit,
             scroll,
             search_matches: &matches_view,
@@ -1878,7 +1934,7 @@ impl SceneContent for TermSurface {
 
     fn input(&mut self, event: &SurfaceInputEvent) {
         if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
-            eprintln!("[input] {event:?}");
+            eprintln!("[input s{} @{self:p}] {event:?}", self.session.id);
         }
         if input_stats() {
             STAT_EVENTS.fetch_add(1, Ordering::Relaxed);

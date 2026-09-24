@@ -343,6 +343,21 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
                 _ => None,
             };
         }
+        // Ctrl+Alt+1..9: jump straight to the nth split.
+        if let Key::Character(text) = key {
+            return match text.as_str() {
+                "1" => Some(TermAction::GotoSplit(0)),
+                "2" => Some(TermAction::GotoSplit(1)),
+                "3" => Some(TermAction::GotoSplit(2)),
+                "4" => Some(TermAction::GotoSplit(3)),
+                "5" => Some(TermAction::GotoSplit(4)),
+                "6" => Some(TermAction::GotoSplit(5)),
+                "7" => Some(TermAction::GotoSplit(6)),
+                "8" => Some(TermAction::GotoSplit(7)),
+                "9" => Some(TermAction::GotoSplit(8)),
+                _ => None,
+            };
+        }
         return None;
     }
     // Ctrl+Alt+Shift+Arrow: move the divider beside the focused pane —
@@ -417,7 +432,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "g" => TermAction::OpenScrollbackEditor,
         "f" => TermAction::Search,
         "p" => TermAction::Palette,
-        "," | "<" => TermAction::Settings,
+        "," | "<" => TermAction::ReloadConfig,
         _ => return None,
     })
 }
@@ -534,6 +549,14 @@ pub enum TermAction {
     SplitDown,
     /// Toggle: the focused pane fills the whole tab (tmux zoom).
     PaneZoom,
+    /// Focus the nth pane in the tab (Ghostty `goto_split`,
+    /// Ctrl+Alt+1..9 — Ctrl+Alt+Arrows already do directional focus).
+    GotoSplit(usize),
+    /// Re-read the config file and live-apply it (Ctrl+Shift+,).
+    ReloadConfig,
+    /// `clipboard-read = ask`: the program's OSC 52 read was approved
+    /// by the snackbar action or Enter.
+    ClipboardReadConfirm,
     /// Cycle pane focus within the tab.
     FocusNextPane,
     FocusPrevPane,

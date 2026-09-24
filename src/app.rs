@@ -46,6 +46,9 @@ const TAB_STRIP_HEIGHT: f32 = 30.0;
 
 /// Shared per-session UI state: the bindings a pane surface reads, plus
 /// the owning `Terminal` (PTY + grid).
+/// OSC 52 clipboard-read reply formatter (alacritty's `fmt` closure).
+type ClipboardReply = std::sync::Arc<dyn Fn(&str) -> String + Sync + Send>;
+
 pub struct Session {
     pub id: u64,
     /// The terminal (Term + EventLoop + PTY channel).
@@ -108,6 +111,11 @@ pub struct Session {
     /// `confirm-close` prompt: `Some((program_label, whole_tab))` while
     /// the snackbar asks before killing a busy pane/tab.
     pub pending_close: Binding<Option<(Str, bool)>>,
+    /// `clipboard-read = ask`: an OSC 52 `?` request waits for Allow /
+    /// Enter; the response formatter is stashed alongside.
+    pub pending_clipboard_read: Binding<bool>,
+    /// The OSC 52 reply formatter captured while the prompt is up.
+    pub pending_clipboard_fmt: Rc<RefCell<Option<ClipboardReply>>>,
 }
 
 impl Session {
@@ -121,6 +129,9 @@ impl Session {
     fn spawn(id: u64, cwd: Option<std::path::PathBuf>, cfg: &AppConfig) -> Self {
         let config = Config {
             scrolling_history: cfg.scrollback,
+            // Loads reach the app's `clipboard-read` policy (allow/ask/deny)
+            // instead of alacritty denying them upstream.
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
             kitty_keyboard: true,
             default_cursor_style: CursorStyle {
                 shape: cfg.cursor_shape,
@@ -176,6 +187,8 @@ impl Session {
             window_padding: binding((cfg.window_padding_x, cfg.window_padding_y)),
             pane_px: Binding::default(),
             pending_close: Binding::default(),
+            pending_clipboard_read: Binding::default(),
+            pending_clipboard_fmt: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -583,7 +596,41 @@ impl AppState {
         for e in &errors {
             eprintln!("hydroterm config: {e}");
         }
-        *self.palette.borrow_mut() = Palette::for_config(&config);
+        self.apply_config(&config);
+    }
+
+    /// `reload-config` action: re-read the file and apply it now —
+    /// the same code path the mtime watcher uses.
+    pub fn reload_config(&self) {
+        let (config, errors) = {
+            let mut w = self.cfg.borrow_mut();
+            w.reload();
+            (w.config.clone(), w.errors.clone())
+        };
+        for e in &errors {
+            eprintln!("hydroterm config: {e}");
+        }
+        self.apply_config(&config);
+    }
+
+    /// Ghostty `goto_split`: focus the nth leaf of the selected tab.
+    pub fn goto_split(&self, index: usize) {
+        let tab_id = self.selected.get();
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let tree: SplitNode = tab.tree.get();
+        // `.as_slice()` — nami's `Signal` blanket impl on `Vec` makes
+        // `vec.get(i)` resolve to the 0-arg `Signal::get`.
+        if let Some(&sid) = tree.leaves().as_slice().get(index) {
+            self.focus_pane(sid);
+        }
+    }
+
+    /// Live-apply a freshly parsed config — shared by `poll_config`
+    /// (mtime watcher) and `reload_config` (the manual action).
+    fn apply_config(&self, config: &AppConfig) {
+        *self.palette.borrow_mut() = Palette::for_config(config);
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
@@ -602,6 +649,7 @@ impl AppState {
             {
                 let mut term = s.terminal.term.lock();
                 term.set_options(alacritty_terminal::term::Config {
+                    osc52: alacritty_terminal::term::Osc52::CopyPaste,
                     scrolling_history: config.scrollback,
                     kitty_keyboard: s.kitty_keyboard,
                     default_cursor_style: cursor_style,
@@ -1240,6 +1288,26 @@ impl View for PaneLeaf {
         // `confirm-close`: closing a pane/tab whose PTY runs a program
         // asks via the snackbar — “Close”/Enter confirms, Escape cancels
         // (the snackbar's single action slot; the surface gate does Esc).
+        // `clipboard-read = ask`: an OSC 52 read waits on Allow / Enter;
+        // Escape denies. Same snackbar overlay pattern as paste/close.
+        let pending_clip = session.0.pending_clipboard_read.clone();
+        let clip_overlay = when(
+            pending_clip,
+            move || {
+                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
+                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
+                    manager.show(
+                        Snackbar::new("Program wants to read the clipboard")
+                            .action("Allow", |s: PaneSession| {
+                                s.push_action(TermAction::ClipboardReadConfirm)
+                            })
+                            .duration(Duration::ZERO)
+                            .state(&PaneSession(s.0.clone())),
+                    );
+                })
+            },
+        )
+        .anyview();
         let pending_close = session.0.pending_close.clone();
         let close_overlay = when(
             pending_close.is_some(),
@@ -1327,6 +1395,7 @@ impl View for PaneLeaf {
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
             close_overlay,
+            clip_overlay,
             resize_badge,
         ))
         .context_menu(menu)
@@ -1711,7 +1780,7 @@ pub fn tabs_view(state: AppState) -> impl View {
     };
 
     zstack((
-        vstack((strip_bar, content)).spacing(0.0),
+        vstack((strip_bar, content)).spacing(0.0).leading(),
         palette_overlay,
         settings_overlay,
         quick,
@@ -1758,6 +1827,7 @@ pub struct PaletteItem {
 pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "New Tab", chord: "ctrl+shift+t", action: TermAction::NewTab },
     PaletteItem { name: "New Window", chord: "ctrl+shift+n", action: TermAction::NewWindow },
+    PaletteItem { name: "Reload Config", chord: "ctrl+shift+,", action: TermAction::ReloadConfig },
     PaletteItem { name: "Close Pane / Tab", chord: "ctrl+shift+w", action: TermAction::CloseTab },
     PaletteItem { name: "Split Right", chord: "ctrl+shift+e", action: TermAction::SplitRight },
     PaletteItem { name: "Split Down", chord: "ctrl+shift+d", action: TermAction::SplitDown },

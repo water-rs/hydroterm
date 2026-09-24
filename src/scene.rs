@@ -50,6 +50,8 @@ pub struct DrawContext<'a> {
     pub blink_on: bool,
     /// Whether the surface has keyboard focus (hollow block vs. solid).
     pub focused: bool,
+    /// `cursor-invert-fg-bg` — swap cell fg onto the block cursor.
+    pub cursor_invert_fg_bg: bool,
     /// IME preedit text shown at the caret, if any: (text, caret byte offset).
     pub preedit: Option<(String, usize)>,
     /// Scrollback overlay data.
@@ -235,7 +237,11 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             }
         }
         if is_cursor {
-            fg = bg;
+            // `cursor-invert-fg-bg`: swap the cell's fg onto the block so
+            // the glyph stays readable; off = themed cursor color only.
+            if ctx.cursor_invert_fg_bg {
+                fg = bg;
+            }
             bg = palette.named(colors, NamedColor::Cursor);
         }
 
@@ -654,11 +660,8 @@ fn draw_cursor(
     match cursor.shape {
         CursorShape::Hidden => {}
         CursorShape::Block => {
-            if ctx.focused && (ctx.blink_on || !cursor.blinking) {
-                // The block itself was painted as the cell bg during harvest;
-                // here we only need the hollow variant for unfocused windows.
-            } else {
-                // Hollow outline.
+            if !ctx.focused {
+                // Hollow outline for an unfocused surface.
                 let r = Rect::new(
                     x as f64 + 0.5,
                     y as f64 + 0.5,
@@ -667,6 +670,9 @@ fn draw_cursor(
                 );
                 scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, &brush, None, &r.to_path(0.0));
             }
+            // Focused: the block was painted as the cell bg during harvest
+            // when (blink_on || !blinking); in the blink-off phase nothing is
+            // drawn, so hollow only ever means unfocused.
         }
         CursorShape::Underline => {
             if ctx.blink_on || !cursor.blinking {

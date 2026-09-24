@@ -57,6 +57,16 @@ pub struct AppConfig {
     /// Hide the pointer while typing; it returns on the next move
     /// (Ghostty `mouse-hide-while-typing`). X11 only — XFixes HideCursor.
     pub mouse_hide_typing: bool,
+    /// `mouse-shift-override` — while a program reports the mouse
+    /// (DECSET 1000/1002/1006), holding Shift bypasses reporting so
+    /// click/drag selects terminal text (Ghostty default true).
+    pub mouse_shift_override: bool,
+    /// `clipboard-read` — policy for program clipboard reads via
+    /// OSC 52 `?` requests (Ghostty `clipboard-read`, default ask).
+    pub clipboard_read: ClipboardRead,
+    /// `cursor-invert-fg-bg` — the block cursor swaps the cell's
+    /// fg/bg so the glyph under it stays readable (Ghostty default on).
+    pub cursor_invert_fg_bg: bool,
     /// Blank space around the cell grid in points (Ghostty
     /// `window-padding-x` / `window-padding-y`); live-reloaded.
     pub window_padding_x: f32,
@@ -135,6 +145,9 @@ impl Default for AppConfig {
             background_opacity: 1.0,
             paste_protection: true,
             mouse_hide_typing: true,
+            mouse_shift_override: true,
+            clipboard_read: ClipboardRead::Ask,
+            cursor_invert_fg_bg: true,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
             term: "xterm-256color".to_string(),
@@ -184,6 +197,9 @@ window-padding-x = 0       # blank margin around the grid, in points
 window-padding-y = 0
 term = xterm-256color      # $TERM value advertised to programs
 osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
+osc52-read = ask           # allow | ask | deny — OSC 52 clipboard reads by programs
+mouse-shift-override = true # Shift+click/drag selects even while a program owns the mouse
+cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
 bold-is-bright = true       # bold text uses the bright palette slot
 unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
 resize-overlay = true      # cols x rows badge while resizing
@@ -353,6 +369,18 @@ impl AppConfig {
                     "deny" | "false" | "no" | "0" | "off" => cfg.osc52_write = false,
                     _ => errors.push(format!("line {}: bad osc52-write {value:?}", n + 1)),
                 },
+                "osc52-read" | "clipboard-read" => match value {
+                    "allow" | "always" | "true" => cfg.clipboard_read = ClipboardRead::Allow,
+                    "ask" | "prompt" => cfg.clipboard_read = ClipboardRead::Ask,
+                    "deny" | "never" | "false" => cfg.clipboard_read = ClipboardRead::Deny,
+                    _ => errors.push(format!("line {}: bad osc52-read {value:?}", n + 1)),
+                },
+                "mouse-shift-override" | "mouse_shift_override" => {
+                    cfg.mouse_shift_override = bool_value(value, n, &mut errors);
+                }
+                "cursor-invert-fg-bg" | "cursor_invert_fg_bg" => {
+                    cfg.cursor_invert_fg_bg = bool_value(value, n, &mut errors);
+                }
                 "bold-is-bright" | "bold_is_bright"
                 | "draw-bold-text-with-bright-colors" => match value {
                     "true" | "yes" | "1" | "on" => cfg.bold_is_bright = true,
@@ -739,6 +767,18 @@ fn named_key_name(key: NamedKey) -> Option<String> {
     Some(s)
 }
 
+/// Program clipboard-read policy (`clipboard-read`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ClipboardRead {
+    /// Reads are answered immediately.
+    Allow,
+    /// Reads wait on a confirm prompt (snackbar "Allow" or Enter).
+    #[default]
+    Ask,
+    /// Reads are answered with empty text.
+    Deny,
+}
+
 /// mtime-based hot reload, polled from the render loop (throttled).
 pub struct ConfigWatcher {
     pub path: PathBuf,
@@ -762,6 +802,15 @@ impl ConfigWatcher {
             mtime,
             last_check: Instant::now(),
         }
+    }
+
+    /// Unconditional re-read (the `reload-config` action path).
+    pub fn reload(&mut self) {
+        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        self.mtime = mtime;
+        let (config, errors) = AppConfig::load(&self.path);
+        self.config = config;
+        self.errors = errors;
     }
 
     /// Reparse when the file changed; returns true when `config` changed.
@@ -994,6 +1043,22 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("window-fullscreen = true\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.window_fullscreen);
+    }
+
+    #[test]
+    fn parses_r19_keys() {
+        let (cfg, errs) = AppConfig::parse(
+            "mouse-shift-override = false\nclipboard-read = deny\ncursor-invert-fg-bg = false\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.mouse_shift_override);
+        assert_eq!(cfg.clipboard_read, ClipboardRead::Deny);
+        assert!(!cfg.cursor_invert_fg_bg);
+        // Defaults are the Ghostty ones: override on, ask, invert on.
+        let (d, _) = AppConfig::parse("");
+        assert!(d.mouse_shift_override);
+        assert_eq!(d.clipboard_read, ClipboardRead::Ask);
+        assert!(d.cursor_invert_fg_bg);
     }
 
     #[test]
