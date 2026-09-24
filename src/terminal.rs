@@ -238,7 +238,10 @@ impl Terminal {
         let options = Options {
             shell: Some(shell),
             working_directory: opts.cwd,
-            drain_on_exit: false,
+            // Drain the PTY's last bytes on child exit so the final
+            // output isn't lost — `wait-after-command` (and any exit)
+            // shows the complete last frame.
+            drain_on_exit: true,
             env,
         };
         let pty = tty::new(
@@ -266,7 +269,11 @@ impl Terminal {
             proxy.inner.events.clone(),
         );
 
-        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
+        // `drain_on_exit` is an EventLoop parameter, not an Options one:
+        // drain the PTY's last bytes on child exit so the final output
+        // isn't lost — `wait-after-command` (and any exit) shows the
+        // complete last frame.
+        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, true, false)?;
         let io = event_loop.channel();
         proxy.inner.notifier.set(Notifier(io.clone())).ok();
         let join = event_loop.spawn();
@@ -876,7 +883,7 @@ mod tests {
 
     /// Row text reconstructed as the renderer sees it: each cell's base char
     /// followed by its zerowidth list, blanks as '.'.
-    fn row_text(term: &Term<VoidListener>, line: i32) -> String {
+    fn row_text<L: EventListener>(term: &Term<L>, line: i32) -> String {
         use alacritty_terminal::index::{Column, Line};
         let mut out = String::new();
         for c in 0..term.columns() {
@@ -923,6 +930,44 @@ mod tests {
             "{text:?}"
         );
         assert_eq!(term.grid().cursor.point.column.0, 4);
+    }
+
+    /// `wait-after-command` plumbing: an instant-exit child's last
+    /// output must reach the grid (drain_on_exit) and ChildExit/Exit
+    /// must be queued — the path that used to leave a zombie window.
+    #[test]
+    fn instant_exit_drains_output_and_queues_exit() {
+        let terminal = Terminal::spawn(
+            Config::default(),
+            80,
+            24,
+            (9, 18),
+            SpawnOpts {
+                cwd: None,
+                shell: Some(Shell::new(
+                    "/bin/echo".to_owned(),
+                    vec!["WAITMARK_DRAIN".to_owned()],
+                )),
+                term_name: "xterm-256color",
+                env_extra: &[],
+            },
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let text = {
+            let t = terminal.term.lock();
+            (0..24)
+                .map(|i| row_text(&t, i))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains("WAITMARK_DRAIN"), "drained output missing:\n{text}");
+        let evs: Vec<TermEvent> = terminal.events.lock().unwrap().try_iter().collect();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, TermEvent::ChildExit(_) | TermEvent::Exit)),
+            "exit events missing"
+        );
     }
 
     /// Plain wide emoji without ZWJ are left untouched.

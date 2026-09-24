@@ -130,6 +130,21 @@ pub struct AppConfig {
     pub window_save_state: bool,
     /// Launch every window fullscreen (Ghostty `window-fullscreen`).
     pub window_fullscreen: bool,
+    /// Keep the surface open after a `command`/`-e` child exits
+    /// (Ghostty `wait-after-command`, default false). Interactive
+    /// shells always close their tab on exit.
+    pub wait_after_command: bool,
+    /// Quit the app when the last tab/surface closes (Ghostty
+    /// `quit-after-last-window-closed`, default true on Linux).
+    pub quit_after_last_window_closed: bool,
+    /// Glyph color under the block cursor (Ghostty `cursor-text`);
+    /// `None` = the inverted cell color.
+    pub cursor_text: Option<Rgb>,
+    /// Snap to the live edge when a key writes bytes to the PTY
+    /// (Ghostty `scroll-on-input`-style; default on).
+    pub scroll_on_input: bool,
+    /// Alpha of the block cursor fill (Ghostty `cursor-opacity`, 0–1).
+    pub cursor_opacity: f32,
     /// `env = NAME=VALUE` lines injected into spawned shells' environment.
     pub env: Vec<(String, String)>,
     /// Extra spacing per cell: `adjust-cell-width`/`adjust-cell-height`
@@ -186,6 +201,11 @@ impl Default for AppConfig {
             selection_invert: false,
             window_save_state: false,
             window_fullscreen: false,
+            wait_after_command: false,
+            quit_after_last_window_closed: true,
+            cursor_text: None,
+            scroll_on_input: true,
+            cursor_opacity: 1.0,
             env: Vec::new(),
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
@@ -494,6 +514,23 @@ impl AppConfig {
                 "window-fullscreen" | "window_fullscreen" => {
                     cfg.window_fullscreen = bool_value(value, n, &mut errors);
                 }
+                "wait-after-command" | "wait_after_command" => {
+                    cfg.wait_after_command = bool_value(value, n, &mut errors);
+                }
+                "quit-after-last-window-closed" | "quit_after_last_window_closed" => {
+                    cfg.quit_after_last_window_closed = bool_value(value, n, &mut errors);
+                }
+                "cursor-text" | "cursor_text" => match parse_rgb(value) {
+                    Some(rgb) => cfg.cursor_text = Some(rgb),
+                    None => errors.push(format!("line {}: bad cursor-text {value:?}", n + 1)),
+                },
+                "scroll-on-input" | "scroll_on_input" => {
+                    cfg.scroll_on_input = bool_value(value, n, &mut errors);
+                }
+                "cursor-opacity" | "cursor_opacity" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=1.0).contains(&v) => cfg.cursor_opacity = v,
+                    _ => errors.push(format!("line {}: bad cursor-opacity {value:?}", n + 1)),
+                },
                 "env" => match value.split_once('=') {
                     Some((name, val)) if !name.trim().is_empty() => {
                         cfg.env.push((name.trim().to_string(), val.to_string()));

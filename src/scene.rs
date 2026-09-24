@@ -52,6 +52,11 @@ pub struct DrawContext<'a> {
     pub focused: bool,
     /// `cursor-invert-fg-bg` — swap cell fg onto the block cursor.
     pub cursor_invert_fg_bg: bool,
+    /// `cursor-text` — glyph color under the block cursor (None = the
+    /// inverted cell fg).
+    pub cursor_text: Option<Rgb>,
+    /// `cursor-opacity` — alpha of the block cursor fill over the cell.
+    pub cursor_opacity: f32,
     /// IME preedit text shown at the caret, if any: (text, caret byte offset).
     pub preedit: Option<(String, usize)>,
     /// Scrollback overlay data.
@@ -150,6 +155,15 @@ pub(crate) fn cell_text(cell: &Cell) -> String {
     s
 }
 
+fn lerp_rgb(from: Rgb, to: Rgb, t: f32) -> Rgb {
+    let m = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Rgb {
+        r: m(from.r, to.r),
+        g: m(from.g, to.g),
+        b: m(from.b, to.b),
+    }
+}
+
 /// Is grid point `p` inside the selection?
 fn in_selection(p: Point, sel: &alacritty_terminal::selection::SelectionRange) -> bool {
     if sel.is_block {
@@ -244,12 +258,19 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             }
         }
         if is_cursor {
-            // `cursor-invert-fg-bg`: swap the cell's fg onto the block so
-            // the glyph stays readable; off = themed cursor color only.
-            if ctx.cursor_invert_fg_bg {
+            // `cursor-text` wins, then `cursor-invert-fg-bg`'s swap;
+            // neither = the glyph keeps its own fg under the block.
+            if let Some(ct) = ctx.cursor_text {
+                fg = ct;
+            } else if ctx.cursor_invert_fg_bg {
                 fg = bg;
             }
-            bg = palette.named(colors, NamedColor::Cursor);
+            let cc = palette.named(colors, NamedColor::Cursor);
+            bg = if ctx.cursor_opacity < 1.0 {
+                lerp_rgb(bg, cc, ctx.cursor_opacity)
+            } else {
+                cc
+            };
         }
 
         row.push(CellData {

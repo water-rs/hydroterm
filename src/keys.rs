@@ -112,7 +112,13 @@ fn kitty_mod(mods: Modifiers) -> u8 {
 fn csi_mod(n: u8, mods: Modifiers, fin: char) -> Vec<u8> {
     let m = xterm_mod(mods);
     if m == 1 {
-        format!("\x1b[{n}{fin}").into_bytes()
+        // Both params at their default → omit them entirely: `\e[D`,
+        // not `\e[1D` (readline binds only the param-less form).
+        if n == 1 {
+            format!("\x1b[{fin}").into_bytes()
+        } else {
+            format!("\x1b[{n}{fin}").into_bytes()
+        }
     } else {
         format!("\x1b[{n};{m}{fin}").into_bytes()
     }

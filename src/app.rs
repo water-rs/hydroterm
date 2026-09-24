@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorStyle;
-use nami::collection::List as NamiList;
+use nami::collection::{Collection, List as NamiList};
 use nami::zip::zip;
 use nami::{Binding, binding};
 use waterui::state;
@@ -111,6 +111,9 @@ pub struct Session {
     /// `confirm-close` prompt: `Some((program_label, whole_tab))` while
     /// the snackbar asks before killing a busy pane/tab.
     pub pending_close: Binding<Option<(Str, bool)>>,
+    /// Spawned with `command`/`-e` — `wait-after-command` holds this
+    /// surface open on child exit instead of closing the tab.
+    pub ran_command: bool,
     /// `clipboard-read = ask`: an OSC 52 `?` request waits for Allow /
     /// Enter; the response formatter is stashed alongside.
     pub pending_clipboard_read: Binding<bool>,
@@ -183,6 +186,7 @@ impl Session {
             resize_label: Binding::default(),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
             kitty_keyboard: config.kitty_keyboard,
+            ran_command: cfg.command.is_some(),
             snackbar: RefCell::new(None),
             window_padding: binding((cfg.window_padding_x, cfg.window_padding_y)),
             pane_px: Binding::default(),
@@ -1174,6 +1178,13 @@ impl AppState {
                 }
             }
         }
+        // `quit-after-last-window-closed` (default on, Ghostty/Linux):
+        // the last tab is gone, so is every session — exit.
+        if self.tabs.is_empty()
+            && self.config(|c| c.quit_after_last_window_closed)
+        {
+            self.quit();
+        }
     }
 
     /// Select the tab at 1-based index `n`.
@@ -1293,8 +1304,9 @@ impl View for PaneLeaf {
         // with both actions visible; the framework's Snackbar has a
         // single action slot and no two-choice transient primitive at
         // this pin (WATERUI_FEEDBACK #30), so the prompt is a composed
-        // card — Deny is deliberately NOT the snackbar's close ✕,
-        // which would silently deny without a discoverable affordance.
+        // card — Allow is the filled primary (`BorderedProminent`), Deny
+        // the lower-emphasis `Bordered` secondary (not the snackbar's
+        // close ✕, which would silently deny).
         let pending_clip = session.0.pending_clipboard_read.clone();
         let clip_overlay = vstack((
             Spacer::flexible(),
@@ -1302,12 +1314,16 @@ impl View for PaneLeaf {
                 vstack((
                     text("Program wants to read the clipboard"),
                     hstack((
-                        button("Deny").action(|s: PaneSession| {
-                            s.push_action(TermAction::ClipboardReadDeny)
-                        }),
-                        button("Allow").action(|s: PaneSession| {
-                            s.push_action(TermAction::ClipboardReadConfirm)
-                        }),
+                        button("Deny")
+                            .bordered()
+                            .action(|s: PaneSession| {
+                                s.push_action(TermAction::ClipboardReadDeny)
+                            }),
+                        button("Allow")
+                            .bordered_prominent()
+                            .action(|s: PaneSession| {
+                                s.push_action(TermAction::ClipboardReadConfirm)
+                            }),
                     ))
                     .spacing(8.0),
                 ))

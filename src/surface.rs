@@ -818,7 +818,19 @@ impl TermSurface {
                     self.session.exited.set(true);
                 }
                 TermEvent::Exit => {
-                    self.app.close_tab(self.session.id);
+                    // `wait-after-command`: a `command`/`-e` child keeps
+                    // its last frame mounted after exit; the pane only
+                    // goes away via an explicit close (Ghostty). Otherwise
+                    // the exit closes just this pane — `close_tab` takes a
+                    // tab id, not a session id, so route via close_pane
+                    // (which removes one split leaf or the whole tab).
+                    let hold = self.session.ran_command
+                        && self.app.config(|c| c.wait_after_command);
+                    if hold {
+                        self.session.exited.set(true);
+                    } else {
+                        self.app.close_pane(self.session.id);
+                    }
                 }
                 TermEvent::Apc(payload, line, col) => {
                     self.handle_apc(&payload, line, col);
@@ -1209,9 +1221,13 @@ impl TermSurface {
     }
 
     /// Keyboard input bound for the PTY snaps the viewport back to the
-    /// live edge — the alacritty/kitty convention. Returns true when the
-    /// viewport moved (needs a frame).
+    /// live edge — the alacritty/kitty convention; `scroll-on-input =
+    /// false` leaves the viewport where the user scrolled it.
+    /// Returns true when the viewport moved (needs a frame).
     fn snap_to_bottom_if_scrolled(&mut self) -> bool {
+        if !self.app.config(|c| c.scroll_on_input) {
+            return false;
+        }
         let mut term = self.session.terminal.term.lock();
         if term.grid().display_offset() == 0 {
             return false;
@@ -1788,6 +1804,8 @@ impl TermSurface {
             blink_on,
             focused,
             cursor_invert_fg_bg,
+            cursor_text: self.app.config(|c| c.cursor_text),
+            cursor_opacity: self.app.config(|c| c.cursor_opacity),
             preedit,
             scroll,
             search_matches: &matches_view,
@@ -1934,6 +1952,11 @@ impl SceneContent for TermSurface {
                         }
                     });
                 self.wake_alive.set(true);
+                // Events queued before this install (a fast child exit,
+                // a clipboard read, ...) arrived while `wake` was a
+                // no-op — self-poke once so they drain on the next frame
+                // instead of sitting in the queue until a repaint.
+                let _ = tx.try_send(());
                 let alive = Rc::clone(&self.wake_alive);
                 let content_gen = Rc::clone(&self.content_gen);
                 self.wake_task = Some(Box::pin(spawn_local(async move {
