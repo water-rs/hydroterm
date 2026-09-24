@@ -437,9 +437,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
     })
 }
 
-/// Ctrl (no shift) digits select tabs 1-8; Ctrl+Tab / Ctrl+Shift+Tab cycle.
+/// Ctrl (no shift) digits select tabs 1-8; Alt+digits select tabs 1-9;
+/// Ctrl+Tab / Ctrl+Shift+Tab cycle.
 pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
-    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
+    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT)
+        || mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::CONTROL)
+    {
         let digit = match code {
             Code::Digit1 => Some(1),
             Code::Digit2 => Some(2),
@@ -449,11 +452,14 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
             Code::Digit6 => Some(6),
             Code::Digit7 => Some(7),
             Code::Digit8 => Some(8),
+            Code::Digit9 if mods.contains(Modifiers::ALT) => Some(9),
             _ => None,
         };
         if let Some(n) = digit {
             return Some(TermAction::SelectTab(n));
         }
+    }
+    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
         if matches!(key, Key::Named(NamedKey::Tab)) {
             return Some(TermAction::NextTab);
         }
@@ -555,8 +561,11 @@ pub enum TermAction {
     /// Re-read the config file and live-apply it (Ctrl+Shift+,).
     ReloadConfig,
     /// `clipboard-read = ask`: the program's OSC 52 read was approved
-    /// by the snackbar action or Enter.
+    /// by the Allow action or Enter.
     ClipboardReadConfirm,
+    /// The OSC 52 read was refused — replies with an empty payload and
+    /// drops the request (Ghostty's Deny button / Escape).
+    ClipboardReadDeny,
     /// Cycle pane focus within the tab.
     FocusNextPane,
     FocusPrevPane,

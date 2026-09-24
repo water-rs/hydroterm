@@ -197,7 +197,6 @@ fn line_map_matches(
     out
 }
 
-const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Max cell distance for a multi-click to count as same-cell.
 const MULTI_CLICK_RANGE: usize = 1;
 /// Min spacing between X11 bell rings — throttles tab-completion storms.
@@ -291,9 +290,10 @@ pub struct TermSurface {
     cursor_hider: Option<crate::xcursor::CursorHider>,
     /// Set when the hider was attempted — avoid reconnecting per frame.
     cursor_hider_tried: bool,
-    /// X11 PRIMARY selection owner — claims on copy-on-select, serves
-    /// middle-click pastes to other clients. `None` off-X11.
-    xsel: Option<crate::xsel::Xsel>,
+    /// Linux PRIMARY selection (X11, or Wayland data-control where the
+    /// compositor offers it) — waterkit-clipboard's `PrimarySelection`;
+    /// claims on copy-on-select, middle-click reads it.
+    primary: Option<waterkit_clipboard::PrimarySelection>,
     /// Last pointer position in surface-local coords — re-evaluates the
     /// Ctrl+hover link affordance when the modifier chord changes.
     pointer_at: (f64, f64),
@@ -347,7 +347,7 @@ impl TermSurface {
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
             cursor_hider: None,
             cursor_hider_tried: false,
-            xsel: crate::xsel::Xsel::new(),
+            primary: waterkit_clipboard::PrimarySelection::new().ok(),
             pointer_at: (0.0, 0.0),
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
@@ -415,6 +415,13 @@ impl TermSurface {
             .unwrap_or_default()
     }
 
+    /// Current PRIMARY contents, `None` when unowned or unsupported.
+    fn primary_text(&self) -> Option<String> {
+        self.primary
+            .as_ref()
+            .and_then(|p| pollster::block_on(p.text()).ok().flatten())
+    }
+
     /// `clipboard-read = ask` answer: [Allow]/Enter replies with the
     /// clipboard, Escape replies empty and drops the request.
     fn clipboard_read_confirm(&mut self, accept: bool) {
@@ -462,14 +469,24 @@ impl TermSurface {
     fn copy_selection(&mut self) {
         let text = self.session.terminal.term.lock().selection_to_string();
         if let Some(text) = text {
+            if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                eprintln!(
+                    "[copy_sel] text={text:?} clip={} primary={}",
+                    self.clipboard.is_some(),
+                    self.primary.is_some()
+                );
+            }
             if let Some(clip) = self.clipboard.as_mut() {
                 let _ = clip.set_text(&text);
             }
-            // X11: the selection clipboard is also PRIMARY — a middle
-            // click anywhere pastes what was last selected (xterm/Ghostty
+            // The selection is also PRIMARY — a middle click anywhere
+            // pastes what was last selected (xterm/Ghostty
             // `copy-on-select = true` semantics).
-            if let Some(xsel) = &self.xsel {
-                xsel.claim(text);
+            if let Some(primary) = self.primary.as_mut() {
+                let r = primary.set_text(&text);
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[copy_sel] primary.set_text={r:?}");
+                }
             }
         }
     }
@@ -608,6 +625,7 @@ impl TermSurface {
             TermAction::GotoSplit(index) => self.app.goto_split(index),
             TermAction::ReloadConfig => self.app.reload_config(),
             TermAction::ClipboardReadConfirm => self.clipboard_read_confirm(true),
+            TermAction::ClipboardReadDeny => self.clipboard_read_confirm(false),
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
@@ -1251,12 +1269,23 @@ impl TermSurface {
         }
     }
 
-    /// Ctrl+hover link affordance: while CONTROL is held, underline the
-    /// link under the pointer and switch the cursor to a pointing hand.
-    /// Re-runs on pointer moves and on modifier-chord changes.
+    /// The `open-link-modifier` config as a `Modifiers` flag.
+    fn link_modifier(&self) -> Modifiers {
+        match self.app.config(|c| c.open_link_modifier) {
+            crate::config::LinkMod::Ctrl => Modifiers::CONTROL,
+            crate::config::LinkMod::Shift => Modifiers::SHIFT,
+            crate::config::LinkMod::Alt => Modifiers::ALT,
+            crate::config::LinkMod::Super => Modifiers::META,
+        }
+    }
+
+    /// Link-hover affordance: while the `open-link-modifier` is held,
+    /// underline the link under the pointer and switch the cursor to a
+    /// pointing hand. Re-runs on pointer moves and on modifier-chord
+    /// changes.
     fn update_hover(&mut self, x: f64, y: f64) {
         self.pointer_at = (x, y);
-        let segs = if self.modifiers.contains(Modifiers::CONTROL) {
+        let segs = if self.modifiers.contains(self.link_modifier()) {
             self.link_span_at(self.grid_point(x, y))
         } else {
             Vec::new()
@@ -1374,8 +1403,8 @@ impl TermSurface {
             self.clear_notify_badge();
             match button {
                 SurfacePointerButton::Primary => {
-                    // Ctrl+click opens an OSC8 link.
-                    if self.modifiers.contains(Modifiers::CONTROL)
+                    // <open-link-modifier>+click opens a link.
+                    if self.modifiers.contains(self.link_modifier())
                         && self.open_link_at(self.grid_point(x, y))
                     {
                         return;
@@ -1385,7 +1414,10 @@ impl TermSurface {
                     let count = self
                         .last_click
                         .filter(|(t, r, c, _)| {
-                            now.duration_since(*t) < MULTI_CLICK
+                            now.duration_since(*t)
+                                < Duration::from_millis(
+                                    self.app.config(|c| c.click_interval),
+                                )
                                 && r.abs_diff(row) <= MULTI_CLICK_RANGE
                                 && c.abs_diff(col) <= MULTI_CLICK_RANGE
                         })
@@ -1410,10 +1442,10 @@ impl TermSurface {
                     self.last_click = Some((now, row, col, count));
                 }
                 SurfacePointerButton::Middle => {
-                    // Middle click pastes PRIMARY on X11 (xterm
+                    // Middle click pastes PRIMARY on Linux (xterm
                     // convention); CLIPBOARD when PRIMARY is empty or
-                    // we're off-X11.
-                    match crate::xsel::Xsel::read() {
+                    // the compositor does not offer it.
+                    match self.primary_text() {
                         Some(text) => {
                             let bracketed = self
                                 .session
@@ -1766,6 +1798,7 @@ impl TermSurface {
             hint_digits: &hint_digits,
             bold_bright: self.app.config(|c| c.bold_is_bright),
             min_contrast: self.app.config(|c| c.minimum_contrast),
+            selection_invert: self.app.config(|c| c.selection_invert),
             hover_link: &self.hover_link,
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;

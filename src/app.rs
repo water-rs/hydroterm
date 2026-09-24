@@ -1288,25 +1288,35 @@ impl View for PaneLeaf {
         // `confirm-close`: closing a pane/tab whose PTY runs a program
         // asks via the snackbar — “Close”/Enter confirms, Escape cancels
         // (the snackbar's single action slot; the surface gate does Esc).
-        // `clipboard-read = ask`: an OSC 52 read waits on Allow / Enter;
-        // Escape denies. Same snackbar overlay pattern as paste/close.
+        // `clipboard-read = ask`: an OSC 52 read waits on Allow / Deny
+        // (or Enter / Escape on the surface's key gate). Ghostty asks
+        // with both actions visible; the framework's Snackbar has a
+        // single action slot and no two-choice transient primitive at
+        // this pin (WATERUI_FEEDBACK #30), so the prompt is a composed
+        // card — Deny is deliberately NOT the snackbar's close ✕,
+        // which would silently deny without a discoverable affordance.
         let pending_clip = session.0.pending_clipboard_read.clone();
-        let clip_overlay = when(
-            pending_clip,
-            move || {
-                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
-                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
-                    manager.show(
-                        Snackbar::new("Program wants to read the clipboard")
-                            .action("Allow", |s: PaneSession| {
-                                s.push_action(TermAction::ClipboardReadConfirm)
-                            })
-                            .duration(Duration::ZERO)
-                            .state(&PaneSession(s.0.clone())),
-                    );
-                })
-            },
-        )
+        let clip_overlay = vstack((
+            Spacer::flexible(),
+            when(pending_clip, move || {
+                vstack((
+                    text("Program wants to read the clipboard"),
+                    hstack((
+                        button("Deny").action(|s: PaneSession| {
+                            s.push_action(TermAction::ClipboardReadDeny)
+                        }),
+                        button("Allow").action(|s: PaneSession| {
+                            s.push_action(TermAction::ClipboardReadConfirm)
+                        }),
+                    ))
+                    .spacing(8.0),
+                ))
+                .spacing(8.0)
+                .padding()
+                .background(Surface)
+            })
+            .padding_vertical(8.0),
+        ))
         .anyview();
         let pending_close = session.0.pending_close.clone();
         let close_overlay = when(

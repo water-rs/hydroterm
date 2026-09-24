@@ -28,13 +28,12 @@ mod surface;
 mod terminal;
 mod theme;
 mod xcursor;
-mod xsel;
 
 use waterui::app::App;
 use waterui::prelude::*;
 use waterui::window::Window;
 use waterui::window::WindowState::Fullscreen;
-use waterui_core::layout::{Rect, Size};
+use waterui_core::layout::{Point, Rect, Size};
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
@@ -96,6 +95,17 @@ fn main() {
                     if w > 0.0 { w } else { size.width },
                     if h > 0.0 { h } else { size.height },
                 ),
+            ));
+        }
+        // `window-x`/`window-y`: launch position (hydrolysis#123 carries
+        // window-position support; KWin may still place the window).
+        let (wx, wy) = state.config(|c| (c.window_x, c.window_y));
+        if wx.is_some() || wy.is_some() {
+            let frame = window.frame.get();
+            let origin = frame.origin();
+            window.frame.set(Rect::new(
+                Point::new(wx.unwrap_or(origin.x), wy.unwrap_or(origin.y)),
+                *frame.size(),
             ));
         }
     }

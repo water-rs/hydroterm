@@ -112,6 +112,19 @@ pub struct AppConfig {
     /// Applied once at launch (Ghostty `window-width`/`window-height`).
     pub window_width: f32,
     pub window_height: f32,
+    /// Launch window position in points (Ghostty `window-position-x`/`y`);
+    /// `None` = let the window manager choose. Applied once at launch.
+    pub window_x: Option<f32>,
+    pub window_y: Option<f32>,
+    /// Modifier that must be held for click-to-open-link (Ghostty
+    /// `open-link-modifier`-style); default Control.
+    pub open_link_modifier: LinkMod,
+    /// Multi-click (word/line select) timing window in milliseconds.
+    pub click_interval: u64,
+    /// Invert the selected cells' foreground/background (Ghostty
+    /// `selection-invert-fg-bg`); when off, `selection_bg`/`selection_fg`
+    /// theme colors are used instead.
+    pub selection_invert: bool,
     /// Restore the last window geometry on launch and save it as the
     /// window moves/resizes (Ghostty `window-save-state`).
     pub window_save_state: bool,
@@ -135,7 +148,7 @@ impl Default for AppConfig {
             font_family: "monospace".to_string(),
             scrollback: 10_000,
             theme: ThemeRef::Named("hydroterm-dark".into()),
-            copy_on_select: false,
+            copy_on_select: true,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             shell: None,
@@ -166,6 +179,11 @@ impl Default for AppConfig {
             confirm_close: true,
             window_width: 0.0,
             window_height: 0.0,
+            window_x: None,
+            window_y: None,
+            open_link_modifier: LinkMod::Ctrl,
+            click_interval: 400,
+            selection_invert: false,
             window_save_state: false,
             window_fullscreen: false,
             env: Vec::new(),
@@ -449,6 +467,27 @@ impl AppConfig {
                     Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_height = v,
                     _ => errors.push(format!("line {}: bad window-height {value:?}", n + 1)),
                 },
+                "window-x" | "window_x" => match value.parse::<f32>() {
+                    Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_x = Some(v),
+                    _ => errors.push(format!("line {}: bad window-x {value:?}", n + 1)),
+                },
+                "window-y" | "window_y" => match value.parse::<f32>() {
+                    Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_y = Some(v),
+                    _ => errors.push(format!("line {}: bad window-y {value:?}", n + 1)),
+                },
+                "open-link-modifier" | "open_link_modifier" => {
+                    match value.parse::<LinkMod>() {
+                        Ok(m) => cfg.open_link_modifier = m,
+                        Err(e) => errors.push(format!("line {}: {e}", n + 1)),
+                    }
+                }
+                "click-interval" | "click_interval" => match value.parse::<u64>() {
+                    Ok(v) if (50..=2000).contains(&v) => cfg.click_interval = v,
+                    _ => errors.push(format!("line {}: bad click-interval {value:?}", n + 1)),
+                },
+                "selection-invert-fg-bg" | "selection_invert_fg_bg" => {
+                    cfg.selection_invert = bool_value(value, n, &mut errors);
+                }
                 "window-save-state" | "window_save_state" => {
                     cfg.window_save_state = bool_value(value, n, &mut errors);
                 }
@@ -765,6 +804,31 @@ fn named_key_name(key: NamedKey) -> Option<String> {
         _ => return None,
     };
     Some(s)
+}
+
+/// Modifier required to open links with a click (`open-link-modifier`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum LinkMod {
+    /// Control key (default, Ghostty-compatible).
+    #[default]
+    Ctrl,
+    Shift,
+    Alt,
+    /// The "super"/meta key.
+    Super,
+}
+
+impl std::str::FromStr for LinkMod {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Ok(Self::Ctrl),
+            "shift" => Ok(Self::Shift),
+            "alt" | "option" => Ok(Self::Alt),
+            "super" | "meta" | "cmd" | "command" => Ok(Self::Super),
+            other => Err(format!("bad open-link-modifier {other:?}")),
+        }
+    }
 }
 
 /// Program clipboard-read policy (`clipboard-read`).

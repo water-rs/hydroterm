@@ -76,6 +76,9 @@ pub struct DrawContext<'a> {
     /// `minimum-contrast` — WCAG ratio floor applied to each cell's
     /// resolved fg against its bg (1.0 = off).
     pub min_contrast: f32,
+    /// `selection-invert-fg-bg` — selected cells swap their fg/bg
+    /// instead of using `selection_bg`/`selection_fg`.
+    pub selection_invert: bool,
     /// Ctrl-hovered link span to underline: `(start col, end col
     /// exclusive, viewport row)` per visible part (wrap-safe, like hints).
     pub hover_link: &'a [(usize, usize, usize)],
@@ -231,9 +234,13 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             fg = bg;
         }
         if is_sel {
-            bg = palette.selection_bg;
-            if let Some(f) = palette.selection_fg {
-                fg = f;
+            if ctx.selection_invert {
+                std::mem::swap(&mut fg, &mut bg);
+            } else {
+                bg = palette.selection_bg;
+                if let Some(f) = palette.selection_fg {
+                    fg = f;
+                }
             }
         }
         if is_cursor {

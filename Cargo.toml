@@ -69,6 +69,11 @@ glifo = { git = "https://github.com/lexoliu/vello", rev = "d68d9e9825bcd1ffee762
 hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "e676ca882769c36ecab7bfe8b78f46682e26f735" }
 hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "233005c53d1e79ce408061bd30c2c8d21a3e24bd" }
 
+# water-rs/waterkit#91: Linux `PrimarySelection` (X11 + Wayland data-control),
+# replaces hydroterm's own ICCCM owner (former src/xsel.rs). Keep pinned to the
+# merge revision until a crates.io release carries it.
+waterkit-clipboard = { git = "https://github.com/water-rs/waterkit", rev = "c413ef4c6b33" }
+
 # The framework at the `dev` revision that lets `SceneContent` receive input
 # (water-rs/waterui#1189) and takes the executor's refresh rate from the host
 # (water-rs/waterui#1201). Every framework crate in the graph comes from the
