@@ -16,11 +16,28 @@ use std::path::PathBuf;
 /// kitty image payloads chunk at ~4KiB each; 1MiB is far past a sane OSC.
 const MAX_STRING_LEN: usize = 1 << 20;
 
+/// How much of the prompt the shell repaints after a resize — the
+/// `redraw` option on OSC 133 `A` (kitty `redraw=0|1`, plus `last` for
+/// shells like bash that repaint only the prompt line under the cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellRedraw {
+    /// Full repaint: the prompt region may be cleared wholesale.
+    True,
+    /// No repaint: nothing may be cleared.
+    False,
+    /// Only the cursor's line is repainted, so only that row may be
+    /// cleared — blanking untouched prompt lines would erase text the
+    /// shell never rewrites.
+    Last,
+}
+
 /// Events extracted from the raw byte stream.
 #[derive(Debug, Clone)]
 pub enum TapEvent {
     /// OSC 133 ; A — prompt start.
     PromptStart,
+    /// OSC 133 ; A ; … ; redraw=X — repaint mode announced at the mark.
+    ShellRedraw(ShellRedraw),
     /// OSC 133 ; B — prompt end / command start.
     PromptEnd,
     /// OSC 133 ; C — command output start (pre-execution).
@@ -225,7 +242,12 @@ impl OscScanner {
                 }
             }
             b"133" => match params.get(1).copied().unwrap_or(b"") {
-                b"A" => tap(TapEvent::PromptStart, &mut self.events),
+                b"A" => {
+                    tap(TapEvent::PromptStart, &mut self.events);
+                    if let Some(r) = params[2..].iter().find_map(|p| parse_redraw(p)) {
+                        tap(TapEvent::ShellRedraw(r), &mut self.events);
+                    }
+                }
                 b"B" => tap(TapEvent::PromptEnd, &mut self.events),
                 b"C" => tap(TapEvent::CommandStart, &mut self.events),
                 // `133;D;{code}` — also `133;D` alone.
@@ -249,6 +271,17 @@ impl OscScanner {
             _ => (),
         }
     }
+}
+
+/// `redraw=0|1|last` → [`ShellRedraw`].
+fn parse_redraw(param: &[u8]) -> Option<ShellRedraw> {
+    let v = param.strip_prefix(b"redraw=")?;
+    Some(match v {
+        b"0" => ShellRedraw::False,
+        b"1" => ShellRedraw::True,
+        b"last" => ShellRedraw::Last,
+        _ => return None,
+    })
 }
 
 /// `file://host/path` → decoded path (localhost or matching hostname only).
@@ -368,6 +401,20 @@ mod tests {
             }
         }
         assert!(matches!(events.as_slice(), [TapEvent::PromptStart, TapEvent::CommandEnd(Some(42))]));
+    }
+
+    #[test]
+    fn osc133_redraw_option() {
+        let (ev, _) = scan(b"\x1b]133;A;redraw=last\x07");
+        assert!(matches!(
+            ev.as_slice(),
+            [TapEvent::PromptStart, TapEvent::ShellRedraw(ShellRedraw::Last)]
+        ));
+        let (ev, _) = scan(b"\x1b]133;A;redraw=0\x07");
+        assert!(ev.iter().any(|e| matches!(e, TapEvent::ShellRedraw(ShellRedraw::False))));
+        // Unknown values are ignored; a bare A emits no redraw event.
+        let (ev, _) = scan(b"\x1b]133;A;redraw=wat\x07\x1b]133;A\x07");
+        assert_eq!(ev.iter().filter(|e| matches!(e, TapEvent::ShellRedraw(_))).count(), 0);
     }
 
     #[test]

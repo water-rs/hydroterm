@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::{Dimensions, GridCell, Scroll};
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -312,10 +312,6 @@ pub struct TermSurface {
     /// — `None` brush means the file failed to read/decode; the path is
     /// still cached so a bad path is not re-read every frame.
     bg_img: RefCell<BgImageCache>,
-    /// Per-row content fingerprints from the previous frame — detects
-    /// linewrap continuations overwritten between resizes
-    /// (`sever_overwritten_wraps`).
-    wrap_fps: Vec<u64>,
 }
 
 /// `background-image` decode cache: (config path, decoded brush + pixel dims).
@@ -368,7 +364,6 @@ impl TermSurface {
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
             bg_img: RefCell::new((None, None)),
-            wrap_fps: Vec::new(),
         }
     }
 
@@ -544,14 +539,25 @@ impl TermSurface {
         }
     }
 
+    /// `clipboard-trim` — strip whitespace at the ends of copied text
+    /// (the per-line trailing pads are already gone).
+    fn trimmed_copy(&self, text: String) -> String {
+        if self.app.config(|c| c.clipboard_trim) {
+            text.trim().to_owned()
+        } else {
+            text
+        }
+    }
+
     /// The explicit Copy action writes CLIPBOARD only — PRIMARY
     /// continues to hold the last selection (kitty/xterm semantics).
     fn copy_selection(&mut self) {
         let text = self.session.terminal.term.lock().selection_to_string();
-        if let Some(text) = text
-            && let Some(clip) = self.clipboard.as_mut()
-        {
-            let _ = clip.set_text(&text);
+        if let Some(text) = text {
+            let text = self.trimmed_copy(text);
+            if let Some(clip) = self.clipboard.as_mut() {
+                let _ = clip.set_text(&text);
+            }
         }
     }
 
@@ -561,6 +567,7 @@ impl TermSurface {
         use crate::config::CopyOnSelect as CoS;
         let text = self.session.terminal.term.lock().selection_to_string();
         if let Some(text) = text {
+            let text = self.trimmed_copy(text);
             if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                 eprintln!(
                     "[copy_sel] mode={mode:?} text={text:?} clip={} primary={}",
@@ -1005,9 +1012,9 @@ impl TermSurface {
                     self.handle_apc(&payload, line, col);
                 }
                 TermEvent::Tap(tap) => match tap {
-                    // Marks are recorded on the reader thread where the
-                    // cursor still sits at the mark position.
-                    TapEvent::PromptStart => {}
+                    // Marks + the redraw mode are recorded on the reader
+                    // thread where the cursor still sits at the mark.
+                    TapEvent::PromptStart | TapEvent::ShellRedraw(_) => {}
                     TapEvent::Cwd(path) => {
                         *self.session.cwd.lock().unwrap() = Some(path);
                     }
@@ -1092,53 +1099,6 @@ impl TermSurface {
                 self.session
                     .resize_label
                     .set(Some(Str::from(format!("{cols}\u{00d7}{lines}"))));
-            }
-        }
-    }
-
-    /// Drop stale linewrap joins: a row whose cells changed since the last
-    /// frame while its WRAPLINE-flagged predecessor stayed unchanged was
-    /// overwritten by output that no longer continues the row above (an
-    /// erase+redraw landing inside a wrapped block). Keeping that join
-    /// lets the next reflow merge the stale head row into the fresh row
-    /// and interleave fragments mid-line.
-    fn sever_overwritten_wraps(&mut self) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut term = self.session.terminal.term.lock();
-        let grid = term.grid_mut();
-        let lines = grid.screen_lines();
-        let cols = grid.columns();
-        if cols == 0 {
-            self.wrap_fps.clear();
-            return;
-        }
-        let mut fps = Vec::with_capacity(lines);
-        for l in 0..lines {
-            let mut h = DefaultHasher::new();
-            for c in 0..cols {
-                let ch = grid[Line(l as i32)][Column(c)].c;
-                if ch != '\0' {
-                    ch.hash(&mut h);
-                }
-            }
-            fps.push(h.finish());
-        }
-        let prev = std::mem::replace(&mut self.wrap_fps, fps.clone());
-        if prev.len() != fps.len() {
-            return;
-        }
-        for l in 1..lines {
-            if fps[l] != prev[l] && fps[l - 1] == prev[l - 1] {
-                let last = Column(cols - 1);
-                if grid[Line(l as i32 - 1)][last]
-                    .flags()
-                    .contains(Flags::WRAPLINE)
-                {
-                    grid[Line(l as i32 - 1)][last]
-                        .flags_mut()
-                        .remove(Flags::WRAPLINE);
-                }
             }
         }
     }
@@ -1235,15 +1195,21 @@ impl TermSurface {
         let mode = *self.session.terminal.term.lock().mode();
         if pressed {
             // Config keybinds first — they may re-map or disable defaults.
+            // `unbind` skips the default chord table too but still falls
+            // through to literal bytes — the reference's semantics: an
+            // unbound keypress reaches the shell as its raw escape.
+            let mut unbound = false;
             match self.app.config(|c| c.lookup_keybind(key, mods)) {
                 Some(Some(action)) => {
                     self.do_action(action);
                     return true;
                 }
-                Some(None) => return false, // explicitly disabled
+                Some(None) => unbound = true, // explicitly disabled
                 None => {}
             }
-            if let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods)) {
+            if !unbound
+                && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
+            {
                 self.do_action(action);
                 return true;
             }
@@ -2190,7 +2156,6 @@ impl SceneContent for TermSurface {
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);
-        self.sever_overwritten_wraps();
         self.session.pane_px.set((width, height));
 
         // A blinking cursor or live bell flash needs the next frame anyway;

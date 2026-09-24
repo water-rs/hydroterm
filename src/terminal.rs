@@ -26,7 +26,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Rgb;
 use polling::{Event as PollingEvent, PollMode, Poller};
 
-use crate::osctap::{OscScanner, TapEvent};
+use crate::osctap::{OscScanner, ShellRedraw, TapEvent};
 
 /// Everything the render loop needs to know that isn't cell data.
 pub enum TermEvent {
@@ -182,6 +182,15 @@ pub struct Terminal {
     /// the `D` (CommandEnd) row — `None` end while the command is still
     /// running. Recorded on the reader thread like `prompt_marks`.
     pub last_output: Arc<Mutex<OutputSpan>>,
+    /// `133;A;redraw=` repaint mode the shell announced for its prompt —
+    /// drives the prompt-region clear on resize. Default `True` matches
+    /// the reference terminal (a shell repaints its prompt until it says
+    /// otherwise).
+    shell_redraw: Arc<Mutex<ShellRedraw>>,
+    /// The prompt's rendered text, captured at `133;B` (prompt end) when
+    /// the `A` mark's row is still exact — the signature used to find
+    /// stale prompt generations on resize.
+    prompt_text: Arc<Mutex<String>>,
     pub events: Mutex<Receiver<TermEvent>>,
     /// Duplicated master fd — `tcgetpgrp` answers the slave's foreground
     /// pgroup without taking the reader's term lock.
@@ -207,6 +216,9 @@ pub struct SpawnOpts<'a> {
     pub env_extra: &'a [(String, String)],
     /// `shell-integration` — which shell gets the OSC 133/7 hooks.
     pub shell_integration: crate::config::ShellIntegration,
+    /// `shell-integration-features` — the extras baked into the hooks
+    /// (`cursor` style at the prompt, `sudo` env passthrough, `title`).
+    pub shell_features: crate::config::ShellFeatures,
 }
 
 impl Terminal {
@@ -225,7 +237,7 @@ impl Terminal {
 
         let (shell, extra_env) = match opts.shell {
             Some(s) => (s, HashMap::new()),
-            None => shell_with_integration(opts.shell_integration),
+            None => shell_with_integration(opts.shell_integration, opts.shell_features),
         };
         let mut env: HashMap<String, String> = [
             ("TERM".to_owned(), opts.term_name.to_owned()),
@@ -266,11 +278,15 @@ impl Terminal {
         let shell_pid = pty.child().id() as i32;
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
         let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
+        let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
+        let prompt_text = Arc::new(Mutex::new(String::new()));
         let pty = TapPty::new(
             pty,
             term.clone(),
             prompt_marks.clone(),
             last_output.clone(),
+            shell_redraw.clone(),
+            prompt_text.clone(),
             proxy.inner.events.clone(),
         );
 
@@ -283,7 +299,7 @@ impl Terminal {
         proxy.inner.notifier.set(Notifier(io.clone())).ok();
         let join = event_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, prompt_text, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
     }
 
     /// The program holding the PTY's foreground process group, or `None`
@@ -313,7 +329,13 @@ impl Terminal {
         {
             let mut term = self.term.lock();
             term.resize(TermSize { cols: cols as usize, lines: lines as usize });
-            sever_cursor_line_join(&mut term);
+            clear_prompt_for_redraw(
+                &mut term,
+                &self.prompt_marks,
+                &self.last_output,
+                &self.prompt_text,
+                *self.shell_redraw.lock().unwrap(),
+            );
         }
         let _ = self.io.lock().unwrap().send(Msg::Resize(WindowSize {
             num_lines: lines,
@@ -329,39 +351,130 @@ impl Terminal {
     }
 }
 
-/// Reset the cursor's logical line after a resize-reflow: blank the head
-/// rows above the cursor row and sever the wrap joins.
+/// Clear the prompt region after a resize-reflow so the shell's SIGWINCH
+/// repaint lands on clean rows — the reference terminal's
+/// `clearPromptForRedraw`, driven by the OSC 133 marks we already parse:
 ///
-/// Interactive line editors (readline) redraw the current line anchored at
-/// the cursor row and only erase the rows their *own* display model says
-/// the prompt occupied — never the extra rows reflow produced by wrapping
-/// the line. Those stale head rows keep their WRAPLINE joins, so the next
-/// reflow merges them into freshly rewritten rows and interleaves
-/// fragments mid-line. Blanking the head rows and severing the joins keeps
-/// each surviving row an ordinary, independently-wrapping line.
-fn sever_cursor_line_join<T: EventListener>(term: &mut Term<T>) {
+/// * `redraw` (`133;A;redraw=`) says how much the shell repaints:
+///   `False` clears nothing; `Last` (bash) clears only the cursor's row —
+///   blanking other prompt lines would erase text bash never rewrites;
+///   `True` (the default) clears from the prompt's first row to the page
+///   end.
+/// * A `C` mark awaiting its `D` means a command is still running — the
+///   cursor sits in its output, not a prompt — so nothing is cleared
+///   (the reference's `semantic_content != .output` check).
+/// * With no prompt marks at all nothing is cleared either — the
+///   prompt's start row is unknown, matching the reference for
+///   unintegrated shells.
+///
+/// The start row is the head of the logical line containing the cursor,
+/// found by walking WRAPLINE joins: for a single-line prompt that is the
+/// `A` mark's own row, and for multi-line prompts it is still inside the
+/// region `redraw=true` shells repaint. (The absolute mark rows recorded
+/// at emit time are not reused for the start — they drift when reflow
+/// moves rows.) The walk then continues upward over *contiguous* stale
+/// generations of that same line — rows whose leading text is a substring
+/// of the cursor line's own text — which is what the reference's
+/// contiguous prompt-marked region covers; an unrelated row ends the
+/// walk, so earlier prompts and output are never touched. Cells are
+/// blanked, never erased, and the WRAPLINE join into the cleared region
+/// is severed so the next reflow cannot splice stale rows back in.
+fn clear_prompt_for_redraw<T: EventListener>(
+    term: &mut Term<T>,
+    marks: &Mutex<Vec<i64>>,
+    output: &Mutex<OutputSpan>,
+    prompt_text: &Mutex<String>,
+    redraw: ShellRedraw,
+) {
+    if redraw == ShellRedraw::False {
+        return;
+    }
+    if matches!(*output.lock().unwrap(), Some((_, None))) {
+        return;
+    }
     let grid = term.grid_mut();
-    let cursor = grid.cursor.point.line.0;
     let cols = grid.columns();
-    if cols == 0 || cursor <= 0 {
+    if cols == 0 {
         return;
     }
-    // Walk to the head row of the logical line containing the cursor.
-    let last = Column(cols - 1);
-    let mut head = cursor;
-    while head > 0 && grid[Line(head - 1)][last].flags().contains(Flags::WRAPLINE) {
-        head -= 1;
-    }
-    if head == cursor {
-        return;
-    }
+    let cursor = grid.cursor.point.line.0;
     let template = grid.cursor.template.clone();
-    for line in head..cursor {
-        let row = &mut grid[Line(line)];
-        for col in 0..cols {
-            row[Column(col)] = template.clone();
+    let last = Column(cols - 1);
+    let clear_rows = |grid: &mut Term<T>, start: i32| {
+        // Sever the wrap join into the region so reflow cannot merge the
+        // stale row above it back into the cleared rows, then blank the
+        // cells (never erase rows — the shell expects the space).
+        if start > 0 {
+            grid.grid_mut()[Line(start - 1)][last].flags_mut().remove(Flags::WRAPLINE);
         }
-        row[last].flags_mut().remove(Flags::WRAPLINE);
+        let grid = grid.grid_mut();
+        for line in start..grid.screen_lines() as i32 {
+            for col in 0..cols {
+                grid[Line(line)][Column(col)] = template.clone();
+            }
+        }
+    };
+    match redraw {
+        ShellRedraw::False => unreachable!(),
+        // `redraw=last`: only the cursor's row may be cleared — other
+        // prompt lines are live text the shell never rewrites.
+        ShellRedraw::Last => clear_rows(term, cursor),
+        ShellRedraw::True => {
+            // The reference walks the cursor's contiguous prompt-marked
+            // region; without any marks there is no prompt to clear.
+            if marks.lock().unwrap().is_empty() {
+                return;
+            }
+            let mut head = cursor;
+            while head > 0
+                && grid[Line(head - 1)][last].flags().contains(Flags::WRAPLINE)
+            {
+                head -= 1;
+            }
+            // Stale generations of the current render sit directly above
+            // the head — the shell's erase pass severed their WRAPLINE
+            // joins, so they are dead rows the repaint never reaches. The
+            // reference clears them because they fall inside the marked
+            // prompt region (mark → page end); our absolute mark row
+            // drifts under reflow, so the region is instead bounded by
+            // content: a row whose leading text is a fragment of the
+            // prompt's rendered text (captured at `133;B`, plus the live
+            // input line for typed-input generations) is a stale copy of
+            // that same prompt. The walk is contiguous, so it stops at
+            // the first unrelated row — earlier prompts and command
+            // output are never touched.
+            let mut haystack = prompt_text.lock().unwrap().clone();
+            for line in head..=cursor {
+                for col in 0..cols {
+                    haystack.push(grid[Line(line)][Column(col)].c);
+                }
+            }
+            let mut start = head;
+            while start > 0 {
+                let mut row_text = String::new();
+                for col in 0..cols {
+                    row_text.push(grid[Line(start - 1)][Column(col)].c);
+                }
+                let frag = row_text.trim();
+                if frag.is_empty() {
+                    // The shell's erase pass can blank a stale row entirely —
+                    // skip through it; unrelated rows above still stop the walk.
+                    start -= 1;
+                    continue;
+                }
+                let prefix: String = frag.chars().take(6).collect();
+                if frag.len() < 3 || !haystack.contains(prefix.as_str()) {
+                    break;
+                }
+                start -= 1;
+            }
+            if std::env::var_os("HYDROTERM_DEBUG_RESIZE").is_some() {
+                eprintln!(
+                    "[resize-clear] cursor={cursor} head={head} start={start} haystack={haystack:?}"
+                );
+            }
+            clear_rows(term, start);
+        }
     }
 }
 
@@ -372,6 +485,7 @@ fn sever_cursor_line_join<T: EventListener>(term: &mut Term<T>) {
 /// one shell (`none` disables it entirely, `detect` is all supported).
 fn shell_with_integration(
     mode: crate::config::ShellIntegration,
+    features: crate::config::ShellFeatures,
 ) -> (Shell, HashMap<String, String>) {
     use crate::config::ShellIntegration as SI;
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -387,7 +501,7 @@ fn shell_with_integration(
         return (Shell::new(program, Vec::new()), HashMap::new());
     }
     match name {
-        "bash" => match bash_integration_rc() {
+        "bash" => match bash_integration_rc(features) {
             Some(rc) => (Shell::new(program, vec!["--rcfile".into(), rc]), HashMap::new()),
             None => (Shell::new(program, Vec::new()), HashMap::new()),
         },
@@ -414,9 +528,23 @@ fn integration_base() -> Option<PathBuf> {
 }
 
 /// Write the bash integration rcfile to the cache dir; returns its path.
-fn bash_integration_rc() -> Option<String> {
+/// `features` (`shell-integration-features`) gates the optional blocks:
+/// `title` drives the window/tab title from the prompt, `cursor` switches
+/// the cursor to a bar while editing, `sudo` keeps the terminal's env
+/// under sudo.
+fn bash_integration_rc(features: crate::config::ShellFeatures) -> Option<String> {
     let path = integration_base()?.join("shell-integration.bash");
-    std::fs::write(&path, BASH_INTEGRATION).ok()?;
+    let mut rc = BASH_INTEGRATION.to_owned();
+    if features.title {
+        rc.push_str("PS1='\\[\\e]0;\\u@\\h:\\w\\a\\e\\\\\\]'\"$PS1\"\n");
+    }
+    if features.cursor {
+        rc.push_str("PS1='\\[\\e[5 q\\]'\"$PS1\"\nPS0='\\[\\e[2 q\\]'\"$PS0\"\n");
+    }
+    if features.sudo {
+        rc.push_str("sudo() { command sudo TERM=\"$TERM\" \"$@\"; }\n");
+    }
+    std::fs::write(&path, rc).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -507,6 +635,8 @@ pub struct TapReader {
     _term: Arc<FairMutex<Term<EventProxy>>>,
     marks: Arc<std::sync::Mutex<Vec<i64>>>,
     output: Arc<Mutex<OutputSpan>>,
+    redraw: Arc<Mutex<ShellRedraw>>,
+    prompt_text: Arc<Mutex<String>>,
     sink: Sender<TermEvent>,
 }
 
@@ -516,6 +646,8 @@ impl TapPty {
         term: Arc<FairMutex<Term<EventProxy>>>,
         marks: Arc<std::sync::Mutex<Vec<i64>>>,
         output: Arc<Mutex<OutputSpan>>,
+        redraw: Arc<Mutex<ShellRedraw>>,
+        prompt_text: Arc<Mutex<String>>,
         sink: Sender<TermEvent>,
     ) -> Self {
         let term_ptr = {
@@ -533,6 +665,8 @@ impl TapPty {
             _term: term,
             marks,
             output,
+            redraw,
+            prompt_text,
             sink,
         };
         Self { inner: pty, reader }
@@ -544,6 +678,34 @@ impl TapReader {
     /// position (this runs on the event-loop thread, with the `Term` only
     /// try-lockable — `lock` would deadlock against the reader's lease).
     fn dispatch(&mut self, ev: TapEvent) {
+        if let TapEvent::ShellRedraw(r) = ev {
+            *self.redraw.lock().unwrap() = r;
+            let _ = self.sink.send(TermEvent::Tap(ev));
+            return;
+        }
+        if let TapEvent::PromptEnd = ev {
+            // Snapshot the prompt's rendered text while the `A` mark's row
+            // is still exact — it is the signature `clear_prompt_for_redraw`
+            // matches stale prompt generations against.
+            // SAFETY: dereferenced on the event-loop thread only (see
+            // `TermPtr`); the `Arc<FairMutex<Term>>` outlives the reader.
+            let term = unsafe { &*self.term.0 };
+            let grid = term.grid();
+            if let Some(&mark) = self.marks.lock().unwrap().last() {
+                let first = (mark - grid.history_size() as i64).max(0) as i32;
+                let last = grid.cursor.point.line.0;
+                let cols = grid.columns();
+                let mut text = String::new();
+                for line in first..=last {
+                    for col in 0..cols {
+                        text.push(grid[Line(line)][Column(col)].c);
+                    }
+                }
+                *self.prompt_text.lock().unwrap() = text;
+            }
+            let _ = self.sink.send(TermEvent::Tap(ev));
+            return;
+        }
         if matches!(
             ev,
             TapEvent::PromptStart | TapEvent::CommandStart | TapEvent::CommandEnd(_)
@@ -1007,6 +1169,11 @@ mod tests {
                 term_name: "xterm-256color",
                 env_extra: &[],
                 shell_integration: crate::config::ShellIntegration::Detect,
+                shell_features: crate::config::ShellFeatures {
+                    cursor: true,
+                    sudo: true,
+                    title: true,
+                },
             },
         )
         .unwrap();

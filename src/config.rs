@@ -47,6 +47,28 @@ pub enum ShellIntegration {
     Fish,
 }
 
+/// `shell-integration-features` — which integration extras a supported
+/// shell gets (Ghostty `cursor,sudo,title`; `no-` prefixes disable).
+#[derive(Debug, Clone, Copy)]
+pub struct ShellFeatures {
+    /// Cursor style changes at the prompt (bar while editing).
+    pub cursor: bool,
+    /// `sudo` wrapper preserving the terminal's env under sudo.
+    pub sudo: bool,
+    /// Window/tab title driven by the prompt (`user@host:cwd`).
+    pub title: bool,
+}
+
+/// `quick-terminal-position` — where the drop-down docks on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickTermPosition {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+}
+
 /// Fully-resolved settings — defaults plus file overrides.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -59,6 +81,13 @@ pub struct AppConfig {
     pub copy_on_select: CopyOnSelect,
     /// `shell-integration` — which shell gets the injected hooks.
     pub shell_integration: ShellIntegration,
+    /// `shell-integration-features` — the integration extras (cursor,
+    /// sudo, title); each can be turned off with `no-<feature>`.
+    pub shell_features: ShellFeatures,
+    /// `quick-terminal-position` — drop-down dock edge (top default).
+    pub quick_terminal_position: QuickTermPosition,
+    /// `clipboard-trim` — trim whitespace at the ends of copied text.
+    pub clipboard_trim: bool,
     /// `desktop-notifications` — OSC 9/777 also posts a freedesktop
     /// notification via `notify-send` when available.
     pub desktop_notifications: bool,
@@ -268,6 +297,9 @@ impl Default for AppConfig {
             theme: ThemeRef::Named("hydroterm-dark".into()),
             copy_on_select: CopyOnSelect::Both,
             shell_integration: ShellIntegration::Detect,
+            shell_features: ShellFeatures { cursor: true, sudo: true, title: true },
+            quick_terminal_position: QuickTermPosition::Top,
+            clipboard_trim: true,
             desktop_notifications: true,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
@@ -414,6 +446,10 @@ confirm-close = true       # ask before closing a running program
 # word-select-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
 # visual-bell = true      # flash the pane on BEL
 # open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
+# quick-terminal-position = top   # top | bottom | left | right | center
+# shell-integration-features = cursor,sudo,title   # prefix a feature with no- to disable
+# clipboard-trim = true   # trim whitespace at the ends of copied text
+# keybind = ctrl+shift+q=unbind   # unbind a chord (falls through to literal keys)
 
 # Alpha of the terminal background fill (0..1); set below 1.0 at launch
 # for a translucent window over the desktop.
@@ -620,6 +656,40 @@ impl AppConfig {
                     "zsh" => cfg.shell_integration = ShellIntegration::Zsh,
                     "fish" => cfg.shell_integration = ShellIntegration::Fish,
                     _ => errors.push(format!("line {}: bad shell-integration {value:?}", n + 1)),
+                },
+                "shell-integration-features" => {
+                    for feat in value.split(',') {
+                        let feat = feat.trim();
+                        match feat {
+                            "cursor" => cfg.shell_features.cursor = true,
+                            "no-cursor" => cfg.shell_features.cursor = false,
+                            "sudo" => cfg.shell_features.sudo = true,
+                            "no-sudo" => cfg.shell_features.sudo = false,
+                            "title" => cfg.shell_features.title = true,
+                            "no-title" => cfg.shell_features.title = false,
+                            "" => {}
+                            _ => errors.push(format!(
+                                "line {}: bad shell-integration-feature {feat:?}",
+                                n + 1
+                            )),
+                        }
+                    }
+                }
+                "quick-terminal-position" => match value {
+                    "top" => cfg.quick_terminal_position = QuickTermPosition::Top,
+                    "bottom" => cfg.quick_terminal_position = QuickTermPosition::Bottom,
+                    "left" => cfg.quick_terminal_position = QuickTermPosition::Left,
+                    "right" => cfg.quick_terminal_position = QuickTermPosition::Right,
+                    "center" => cfg.quick_terminal_position = QuickTermPosition::Center,
+                    _ => errors.push(format!(
+                        "line {}: bad quick-terminal-position {value:?}",
+                        n + 1
+                    )),
+                },
+                "clipboard-trim" => match value {
+                    "true" | "1" | "yes" | "on" => cfg.clipboard_trim = true,
+                    "false" | "0" | "no" | "off" => cfg.clipboard_trim = false,
+                    _ => errors.push(format!("line {}: bad clipboard-trim {value:?}", n + 1)),
                 },
                 "desktop-notifications" => {
                     cfg.desktop_notifications = bool_value(value, n, &mut errors);

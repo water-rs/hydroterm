@@ -168,6 +168,7 @@ impl Session {
                 term_name: &cfg.term,
                 env_extra: &cfg.env,
                 shell_integration: cfg.shell_integration,
+                shell_features: cfg.shell_features,
             },
         )
             .expect("failed to spawn PTY — is a shell available?");
@@ -826,16 +827,26 @@ impl AppState {
         })
         .style(WindowStyle::Borderless)
         .resizable(false);
-        // Dock: top of the primary screen, full width, 45% height. The
-        // initial frame is requested up front — position applied while the
-        // X11 window is still invisible is currently dropped by the WM
+        // `quick-terminal-position` — dock geometry on the primary
+        // screen (top/bottom: full width × 45% height; left/right:
+        // 40% width × full height; center: 70%×70% centered). The initial
+        // frame is requested up front — position applied while the X11
+        // window is still invisible is currently dropped by the WM
         // (hydrolysis#105), so the drop-down may land wherever the window
         // manager places it until that fix lands. No timed re-emit: racing
         // the WM is forbidden workaround, not a fix.
         if let Some((sw, sh)) = crate::quickterm::screen_size() {
+            use crate::config::QuickTermPosition as P;
+            let (x, y, w_px, h_px) = match self.config(|c| c.quick_terminal_position) {
+                P::Top => (0.0, 0.0, sw, sh * 0.45),
+                P::Bottom => (0.0, sh * 0.55, sw, sh * 0.45),
+                P::Left => (0.0, 0.0, sw * 0.40, sh),
+                P::Right => (sw * 0.60, 0.0, sw * 0.40, sh),
+                P::Center => (sw * 0.15, sh * 0.15, sw * 0.70, sh * 0.70),
+            };
             w.frame.set(Rect::new(
-                Point::new(0.0, 0.0),
-                Size::new(sw as f32, (sh * 0.45) as f32),
+                Point::new(x as f32, y as f32),
+                Size::new(w_px as f32, h_px as f32),
             ));
         }
         w

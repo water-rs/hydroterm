@@ -3,9 +3,8 @@
 // prompt at the new width?
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::grid::GridCell;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::{Config, Term, cell::{Cell, Flags}};
+use alacritty_terminal::term::{Config, Term, cell::Cell};
 use alacritty_terminal::vte::ansi::Processor;
 
 struct Sz(usize, usize);
@@ -63,18 +62,16 @@ fn main() {
     let step14 = b"\r             \r<oterm$ ";
     for (cols, bytes) in [(31usize, &step31[..]), (14usize, &step14[..])] {
         term.resize(Sz(24, cols));
-        // Mirror of hydroterm's sever_cursor_line_join.
+        // Mirror of hydroterm's clear_prompt_for_redraw at `redraw=last`
+        // (what our bash integration emits): blank the cursor row only.
         {
             let grid = term.grid_mut();
             let cursor = grid.cursor.point.line.0;
-            if cursor > 0 {
-                let above = Line(cursor - 1);
-                let last = Column(cols - 1);
-                if grid[above][last].flags().contains(Flags::WRAPLINE) {
-                    grid[above][last].flags_mut().remove(Flags::WRAPLINE);
-                    println!("  [severed join at row {}]", cursor - 1);
-                }
+            let template = grid.cursor.template.clone();
+            for col in 0..cols {
+                grid[Line(cursor)][Column(col)] = template.clone();
             }
+            println!("  [cleared cursor row {cursor}]");
         }
         println!("=== after resize to {cols} (no redraw yet) ===");
         dump(&term, cols);
