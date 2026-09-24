@@ -357,7 +357,10 @@ pub struct PaneTab {
     pub id: u64,
     pub title: Binding<Str>,
     pub tree: Binding<SplitNode>,
-    /// Focused session id inside `tree`.
+    /// Focused session id inside `tree` — the per-tab *record* of which
+    /// pane is active (drives the unfocused-dim + title sync). The actual
+    /// embedded key focus lives in `AppState::focus_owner` and syncs here
+    /// through the `on_change` watcher in `tabs_view`.
     pub focused: Binding<u64>,
     /// Zoomed pane: `Some(id)` renders only that leaf (it fills the tab);
     /// `None` = normal split layout. tmux zoom / kitty overlay semantics.
@@ -378,6 +381,11 @@ pub struct AppState {
     session_tab: Arc<Mutex<HashMap<u64, u64>>>,
     /// Selected tab id.
     pub selected: Binding<u64>,
+    /// `(tab_id, session_id)` of the pane holding embedded key focus —
+    /// the single source `.focused` modifiers consume. `None` while no
+    /// pane is focused (e.g. focus on the search field). Written back by
+    /// hydrolysis when pointer focus moves between surfaces.
+    pub focus_owner: Binding<Option<(u64, u64)>>,
     /// Window title binding.
     pub window_title: Binding<Str>,
     /// Window state binding — normal/minimized/fullscreen/closed.
@@ -483,6 +491,7 @@ impl AppState {
             tabs: NamiList::new(),
             session_tab: Arc::new(Mutex::new(HashMap::new())),
             selected: Binding::u64(0),
+            focus_owner: Binding::default(),
             window_title: binding(Str::from("hydroterm")),
             window_state: binding(WindowState::Normal),
             window_frame: Rc::new(RefCell::new(None)),
@@ -509,7 +518,12 @@ impl AppState {
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         };
-        state.new_tab();
+        let first_tab = state.new_tab();
+        // Seed the embedded-focus owner so `.focused` grants key focus to
+        // the first pane at mount — the launch dead-keys fix (#29).
+        if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
+            state.focus_owner.set(Some((first_tab, t.focused.get())));
+        }
         // `-e` applies to the first session only (like xterm/kitty).
         state.cfg.borrow_mut().config.command = None;
         // `theme = auto`: watch the desktop color-scheme. gsettings
@@ -708,6 +722,11 @@ impl AppState {
             },
         )
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        if state.config(|c| c.window_fullscreen) {
+            state
+                .window_state
+                .set(WindowState::Fullscreen);
+        }
         window.show(env);
     }
 
@@ -829,7 +848,7 @@ impl AppState {
             .lock()
             .unwrap()
             .insert(session.id, tab_id);
-        tab.focused.set(session.id);
+        self.focus_pane(session.id);
         Some(session.id)
     }
 
@@ -848,6 +867,9 @@ impl AppState {
             return;
         }
         tab.focused.set(session_id);
+        if self.selected.get() == tab_id {
+            self.focus_owner.set(Some((tab_id, session_id)));
+        }
         if let Some(s) = self.session(session_id) {
             tab.title.set(s.title.get());
         }
@@ -1062,7 +1084,7 @@ impl AppState {
                 if tab.focused.get() == session_id
                     && let Some(next) = new_tree.leaves().first()
                 {
-                    tab.focused.set(*next);
+                    self.focus_pane(*next);
                 }
                 tab.tree.set(new_tree);
             }
@@ -1139,8 +1161,9 @@ impl AppState {
 struct PaneLeaf {
     session: Rc<Session>,
     state: AppState,
-    /// The owning tab's focused-pane id — the unfocused-dim computed
-    /// compares this pane's session id against it.
+    /// The owning tab's id and its focused-pane record — `.focused` on
+    /// the surface reads `AppState::focus_owner`, the dim compares this.
+    tab_id: u64,
     focused: Binding<u64>,
 }
 
@@ -1164,7 +1187,15 @@ impl View for PaneLeaf {
         );
         // Reactive IBeam/pointing-hand over Ctrl-hovered links.
         let hover_cursor = term_surface.hover_cursor.clone();
+        // `.focused` is hydrolysis's programmatic embedded-focus grant
+        // (#132): when `focus_owner == (this tab, this pane)` the surface
+        // takes key focus without a click — at launch, after a tab switch,
+        // and across split rebuilds. Pointer focus writes back into
+        // `focus_owner`; the `on_change` watchers in `tabs_view` keep it
+        // and `tab.focused` in sync. Hidden tabs' panes never match the
+        // owner, so only the visible pane can hold embedded focus.
         let surface = SceneView::new(term_surface)
+            .focused(&self.state.focus_owner, (self.tab_id, self.session.id))
             .cursor(hover_cursor)
             // Drag-and-drop: a file dropped on the pane pastes its
             // shell-quoted path into the PTY (Ghostty/kitty behaviour).
@@ -1304,7 +1335,7 @@ impl View for PaneLeaf {
 }
 
 /// Render one pane node as WaterUI views.
-fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyView {
+fn pane_view(node: &SplitNode, focused: &Binding<u64>, tab_id: u64, state: &AppState) -> AnyView {
     match node {
         SplitNode::Leaf(sid) => {
             let session = state.session(*sid);
@@ -1312,6 +1343,7 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyV
                 Some(session) => PaneLeaf {
                     session,
                     state: state.clone(),
+                    tab_id,
                     focused: focused.clone(),
                 }
                 .anyview(),
@@ -1354,7 +1386,7 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyV
                         let st = state.clone();
                         let d = *dir;
                         move || {
-                            let child_view = pane_view(&child, &foc, &st);
+                            let child_view = pane_view(&child, &foc, tab_id, &st);
                             let ext = extent.clone();
                             let frame = Frame::new(child_view);
                             match d {
@@ -1370,7 +1402,7 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, state: &AppState) -> AnyV
                     let st = state.clone();
                     // No measured extent yet — let the stack share space
                     // equally until the seed lands.
-                    move || pane_view(&child, &foc, &st)
+                    move || pane_view(&child, &foc, tab_id, &st)
                 });
                 views.push(framed.anyview());
             }
@@ -1578,14 +1610,15 @@ fn tab_content(tab: PaneTab, app: AppState) -> impl View {
         let app = app.clone();
         let tree = tab.tree.clone();
         let tab_focused = tab.focused.clone();
+        let tab_id = tab.id;
         move |z: Option<u64>| {
             if let Some(z) = z.filter(|z| app.session(*z).is_some()) {
-                pane_view(&SplitNode::Leaf(z), &tab_focused, &app)
+                pane_view(&SplitNode::Leaf(z), &tab_focused, tab_id, &app)
             } else {
                 watch(tree.clone(), {
                     let app = app.clone();
                     let tab_focused = tab_focused.clone();
-                    move |node: SplitNode| pane_view(&node, &tab_focused, &app)
+                    move |node: SplitNode| pane_view(&node, &tab_focused, tab_id, &app)
                 })
                 .anyview()
             }
@@ -1683,6 +1716,34 @@ pub fn tabs_view(state: AppState) -> impl View {
         settings_overlay,
         quick,
     ))
+    // Tab switch → grant embedded focus to that tab's remembered pane.
+    .on_change(&state.selected, {
+        let app = state.clone();
+        move |sel: u64| {
+            if let Some(t) = app.tabs.iter().find(|t| t.id == sel) {
+                app.focus_owner.set(Some((sel, t.focused.get())));
+            }
+        }
+    })
+    // Pointer/programmatic focus write-back → keep the per-tab focus
+    // record (unfocused dim, title sync) following the real owner. Only
+    // the selected tab can ever appear here, so a hidden tab's pane can
+    // never be recorded as focused.
+    .on_change(&state.focus_owner, {
+        let app = state.clone();
+        move |o: Option<(u64, u64)>| {
+            let Some((tab_id, session_id)) = o else { return };
+            let Some(t) = app.tabs.iter().find(|t| t.id == tab_id) else {
+                return;
+            };
+            if t.focused.get() != session_id {
+                t.focused.set(session_id);
+                if let Some(s) = app.session(session_id) {
+                    t.title.set(s.title.get());
+                }
+            }
+        }
+    })
     .state(&state)
 }
 

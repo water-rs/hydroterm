@@ -28,10 +28,12 @@ mod surface;
 mod terminal;
 mod theme;
 mod xcursor;
+mod xsel;
 
 use waterui::app::App;
 use waterui::prelude::*;
 use waterui::window::Window;
+use waterui::window::WindowState::Fullscreen;
 use waterui_core::layout::{Rect, Size};
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...]`
@@ -98,6 +100,11 @@ fn main() {
         }
     }
     *state.window_frame.borrow_mut() = Some(window.frame.clone());
+    // `window-fullscreen`: every window starts fullscreen (same binding
+    // F11 toggles, so it can be toggled back out).
+    if state.config(|c| c.window_fullscreen) {
+        state.window_state.set(Fullscreen);
+    }
     let app = App::new_with_windows([window], Environment::new());
     hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }

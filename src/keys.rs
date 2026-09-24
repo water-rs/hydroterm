@@ -389,6 +389,9 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             NamedKey::PageDown => TermAction::MoveTabRight,
             NamedKey::Home => TermAction::ScrollToTop,
             NamedKey::End => TermAction::ScrollToBottom,
+            // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
+            // convention) — same action as Ctrl+Shift+Z.
+            NamedKey::Enter => TermAction::PaneZoom,
             _ => return None,
         });
     }

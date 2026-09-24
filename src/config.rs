@@ -105,6 +105,8 @@ pub struct AppConfig {
     /// Restore the last window geometry on launch and save it as the
     /// window moves/resizes (Ghostty `window-save-state`).
     pub window_save_state: bool,
+    /// Launch every window fullscreen (Ghostty `window-fullscreen`).
+    pub window_fullscreen: bool,
     /// `env = NAME=VALUE` lines injected into spawned shells' environment.
     pub env: Vec<(String, String)>,
     /// Extra spacing per cell: `adjust-cell-width`/`adjust-cell-height`
@@ -152,6 +154,7 @@ impl Default for AppConfig {
             window_width: 0.0,
             window_height: 0.0,
             window_save_state: false,
+            window_fullscreen: false,
             env: Vec::new(),
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
@@ -209,6 +212,7 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
 confirm-close = true       # ask before closing a running program
 # window-width = 800       # initial window size in points (0 = default)
+# window-fullscreen = false  # start windows fullscreen
 # window-height = 600
 # window-save-state = true # remember window geometry across launches
 # adjust-cell-width = 10%  # widen cells: N% or Npx
@@ -419,6 +423,9 @@ impl AppConfig {
                 },
                 "window-save-state" | "window_save_state" => {
                     cfg.window_save_state = bool_value(value, n, &mut errors);
+                }
+                "window-fullscreen" | "window_fullscreen" => {
+                    cfg.window_fullscreen = bool_value(value, n, &mut errors);
                 }
                 "env" => match value.split_once('=') {
                     Some((name, val)) if !name.trim().is_empty() => {
@@ -980,6 +987,13 @@ mod tests {
         assert!((cfg.window_width - 1024.0).abs() < f32::EPSILON);
         assert!((cfg.window_height - 768.0).abs() < f32::EPSILON);
         assert!(cfg.window_save_state);
+    }
+
+    #[test]
+    fn parses_window_fullscreen() {
+        let (cfg, errs) = AppConfig::parse("window-fullscreen = true\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.window_fullscreen);
     }
 
     #[test]

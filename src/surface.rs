@@ -291,6 +291,9 @@ pub struct TermSurface {
     cursor_hider: Option<crate::xcursor::CursorHider>,
     /// Set when the hider was attempted — avoid reconnecting per frame.
     cursor_hider_tried: bool,
+    /// X11 PRIMARY selection owner — claims on copy-on-select, serves
+    /// middle-click pastes to other clients. `None` off-X11.
+    xsel: Option<crate::xsel::Xsel>,
     /// Last pointer position in surface-local coords — re-evaluates the
     /// Ctrl+hover link affordance when the modifier chord changes.
     pointer_at: (f64, f64),
@@ -344,6 +347,7 @@ impl TermSurface {
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
             cursor_hider: None,
             cursor_hider_tried: false,
+            xsel: crate::xsel::Xsel::new(),
             pointer_at: (0.0, 0.0),
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
@@ -435,8 +439,16 @@ impl TermSurface {
 
     fn copy_selection(&mut self) {
         let text = self.session.terminal.term.lock().selection_to_string();
-        if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut()) {
-            let _ = clip.set_text(&text);
+        if let Some(text) = text {
+            if let Some(clip) = self.clipboard.as_mut() {
+                let _ = clip.set_text(&text);
+            }
+            // X11: the selection clipboard is also PRIMARY — a middle
+            // click anywhere pastes what was last selected (xterm/Ghostty
+            // `copy-on-select = true` semantics).
+            if let Some(xsel) = &self.xsel {
+                xsel.claim(text);
+            }
         }
     }
 
@@ -1344,7 +1356,22 @@ impl TermSurface {
                     self.last_click = Some((now, row, col, count));
                 }
                 SurfacePointerButton::Middle => {
-                    self.paste_clipboard();
+                    // Middle click pastes PRIMARY on X11 (xterm
+                    // convention); CLIPBOARD when PRIMARY is empty or
+                    // we're off-X11.
+                    match crate::xsel::Xsel::read() {
+                        Some(text) => {
+                            let bracketed = self
+                                .session
+                                .terminal
+                                .term
+                                .lock()
+                                .mode()
+                                .contains(TermMode::BRACKETED_PASTE);
+                            self.paste_text(&text, bracketed);
+                        }
+                        None => self.paste_clipboard(),
+                    }
                 }
                 SurfacePointerButton::Secondary
                     if self.session.terminal.term.lock().selection.is_some() =>
