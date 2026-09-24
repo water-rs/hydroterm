@@ -803,7 +803,7 @@ impl AppState {
             return;
         }
         let (tx, rx) = async_channel::unbounded::<()>();
-        match crate::quickterm::spawn_hotkey(tx, crate::quickterm::XK_F12, ()) {
+        match crate::quickterm::spawn_hotkey(tx, crate::quickterm::XK_F12, 0, ()) {
             Some(_) => {
                 let app = self.clone();
                 let task = spawn_local(async move {
@@ -816,6 +816,60 @@ impl AppState {
             }
             None => {
                 *self.quick_unavailable.borrow_mut() = true;
+            }
+        }
+        self.start_global_hotkeys();
+    }
+
+    /// Grab each `keybind = global:chord=action` on the X11 root window.
+    /// A chord press anywhere fires the action through the same dispatch
+    /// as a window-local keybind (focused session first, app-level
+    /// fallback). Idempotent — grabbed once per launch.
+    fn start_global_hotkeys(&self) {
+        let globals: Vec<(String, Option<TermAction>)> = self
+            .config(|c| {
+                c.keybinds
+                    .iter()
+                    .filter(|(chord, _)| chord.starts_with("global:"))
+                    .cloned()
+                    .collect()
+            });
+        for (chord, action) in globals {
+            let Some(action) = action else { continue };
+            let body = &chord["global:".len()..];
+            // Canonical order: ctrl+alt+shift+super+key.
+            let mut mods = [false; 4];
+            let mut key = "";
+            for part in body.split('+') {
+                match part {
+                    "ctrl" => mods[0] = true,
+                    "alt" => mods[1] = true,
+                    "shift" => mods[2] = true,
+                    "super" => mods[3] = true,
+                    k => key = k,
+                }
+            }
+            let Some(keysym) = crate::quickterm::key_name_to_keysym(key) else {
+                tracing::warn!(chord, "global: unmapped key name");
+                continue;
+            };
+            let mod_bits =
+                crate::quickterm::chord_mod_bits(mods[0], mods[1], mods[2], mods[3]);
+            let (tx, rx) = async_channel::unbounded::<TermAction>();
+            match crate::quickterm::spawn_hotkey(tx, keysym, mod_bits, action) {
+                Some(_) => {
+                    let app = self.clone();
+                    spawn_local(async move {
+                        while let Ok(action) = rx.recv().await {
+                            while rx.try_recv().is_ok() {}
+                            app.run_palette_action(action);
+                        }
+                    })
+                    .detach();
+                }
+                None => {
+                    tracing::warn!(chord, "global: grab failed (taken or no X11)");
+                }
             }
         }
     }
@@ -929,16 +983,28 @@ impl AppState {
         // `working-directory` fills in when no OSC 7 cwd was inherited.
         let cwd = cwd.or_else(|| cfg.working_directory.clone());
         let session = Rc::new(Session::spawn(id, cwd, &cfg));
+        // `window-inherit-font-size`: a spawned surface takes the
+        // focused surface's live zoom instead of the config value.
+        if cfg.inherit_font_size
+            && let Some(focused) = self.focused_session()
+        {
+            session.font_size.set(focused.font_size.snapshot());
+        }
         self.sessions.borrow_mut().push(session.clone());
         session
     }
 
     /// Spawn a session, wrap it in a new tab, select it. Inherits the OSC 7
-    /// cwd of the currently focused session when the shell reported one.
+    /// cwd of the currently focused session when the shell reported one
+    /// (`window-inherit-working-directory`).
     pub fn new_tab(&self) -> u64 {
         let cwd = self
-            .focused_session()
-            .and_then(|s| s.cwd.lock().unwrap().clone());
+            .config(|c| c.inherit_working_directory)
+            .then(|| {
+                self.focused_session()
+                    .and_then(|s| s.cwd.lock().unwrap().clone())
+            })
+            .flatten();
         let session = self.spawn_session(cwd);
         self.adopt_tab(session)
     }
@@ -968,7 +1034,21 @@ impl AppState {
             .unwrap()
             .insert(session.id, tab.id);
         let tab_id = tab.id;
-        self.tabs.push(tab);
+        // `window-new-tab-position = current` inserts right after the
+        // selected tab instead of appending at the strip's end.
+        match self.config(|c| c.new_tab_position) {
+            crate::config::NewTabPosition::Current => {
+                let sel = self.selected.snapshot();
+                let at = self
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == sel)
+                    .map(|i| i + 1)
+                    .unwrap_or_else(|| self.tabs.len());
+                self.tabs.insert(at, tab);
+            }
+            crate::config::NewTabPosition::End => self.tabs.push(tab),
+        }
         self.tab_count.set(self.tabs.len());
         self.selected.set(tab_id);
         tab_id
@@ -1770,15 +1850,21 @@ fn divider_handle(
             move |event: Option<Use<DragEvent>>,
                   State(sizes): State<Binding<Vec<f32>>>,
                   State(grab): State<Binding<Option<(f32, f32)>>>| {
-                if std::env::var_os("HYDROTERM_DEBUG_GESTURE").is_some() {
-                    eprintln!("[divider {:?}] fired: present={}", dir, event.is_some());
-                }
+                let present = event.is_some();
                 let Some(event) = event.map(|e| e.0) else { return };
-                if std::env::var_os("HYDROTERM_DEBUG_GESTURE").is_some() {
-                    eprintln!("[divider {:?}] phase={:?} t=({:.1},{:.1})", dir, event.phase, event.translation.x, event.translation.y);
-                }
+                tracing::debug!(?dir, present, phase = ?event.phase, t = ?event.translation, "divider");
                 match event.phase {
                     GesturePhase::Started => {
+                        // A press just inside a pane's edge starts a drag
+                        // selection that this gesture then steals — the
+                        // drag owns the pointer now, so drop the
+                        // half-formed highlight on both sides.
+                        for leaf in left.leaves().into_iter().chain(right.leaves()) {
+                            if let Some(s) = app.session(leaf) {
+                                let had = s.terminal.term.lock().selection.take().is_some();
+                                tracing::debug!(leaf, had, "divider clears selection");
+                            }
+                        }
                         grab.set(Some((
                             subtree_px(&left, &app, dir),
                             subtree_px(&right, &app, dir),
@@ -2206,6 +2292,7 @@ impl AppState {
                 self.new_tab();
             }
             TermAction::NewWindow => self.new_window(),
+            TermAction::ToggleQuickTerminal => self.toggle_quick(),
             TermAction::NextTab => self.cycle_tab(1),
             TermAction::PrevTab => self.cycle_tab(-1),
             TermAction::Fullscreen => self.toggle_fullscreen(),

@@ -43,13 +43,55 @@ pub fn screen_size() -> Option<(f64, f64)> {
     ))
 }
 
+/// Canonical keybind key name → X11 keysym, for `global:` chords. Covers
+/// the whole `canonical_key_name` set: single chars, F1–F24, and the
+/// named navigation keys.
+pub fn key_name_to_keysym(name: &str) -> Option<u32> {
+    let mut ch = name.chars();
+    if let (Some(c), None) = (ch.next(), ch.next()) {
+        return Some(u32::from(c));
+    }
+    if let Some(digits) = name.strip_prefix('f')
+        && let Ok(d) = digits.parse::<u32>()
+        && (1..=24).contains(&d)
+    {
+        return Some(0xffbd + d); // XK_F1 = 0xffbe
+    }
+    Some(match name {
+        "arrowup" => 0xff52,
+        "arrowdown" => 0xff54,
+        "arrowleft" => 0xff51,
+        "arrowright" => 0xff53,
+        "pageup" => 0xff55,
+        "pagedown" => 0xff56,
+        "home" => 0xff50,
+        "end" => 0xff57,
+        "insert" => 0xff63,
+        "delete" => 0xffff,
+        "backspace" => 0xff08,
+        "tab" => 0xff09,
+        "enter" => 0xff0d,
+        "escape" => 0xff1b,
+        "space" => 0x20,
+        _ => return None,
+    })
+}
+
+/// `ctrl+alt+shift+super` bits of a canonical chord → an X11 `ModMask`
+/// bitfield (Shift=0x01, Control=0x04, Mod1/Alt=0x08, Mod4/Super=0x40).
+pub fn chord_mod_bits(ctrl: bool, alt: bool, shift: bool, sup: bool) -> u8 {
+    (shift as u8) | ((alt as u8) << 3) | ((ctrl as u8) << 2) | ((sup as u8) << 6)
+}
+
 /// Spawn the grab thread. `Some` only on a reachable X11 display where the
 /// key is free — under Wayland, headless, or when another client already
 /// owns the hotkey it returns `None` and the caller marks the feature
-/// unavailable.
+/// unavailable. `mod_bits` are extra modifiers that must be held
+/// (`chord_mod_bits`).
 pub fn spawn_hotkey<E: Clone + Send + 'static>(
     send: async_channel::Sender<E>,
     keysym: u32,
+    mod_bits: u8,
     event: E,
 ) -> Option<thread::JoinHandle<()>> {
     let Ok((conn, screen)) = RustConnection::connect(None) else {
@@ -62,13 +104,13 @@ pub fn spawn_hotkey<E: Clone + Send + 'static>(
         return None;
     };
     // `ModMask::ANY` conflicts with *every* existing grab on the key (a
-    // desktop shell's Ctrl+F12 makes it fail), so grab the bare key in all
+    // desktop shell's Ctrl+F12 makes it fail), so grab the chord in all
     // lock-mask variants instead — CapsLock, NumLock, and both together.
     let variants = [
-        ModMask::from(0u8),
-        ModMask::LOCK,
-        ModMask::M2,
-        ModMask::LOCK | ModMask::M2,
+        ModMask::from(mod_bits),
+        ModMask::LOCK | ModMask::from(mod_bits),
+        ModMask::M2 | ModMask::from(mod_bits),
+        ModMask::LOCK | ModMask::M2 | ModMask::from(mod_bits),
     ];
     for mask in variants {
         let cookie = conn.grab_key(
@@ -89,7 +131,7 @@ pub fn spawn_hotkey<E: Clone + Send + 'static>(
         }
     }
     conn.flush().ok()?;
-    eprintln!("quickterm: F12 grabbed as keycode {keycode} on root {root:#x}");
+    eprintln!("quickterm: grabbed {keysym:#x}+{mod_bits:#x} as keycode {keycode} on root {root:#x}");
     Some(thread::spawn(move || loop {
         match conn.wait_for_event() {
             Ok(Event::KeyPress(e)) if e.detail == keycode => {

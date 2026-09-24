@@ -661,6 +661,7 @@ impl TermSurface {
             TermAction::CloseTab => self.app.try_close_pane(self.session.id),
             TermAction::CloseConfirm => self.app.confirm_close(self.session.id),
             TermAction::NewWindow => self.app.new_window(),
+            TermAction::ToggleQuickTerminal => self.app.toggle_quick(),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),

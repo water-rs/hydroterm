@@ -69,6 +69,15 @@ pub enum QuickTermPosition {
     Center,
 }
 
+/// `window-new-tab-position` — where a new tab lands in the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTabPosition {
+    /// Append after the last tab (Ghostty default).
+    End,
+    /// Insert immediately after the selected tab.
+    Current,
+}
+
 /// Fully-resolved settings — defaults plus file overrides.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -244,6 +253,16 @@ pub struct AppConfig {
     /// Repeat `background-image` instead of stretching one copy
     /// (Ghostty `background-image-repeat`).
     pub background_image_repeat: bool,
+    /// `window-new-tab-position = end|current` — where a new tab is
+    /// inserted in the strip (Ghostty `window-new-tab-position`).
+    pub new_tab_position: NewTabPosition,
+    /// New tab inherits the focused surface's OSC 7 working directory
+    /// (Ghostty `window-inherit-working-directory`, default true).
+    pub inherit_working_directory: bool,
+    /// New tab/window/pane inherits the focused surface's live font
+    /// size instead of the config value (Ghostty
+    /// `window-inherit-font-size`, default true).
+    pub inherit_font_size: bool,
     /// Snap the viewport to the cursor when an interaction that can move
     /// it lands while scrolled back — paste, IME commit, program-input
     /// keys (Ghostty folds this into input snapping; ours gates the
@@ -358,6 +377,9 @@ impl Default for AppConfig {
             background_image_opacity: 1.0,
             background_image_fit: BgFit::Cover,
             background_image_repeat: false,
+            new_tab_position: NewTabPosition::End,
+            inherit_working_directory: true,
+            inherit_font_size: true,
             scroll_to_cursor: true,
             tab_bar_min_tabs: 1,
             word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
@@ -397,6 +419,9 @@ resize-overlay = true      # cols x rows badge while resizing
 focus-follows-mouse = false
 # command = tmux attach    # program for the initial session (`-e` wins)
 # working-directory = ~/projects   # initial cwd when no OSC 7 report
+# window-new-tab-position = end    # end | current — where new tabs insert
+# window-inherit-working-directory = true  # new tab takes focused pane's OSC 7 cwd
+# window-inherit-font-size = true  # new tab takes focused pane's live zoom
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
 #        solarized-dark | solarized-light
@@ -442,6 +467,7 @@ confirm-close = true       # ask before closing a running program
 # scroll_to_bottom, quit, split_right, split_down,
 # focus_next_pane, focus_prev_pane
 # keybind = ctrl+alt+a=select_all
+# keybind = global:ctrl+alt+u=toggle_quick_terminal   # X11 root grab — fires anywhere
 # tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
 # word-select-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
 # visual-bell = true      # flash the pane on BEL
@@ -822,6 +848,24 @@ impl AppConfig {
                 "background-image-repeat" | "background_image_repeat" => {
                     cfg.background_image_repeat = bool_value(value, n, &mut errors);
                 }
+                "window-new-tab-position" | "window_new_tab_position" | "new-tab-position" => {
+                    match value {
+                        "end" => cfg.new_tab_position = NewTabPosition::End,
+                        "current" => cfg.new_tab_position = NewTabPosition::Current,
+                        _ => errors.push(format!(
+                            "line {}: bad window-new-tab-position {value:?} (end|current)",
+                            n + 1
+                        )),
+                    }
+                }
+                "window-inherit-working-directory" | "window_inherit_working_directory"
+                | "inherit-working-directory" => {
+                    cfg.inherit_working_directory = bool_value(value, n, &mut errors);
+                }
+                "window-inherit-font-size" | "window_inherit_font_size"
+                | "inherit-font-size" => {
+                    cfg.inherit_font_size = bool_value(value, n, &mut errors);
+                }
                 "scroll-to-cursor" | "scroll_to_cursor" => {
                     cfg.scroll_to_cursor = bool_value(value, n, &mut errors);
                 }
@@ -1026,7 +1070,17 @@ fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
     let (chord, action) = value
         .split_once('=')
         .ok_or_else(|| format!("keybind needs `<chord>=<action>`: {value:?}"))?;
-    let chord = normalize_chord(chord.trim())?;
+    // `global:` — an X11 root grab, fired while any window has focus
+    // (Ghostty `keybind = global:chord=action`). Kept inside `keybinds`
+    // with a `global:` tag; `lookup_keybind` never produces it.
+    let raw = chord.trim();
+    let chord = match raw
+        .to_ascii_lowercase()
+        .strip_prefix("global:")
+    {
+        Some(rest) => format!("global:{}", normalize_chord(rest)?),
+        None => normalize_chord(raw)?,
+    };
     let action = action.trim().to_ascii_lowercase();
     let action = match action.as_str() {
         "" | "none" | "unbind" => None,
@@ -1107,6 +1161,7 @@ fn action_from_str(name: &str) -> Option<TermAction> {
         "new_tab" => TermAction::NewTab,
         "close_tab" => TermAction::CloseTab,
         "new_window" => TermAction::NewWindow,
+        "toggle_quick_terminal" | "quick_terminal" => TermAction::ToggleQuickTerminal,
         "next_tab" => TermAction::NextTab,
         "prev_tab" => TermAction::PrevTab,
         "font_bigger" => TermAction::FontBigger,

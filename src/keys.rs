@@ -518,6 +518,10 @@ pub enum TermAction {
     CloseTab,
     /// Open a whole new OS window (its own tabs and sessions).
     NewWindow,
+    /// Flip the drop-down quick terminal open/closed (Ghostty
+    /// `toggle_quick_terminal`; works as a window-local keybind and as
+    /// the `global:` hotkey target).
+    ToggleQuickTerminal,
     NextTab,
     PrevTab,
     SelectTab(usize),
