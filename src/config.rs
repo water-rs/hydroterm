@@ -93,6 +93,21 @@ pub enum BoldColor {
     Color(Rgb),
 }
 
+/// `right-click-action` — what a secondary click does on a pane
+/// (Ghostty `right-click-action`, default `context-menu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightClickAction {
+    /// Show the framework context menu (and extend a live selection
+    /// under the pointer, xterm-style).
+    ContextMenu,
+    /// Copy the active selection to the clipboard.
+    Copy,
+    /// Paste the clipboard at the pointer.
+    Paste,
+    /// Do nothing on a right click.
+    Ignore,
+}
+
 /// `window-new-tab-position` — where a new tab lands in the strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewTabPosition {
@@ -107,6 +122,15 @@ pub enum NewTabPosition {
 pub struct AppConfig {
     pub font_size: f32,
     pub font_family: String,
+    /// `font-family-bold` / `font-family-italic` /
+    /// `font-family-bold-italic` — style-specific family overrides
+    /// (Ghostty); unset falls back to `font-family`.
+    pub font_family_bold: Option<String>,
+    pub font_family_italic: Option<String>,
+    pub font_family_bold_italic: Option<String>,
+    /// `font-thicken` — overdraw every glyph run to darken strokes
+    /// (Ghostty `font-thicken`, default false).
+    pub font_thicken: bool,
     pub scrollback: usize,
     /// Resolved at load; `Auto` consults the desktop once per (re)load.
     pub theme: ThemeRef,
@@ -169,6 +193,17 @@ pub struct AppConfig {
     /// `window-padding-x` / `window-padding-y`); live-reloaded.
     pub window_padding_x: f32,
     pub window_padding_y: f32,
+    /// `window-padding-balance` — center the cell grid inside the
+    /// frame, splitting leftover space evenly between the two edges
+    /// (Ghostty `window-padding-balance`, default false = leftover
+    /// sits on the right/bottom).
+    pub window_padding_balance: bool,
+    /// `middle-click-paste` — paste the PRIMARY selection on a middle
+    /// click (Ghostty `middle-click-paste`, default true).
+    pub middle_click_paste: bool,
+    /// `right-click-action` — secondary-click behaviour on a pane
+    /// (Ghostty `right-click-action`, default `context-menu`).
+    pub right_click_action: RightClickAction,
     /// `$TERM` the PTY advertises (Ghostty `term`).
     pub term: String,
     /// Whether programs may write the clipboard through OSC 52
@@ -370,6 +405,10 @@ impl Default for AppConfig {
         Self {
             font_size: 13.0,
             font_family: "monospace".to_string(),
+            font_family_bold: None,
+            font_family_italic: None,
+            font_family_bold_italic: None,
+            font_thicken: false,
             scrollback: 10_000,
             theme: ThemeRef::Named("hydroterm-dark".into()),
             copy_on_select: CopyOnSelect::Both,
@@ -394,6 +433,9 @@ impl Default for AppConfig {
             cursor_invert_fg_bg: true,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
+            window_padding_balance: false,
+            middle_click_paste: true,
+            right_click_action: RightClickAction::ContextMenu,
             term: "xterm-256color".to_string(),
             osc52_write: true,
             bold_color: BoldColor::Bright,
@@ -476,6 +518,13 @@ font-family = monospace
 scrollback = 10000
 window-padding-x = 0       # blank margin around the grid, in points
 window-padding-y = 0
+window-padding-balance = false  # center the grid when it doesn't fill the frame
+middle-click-paste = true  # middle click pastes the PRIMARY selection
+right-click-action = context-menu  # context-menu | copy | paste | ignore
+font-thicken = false       # overdraw glyph runs to darken strokes
+# font-family-bold = DejaVu Sans Mono   # per-style family overrides
+# font-family-italic = DejaVu Sans Mono
+# font-family-bold-italic = DejaVu Sans Mono
 term = xterm-256color      # $TERM value advertised to programs
 osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
 osc52-read = ask           # allow | ask | deny — OSC 52 clipboard reads by programs
@@ -618,6 +667,30 @@ impl AppConfig {
                     _ => errors.push(format!("line {}: bad font-size {value:?}", n + 1)),
                 },
                 "font-family" => cfg.font_family = value.to_string(),
+                "font-family-bold" => cfg.font_family_bold = Some(value.to_string()),
+                "font-family-italic" => cfg.font_family_italic = Some(value.to_string()),
+                "font-family-bold-italic" => {
+                    cfg.font_family_bold_italic = Some(value.to_string());
+                }
+                "font-thicken" => cfg.font_thicken = bool_value(value, n, &mut errors),
+                "middle-click-paste" | "middle_click_paste" => {
+                    cfg.middle_click_paste = bool_value(value, n, &mut errors);
+                }
+                "right-click-action" | "right_click_action" => {
+                    cfg.right_click_action = match value {
+                        "context-menu" | "context_menu" => RightClickAction::ContextMenu,
+                        "copy" => RightClickAction::Copy,
+                        "paste" => RightClickAction::Paste,
+                        "ignore" | "none" => RightClickAction::Ignore,
+                        _ => {
+                            errors.push(format!(
+                                "line {}: bad right-click-action {value:?}",
+                                n + 1
+                            ));
+                            cfg.right_click_action
+                        }
+                    };
+                }
                 "scrollback" => match value.parse::<usize>() {
                     Ok(v) => cfg.scrollback = v.min(1_000_000),
                     Err(_) => errors.push(format!("line {}: bad scrollback {value:?}", n + 1)),
@@ -646,6 +719,9 @@ impl AppConfig {
                     }
                     _ => errors.push(format!("line {}: bad window-padding {value:?}", n + 1)),
                 },
+                "window-padding-balance" | "window_padding_balance" => {
+                    cfg.window_padding_balance = bool_value(value, n, &mut errors);
+                }
                 "term" => cfg.term = value.to_string(),
                 "foreground" => match parse_rgb(value) {
                     Some(c) => cfg.foreground = Some(c),

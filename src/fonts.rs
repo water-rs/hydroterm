@@ -72,6 +72,12 @@ pub struct TermFonts {
     /// The primary monospace family as a parley `FontFamily` — a named family
     /// when one of the preferences is installed, generic monospace otherwise.
     family: FontFamily<'static>,
+    /// `font-family-bold` / `font-family-italic` /
+    /// `font-family-bold-italic` per-style overrides (Ghostty);
+    /// `None` falls back to `family`.
+    family_bold: Option<FontFamily<'static>>,
+    family_italic: Option<FontFamily<'static>>,
+    family_bold_italic: Option<FontFamily<'static>>,
     size_px: f32,
     /// `adjust-cell-width`/`adjust-cell-height` — spacing added to the
     /// measured cell (fraction of the cell or absolute points).
@@ -150,6 +156,9 @@ impl TermFonts {
             collection,
             layout_cx: LayoutContext::new(),
             family,
+            family_bold: None,
+            family_italic: None,
+            family_bold_italic: None,
             size_px: size_pt,
             cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
             baseline_adjust: crate::config::CellAdjust::None,
@@ -158,6 +167,34 @@ impl TermFonts {
         };
         fonts.metrics = fonts.probe_metrics();
         fonts
+    }
+
+    /// Set the per-style family overrides (Ghostty `font-family-bold`
+    /// / `font-family-italic` / `font-family-bold-italic`). Each name is
+    /// resolved like `font-family` (generic aliases allowed); an
+    /// uninstalled or empty name clears the override, leaving the run on
+    /// the primary family.
+    pub fn set_style_families(
+        &mut self,
+        bold: &Option<String>,
+        italic: &Option<String>,
+        bold_italic: &Option<String>,
+    ) {
+        self.collection.use_fonts(|fonts| {
+            let mut resolve = |pref: &Option<String>| {
+                pref.as_deref().and_then(|pref| {
+                    resolve_family_name(fonts, pref).map(|name| {
+                        FontFamily::List(std::borrow::Cow::Owned(vec![
+                            name,
+                            FontFamilyName::Generic(GenericFamily::Emoji),
+                        ]))
+                    })
+                })
+            };
+            self.family_bold = resolve(bold);
+            self.family_italic = resolve(italic);
+            self.family_bold_italic = resolve(bold_italic);
+        });
     }
 
     /// Re-measure after a font-size change.
@@ -211,7 +248,20 @@ impl TermFonts {
     /// the terminal's font fallback now comes from.
     pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> Layout<[u8; 4]> {
         let size = self.size_px;
-        let family = self.family.clone();
+        // `font-family-bold-italic` wins, then the per-style override,
+        // then the primary family (Ghostty precedence).
+        let family = match (bold, italic) {
+            (true, true) => self
+                .family_bold_italic
+                .as_ref()
+                .or(self.family_bold.as_ref())
+                .or(self.family_italic.as_ref())
+                .unwrap_or(&self.family),
+            (true, false) => self.family_bold.as_ref().unwrap_or(&self.family),
+            (false, true) => self.family_italic.as_ref().unwrap_or(&self.family),
+            (false, false) => &self.family,
+        }
+        .clone();
         self.collection.use_fonts(|fonts| {
             let mut builder = self
                 .layout_cx
@@ -271,6 +321,32 @@ impl TermFonts {
         metrics.finish();
         metrics
     }
+}
+
+/// Resolve one family name — generic aliases map to their generic
+/// family, anything else must name an installed family.
+fn resolve_family_name(
+    fonts: &mut parley::FontContext,
+    name: &str,
+) -> Option<FontFamilyName<'static>> {
+    let generic = match name.to_ascii_lowercase().as_str() {
+        "monospace" => Some(GenericFamily::Monospace),
+        "sans-serif" | "sans" => Some(GenericFamily::SansSerif),
+        "serif" => Some(GenericFamily::Serif),
+        "cursive" => Some(GenericFamily::Cursive),
+        "fantasy" => Some(GenericFamily::Fantasy),
+        "system-ui" | "ui" => Some(GenericFamily::SystemUi),
+        "emoji" => Some(GenericFamily::Emoji),
+        "math" => Some(GenericFamily::Math),
+        _ => None,
+    };
+    if let Some(g) = generic {
+        return Some(FontFamilyName::Generic(g));
+    }
+    fonts
+        .collection
+        .family_by_name(name)
+        .map(|_| FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())))
 }
 
 impl CellMetrics {

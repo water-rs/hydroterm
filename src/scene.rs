@@ -106,6 +106,13 @@ pub struct DrawContext<'a> {
     /// Same pair for strikethrough (Ghostty
     /// `adjust-strikethrough-position` / `-thickness`).
     pub strikethrough_adjust: (f32, f32),
+    /// Grid origin within the frame — `PADDING`, or `PADDING` plus half
+    /// the leftover space when `window-padding-balance` centers the grid.
+    pub pad_x: f32,
+    pub pad_y: f32,
+    /// `font-thicken` — every glyph run is emboldened (Ghostty
+    /// `font-thicken`).
+    pub font_thicken: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +364,7 @@ pub fn draw_term(
     underlay: &mut dyn FnMut(&mut dyn Scene2D),
 ) {
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
+    let (cw, ch, padx, pady) = (m.cell_w, m.cell_h, ctx.pad_x, ctx.pad_y);
 
     let (grid, cursor) = harvest(term, ctx);
     let mode = *term.mode();
@@ -398,14 +405,14 @@ pub fn draw_term(
         if row.is_empty() {
             continue;
         }
-        let y = row_y(pad, ch, row_i);
+        let y = row_y(pady, ch, row_i);
         for (start, end, style) in style_runs(row) {
             // Cells on the default bg are covered by the base fill — skipping
             // them keeps explicit backgrounds opaque over a translucent base.
             if style.bg == theme_bg {
                 continue;
             }
-            let x = col_x(pad, cw, start);
+            let x = col_x(padx, cw, start);
             let w = (end - start) as f32 * cw;
             let bgc = style.bg;
             scene.fill(
@@ -431,7 +438,7 @@ pub fn draw_term(
             Affine::IDENTITY,
             &Brush::Solid(peniko_alpha(color, if active { 0.55 } else { 0.30 })),
             None,
-            &rect(col_x(pad, cw, c0), row_y(pad, ch, r), (c1 - c0) as f32 * cw, ch),
+            &rect(col_x(padx, cw, c0), row_y(pady, ch, r), (c1 - c0) as f32 * cw, ch),
         );
     }
 
@@ -443,10 +450,10 @@ pub fn draw_term(
         if row.is_empty() {
             continue;
         }
-        let baseline_y = row_y(pad, ch, row_i) + m.baseline;
+        let baseline_y = row_y(pady, ch, row_i) + m.baseline;
         for (start, end, style) in style_runs(row) {
-            draw_text_run(scene, row, start, end, style, row_i, pad, baseline_y, ctx);
-            draw_decorations(scene, start, end, style, row_i, pad, ch, baseline_y, ctx);
+            draw_text_run(scene, row, start, end, style, row_i, padx, pady, baseline_y, ctx);
+            draw_decorations(scene, start, end, style, row_i, padx, ch, baseline_y, ctx);
         }
     }
 
@@ -454,8 +461,8 @@ pub fn draw_term(
     if !ctx.hover_link.is_empty() {
         let hover_line = Brush::Solid(peniko_alpha(palette.accent, 0.85));
         for &(c0, c1, row) in ctx.hover_link {
-            let x = col_x(pad, cw, c0);
-            let y = row_y(pad, ch, row);
+            let x = col_x(padx, cw, c0);
+            let y = row_y(pady, ch, row);
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
@@ -480,8 +487,8 @@ pub fn draw_term(
             // badge to its link — including parts across a soft wrap —
             // without washing out the text.
             for &(c0, c1, row) in &h.segments {
-                let x = col_x(pad, cw, c0);
-                let y = row_y(pad, ch, row);
+                let x = col_x(padx, cw, c0);
+                let y = row_y(pady, ch, row);
                 let span_w = (c1 - c0) as f32 * cw;
                 scene.fill(
                     Fill::NonZero,
@@ -492,8 +499,8 @@ pub fn draw_term(
                 );
             }
             let &(bc, _, brow) = &h.segments[0];
-            let x = col_x(pad, cw, bc);
-            let y = row_y(pad, ch, brow);
+            let x = col_x(padx, cw, bc);
+            let y = row_y(pady, ch, brow);
             scene.fill(Fill::NonZero, Affine::IDENTITY, &chip_bg, None, &rect(x, y, w, ch));
             draw_chip_text(scene, &label, x, y + m.baseline, palette.accent_fg, ctx);
         }
@@ -550,7 +557,8 @@ fn draw_text_run(
     end: usize,
     style: StyleKey,
     _row_i: usize,
-    pad: f32,
+    padx: f32,
+    _pady: f32,
     baseline_y: f32,
     ctx: &mut DrawContext<'_>,
 ) {
@@ -594,7 +602,7 @@ fn draw_text_run(
                     cur_col = col;
                     pen = 0.0;
                 }
-                let cell_x = col_x(pad, cw, col);
+                let cell_x = col_x(padx, cw, col);
                 for g in cluster.glyphs() {
                     glyphs.push(Glyph {
                         id: g.id,
@@ -626,8 +634,9 @@ fn draw_text_run(
             scene.draw_glyph_run(&out);
 
             // Faux bold: redraw with a half-cell-fraction offset, like the
-            // offset emboldening native text stacks apply.
-            if synthesis.embolden {
+            // offset emboldening native text stacks apply. `font-thicken`
+            // applies the same overdraw to every run.
+            if synthesis.embolden || ctx.font_thicken {
                 let bold_run = GlyphRun {
                     transform: Affine::translate((0.6, baseline_y as f64)),
                     ..out
@@ -646,14 +655,14 @@ fn draw_decorations(
     end: usize,
     style: StyleKey,
     _row_i: usize,
-    pad: f32,
+    padx: f32,
     _ch: f32,
     baseline_y: f32,
     ctx: &mut DrawContext<'_>,
 ) {
     let m = ctx.fonts.metrics;
     let cw = m.cell_w;
-    let x = col_x(pad, cw, start);
+    let x = col_x(padx, cw, start);
     let w = (end - start) as f32 * cw;
     let brush = Brush::Solid(peniko(style.ul_color.unwrap_or(style.fg)));
 
@@ -737,10 +746,10 @@ fn draw_cursor(
         return;
     }
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
+    let (cw, ch, padx, pady) = (m.cell_w, m.cell_h, ctx.pad_x, ctx.pad_y);
     let row = cursor.row as usize;
-    let x = col_x(pad, cw, cursor.col);
-    let y = row_y(pad, ch, row);
+    let x = col_x(padx, cw, cursor.col);
+    let y = row_y(pady, ch, row);
     let brush = Brush::Solid(peniko(ctx.palette.cursor));
 
     match cursor.shape {
@@ -802,9 +811,9 @@ fn draw_preedit(
         return;
     }
     let m = ctx.fonts.metrics;
-    let (cw, ch, pad) = (m.cell_w, m.cell_h, PADDING);
-    let baseline_y = row_y(pad, ch, cursor.row as usize) + m.baseline;
-    let x0 = col_x(pad, cw, cursor.col);
+    let (cw, ch, padx, pady) = (m.cell_w, m.cell_h, ctx.pad_x, ctx.pad_y);
+    let baseline_y = row_y(pady, ch, cursor.row as usize) + m.baseline;
+    let x0 = col_x(padx, cw, cursor.col);
 
     // Shape the preedit like any other run; the chip is sized off the total
     // advance so the composed text always has a backdrop.

@@ -105,6 +105,10 @@ pub struct Session {
     /// `unfocused-split-opacity` — alpha applied when this pane is not
     /// the tab's focused split; live-reloaded via `poll_config`.
     pub unfocused_opacity: Binding<f32>,
+    /// `right-click-action = context-menu` — the pane's `.context_menu`
+    /// items exist only for the menu action; copy/paste/ignore deliver
+    /// the secondary click to the scene instead.
+    pub context_menu_enabled: Binding<bool>,
     /// cols×rows text while resizing (Ghostty `resize-overlay`);
     /// `None` when no recent size change.
     pub resize_label: Binding<Option<Str>>,
@@ -204,6 +208,9 @@ impl Session {
             scrollback: std::sync::Mutex::new(cfg.scrollback),
             word_chars: std::sync::Mutex::new(cfg.word_select_chars.clone()),
             unfocused_opacity: Binding::f32(cfg.unfocused_split_opacity),
+            context_menu_enabled: Binding::bool(
+                cfg.right_click_action == crate::config::RightClickAction::ContextMenu,
+            ),
             resize_label: Binding::default(),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
             kitty_keyboard: config.kitty_keyboard,
@@ -741,6 +748,8 @@ impl AppState {
             s.window_padding
                 .set_from((config.window_padding_x, config.window_padding_y));
             s.unfocused_opacity.set(config.unfocused_split_opacity);
+            s.context_menu_enabled
+                .set(config.right_click_action == crate::config::RightClickAction::ContextMenu);
             // Live scrollback-limit / cursor-style change — `set_options`
             // is alacritty's own live-reconfigure path. Rebuild the Config
             // exactly as spawn does so kitty-keyboard survives intact.
@@ -1582,6 +1591,9 @@ struct PaneLeaf {
 
 impl View for PaneLeaf {
     fn body(self, env: &Environment) -> impl View {
+        let menu_enabled = self.session.context_menu_enabled.clone();
+        let env = env.clone();
+        let assemble = std::rc::Rc::new(move |with_menu: bool| -> AnyView {
         // Search bar: a real WaterUI row that appears above the surface —
         // the field is a sibling, so toggling it never remounts the
         // SceneView or drops its keyboard focus.
@@ -1595,8 +1607,8 @@ impl View for PaneLeaf {
         let term_surface = TermSurface::new(
             self.session.clone(),
             self.state.clone(),
-            self.state.palette,
-            FontCollection::from_env(env),
+            self.state.palette.clone(),
+            FontCollection::from_env(&env),
         );
         // Reactive IBeam/pointing-hand over Ctrl-hovered links.
         let hover_cursor = term_surface.hover_cursor.clone();
@@ -1621,7 +1633,7 @@ impl View for PaneLeaf {
         // Paste-protection confirm: multi-line clipboard content waits in
         // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
         let pending = self.session.pending_paste.clone();
-        let session = PaneSession(self.session); // `.state` stores a clone
+        let session = PaneSession(self.session.clone()); // `.state` stores a clone
         // Paste-protection confirmation rides the framework's own snackbar
         // overlay (mounted by `Window::new`), so it layers above the pane
         // correctly. The `when` gate mounts a zero-size trigger whose
@@ -1731,9 +1743,10 @@ impl View for PaneLeaf {
         // mouse input — under DECSET 1000/1002/1006 a secondary click is
         // program input, so the item list collapses to empty and the
         // click falls through to the surface (hydrolysis hit-testing).
-        let menu = reporting
-            .map(|reporting| -> Vec<MenuItem> {
-                if reporting {
+        let menu_enabled = session.0.context_menu_enabled.clone();
+        let menu = zip(reporting, menu_enabled)
+            .map(|(reporting, menu_enabled)| -> Vec<MenuItem> {
+                if reporting || !menu_enabled {
                     Vec::new()
                 } else {
                     vec![
@@ -1751,7 +1764,7 @@ impl View for PaneLeaf {
         // signal-driven dim like Ghostty's.
         let session_id = session.0.id;
         let pane_alpha = zip(
-            self.focused.equal_to(session_id),
+            self.focused.clone().equal_to(session_id),
             session.0.unfocused_opacity.clone(),
         )
         .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
@@ -1807,7 +1820,7 @@ impl View for PaneLeaf {
             })
             .padding_vertical(8.0),
         ));
-        zstack((
+        let stack = zstack((
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
             close_overlay,
@@ -1815,9 +1828,22 @@ impl View for PaneLeaf {
             resize_badge,
             title_prompt,
             inspector_badge,
-        ))
-        .context_menu(menu)
-        .state(&session)
+        ));
+        // `right-click-action`: only `context-menu` attaches the framework
+        // modifier — an attached modifier registers a menu target that
+        // claims every secondary click (debug builds also mount the
+        // inspect item even over an empty item list), so copy / paste /
+        // ignore must carry no target at all and let the scene's own
+        // Secondary arm handle the button.
+        if with_menu {
+            stack.context_menu(menu).state(&session).anyview()
+        } else {
+            stack.state(&session).anyview()
+        }
+        });
+        let otherwise_assemble = assemble.clone();
+        when(menu_enabled, move || assemble(true))
+            .otherwise(move || otherwise_assemble(false))
     }
 }
 

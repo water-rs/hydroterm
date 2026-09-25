@@ -251,10 +251,17 @@ pub struct TermSurface {
     /// The `font-family` pref the shaping stack was built for — compared
     /// against `session.font_family` each frame (hot reload).
     family_pref: String,
+    /// `font-family-bold` / `-italic` / `-bold-italic` last applied —
+    /// re-resolved inside `sync_fonts` only when one changes.
+    style_prefs: (Option<String>, Option<String>, Option<String>),
 
     // geometry (grid size in cells, logical units at draw time)
     cols: u16,
     lines: u16,
+    /// Draw/input origin of the cell grid — `PADDING`, or `PADDING` plus
+    /// half the leftover when `window-padding-balance` centers the grid.
+    pad_x: f32,
+    pad_y: f32,
 
     // The backend's frame-request callback — kept so input events (which
     // don't schedule a frame on delivery) can request a repaint when they
@@ -332,15 +339,27 @@ impl TermSurface {
         let font_size = session.font_size.snapshot();
         let family_pref = session.font_family.snapshot().to_string();
         app.register_theme_wake(&session.terminal);
+        let style_prefs = app.config(|c| {
+            (
+                c.font_family_bold.clone(),
+                c.font_family_italic.clone(),
+                c.font_family_bold_italic.clone(),
+            )
+        });
+        let mut fonts = TermFonts::load(fonts, font_size, &family_pref);
+        fonts.set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
         Self {
             session,
             app,
-            fonts: TermFonts::load(fonts, font_size, &family_pref),
+            fonts,
+            style_prefs,
             palette,
             font_size_pt: font_size,
             family_pref,
             cols: 0,
             lines: 0,
+            pad_x: PADDING,
+            pad_y: PADDING,
             invalidator: None,
             wake_tx: None,
             content_gen: Rc::new(Cell::new(0)),
@@ -434,10 +453,12 @@ impl TermSurface {
     /// Surface-local logical position → (col, row) in viewport coords.
     fn viewport_cell(&self, x: f64, y: f64) -> (usize, usize) {
         let m = self.fonts.metrics;
-        let pad = PADDING as f64;
+        let (pad_x, pad_y) = (self.pad_x as f64, self.pad_y as f64);
         let (cw, ch) = (m.cell_w as f64, m.cell_h as f64);
-        let col = ((x - pad) / cw).clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
-        let row = ((y - pad) / ch).clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
+        let col = ((x - pad_x) / cw)
+            .clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
+        let row = ((y - pad_y) / ch)
+            .clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
         (col, row)
     }
 
@@ -451,7 +472,7 @@ impl TermSurface {
     /// Which side of a cell the pointer is on (for selection anchors).
     fn cell_side(&self, x: f64) -> Side {
         let m = self.fonts.metrics;
-        let pad = PADDING as f64;
+        let pad = self.pad_x as f64;
         let cw = m.cell_w as f64;
         let within = (x - pad).rem_euclid(cw);
         if within < cw * 0.5 { Side::Left } else { Side::Right }
@@ -1191,6 +1212,18 @@ impl TermSurface {
             self.family_pref = pref.clone();
             self.fonts.reload_family(&pref);
         }
+        let style_prefs = self.app.config(|c| {
+            (
+                c.font_family_bold.clone(),
+                c.font_family_italic.clone(),
+                c.font_family_bold_italic.clone(),
+            )
+        });
+        if style_prefs != self.style_prefs {
+            self.fonts
+                .set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
+            self.style_prefs = style_prefs;
+        }
         let want = self.session.font_size.snapshot();
         if (want - self.font_size_pt).abs() > f32::EPSILON {
             self.font_size_pt = want;
@@ -1217,6 +1250,17 @@ impl TermSurface {
         let lines = ((height - pad) / m.cell_h).floor().max(1.0) as u16;
         // Degenerate frames (window unmapped/collapsed) must not shrink the
         // PTY — a 1-line winsize breaks apps that read TIOCGWINSZ at start.
+        // `window-padding-balance`: split the leftover frame space evenly
+        // between the two edges; off, it sits on the right/bottom.
+        if self.app.config(|c| c.window_padding_balance) {
+            let rem_x = (width - pad - f32::from(cols) * m.cell_w).max(0.0);
+            let rem_y = (height - pad - f32::from(lines) * m.cell_h).max(0.0);
+            self.pad_x = PADDING + rem_x / 2.0;
+            self.pad_y = PADDING + rem_y / 2.0;
+        } else {
+            self.pad_x = PADDING;
+            self.pad_y = PADDING;
+        }
         if cols > 2 && lines > 1 && (cols != self.cols || lines != self.lines) {
             self.cols = cols;
             self.lines = lines;
@@ -1869,29 +1913,46 @@ impl TermSurface {
                 SurfacePointerButton::Middle => {
                     // Middle click pastes PRIMARY on Linux (xterm
                     // convention); CLIPBOARD when PRIMARY is empty or
-                    // the compositor does not offer it.
-                    match self.primary_text() {
-                        Some(text) => {
-                            let bracketed = self
-                                .session
-                                .terminal
-                                .term
-                                .lock()
-                                .mode()
-                                .contains(TermMode::BRACKETED_PASTE);
-                            self.paste_text(&text, bracketed);
+                    // the compositor does not offer it. `middle-click-paste`
+                    // disables the gesture.
+                    if self.app.config(|c| c.middle_click_paste) {
+                        match self.primary_text() {
+                            Some(text) => {
+                                let bracketed = self
+                                    .session
+                                    .terminal
+                                    .term
+                                    .lock()
+                                    .mode()
+                                    .contains(TermMode::BRACKETED_PASTE);
+                                self.paste_text(&text, bracketed);
+                            }
+                            None => self.paste_clipboard(),
                         }
-                        None => self.paste_clipboard(),
                     }
                 }
-                SurfacePointerButton::Secondary
-                    if self.session.terminal.term.lock().selection.is_some() =>
-                {
-                    // Right-click: extend an existing selection like xterm does.
-                    let point = self.grid_point(x, y);
-                    let mut term = self.session.terminal.term.lock();
-                    if let Some(sel) = &mut term.selection {
-                        sel.update(point, self.cell_side(x));
+                SurfacePointerButton::Secondary => {
+                    match self.app.config(|c| c.right_click_action) {
+                        crate::config::RightClickAction::Ignore => {}
+                        crate::config::RightClickAction::Copy => {
+                            self.copy_selection();
+                        }
+                        crate::config::RightClickAction::Paste => {
+                            self.paste_clipboard();
+                        }
+                        crate::config::RightClickAction::ContextMenu => {
+                            // `context-menu` (Ghostty default): the
+                            // framework `.context_menu` modifier mounts the
+                            // popup; the scene press still extends a live
+                            // selection, xterm-style.
+                            if self.session.terminal.term.lock().selection.is_some() {
+                                let point = self.grid_point(x, y);
+                                let mut term = self.session.terminal.term.lock();
+                                if let Some(sel) = &mut term.selection {
+                                    sel.update(point, self.cell_side(x));
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -2364,6 +2425,9 @@ impl TermSurface {
             bg_opacity,
             hints: &hint_spans,
             hint_digits: &hint_digits,
+            pad_x: self.pad_x,
+            pad_y: self.pad_y,
+            font_thicken: self.app.config(|c| c.font_thicken),
             bold_color: self.app.config(|c| c.bold_color),
             faint_opacity: self.app.config(|c| c.faint_opacity),
             min_contrast: self.app.config(|c| c.minimum_contrast),
@@ -2389,7 +2453,7 @@ impl TermSurface {
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
-        let pad = PADDING;
+        let (pad, pad_y) = (self.pad_x, self.pad_y);
         let draw_img = |scene: &mut dyn Scene2D, img: &crate::kitty::KittyImage| {
             let row = img.line - top;
             let rows = if img.rows > 0 {
@@ -2401,7 +2465,7 @@ impl TermSurface {
                 return;
             }
             let x = pad + img.col as f32 * m.cell_w;
-            let y = pad + row as f32 * m.cell_h;
+            let y = pad_y + row as f32 * m.cell_h;
             let w = if img.cols > 0 {
                 img.cols as f32 * m.cell_w
             } else {
@@ -2651,8 +2715,8 @@ impl SceneContent for TermSurface {
             return None;
         }
         let m = self.fonts.metrics;
-        let x = PADDING as f64 + col as f64 * m.cell_w as f64;
-        let y = PADDING as f64 + row as f64 * m.cell_h as f64;
+        let x = self.pad_x as f64 + col as f64 * m.cell_w as f64;
+        let y = self.pad_y as f64 + row as f64 * m.cell_h as f64;
         Some(kurbo::Rect::new(x, y, x + 2.0, y + m.cell_h as f64))
     }
 
