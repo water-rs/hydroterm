@@ -3524,7 +3524,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis?rev=6d0d183534710e8aed4685dafed74134c8fc57d0#6d0d183534710e8aed4685dafed74134c8fc57d0"
+source = "git+https://github.com/water-rs/hydrolysis?rev=8bdf901c2278487aca99c3b155ec79def3ec5929#8bdf901c2278487aca99c3b155ec79def3ec5929"
 dependencies = [
  "accesskit",
  "async-task",
@@ -3569,7 +3569,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis-m3"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis-m3?rev=fd33cf8cfcb7a247f1e26535ddc7916b661d02dd#fd33cf8cfcb7a247f1e26535ddc7916b661d02dd"
+source = "git+https://github.com/water-rs/hydrolysis-m3?rev=7a86b5e77964d81a10453d9098f7d94afc9f1e87#7a86b5e77964d81a10453d9098f7d94afc9f1e87"
 dependencies = [
  "hydrolysis",
  "material-color-utils",
@@ -10088,7 +10088,7 @@ dependencies = [
 [[package]]
 name = "waterui-barcode"
 version = "0.3.0"
-source = "git+https://github.com/water-rs/barcode?rev=66ba38ba58571885508505a52fa64f9474b36f87#66ba38ba58571885508505a52fa64f9474b36f87"
+source = "git+https://github.com/water-rs/barcode?rev=4fb3ce26549229defcdd968d1bdcb0c48d97b30e#4fb3ce26549229defcdd968d1bdcb0c48d97b30e"
 dependencies = [
  "barcoders",
  "fast_qr",
@@ -10170,7 +10170,7 @@ dependencies = [
 [[package]]
 name = "waterui-canvas"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/canvas?rev=6039fc7f39e5f3c8ce2d03a8224e94edea6b3491#6039fc7f39e5f3c8ce2d03a8224e94edea6b3491"
+source = "git+https://github.com/water-rs/canvas?rev=4de31106fd4497e7e0b01172c77d9bdd1369695e#4de31106fd4497e7e0b01172c77d9bdd1369695e"
 dependencies = [
  "image",
  "kurbo",
@@ -10184,7 +10184,7 @@ dependencies = [
 [[package]]
 name = "waterui-chart"
 version = "0.3.0"
-source = "git+https://github.com/water-rs/chart?rev=2bfea4da217e8fdd39bb9f41e1d5bbeb78ea7a25#2bfea4da217e8fdd39bb9f41e1d5bbeb78ea7a25"
+source = "git+https://github.com/water-rs/chart?rev=4b9f834908e6d3533124b557aec932b4ade488d5#4b9f834908e6d3533124b557aec932b4ade488d5"
 dependencies = [
  "bytemuck",
  "nami",
@@ -10456,7 +10456,7 @@ dependencies = [
 [[package]]
 name = "waterui-image"
 version = "0.5.0"
-source = "git+https://github.com/water-rs/image?rev=2abf00f625134095f46ff093928260e887fb48bf#2abf00f625134095f46ff093928260e887fb48bf"
+source = "git+https://github.com/water-rs/image?rev=edb80117b1f6fc4dfb7c96f0d6db189241470632#edb80117b1f6fc4dfb7c96f0d6db189241470632"
 dependencies = [
  "half",
  "image",
@@ -10619,7 +10619,7 @@ dependencies = [
 [[package]]
 name = "waterui-map-gpu"
 version = "0.3.0"
-source = "git+https://github.com/water-rs/map-gpu?rev=7527ee012ac6eea2d9b940f095d53dca2f4f6956#7527ee012ac6eea2d9b940f095d53dca2f4f6956"
+source = "git+https://github.com/water-rs/map-gpu?rev=6003edd364aa58341cf9aaf066bf0afeeab3a58b#6003edd364aa58341cf9aaf066bf0afeeab3a58b"
 dependencies = [
  "blocking",
  "bytemuck",
@@ -10755,7 +10755,7 @@ dependencies = [
 [[package]]
 name = "waterui-particle"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/particle?rev=0d6213ee69be4fd3d40b92aed9097efc77305fb2#0d6213ee69be4fd3d40b92aed9097efc77305fb2"
+source = "git+https://github.com/water-rs/particle?rev=8e163cc006cd0d1eed85545ef1984c19f68ae062#8e163cc006cd0d1eed85545ef1984c19f68ae062"
 dependencies = [
  "bytemuck",
  "encase",
@@ -10918,7 +10918,7 @@ dependencies = [
 [[package]]
 name = "waterui-video-gpu"
 version = "0.4.0"
-source = "git+https://github.com/water-rs/video-gpu?rev=70f586ffc91080fe827db87e7750cbc59f207ff4#70f586ffc91080fe827db87e7750cbc59f207ff4"
+source = "git+https://github.com/water-rs/video-gpu?rev=3da5283f317dfde422ab750411f08bc0765d458b#3da5283f317dfde422ab750411f08bc0765d458b"
 dependencies = [
  "async-channel",
  "executor-core",
