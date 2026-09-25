@@ -26,8 +26,10 @@ pub struct Palette {
     pub cursor: Rgb,
     /// Dim foreground used when no dim override exists.
     pub dim_foreground: Rgb,
-    pub selection_bg: Rgb,
-    /// Selection text color; `None` keeps the cell's own fg.
+    /// `selection-background`; `None` inverts the cell's own fg (the
+    /// reference default — themes do not supply selection colors).
+    pub selection_bg: Option<Rgb>,
+    /// `selection-foreground`; `None` inverts the cell's own bg.
     pub selection_fg: Option<Rgb>,
     /// Badge/chip background (URL hints) — the theme's accent slot.
     pub accent: Rgb,
@@ -73,7 +75,7 @@ impl Default for Palette {
             background: rgb(0x1d, 0x1f, 0x21),
             cursor: rgb(0xc5, 0xc8, 0xc6),
             dim_foreground: rgb(0x62, 0x64, 0x63),
-            selection_bg: rgb(0x37, 0x3b, 0x41),
+            selection_bg: None,
             selection_fg: None,
             accent: rgb(0x81, 0xa2, 0xbe),
             accent_fg: rgb(0x1d, 0x1f, 0x21),
@@ -91,8 +93,10 @@ impl Palette {
         palette.background = theme.background;
         palette.cursor = theme.cursor;
         palette.dim_foreground = theme.dim_foreground;
-        palette.selection_bg = theme.selection_bg;
-        palette.selection_fg = theme.selection_fg;
+        // Selection colors come only from `selection-foreground` /
+        // `selection-background` config — the reference inverts a
+        // selected cell's fg/bg when they are unset, so a theme's own
+        // selection slots are intentionally not applied.
         palette.accent = theme.accent;
         palette.accent_fg = theme.accent_fg;
         palette
@@ -117,7 +121,7 @@ impl Palette {
             palette.selection_fg = Some(c);
         }
         if let Some(c) = cfg.selection_background {
-            palette.selection_bg = c;
+            palette.selection_bg = Some(c);
         }
         for (i, c) in &cfg.palette_overrides {
             palette.indexed[*i as usize] = *c;

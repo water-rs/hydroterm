@@ -1152,6 +1152,12 @@ impl TermSurface {
                     if self.app.config(|c| c.audible_bell) {
                         ring_bell(&mut self.bell_ring_at);
                     }
+                    // `bell-features` `attention` — the tab badge is the
+                    // request-attention channel (Ghostty sends a WM
+                    // urgency hint; ours is the 🔔 badge).
+                    if self.app.config(|c| c.bell_attention) {
+                        *self.session.notify_badge.lock().unwrap() = true;
+                    }
                 }
                 TermEvent::ChildExit(_status) => {
                     self.session.exited.set(true);
@@ -1192,10 +1198,12 @@ impl TermSurface {
                         if self.app.config(|c| c.desktop_notifications) {
                             notify_desktop(&title, &body);
                         }
-                        let text = if title.is_empty() { body } else { format!("{title}: {body}") };
-                        *self.session.notify_badge.lock().unwrap() = true;
-                        self.app
-                            .set_session_title(self.session.id, Str::from(format!("\u{1f514} {text}")));
+                        if self.app.config(|c| c.bell_attention) {
+                            let text = if title.is_empty() { body } else { format!("{title}: {body}") };
+                            *self.session.notify_badge.lock().unwrap() = true;
+                            self.app
+                                .set_session_title(self.session.id, Str::from(format!("\u{1f514} {text}")));
+                        }
                     }
                     TapEvent::Apc(_payload) => {}
                 },
@@ -1277,8 +1285,10 @@ impl TermSurface {
         if self.app.config(|c| c.window_padding_balance) {
             let rem_x = (width - pad - f32::from(cols) * m.cell_w).max(0.0);
             let rem_y = (height - pad - f32::from(lines) * m.cell_h).max(0.0);
-            self.pad_x = PADDING + rem_x / 2.0;
-            self.pad_y = PADDING + rem_y / 2.0;
+            // Integer pads keep every cell edge on a device-pixel boundary;
+            // a fractional offset AA-blends each row/column shared edge.
+            self.pad_x = PADDING + (rem_x / 2.0).round();
+            self.pad_y = PADDING + (rem_y / 2.0).round();
         } else {
             self.pad_x = PADDING;
             self.pad_y = PADDING;

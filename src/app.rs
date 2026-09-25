@@ -2259,7 +2259,8 @@ pub fn tabs_view(state: AppState) -> impl View {
                 strip,
                 text("+")
                     .muted()
-                    .padding()
+                    .padding_horizontal(4.0)
+                    .height(TAB_STRIP_HEIGHT)
                     .on_tap(|app: AppState| _ = app.new_tab()),
             ))
             .spacing(4.0)

@@ -178,6 +178,11 @@ pub struct AppConfig {
     pub keybinds: Vec<(String, Option<TermAction>)>,
     /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
     pub audible_bell: bool,
+    /// `bell-features` `attention` arm — the tab's 🔔 notification badge on
+    /// `TermEvent::Bell`/OSC 9 (Ghostty's request-attention feature; the
+    /// badge is our attention channel). Default on; a `bell-features` line
+    /// without `attention` turns it off.
+    pub bell_attention: bool,
     /// Window/transparency: alpha of the terminal's own background fill,
     /// 0.0 (invisible) ..= 1.0 (opaque). The winit window is created
     /// transparent when this starts below 1.0 — raising it live works;
@@ -247,8 +252,8 @@ pub struct AppConfig {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
     pub cursor_color: Option<Rgb>,
-    /// Selection text color — `selection-color` sets the ink; the
-    /// highlight fill stays the theme's `selection_bg`.
+    /// Selection text color — `selection-color` sets the ink; when unset
+    /// the selected cell's own background becomes the ink (inverted).
     pub selection_color: Option<Rgb>,
     /// `palette = 1=#ff0000` — indexed 0-255 slot overrides.
     pub palette_overrides: Vec<(u8, Rgb)>,
@@ -275,8 +280,8 @@ pub struct AppConfig {
     /// Multi-click (word/line select) timing window in milliseconds.
     pub click_interval: u64,
     /// Invert the selected cells' foreground/background (Ghostty
-    /// `selection-invert-fg-bg`); when off, `selection_bg`/`selection_fg`
-    /// theme colors are used instead.
+    /// `selection-invert-fg-bg`) — always swaps, even when
+    /// `selection-color`/`selection-background` are configured.
     pub selection_invert: bool,
     /// Restore the last window geometry on launch and save it as the
     /// window moves/resizes (Ghostty `window-save-state`).
@@ -297,7 +302,8 @@ pub struct AppConfig {
     /// Border token.
     pub split_divider_color: Option<Rgb>,
     /// `selection-background` — selection highlight fill (Ghostty
-    /// `selection-background`); `None` = theme's `selection_bg`.
+    /// `selection-background`); `None` = the selected cell's own
+    /// foreground (the reference default: swap fg/bg).
     pub selection_background: Option<Rgb>,
     /// `unfocused-split-fill` — background color painted under an
     /// unfocused split's cells (Ghostty `unfocused-split-fill`).
@@ -446,6 +452,7 @@ impl Default for AppConfig {
             command: None,
             keybinds: Vec::new(),
             audible_bell: true,
+            bell_attention: true,
             background_opacity: 1.0,
             paste_protection: true,
             mouse_hide_typing: true,
@@ -970,6 +977,28 @@ impl AppConfig {
                     "false" | "0" | "no" | "off" => cfg.clipboard_trim = false,
                     _ => errors.push(format!("line {}: bad clipboard-trim {value:?}", n + 1)),
                 },
+                // Ghostty `bell-features` — a comma list naming the enabled
+                // bell channels; features absent from the list are disabled.
+                // `system` → desktop notifications, `audio` → xkbbell,
+                // `visual` → pane flash, `attention` → the tab 🔔 badge.
+                "bell-features" | "bell_features" => {
+                    cfg.desktop_notifications = false;
+                    cfg.audible_bell = false;
+                    cfg.visual_bell = false;
+                    cfg.bell_attention = false;
+                    for feature in value.split(',') {
+                        match feature.trim() {
+                            "system" => cfg.desktop_notifications = true,
+                            "audio" => cfg.audible_bell = true,
+                            "visual" => cfg.visual_bell = true,
+                            "attention" => cfg.bell_attention = true,
+                            _ => errors.push(format!(
+                                "line {}: bad bell-features item {feature:?}",
+                                n + 1
+                            )),
+                        }
+                    }
+                }
                 "desktop-notifications" => {
                     cfg.desktop_notifications = bool_value(value, n, &mut errors);
                 }

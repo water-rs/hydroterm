@@ -288,13 +288,16 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             fg = bg;
         }
         if is_sel {
+            // Reference semantics: `selection-invert-fg-bg` always swaps;
+            // otherwise each channel takes its configured color or inverts
+            // the opposite channel — so the default is always readable.
+            let (of, ob) = (fg, bg);
             if ctx.selection_invert {
-                std::mem::swap(&mut fg, &mut bg);
+                fg = ob;
+                bg = of;
             } else {
-                bg = palette.selection_bg;
-                if let Some(f) = palette.selection_fg {
-                    fg = f;
-                }
+                fg = palette.selection_fg.unwrap_or(ob);
+                bg = palette.selection_bg.unwrap_or(of);
             }
         }
         if is_cursor {
@@ -339,8 +342,20 @@ fn row_y(pad: f32, ch: f32, row: usize) -> f32 {
     pad + row as f32 * ch
 }
 
+/// Fill rect with edges snapped to device pixels. Frame/pad origins land on
+/// fractional coordinates (e.g. a half-pixel `rem/2`), and unaligned fill
+/// edges anti-alias — two adjacent row rects then each blend their shared
+/// edge against the base fill, leaving a hairline seam. Cell pitch is already
+/// an integer, so flooring both edges keeps every tiled region contiguous
+/// (cursor, decorations, and strokes keep their own sub-pixel geometry).
 fn rect(x: f32, y: f32, w: f32, h: f32) -> BezPath {
-    Rect::new(x as f64, y as f64, (x + w) as f64, (y + h) as f64).to_path(0.0)
+    Rect::new(
+        f64::from(x).floor(),
+        f64::from(y).floor(),
+        f64::from(x + w).floor(),
+        f64::from(y + h).floor(),
+    )
+    .to_path(0.0)
 }
 
 /// Segment a row into same-style runs.
@@ -857,7 +872,12 @@ fn draw_preedit(
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        &Brush::Solid(peniko_alpha(ctx.palette.selection_bg, 0.8)),
+        &Brush::Solid(peniko_alpha(
+            ctx.palette
+                .selection_bg
+                .unwrap_or_else(|| lerp_rgb(ctx.palette.background, ctx.palette.foreground, 0.15)),
+            0.8,
+        )),
         None,
         &rect(x0, baseline_y - m.baseline, w, ch),
     );
