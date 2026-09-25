@@ -33,10 +33,10 @@ use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
 use waterui_graphics::{Code, Key, Modifiers, NamedKey};
 use waterui_text::FontCollection;
 
-use crate::app::{AppState, FONT_SIZE, Session};
+use crate::app::{AppState, Session};
 use crate::config::MouseShiftCapture;
 use crate::fonts::TermFonts;
-use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
+use crate::keys::{FileSink, TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
 use crate::mouse::{self, CellPos, MouseAction};
 use crate::osctap::TapEvent;
 use crate::palette::Palette;
@@ -296,6 +296,9 @@ pub struct TermSurface {
     preedit: Option<(String, usize)>,
     scroll_accum_px: f64,
     bell_at: Option<Instant>,
+    /// `bell-features` `border` — ring the pane until re-focused or
+    /// interacted with (cleared in `clear_notify_badge`).
+    bell_border: bool,
     /// Last grid-size change for the `resize-overlay` badge decay.
     resize_at: Option<Instant>,
     /// Last time the X11 bell actually rang (throttle).
@@ -387,6 +390,7 @@ impl TermSurface {
             preedit: None,
             scroll_accum_px: 0.0,
             bell_at: None,
+            bell_border: false,
             resize_at: None,
             bell_ring_at: None,
             blink_epoch: Instant::now(),
@@ -542,6 +546,7 @@ impl TermSurface {
         if let Some(manager) = self.session.snackbar.borrow().as_ref() {
             manager.dismiss();
         }
+        self.app.refocus(self.session.id);
         if let Some(fmt) = fmt {
             let text = if accept { self.clipboard_text() } else { String::new() };
             self.write(fmt(&text).into_bytes());
@@ -571,6 +576,7 @@ impl TermSurface {
         if let Some(manager) = self.session.snackbar.borrow().as_ref() {
             manager.dismiss();
         }
+        self.app.refocus(self.session.id);
         if accept && let Some(text) = text {
             let bracketed =
                 self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
@@ -632,13 +638,13 @@ impl TermSurface {
         }
     }
 
-    /// Open the link under `point`: an OSC8 hyperlink first, then a
-    /// plain-text URL scanned off the row (like xterm/kitty Ctrl+click).
-    /// `link-url = false` gates only the detected-URL scan.
-    fn open_link_at(&self, point: Point) -> bool {
+    /// The URI under `point`: an OSC8 hyperlink first, then a
+    /// plain-text URL scanned off the row. `link-url = false` gates
+    /// only the detected-URL scan.
+    fn link_at(&self, point: Point) -> Option<String> {
         let term = self.session.terminal.term.lock();
         let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
-        let uri = uri.or_else(|| {
+        uri.or_else(|| {
             if !self.app.config(|c| c.link_url) {
                 return None;
             }
@@ -652,9 +658,12 @@ impl TermSurface {
                 .rfind(|m| m.1 == point.line.0 && m.2 <= point.column.0)
                 .map(|m| m.0)?;
             url_at(&lm.chars, idx)
-        });
-        drop(term);
-        if let Some(uri) = uri {
+        })
+    }
+
+    /// Open the link under `point` (like xterm/kitty Ctrl+click).
+    fn open_link_at(&self, point: Point) -> bool {
+        if let Some(uri) = self.link_at(point) {
             self.open_uri(&uri);
             return true;
         }
@@ -698,15 +707,11 @@ impl TermSurface {
     /// once through `do_action`.
     fn do_action_all(&mut self, action: TermAction) {
         match action {
-            TermAction::FontBigger | TermAction::FontSmaller | TermAction::FontReset => {
+            TermAction::FontReset => {
+                let configured = self.app.config(|c| c.font_size);
                 for s in self.app.all_sessions().iter() {
-                    let cur = s.font_size.snapshot();
-                    let next = match action {
-                        TermAction::FontBigger => (cur + 1.0).min(96.0),
-                        TermAction::FontSmaller => (cur - 1.0).max(6.0),
-                        _ => FONT_SIZE,
-                    };
-                    s.font_size.set(next);
+                    s.font_size_override.set(false);
+                    s.font_size.set(configured);
                 }
             }
             TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
@@ -717,7 +722,14 @@ impl TermSurface {
                 };
                 for s in self.app.all_sessions().iter() {
                     let cur = s.font_size.snapshot();
+                    s.font_size_override.set(true);
                     s.font_size.set((cur + delta).clamp(6.0, 96.0));
+                }
+            }
+            TermAction::SetFontSize(pt) => {
+                for s in self.app.all_sessions().iter() {
+                    s.font_size_override.set(true);
+                    s.font_size.set(pt.clamp(6.0, 96.0));
                 }
             }
             TermAction::ClearScrollback => {
@@ -756,8 +768,16 @@ impl TermSurface {
             TermAction::NewTab => {
                 self.app.new_tab();
             }
-            TermAction::CloseTab => self.app.try_close_pane(self.session.id),
-            TermAction::CloseConfirm => self.app.confirm_close(self.session.id),
+            TermAction::CloseTab => {
+                if let Some(tab_id) = self.app.tab_id_of(self.session.id) {
+                    self.app.try_close_tab(tab_id);
+                }
+            }
+            TermAction::CloseSurface => self.app.try_close_pane(self.session.id),
+            TermAction::CloseConfirm => {
+                self.app.confirm_close(self.session.id);
+                self.app.refocus(self.session.id);
+            }
             TermAction::NewWindow => self.app.new_window(),
             TermAction::ToggleQuickTerminal => self.app.toggle_quick(),
             TermAction::LastTab => self.app.select_last_tab(),
@@ -768,14 +788,11 @@ impl TermSurface {
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
             TermAction::SelectTab(n) => self.app.select_tab(n),
-            TermAction::FontBigger | TermAction::FontSmaller | TermAction::FontReset => {
-                let cur = self.session.font_size.snapshot();
-                let next = match action {
-                    TermAction::FontBigger => (cur + 1.0).min(96.0),
-                    TermAction::FontSmaller => (cur - 1.0).max(6.0),
-                    _ => FONT_SIZE,
-                };
-                self.session.font_size.set(next);
+            TermAction::FontReset => {
+                self.session.font_size_override.set(false);
+                self.session
+                    .font_size
+                    .set(self.app.config(|c| c.font_size));
             }
             TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
                 let cur = self.session.font_size.snapshot();
@@ -784,7 +801,12 @@ impl TermSurface {
                 } else {
                     pts as f32
                 };
+                self.session.font_size_override.set(true);
                 self.session.font_size.set((cur + delta).clamp(6.0, 96.0));
+            }
+            TermAction::SetFontSize(pt) => {
+                self.session.font_size_override.set(true);
+                self.session.font_size.set(pt.clamp(6.0, 96.0));
             }
             TermAction::ClearScrollback => {
                 let mut term = self.session.terminal.term.lock();
@@ -808,9 +830,66 @@ impl TermSurface {
                 p.advance(&mut *term, b"\x1bc");
                 term.scroll_display(Scroll::Bottom);
             }
-            TermAction::Search => self.session.search_open.toggle(),
-            TermAction::PromptPrev => self.jump_prompt(-1),
-            TermAction::PromptNext => self.jump_prompt(1),
+            TermAction::Search => {
+                self.session.search_open.toggle();
+                if !self.session.search_open.snapshot() {
+                    self.app.refocus(self.session.id);
+                }
+            }
+            TermAction::StartSearch => self.session.search_open.set(true),
+            TermAction::EndSearch => {
+                self.session.search_open.set(false);
+                self.session.search_query.set_from("");
+                self.app.refocus(self.session.id);
+            }
+            TermAction::SearchSelection => {
+                let text = self
+                    .session
+                    .terminal
+                    .term
+                    .lock()
+                    .selection_to_string();
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    self.session.search_query.set_from(text);
+                    self.session.search_open.set(true);
+                }
+            }
+            // `search:text` — set the query (the bar only needs to open
+            // when a non-empty query is set); empty cancels the search
+            // without hiding the bar (the reference's semantics).
+            TermAction::SearchFor(text) => {
+                if text.is_empty() {
+                    self.session.search_query.set_from("");
+                } else {
+                    self.session.search_query.set_from(text);
+                    self.session.search_open.set(true);
+                }
+            }
+            TermAction::JumpToPrompt(n) => {
+                let dir = n.signum();
+                for _ in 0..n.abs() {
+                    let before = self
+                        .session
+                        .terminal
+                        .term
+                        .lock()
+                        .grid()
+                        .display_offset();
+                    self.jump_prompt(dir);
+                    // A markless direction ends the loop early.
+                    if self
+                        .session
+                        .terminal
+                        .term
+                        .lock()
+                        .grid()
+                        .display_offset()
+                        == before
+                    {
+                        break;
+                    }
+                }
+            }
             TermAction::SelectAll => {
                 let mut term = self.session.terminal.term.lock();
                 let history = term.grid().history_size();
@@ -861,22 +940,27 @@ impl TermSurface {
                 let page = term.grid().screen_lines().saturating_sub(1) as i32;
                 term.scroll_display(Scroll::Delta(-page));
             }
-            TermAction::ScrollLineUp => {
-                self.session
-                    .terminal
-                    .term
-                    .lock()
-                    .scroll_display(Scroll::Delta(1));
+            // `scroll_page_lines:N` — positive N scrolls down
+            // (toward the live edge), matching the negative delta.
+            TermAction::ScrollPageLines(n) => {
+                if n != 0 {
+                    self.session
+                        .terminal
+                        .term
+                        .lock()
+                        .scroll_display(Scroll::Delta(-n));
+                }
             }
-            TermAction::ScrollLineDown => {
-                self.session
-                    .terminal
-                    .term
-                    .lock()
-                    .scroll_display(Scroll::Delta(-1));
+            // `scroll_page_fractional:f` — positive f scrolls down.
+            TermAction::ScrollPageFractional(f) => {
+                let mut term = self.session.terminal.term.lock();
+                let page = term.grid().screen_lines().saturating_sub(1) as f64;
+                let delta = (-f * page).round() as i32;
+                if delta != 0 {
+                    term.scroll_display(Scroll::Delta(delta));
+                }
             }
-            TermAction::MoveTabLeft => self.app.move_tab(-1),
-            TermAction::MoveTabRight => self.app.move_tab(1),
+            TermAction::MoveTab(n) => self.app.move_tab(n as isize),
             TermAction::FocusPaneDir { horizontal, forward } => {
                 self.app.focus_pane_dir(horizontal, forward);
             }
@@ -890,12 +974,24 @@ impl TermSurface {
             TermAction::UrlHints => self.url_hints(),
             TermAction::CopyLastOutput => self.copy_last_output(),
             TermAction::OpenScrollbackEditor => self.open_scrollback_editor(),
-            TermAction::WriteScreenFile => self.write_screen_file(),
-            TermAction::WriteScrollbackFile => self.write_scrollback_file(),
-            TermAction::WriteSelectionFile => self.write_selection_file(),
-            TermAction::WriteLastOutputFile => {
+            TermAction::WriteScreenFile(sink) => {
+                if let Some(text) = self.screen_text() {
+                    self.write_buffer_sink(text, "screen", sink);
+                }
+            }
+            TermAction::WriteScrollbackFile(sink) => {
+                if let Some(text) = self.scrollback_text() {
+                    self.write_buffer_sink(text, "scrollback", sink);
+                }
+            }
+            TermAction::WriteSelectionFile(sink) => {
+                if let Some(text) = self.selection_text_dump() {
+                    self.write_buffer_sink(text, "selection", sink);
+                }
+            }
+            TermAction::WriteLastOutputFile(sink) => {
                 if let Some(text) = self.last_output_text() {
-                    self.write_buffer_to_editor(text, "last-output");
+                    self.write_buffer_sink(text, "last-output", sink);
                 }
             }
             TermAction::OpenConfig => self.open_config(),
@@ -913,8 +1009,7 @@ impl TermSurface {
                 self.session.terminal.term.lock().selection = None;
                 self.keysel = None;
             }
-            TermAction::SearchNext => self.search_step(1),
-            TermAction::SearchPrev => self.search_step(-1),
+            TermAction::NavigateSearch(dir) => self.search_step(dir),
             TermAction::Quit => self.app.quit(),
             TermAction::SplitAuto => {
                 let (w, h) = self.session.pane_px.snapshot();
@@ -992,20 +1087,54 @@ impl TermSurface {
                 }
             }
             TermAction::PromptTitle => {
+                self.session.title_prompt_writes_tab.set(false);
                 self.session
                     .title_query
                     .set(self.session.title.snapshot());
                 self.session.title_prompt_open.set(true);
             }
+            TermAction::PromptTabTitle => {
+                self.session.title_prompt_writes_tab.set(true);
+                let seed = self
+                    .app
+                    .tab_title_of(self.session.id)
+                    .unwrap_or_else(|| self.session.title.snapshot());
+                self.session.title_query.set(seed);
+                self.session.title_prompt_open.set(true);
+            }
+            TermAction::SetSurfaceTitle(title) => {
+                self.app.set_session_title(self.session.id, Str::from(title));
+            }
+            TermAction::SetTabTitle(title) => {
+                self.app
+                    .set_tab_title(self.session.id, (!title.is_empty()).then_some(title));
+            }
             TermAction::Inspector => {
                 let s = &self.session;
                 s.inspector_open.set(!s.inspector_open.snapshot());
             }
+            TermAction::InspectorSet(open) => {
+                self.session.inspector_open.set(open);
+            }
+            TermAction::Ignore => {}
+            TermAction::CopyUrlToClipboard => {
+                let (x, y) = self.pointer_at;
+                if let Some(uri) = self.link_at(self.grid_point(x, y))
+                    && let Some(clip) = self.clipboard.as_mut()
+                {
+                    let _ = clip.set_text(&uri);
+                }
+            }
+            TermAction::CopyTitleToClipboard => {
+                if let Some(clip) = self.clipboard.as_mut() {
+                    let _ = clip.set_text(self.session.title.snapshot().as_ref());
+                }
+            }
         }
     }
 
-    /// Scroll so the next OSC 133 prompt mark sits at the viewport top.
-    /// `dir` -1 = previous prompt, +1 = next.
+    /// Scroll so the OSC 133 prompt mark sits at the viewport top.
+    /// `dir` -1 = previous prompt, +1 = next (one mark per call).
     fn jump_prompt(&mut self, dir: i32) {
         let marks = self.session.terminal.prompt_marks.lock().unwrap();
         if marks.is_empty() {
@@ -1190,6 +1319,21 @@ impl TermSurface {
                     // urgency hint; ours is the 🔔 badge).
                     if self.app.config(|c| c.bell_attention) {
                         *self.session.notify_badge.lock().unwrap() = true;
+                            self.app.tab_badge(self.session.id, true);
+                    }
+                    // `bell-features` `border` — a ring around the pane
+                    // until it's re-focused or receives input (Ghostty).
+                    if self.app.config(|c| c.bell_border) {
+                        self.bell_border = true;
+                    }
+                    // `bell-features` `title` — prepend 🔔 to the
+                    // window/tab title (Ghostty).
+                    if self.app.config(|c| c.bell_title) {
+                        let base = self.session.base_title.lock().unwrap().clone();
+                        self.app.set_session_title(
+                            self.session.id,
+                            Str::from(format!("\u{1f514} {base}")),
+                        );
                     }
                 }
                 TermEvent::ChildExit(_status) => {
@@ -1248,11 +1392,15 @@ impl TermSurface {
                             if self.app.config(|c| c.visual_bell) {
                                 self.bell_at = Some(Instant::now());
                             }
-                            if self.app.config(|c| c.desktop_notifications) {
-                                notify_desktop("hydroterm", "Command finished");
-                            }
+                            notify_desktop("hydroterm", "Command finished");
                             if self.app.config(|c| c.bell_attention) {
                                 *self.session.notify_badge.lock().unwrap() = true;
+                            self.app.tab_badge(self.session.id, true);
+                            }
+                            if self.app.config(|c| c.bell_border) {
+                                self.bell_border = true;
+                            }
+                            if self.app.config(|c| c.bell_title) {
                                 self.app.set_session_title(
                                     self.session.id,
                                     Str::from("\u{1f514} Command finished"),
@@ -1266,12 +1414,16 @@ impl TermSurface {
                         if self.app.config(|c| c.visual_bell) {
                             self.bell_at = Some(Instant::now());
                         }
-                        if self.app.config(|c| c.desktop_notifications) {
-                            notify_desktop(&title, &body);
-                        }
+                        notify_desktop(&title, &body);
                         if self.app.config(|c| c.bell_attention) {
-                            let text = if title.is_empty() { body } else { format!("{title}: {body}") };
                             *self.session.notify_badge.lock().unwrap() = true;
+                            self.app.tab_badge(self.session.id, true);
+                        }
+                        if self.app.config(|c| c.bell_border) {
+                            self.bell_border = true;
+                        }
+                        if self.app.config(|c| c.bell_title) {
+                            let text = if title.is_empty() { body } else { format!("{title}: {body}") };
                             self.app
                                 .set_session_title(self.session.id, Str::from(format!("\u{1f514} {text}")));
                         }
@@ -1410,9 +1562,13 @@ impl TermSurface {
 
     /// User attention on this pane clears a 🔔 notification badge.
     fn clear_notify_badge(&mut self) {
+        // Bell `border`/`title`/`attention` alerts all persist until the
+        // pane is re-focused or receives input (Ghostty).
+        self.bell_border = false;
         let mut badge = self.session.notify_badge.lock().unwrap();
         if *badge {
             *badge = false;
+            self.app.tab_badge(self.session.id, false);
             let t = self.session.base_title.lock().unwrap().clone();
             drop(badge);
             self.app.set_session_title(self.session.id, t);
@@ -1470,8 +1626,14 @@ impl TermSurface {
         // program we're about to kill.
         if pressed && self.session.pending_close.snapshot().is_some() {
             match key {
-                Key::Named(NamedKey::Enter) => self.app.confirm_close(self.session.id),
-                Key::Named(NamedKey::Escape) => self.app.cancel_close_prompt(self.session.id),
+                Key::Named(NamedKey::Enter) => {
+                    self.app.confirm_close(self.session.id);
+                    self.app.refocus(self.session.id);
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.app.cancel_close_prompt(self.session.id);
+                    self.app.refocus(self.session.id);
+                }
                 _ => {}
             }
             return true;
@@ -1539,6 +1701,7 @@ impl TermSurface {
             Key::Named(NamedKey::Enter) => {
                 let sel = self.app.palette_sel.snapshot().unwrap_or(0);
                 self.app.run_palette_at(sel);
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
@@ -1567,6 +1730,7 @@ impl TermSurface {
             }
             Key::Named(NamedKey::Escape) => {
                 self.app.palette_open.set(false);
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Backspace) if mods.is_empty() => {
@@ -1597,12 +1761,19 @@ impl TermSurface {
         match key {
             Key::Named(NamedKey::Enter) => {
                 let q = self.session.title_query.snapshot();
-                self.app.set_session_title(self.session.id, q);
+                if self.session.title_prompt_writes_tab.get() {
+                    self.app
+                        .set_tab_title(self.session.id, Some(q.to_string()));
+                } else {
+                    self.app.set_session_title(self.session.id, q);
+                }
                 self.session.title_prompt_open.set(false);
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Escape) => {
                 self.session.title_prompt_open.set(false);
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Backspace) if mods.is_empty() => {
@@ -1632,6 +1803,7 @@ impl TermSurface {
             }
             Key::Named(NamedKey::Escape) => {
                 self.session.search_open.set(false);
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Backspace) => {
@@ -1678,10 +1850,12 @@ impl TermSurface {
         match key {
             Key::Named(NamedKey::Enter) => {
                 self.app.apply_settings();
+                self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Escape) => {
                 self.app.settings_open.set(false);
+                self.app.refocus(self.session.id);
                 true
             }
             // Printable keys: swallowed (controls own their own editing);
@@ -2026,13 +2200,12 @@ impl TermSurface {
                     self.last_click = Some((now, row, col, count));
                 }
                 SurfacePointerButton::Middle => {
-                    // Middle click pastes PRIMARY on Linux (xterm
-                    // convention); CLIPBOARD when PRIMARY is empty or
-                    // the compositor does not offer it. `middle-click-paste`
-                    // disables the gesture.
-                    if self.app.config(|c| c.middle_click_paste) {
-                        match self.primary_text() {
-                            Some(text) => {
+                    // `middle-click-action`: `primary-paste` pastes the
+                    // selection clipboard only (the xterm convention),
+                    // `clipboard-paste` the standard clipboard.
+                    match self.app.config(|c| c.middle_click_action) {
+                        crate::config::MiddleClickAction::PrimaryPaste => {
+                            if let Some(text) = self.primary_text() {
                                 let bracketed = self
                                     .session
                                     .terminal
@@ -2042,8 +2215,12 @@ impl TermSurface {
                                     .contains(TermMode::BRACKETED_PASTE);
                                 self.paste_text(&text, bracketed);
                             }
-                            None => self.paste_clipboard(),
                         }
+                        // `clipboard-paste` — the standard clipboard.
+                        crate::config::MiddleClickAction::ClipboardPaste => {
+                            self.paste_clipboard()
+                        }
+                        crate::config::MiddleClickAction::Ignore => {}
                     }
                 }
                 SurfacePointerButton::Secondary => {
@@ -2306,52 +2483,42 @@ impl TermSurface {
     /// Dump scrollback + screen to a temp file and open `$VISUAL`/`$EDITOR`
     /// on it in a fresh tab (kitty `scrollback_pager`/WezTerm parity).
     fn open_scrollback_editor(&mut self) {
-        let text = {
-            let term = self.session.terminal.term.lock();
-            let grid = term.grid();
-            let history = grid.history_size() as i32;
-            term.bounds_to_string(
-                Point::new(Line(-history), Column(0)),
-                Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
-            )
-        };
-        self.write_buffer_to_editor(text, "scrollback");
+        if let Some(text) = self.scrollback_text() {
+            self.write_buffer_sink(text, "scrollback", FileSink::Open);
+        }
     }
 
-    /// `write_screen_file` — the visible viewport only (no scrollback).
-    fn write_screen_file(&mut self) {
-        let text = {
-            let term = self.session.terminal.term.lock();
-            let grid = term.grid();
-            term.bounds_to_string(
-                Point::new(Line(0), Column(0)),
-                Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
-            )
-        };
-        self.write_buffer_to_editor(text, "screen");
+    /// `write_scrollback_file`/`open_scrollback_editor` region:
+    /// scrollback + screen.
+    fn scrollback_text(&mut self) -> Option<String> {
+        let term = self.session.terminal.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size() as i32;
+        Some(term.bounds_to_string(
+            Point::new(Line(-history), Column(0)),
+            Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
+        ))
     }
 
-    /// `write_scrollback_file` — scrollback + screen (same region as the
-    /// scrollback editor; Ghostty keeps the editor-less name).
-    fn write_scrollback_file(&mut self) {
-        self.open_scrollback_editor();
+    /// `write_screen_file` region — the visible viewport only.
+    fn screen_text(&mut self) -> Option<String> {
+        let term = self.session.terminal.term.lock();
+        let grid = term.grid();
+        Some(term.bounds_to_string(
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column()),
+        ))
     }
 
-    /// `write_selection_file` — the current selection's text.
-    fn write_selection_file(&mut self) {
-        let text = self
-            .session
-            .terminal
-            .term
-            .lock()
-            .selection_to_string()
-            .unwrap_or_default();
-        self.write_buffer_to_editor(text, "selection");
+    /// `write_selection_file` region — the current selection's text.
+    fn selection_text_dump(&mut self) -> Option<String> {
+        self.session.terminal.term.lock().selection_to_string()
     }
 
-    /// Dump `text` to a temp file and open it in `$VISUAL`/`$EDITOR`
-    /// inside a new tab (kitty/Ghostty write-file shape).
-    fn write_buffer_to_editor(&mut self, text: String, kind: &str) {
+    /// `write_*_file[:action]` — dump `text` to a temp file, then
+    /// `open` it in the editor tab, `copy` the path to the clipboard,
+    /// or `paste` the path at the cursor (Ghostty's action suffix).
+    fn write_buffer_sink(&mut self, text: String, kind: &str, sink: FileSink) {
         if text.trim().is_empty() {
             return;
         }
@@ -2363,12 +2530,33 @@ impl TermSurface {
         if std::fs::write(&path, text).is_err() {
             return;
         }
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".to_string());
-        let mut cmd: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
-        cmd.push(path.to_string_lossy().into_owned());
-        self.app.new_tab_command(cmd);
+        let path = path.to_string_lossy().into_owned();
+        match sink {
+            FileSink::Open => {
+                let editor = std::env::var("VISUAL")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_else(|_| "vi".to_string());
+                let mut cmd: Vec<String> =
+                    editor.split_whitespace().map(str::to_string).collect();
+                cmd.push(path);
+                self.app.new_tab_command(cmd);
+            }
+            FileSink::Copy => {
+                if let Some(clip) = self.clipboard.as_mut() {
+                    let _ = clip.set_text(&path);
+                }
+            }
+            FileSink::Paste => {
+                let bracketed = self
+                    .session
+                    .terminal
+                    .term
+                    .lock()
+                    .mode()
+                    .contains(TermMode::BRACKETED_PASTE);
+                self.paste_text(&path, bracketed);
+            }
+        }
     }
 
     /// Step the search-match cursor by `dir` (+1 next, -1 prev), wrapping.
@@ -2572,6 +2760,7 @@ impl TermSurface {
             search_matches: &matches_view,
             search_active: &active,
             bell_flash: bell_alpha,
+            bell_border: self.bell_border,
             bg_opacity,
             cell_bg_opacity: self
                 .app

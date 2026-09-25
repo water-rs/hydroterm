@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use keyboard_types::{Key, Modifiers, NamedKey};
 
-use crate::keys::TermAction;
+use crate::keys::{FileSink, TermAction};
 use crate::theme::Theme;
 
 /// Which theme a `theme =` value resolves to.
@@ -122,6 +122,30 @@ pub enum RightClickAction {
     Ignore,
 }
 
+/// `middle-click-action` — what a middle click does on a pane
+/// (Ghostty `middle-click-action`, default `primary-paste`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddleClickAction {
+    /// Paste the PRIMARY selection.
+    PrimaryPaste,
+    /// Paste the regular clipboard.
+    ClipboardPaste,
+    /// Do nothing on a middle click.
+    Ignore,
+}
+
+/// `confirm-close-surface` — when closing a pane/tab prompts
+/// (Ghostty `confirm-close-surface`, default `true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmCloseSurface {
+    /// Never prompt — close immediately.
+    False,
+    /// Prompt only when a program other than the shell is running.
+    True,
+    /// Always prompt, even at an idle shell.
+    Always,
+}
+
 /// `window-new-tab-position` — where a new tab lands in the strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewTabPosition {
@@ -213,9 +237,10 @@ pub struct AppConfig {
     /// `notify-on-command-finish-after` — minimum command duration
     /// before it notifies (seconds; Ghostty default 5).
     pub notify_on_command_finish_after: f64,
-    /// `desktop-notifications` — OSC 9/777 also posts a freedesktop
-    /// notification via `notify-send` when available.
-    pub desktop_notifications: bool,
+    /// `bell-features` `title` arm — prepend 🔔 to the window/tab
+    /// title when the bell rings or a notification fires (Ghostty's
+    /// `title` feature). Default on.
+    pub bell_title: bool,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
     /// Shell program override; `None` = `$SHELL` with integration.
@@ -228,9 +253,13 @@ pub struct AppConfig {
     pub audible_bell: bool,
     /// `bell-features` `attention` arm — the tab's 🔔 notification badge on
     /// `TermEvent::Bell`/OSC 9 (Ghostty's request-attention feature; the
-    /// badge is our attention channel). Default on; a `bell-features` line
-    /// without `attention` turns it off.
+    /// badge is our attention channel). Default on; `no-attention` (or an
+    /// empty `bell-features =`) turns it off.
     pub bell_attention: bool,
+    /// `bell-features` `border` arm — draw a border ring around the
+    /// alerted pane until it is re-focused or receives input (Ghostty's
+    /// `border` feature). Default off.
+    pub bell_border: bool,
     /// Window/transparency: alpha of the terminal's own background fill,
     /// 0.0 (invisible) ..= 1.0 (opaque). The winit window is created
     /// transparent when this starts below 1.0 — raising it live works;
@@ -275,9 +304,9 @@ pub struct AppConfig {
     /// `window-padding-color` — what the padding area is painted with
     /// (Ghostty `window-padding-color`, default `background`).
     pub window_padding_color: WindowPaddingColor,
-    /// `middle-click-paste` — paste the PRIMARY selection on a middle
-    /// click (Ghostty `middle-click-paste`, default true).
-    pub middle_click_paste: bool,
+    /// `middle-click-action` — what a middle click does (Ghostty,
+    /// default `primary-paste`).
+    pub middle_click_action: MiddleClickAction,
     /// `right-click-action` — secondary-click behaviour on a pane
     /// (Ghostty `right-click-action`, default `context-menu`).
     pub right_click_action: RightClickAction,
@@ -308,12 +337,12 @@ pub struct AppConfig {
     /// GUI key focus still needs a press until hydrolysis#126.
     pub focus_follows_mouse: bool,
     /// Theme color overrides (Ghostty `foreground` / `background` /
-    /// `cursor-color` / `selection-color` / `palette = N=#rgb`);
+    /// `cursor-color` / `selection-foreground` / `palette = N=#rgb`);
     /// applied on top of the resolved theme, live-reloaded.
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
     pub cursor_color: Option<Rgb>,
-    /// Selection text color — `selection-color` sets the ink; when unset
+    /// Selection text color — `selection-foreground` sets the ink; when unset
     /// the selected cell's own background becomes the ink (inverted).
     pub selection_color: Option<Rgb>,
     /// `palette = 1=#ff0000` — indexed 0-255 slot overrides.
@@ -322,7 +351,7 @@ pub struct AppConfig {
     pub mouse_scroll_multiplier: f32,
     /// Ask before closing a pane/tab whose PTY foreground is a program
     /// other than the shell (Ghostty `confirm-close-surface`).
-    pub confirm_close: bool,
+    pub confirm_close: ConfirmCloseSurface,
     /// Initial window content size in points; 0 = framework default.
     /// Applied once at launch (Ghostty `window-width`/`window-height`).
     pub window_width: f32,
@@ -342,7 +371,7 @@ pub struct AppConfig {
     pub click_interval: u64,
     /// Invert the selected cells' foreground/background (Ghostty
     /// `selection-invert-fg-bg`) — always swaps, even when
-    /// `selection-color`/`selection-background` are configured.
+    /// `selection-foreground`/`selection-background` are configured.
     pub selection_invert: bool,
     /// Restore the last window geometry on launch and save it as the
     /// window moves/resizes (Ghostty `window-save-state`).
@@ -506,14 +535,17 @@ impl Default for AppConfig {
             quick_terminal_position: QuickTermPosition::Top,
             quick_terminal_size: None,
             clipboard_trim: true,
-            desktop_notifications: true,
+            bell_title: true,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             shell: None,
             command: None,
             keybinds: Vec::new(),
-            audible_bell: true,
+            // `bell-features` defaults (Ghostty): `attention` and `title`
+            // on, `system`/`audio`/`border` off.
+            audible_bell: false,
             bell_attention: true,
+            bell_border: false,
             background_opacity: 1.0,
             background_opacity_cells: false,
             paste_protection: true,
@@ -528,7 +560,7 @@ impl Default for AppConfig {
             window_padding_y: 0.0,
             window_padding_balance: false,
             window_padding_color: WindowPaddingColor::Background,
-            middle_click_paste: true,
+            middle_click_action: MiddleClickAction::PrimaryPaste,
             right_click_action: RightClickAction::ContextMenu,
             term: "xterm-256color".to_string(),
             osc52_write: true,
@@ -544,7 +576,7 @@ impl Default for AppConfig {
             selection_color: None,
             palette_overrides: Vec::new(),
             mouse_scroll_multiplier: 1.0,
-            confirm_close: true,
+            confirm_close: ConfirmCloseSurface::True,
             window_width: 0.0,
             window_height: 0.0,
             window_x: None,
@@ -622,15 +654,15 @@ scrollback = 10000
 window-padding-x = 0       # blank margin around the grid, in points
 window-padding-y = 0
 window-padding-balance = false  # center the grid when it doesn't fill the frame
-middle-click-paste = true  # middle click pastes the PRIMARY selection
+middle-click-action = primary-paste  # middle click pastes the PRIMARY selection
 right-click-action = context-menu  # context-menu | copy | paste | ignore
 font-thicken = false       # overdraw glyph runs to darken strokes
 # font-family-bold = DejaVu Sans Mono   # per-style family overrides
 # font-family-italic = DejaVu Sans Mono
 # font-family-bold-italic = DejaVu Sans Mono
 term = xterm-256color      # $TERM value advertised to programs
-osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
-osc52-read = ask           # allow | ask | deny — OSC 52 clipboard reads by programs
+clipboard-write = allow    # allow | deny — OSC 52 clipboard writes by programs
+clipboard-read = ask       # allow | ask | deny — OSC 52 clipboard reads by programs
 mouse-shift-capture = false # false | true | always | never — whether Shift reaches a mouse-reporting program
 cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
 bold-color = bright        # bright | #rrggbb — bold-text color (unset = no override)
@@ -655,10 +687,9 @@ cursor-style = block        # block | beam | underline | hollow
 cursor-style-blink = true
 copy-on-select = both       # both | clipboard | primary | false
 shell-integration = detect  # detect | none | bash | zsh | fish
-desktop-notifications = true # OSC 9/777 also notify via notify-send
+bell-features = system,audio,attention,title  # bell channels (no-X disables; `visual` = pane flash extension)
 notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
 notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
-audible-bell = true       # ring the X11 keyboard bell on BEL
 # shell = /bin/bash
 
 # Colors: overrides on top of the resolved theme
@@ -666,7 +697,7 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 # foreground = #ddeeff
 # background = #101418
 # cursor-color = #ffcc00
-# selection-color = #ffffff
+# selection-foreground = #ffffff
 # selection-background = #3b4d5a   # selection highlight fill
 # split-divider-color = #888888    # pane separator (default: theme Border)
 # unfocused-split-fill = #2a2a2a   # bg of unfocused splits
@@ -674,7 +705,7 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 # palette = 1=#e06c75   # indexed slot 0-255
 
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
-confirm-close = true       # ask before closing a running program
+confirm-close-surface = true  # ask before closing a running program (true|false|always)
 # window-width = 800       # initial window size in points (0 = default)
 # fullscreen = false         # start windows fullscreen
 # window-height = 600
@@ -684,30 +715,28 @@ confirm-close = true       # ask before closing a running program
 # adjust-font-baseline = 0px   # +Npx raises the text baseline; N% or Npx
 # font-feature = -calt         # OpenType toggle: -tag off, +tag/tag/tag=N on
 # font-style = Italic        # named style of font-family for regular text
-# font-synthetic = bold      # allow embolden synthesis; repeat for italic
+# font-synthetic-style = bold      # allow embolden synthesis; repeat for italic (or no-bold,no-italic,true,false)
 # font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono  # per-codepoint family
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
 # chords: ctrl+shift+c, alt+enter, ...  actions: copy, paste,
-# new_tab, close_tab, new_window, next_tab, prev_tab, select_tab_1..8,
-# font_bigger, font_smaller, font_reset, clear_scrollback, search,
-# prompt_prev, prompt_next, select_all, scroll_to_top,
-# scroll_to_bottom, quit, split_right, split_down,
-# focus_next_pane, focus_prev_pane
+# new_tab, close_tab, close_surface, new_window, next_tab, previous_tab,
+# goto_tab:N, increase_font_size:N, decrease_font_size:N, reset_font_size,
+# clear_scrollback, search, jump_to_prompt:±N, select_all, scroll_to_top,
+# scroll_to_bottom, quit, new_split:right|down, goto_split:dir
 # keybind = ctrl+alt+a=select_all
 # keybind = global:ctrl+alt+u=toggle_quick_terminal   # X11 root grab — fires anywhere
 # tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
-# word-select-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
-# visual-bell = true      # flash the pane on BEL
+# selection-word-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
 # open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
 # quick-terminal-position = top   # top | bottom | left | right | center
 # quick-terminal-size = 45%       # N% or Npx[, second axis] — primary axis
 #                                  # is height for top/bottom, width for
 #                                  # left/right; edge docks maximize the rest
 # shell-integration-features = cursor,sudo,title   # prefix a feature with no- to disable
-# clipboard-trim = true   # trim whitespace at the ends of copied text
+# clipboard-trim-trailing-spaces = true   # trim whitespace at the ends of copied text
 # keybind = ctrl+shift+q=unbind   # unbind a chord (falls through to literal keys)
 
 # Alpha of the terminal background fill (0..1); set below 1.0 at launch
@@ -781,26 +810,47 @@ impl AppConfig {
                     cfg.font_family_bold_italic = Some(value.to_string());
                 }
                 "font-thicken" => cfg.font_thicken = bool_value(value, n, &mut errors),
-                "font-style" | "font_style" => cfg.font_style = Some(value.to_string()),
-                "font-synthetic" | "font_synthetic" => {
-                    let (b, i) = cfg.font_synthetic.get_or_insert((false, false));
-                    for tok in value.split('|').map(|t| t.trim().to_ascii_lowercase()) {
+                "font-style" => cfg.font_style = Some(value.to_string()),
+                "font-synthetic-style" => {
+                    // Ghostty's form is `no-bold`,`no-italic`,`no-bold-italic`
+                    // disables and `true`/`false` covers both; bare
+                    // `bold`/`italic` are the allow-list form; an empty
+                    // value allows nothing.
+                    if value.trim().is_empty() {
+                        cfg.font_synthetic = Some((false, false));
+                    }
+                    for tok in value.split(&[',', '|'][..]).map(|t| t.trim().to_ascii_lowercase()) {
                         match tok.as_str() {
-                            "bold" => *b = true,
-                            "italic" | "oblique" => *i = true,
-                            "bold-italic" | "bolditalic" => {
-                                *b = true;
-                                *i = true;
+                            "true" => {
+                                cfg.font_synthetic = Some((true, true));
+                            }
+                            "false" => {
+                                cfg.font_synthetic = Some((false, false));
+                            }
+                            "bold" => {
+                                cfg.font_synthetic.get_or_insert((false, false)).0 = true;
+                            }
+                            "italic" => {
+                                cfg.font_synthetic.get_or_insert((false, false)).1 = true;
+                            }
+                            "no-bold" => {
+                                cfg.font_synthetic.get_or_insert((true, true)).0 = false;
+                            }
+                            "no-italic" => {
+                                cfg.font_synthetic.get_or_insert((true, true)).1 = false;
+                            }
+                            "no-bold-italic" => {
+                                cfg.font_synthetic = Some((false, false));
                             }
                             "" => {}
                             _ => errors.push(format!(
-                                "line {}: bad font-synthetic token {tok:?}",
+                                "line {}: bad font-synthetic-style token {tok:?}",
                                 n + 1
                             )),
                         }
                     }
                 }
-                "font-codepoint-map" | "font_codepoint_map" => {
+                "font-codepoint-map" => {
                     match parse_codepoint_map(value) {
                         Some((lo, hi, fam)) => cfg.font_codepoint_map.push((lo, hi, fam)),
                         None => errors.push(format!(
@@ -809,15 +859,26 @@ impl AppConfig {
                         )),
                     }
                 }
-                "middle-click-paste" | "middle_click_paste" => {
-                    cfg.middle_click_paste = bool_value(value, n, &mut errors);
+                "middle-click-action" => {
+                    cfg.middle_click_action = match value {
+                        "primary-paste" => MiddleClickAction::PrimaryPaste,
+                        "clipboard-paste" => MiddleClickAction::ClipboardPaste,
+                        "ignore" => MiddleClickAction::Ignore,
+                        _ => {
+                            errors.push(format!(
+                                "line {}: bad middle-click-action {value:?} (want primary-paste|clipboard-paste|ignore)",
+                                n + 1
+                            ));
+                            cfg.middle_click_action
+                        }
+                    };
                 }
-                "right-click-action" | "right_click_action" => {
+                "right-click-action" => {
                     cfg.right_click_action = match value {
-                        "context-menu" | "context_menu" => RightClickAction::ContextMenu,
+                        "context-menu" => RightClickAction::ContextMenu,
                         "copy" => RightClickAction::Copy,
                         "paste" => RightClickAction::Paste,
-                        "ignore" | "none" => RightClickAction::Ignore,
+                        "ignore" => RightClickAction::Ignore,
                         _ => {
                             errors.push(format!(
                                 "line {}: bad right-click-action {value:?}",
@@ -831,31 +892,24 @@ impl AppConfig {
                     Ok(v) => cfg.scrollback = v.min(1_000_000),
                     Err(_) => errors.push(format!("line {}: bad scrollback {value:?}", n + 1)),
                 },
-                "background-opacity" | "background_opacity" => match value.parse::<f32>() {
+                "background-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
                     _ => errors.push(format!("line {}: bad background-opacity {value:?}", n + 1)),
                 },
-                "paste-protection" | "clipboard-paste-protection" => match value {
-                    "true" | "yes" | "1" | "on" => cfg.paste_protection = true,
-                    "false" | "no" | "0" | "off" => cfg.paste_protection = false,
-                    _ => errors.push(format!("line {}: bad paste-protection {value:?}", n + 1)),
+                "clipboard-paste-protection" => match value {
+                    "true" | "1" => cfg.paste_protection = true,
+                    "false" | "0" => cfg.paste_protection = false,
+                    _ => errors.push(format!("line {}: bad clipboard-paste-protection {value:?}", n + 1)),
                 },
-                "window-padding-x" | "window_padding_x" => match value.parse::<f32>() {
+                "window-padding-x" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=200.0).contains(&v) => cfg.window_padding_x = v,
                     _ => errors.push(format!("line {}: bad window-padding-x {value:?}", n + 1)),
                 },
-                "window-padding-y" | "window_padding_y" => match value.parse::<f32>() {
+                "window-padding-y" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=200.0).contains(&v) => cfg.window_padding_y = v,
                     _ => errors.push(format!("line {}: bad window-padding-y {value:?}", n + 1)),
                 },
-                "window-padding" | "window_padding" => match value.parse::<f32>() {
-                    Ok(v) if (0.0..=200.0).contains(&v) => {
-                        cfg.window_padding_x = v;
-                        cfg.window_padding_y = v;
-                    }
-                    _ => errors.push(format!("line {}: bad window-padding {value:?}", n + 1)),
-                },
-                "window-padding-balance" | "window_padding_balance" => {
+                "window-padding-balance" => {
                     cfg.window_padding_balance = bool_value(value, n, &mut errors);
                 }
                 "term" => cfg.term = value.to_string(),
@@ -867,33 +921,33 @@ impl AppConfig {
                     Some(c) => cfg.background = Some(c),
                     None => errors.push(format!("line {}: bad background {value:?}", n + 1)),
                 },
-                "cursor-color" | "cursor_color" => match parse_rgb(value) {
+                "cursor-color" => match parse_rgb(value) {
                     Some(c) => cfg.cursor_color = Some(c),
                     None => errors.push(format!("line {}: bad cursor-color {value:?}", n + 1)),
                 },
-                "selection-color" | "selection_color" | "selection-foreground" => {
+                "selection-foreground" => {
                     match parse_rgb(value) {
                         Some(c) => cfg.selection_color = Some(c),
                         None => {
-                            errors.push(format!("line {}: bad selection-color {value:?}", n + 1))
+                            errors.push(format!("line {}: bad selection-foreground {value:?}", n + 1))
                         }
                     }
                 }
-                "selection-background" | "selection_background" => {
+                "selection-background" => {
                     match parse_rgb(value) {
                         Some(c) => cfg.selection_background = Some(c),
                         None => errors
                             .push(format!("line {}: bad selection-background {value:?}", n + 1)),
                     }
                 }
-                "split-divider-color" | "split_divider_color" => {
+                "split-divider-color" => {
                     match parse_rgb(value) {
                         Some(c) => cfg.split_divider_color = Some(c),
                         None => errors
                             .push(format!("line {}: bad split-divider-color {value:?}", n + 1)),
                     }
                 }
-                "unfocused-split-fill" | "unfocused_split_fill" => {
+                "unfocused-split-fill" => {
                     match parse_rgb(value) {
                         Some(c) => cfg.unfocused_split_fill = Some(c),
                         None => errors
@@ -916,7 +970,7 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "mouse-scroll-multiplier" | "mouse_scroll_multiplier" => {
+                "mouse-scroll-multiplier" => {
                     match value.parse::<f32>() {
                         Ok(v) if (0.1..=100.0).contains(&v) => {
                             cfg.mouse_scroll_multiplier = v;
@@ -927,25 +981,36 @@ impl AppConfig {
                         )),
                     }
                 }
-                "confirm-close" | "confirm-close-surface" | "confirm_close" => {
-                    cfg.confirm_close = bool_value(value, n, &mut errors);
+                "confirm-close-surface" => {
+                    cfg.confirm_close = match value {
+                        "true" | "on" => ConfirmCloseSurface::True,
+                        "false" | "off" => ConfirmCloseSurface::False,
+                        "always" => ConfirmCloseSurface::Always,
+                        _ => {
+                            errors.push(format!(
+                                "line {}: bad confirm-close-surface {value:?} (want true|false|always)",
+                                n + 1
+                            ));
+                            cfg.confirm_close
+                        }
+                    };
                 }
-                "osc52-write" | "clipboard-write" => match value {
-                    "allow" | "true" | "yes" | "1" | "on" => cfg.osc52_write = true,
-                    "deny" | "false" | "no" | "0" | "off" => cfg.osc52_write = false,
-                    _ => errors.push(format!("line {}: bad osc52-write {value:?}", n + 1)),
+                "clipboard-write" => match value {
+                    "allow" | "true" | "1" => cfg.osc52_write = true,
+                    "deny" | "false" | "0" => cfg.osc52_write = false,
+                    _ => errors.push(format!("line {}: bad clipboard-write {value:?}", n + 1)),
                 },
-                "osc52-read" | "clipboard-read" => match value {
-                    "allow" | "always" | "true" => cfg.clipboard_read = ClipboardRead::Allow,
-                    "ask" | "prompt" => cfg.clipboard_read = ClipboardRead::Ask,
-                    "deny" | "never" | "false" => cfg.clipboard_read = ClipboardRead::Deny,
-                    _ => errors.push(format!("line {}: bad osc52-read {value:?}", n + 1)),
+                "clipboard-read" => match value {
+                    "allow" | "always" => cfg.clipboard_read = ClipboardRead::Allow,
+                    "ask" => cfg.clipboard_read = ClipboardRead::Ask,
+                    "deny" | "never" => cfg.clipboard_read = ClipboardRead::Deny,
+                    _ => errors.push(format!("line {}: bad clipboard-read {value:?}", n + 1)),
                 },
                 "notify-on-command-finish" => {
                     cfg.notify_on_command_finish = match value {
-                        "no" | "false" => NotifyWhen::No,
+                        "no" => NotifyWhen::No,
                         "unfocused" => NotifyWhen::Unfocused,
-                        "always" | "true" => NotifyWhen::Always,
+                        "always" => NotifyWhen::Always,
                         _ => {
                             errors.push(format!("line {}: bad notify-on-command-finish {value:?}", n + 1));
                             cfg.notify_on_command_finish
@@ -973,20 +1038,12 @@ impl AppConfig {
                         }
                     };
                 }
-                "cursor-invert-fg-bg" | "cursor_invert_fg_bg" => {
+                "cursor-invert-fg-bg" => {
                     cfg.cursor_invert_fg_bg = bool_value(value, n, &mut errors);
                 }
-                "cursor-click-to-move" | "cursor_click_to_move" => {
+                "cursor-click-to-move" => {
                     cfg.cursor_click_to_move = bool_value(value, n, &mut errors);
                 }
-                "bold-is-bright" | "bold_is_bright"
-                | "draw-bold-text-with-bright-colors" => match value {
-                    // Deprecated alias for `bold-color` (Ghostty 1.2 shim:
-                    // true → bright, false → unset).
-                    "true" | "yes" | "1" | "on" => cfg.bold_color = BoldColor::Bright,
-                    "false" | "no" | "0" | "off" => cfg.bold_color = BoldColor::None,
-                    _ => errors.push(format!("line {}: bad bold-is-bright {value:?}", n + 1)),
-                },
                 "bold-color" => {
                     if value.eq_ignore_ascii_case("bright") {
                         cfg.bold_color = BoldColor::Bright;
@@ -1008,9 +1065,9 @@ impl AppConfig {
                 "selection-clear-on-typing" => {
                     cfg.selection_clear_on_typing = bool_value(value, n, &mut errors);
                 }
-                "mouse-hide-while-typing" | "mouse_hide_while_typing" => match value {
-                    "true" | "yes" | "1" | "on" => cfg.mouse_hide_typing = true,
-                    "false" | "no" | "0" | "off" => cfg.mouse_hide_typing = false,
+                "mouse-hide-while-typing" => match value {
+                    "true" | "1" => cfg.mouse_hide_typing = true,
+                    "false" | "0" => cfg.mouse_hide_typing = false,
                     _ => errors.push(format!("line {}: bad mouse-hide-while-typing {value:?}", n + 1)),
                 },
                 "theme" => {
@@ -1029,8 +1086,8 @@ impl AppConfig {
                     }
                 }
                 "copy-on-select" => cfg.copy_on_select = match value {
-                    "true" | "yes" | "on" | "both" => CopyOnSelect::Both,
-                    "false" | "no" | "off" | "disabled" | "none" => CopyOnSelect::Disabled,
+                    "true" | "on" => CopyOnSelect::Both,
+                    "false" | "no" | "disabled" => CopyOnSelect::Disabled,
                     "clipboard" => CopyOnSelect::Clipboard,
                     "primary" => CopyOnSelect::Primary,
                     _ => {
@@ -1079,26 +1136,42 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "clipboard-trim" => match value {
-                    "true" | "1" | "yes" | "on" => cfg.clipboard_trim = true,
-                    "false" | "0" | "no" | "off" => cfg.clipboard_trim = false,
-                    _ => errors.push(format!("line {}: bad clipboard-trim {value:?}", n + 1)),
+                "clipboard-trim-trailing-spaces" => match value {
+                    "true" | "yes" => cfg.clipboard_trim = true,
+                    "false" | "no" => cfg.clipboard_trim = false,
+                    _ => errors.push(format!(
+                        "line {}: bad clipboard-trim-trailing-spaces {value:?}",
+                        n + 1
+                    )),
                 },
                 // Ghostty `bell-features` — a comma list naming the enabled
-                // bell channels; features absent from the list are disabled.
-                // `system` → desktop notifications, `audio` → xkbbell,
-                // `visual` → pane flash, `attention` → the tab 🔔 badge.
-                "bell-features" | "bell_features" => {
-                    cfg.desktop_notifications = false;
-                    cfg.audible_bell = false;
-                    cfg.visual_bell = false;
-                    cfg.bell_attention = false;
+                // bell channels; `no-<name>` disables and an empty value
+                // turns every channel off (the reference's packed-set
+                // semantics: each line applies its items to the set).
+                // `system`/`audio` → the X11 bell (audio's custom sound
+                // file isn't played), `attention` → the tab 🔔 badge,
+                // `title` → 🔔 in the title, `border` → a border ring.
+                "bell-features" => {
+                    if value.trim().is_empty() {
+                        cfg.audible_bell = false;
+                        cfg.bell_attention = false;
+                        cfg.bell_title = false;
+                        cfg.bell_border = false;
+                    }
                     for feature in value.split(',') {
-                        match feature.trim() {
-                            "system" => cfg.desktop_notifications = true,
-                            "audio" => cfg.audible_bell = true,
-                            "visual" => cfg.visual_bell = true,
-                            "attention" => cfg.bell_attention = true,
+                        let feature = feature.trim();
+                        if feature.is_empty() {
+                            continue;
+                        }
+                        let (on, name) = match feature.strip_prefix("no-") {
+                            Some(rest) => (false, rest),
+                            None => (true, feature),
+                        };
+                        match name {
+                            "system" | "audio" => cfg.audible_bell = on,
+                            "attention" => cfg.bell_attention = on,
+                            "title" => cfg.bell_title = on,
+                            "border" => cfg.bell_border = on,
                             _ => errors.push(format!(
                                 "line {}: bad bell-features item {feature:?}",
                                 n + 1
@@ -1106,10 +1179,6 @@ impl AppConfig {
                         }
                     }
                 }
-                "desktop-notifications" => {
-                    cfg.desktop_notifications = bool_value(value, n, &mut errors);
-                }
-                "audible-bell" => cfg.audible_bell = bool_value(value, n, &mut errors),
                 "cursor-style-blink" => {
                     cfg.cursor_blink = bool_value(value, n, &mut errors)
                 }
@@ -1117,7 +1186,7 @@ impl AppConfig {
                     "block" => cfg.cursor_shape = CursorShape::Block,
                     "beam" => cfg.cursor_shape = CursorShape::Beam,
                     "underline" => cfg.cursor_shape = CursorShape::Underline,
-                    "hollow" | "hollow-block" => cfg.cursor_shape = CursorShape::HollowBlock,
+                    "hollow-block" => cfg.cursor_shape = CursorShape::HollowBlock,
                     _ => errors.push(format!("line {}: bad cursor-style {value:?}", n + 1)),
                 },
                 "shell" => cfg.shell = (!value.is_empty()).then(|| value.to_string()),
@@ -1126,10 +1195,10 @@ impl AppConfig {
                         value.split_whitespace().map(String::from).collect();
                     cfg.command = (!argv.is_empty()).then_some(argv);
                 }
-                "working-directory" | "working_directory" | "working-dir" => {
+                "working-directory" => {
                     cfg.working_directory = (!value.is_empty()).then(|| expand_home(value));
                 }
-                "unfocused-split-opacity" | "unfocused_split_opacity" => {
+                "unfocused-split-opacity" => {
                     match value.parse::<f32>() {
                         Ok(v) if (0.0..=1.0).contains(&v) => {
                             cfg.unfocused_split_opacity = v;
@@ -1140,17 +1209,17 @@ impl AppConfig {
                         )),
                     }
                 }
-                "resize-overlay" | "resize_overlay" => {
+                "resize-overlay" => {
                     cfg.resize_overlay = bool_value(value, n, &mut errors);
                 }
-                "focus-follows-mouse" | "focus_follows_mouse" => {
+                "focus-follows-mouse" => {
                     cfg.focus_follows_mouse = bool_value(value, n, &mut errors);
                 }
-                "window-width" | "window_width" => match value.parse::<f32>() {
+                "window-width" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_width = v,
                     _ => errors.push(format!("line {}: bad window-width {value:?}", n + 1)),
                 },
-                "window-height" | "window_height" => match value.parse::<f32>() {
+                "window-height" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_height = v,
                     _ => errors.push(format!("line {}: bad window-height {value:?}", n + 1)),
                 },
@@ -1162,10 +1231,10 @@ impl AppConfig {
                     Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_y = Some(v),
                     _ => errors.push(format!("line {}: bad window-position-y {value:?}", n + 1)),
                 },
-                "link-url" | "link_url" => {
+                "link-url" => {
                     cfg.link_url = bool_value(value, n, &mut errors);
                 }
-                "open-link-modifier" | "open_link_modifier" => {
+                "open-link-modifier" => {
                     match value.parse::<LinkMod>() {
                         Ok(m) => cfg.open_link_modifier = m,
                         Err(e) => errors.push(format!("line {}: {e}", n + 1)),
@@ -1175,35 +1244,35 @@ impl AppConfig {
                     Ok(v) if (50..=2000).contains(&v) => cfg.click_interval = v,
                     _ => errors.push(format!("line {}: bad click-repeat-interval {value:?}", n + 1)),
                 },
-                "selection-invert-fg-bg" | "selection_invert_fg_bg" => {
+                "selection-invert-fg-bg" => {
                     cfg.selection_invert = bool_value(value, n, &mut errors);
                 }
-                "window-save-state" | "window_save_state" => {
+                "window-save-state" => {
                     cfg.window_save_state = bool_value(value, n, &mut errors);
                 }
                 "fullscreen" => {
                     cfg.window_fullscreen = bool_value(value, n, &mut errors);
                 }
-                "wait-after-command" | "wait_after_command" => {
+                "wait-after-command" => {
                     cfg.wait_after_command = bool_value(value, n, &mut errors);
                 }
-                "quit-after-last-window-closed" | "quit_after_last_window_closed" => {
+                "quit-after-last-window-closed" => {
                     cfg.quit_after_last_window_closed = bool_value(value, n, &mut errors);
                 }
-                "window-theme" | "window_theme" => match value {
-                    "auto" | "system" => cfg.window_theme = WindowTheme::Auto,
+                "window-theme" => match value {
+                    "auto" => cfg.window_theme = WindowTheme::Auto,
                     "light" => cfg.window_theme = WindowTheme::Light,
                     "dark" => cfg.window_theme = WindowTheme::Dark,
                     _ => errors.push(format!("line {}: bad window-theme {value:?}", n + 1)),
                 },
-                "window-decoration" | "window_decoration" => {
+                "window-decoration" => {
                     cfg.window_decoration = match value {
-                        "false" | "none" => false,
-                        "true" | "auto" | "client" | "server" => true,
+                        "false" => false,
+                        "true" | "client" => true,
                         _ => bool_value(value, n, &mut errors),
                     };
                 }
-                "background-image" | "background_image" => {
+                "background-image" => {
                     let p = value.trim();
                     if p.is_empty() || p == "none" {
                         cfg.background_image = None;
@@ -1218,7 +1287,7 @@ impl AppConfig {
                         cfg.background_image = Some(expanded);
                     }
                 }
-                "background-image-opacity" | "background_image_opacity" => {
+                "background-image-opacity" => {
                     match value.parse::<f32>() {
                         Ok(v) if (0.0..=1.0).contains(&v) => {
                             cfg.background_image_opacity = v;
@@ -1229,7 +1298,7 @@ impl AppConfig {
                         )),
                     }
                 }
-                "background-image-fit" | "background_image_fit" => match value {
+                "background-image-fit" => match value {
                     "contain" => cfg.background_image_fit = BgFit::Contain,
                     "cover" => cfg.background_image_fit = BgFit::Cover,
                     "stretch" => cfg.background_image_fit = BgFit::Stretch,
@@ -1239,10 +1308,10 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "background-image-repeat" | "background_image_repeat" => {
+                "background-image-repeat" => {
                     cfg.background_image_repeat = bool_value(value, n, &mut errors);
                 }
-                "window-new-tab-position" | "window_new_tab_position" | "new-tab-position" => {
+                "window-new-tab-position" => {
                     match value {
                         "end" => cfg.new_tab_position = NewTabPosition::End,
                         "current" => cfg.new_tab_position = NewTabPosition::Current,
@@ -1252,34 +1321,32 @@ impl AppConfig {
                         )),
                     }
                 }
-                "window-inherit-working-directory" | "window_inherit_working_directory"
-                | "inherit-working-directory" => {
+                "window-inherit-working-directory" => {
                     cfg.inherit_working_directory = bool_value(value, n, &mut errors);
                 }
-                "window-inherit-font-size" | "window_inherit_font_size"
-                | "inherit-font-size" => {
+                "window-inherit-font-size" => {
                     cfg.inherit_font_size = bool_value(value, n, &mut errors);
                 }
-                "scroll-to-cursor" | "scroll_to_cursor" => {
+                "scroll-to-cursor" => {
                     cfg.scroll_to_cursor = bool_value(value, n, &mut errors);
                 }
-                "cursor-text" | "cursor_text" => match parse_rgb(value) {
+                "cursor-text" => match parse_rgb(value) {
                     Some(rgb) => cfg.cursor_text = Some(rgb),
                     None => errors.push(format!("line {}: bad cursor-text {value:?}", n + 1)),
                 },
-                "background-opacity-cells" | "background_opacity_cells" => {
+                "background-opacity-cells" => {
                     cfg.background_opacity_cells = bool_value(value, n, &mut errors)
                 }
-                "window-padding-color" | "window_padding_color" => match value {
+                "window-padding-color" => match value {
                     "background" => cfg.window_padding_color = WindowPaddingColor::Background,
                     "extend" => cfg.window_padding_color = WindowPaddingColor::Extend,
                     "extend-always" => cfg.window_padding_color = WindowPaddingColor::ExtendAlways,
                     _ => errors.push(format!("line {}: bad window-padding-color {value:?}", n + 1)),
                 },
-                "scroll-on-input" | "scroll_on_input" => {
+                "scroll-on-input" => {
                     cfg.scroll_on_input = bool_value(value, n, &mut errors);
                 }
-                "cursor-opacity" | "cursor_opacity" => match value.parse::<f32>() {
+                "cursor-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.cursor_opacity = v,
                     _ => errors.push(format!("line {}: bad cursor-opacity {value:?}", n + 1)),
                 },
@@ -1292,28 +1359,28 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "adjust-cell-width" | "cell-width" => match parse_cell_adjust(value) {
+                "adjust-cell-width" => match parse_cell_adjust(value) {
                     Some(pct) => cfg.cell_width_adjust = pct,
                     None => errors.push(format!(
                         "line {}: bad adjust-cell-width {value:?} (want N% or Npx)",
                         n + 1
                     )),
                 },
-                "adjust-cell-height" | "cell-height" => match parse_cell_adjust(value) {
+                "adjust-cell-height" => match parse_cell_adjust(value) {
                     Some(pct) => cfg.cell_height_adjust = pct,
                     None => errors.push(format!(
                         "line {}: bad adjust-cell-height {value:?} (want N% or Npx)",
                         n + 1
                     )),
                 },
-                "adjust-font-baseline" | "font-baseline" => match parse_cell_adjust(value) {
+                "adjust-font-baseline" => match parse_cell_adjust(value) {
                     Some(pct) => cfg.font_baseline_adjust = pct,
                     None => errors.push(format!(
                         "line {}: bad adjust-font-baseline {value:?} (want N% or Npx)",
                         n + 1
                     )),
                 },
-                "adjust-cursor-thickness" | "cursor-thickness" => {
+                "adjust-cursor-thickness" => {
                     match value.parse::<u16>() {
                         Ok(p) => cfg.adjust_cursor_thickness = p,
                         Err(_) => errors.push(format!(
@@ -1336,7 +1403,7 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "adjust-strikethrough-position" | "adjust-strikeout-position" => {
+                "adjust-strikethrough-position" => {
                     match value.parse::<i16>() {
                         Ok(p) => cfg.adjust_strikethrough_position = p,
                         Err(_) => errors.push(format!(
@@ -1345,7 +1412,7 @@ impl AppConfig {
                         )),
                     }
                 }
-                "adjust-strikethrough-thickness" | "adjust-strikeout-thickness" => {
+                "adjust-strikethrough-thickness" => {
                     match value.parse::<u16>() {
                         Ok(p) => cfg.adjust_strikethrough_thickness = p,
                         Err(_) => errors.push(format!(
@@ -1361,7 +1428,7 @@ impl AppConfig {
                         cfg.window_subtitle = Some(value.to_string());
                     }
                 }
-                "font-feature" | "font_feature" => {
+                "font-feature" => {
                     for spec in value.split(',') {
                         let spec = spec.trim();
                         if spec.is_empty() {
@@ -1377,38 +1444,35 @@ impl AppConfig {
                         }
                     }
                 }
-                "minimum-contrast" | "minimum_contrast" => match value.parse::<f32>() {
+                "minimum-contrast" => match value.parse::<f32>() {
                     Ok(v) if (1.0..=21.0).contains(&v) => cfg.minimum_contrast = v,
                     _ => errors.push(format!(
                         "line {}: bad minimum-contrast {value:?} (want 1.0-21.0)",
                         n + 1
                     )),
                 },
-                "window-show-tab-bar" | "window_show_tab_bar" => match value {
+                "window-show-tab-bar" => match value {
                     "always" => cfg.tab_bar_min_tabs = 1,
                     "auto" => cfg.tab_bar_min_tabs = 2,
                     "never" => cfg.tab_bar_min_tabs = usize::MAX,
                     _ => errors.push(format!("line {}: bad window-show-tab-bar {value:?}", n + 1)),
                 },
-                "tab-bar-min-tabs" | "tab_bar_min_tabs" => match value.parse::<usize>() {
+                "tab-bar-min-tabs" => match value.parse::<usize>() {
                     Ok(v) if v <= 64 => cfg.tab_bar_min_tabs = v,
                     _ => errors.push(format!("line {}: bad tab-bar-min-tabs {value:?}", n + 1)),
                 },
-                "word-select-chars" | "word_select_chars" => {
+                "selection-word-chars" => {
                     cfg.word_select_chars =
                         value.replace("\\t", "\t").replace("\\n", "\n");
                 }
-                "visual-bell" | "visual_bell" => {
-                    cfg.visual_bell = bool_value(value, n, &mut errors);
-                }
-                "visual-bell-color" | "visual_bell_color" => match parse_rgb(value) {
+                "visual-bell-color" => match parse_rgb(value) {
                     Some(rgb) => cfg.visual_bell_color = Some(rgb),
                     None => errors.push(format!(
                         "line {}: bad visual-bell-color {value:?}",
                         n + 1
                     )),
                 },
-                "open-link-with" | "open_link_with" => {
+                "open-link-with" => {
                     cfg.open_link_with = (!value.is_empty()).then(|| value.to_string());
                 }
                 "keybind" => match parse_keybind(value) {
@@ -1600,35 +1664,41 @@ fn parse_rgb(value: &str) -> Option<Rgb> {
 /// Every action name the `keybind` parser accepts — printed by
 /// `+list-actions`. Parameterized forms show their argument shape.
 pub const ACTION_NAMES: &[&str] = &[
-    "copy", "paste", "new_tab", "close_tab", "new_window", "next_tab", "prev_tab",
-    "select_tab_<n>", "move_tab_left", "move_tab_right",
-    "font_bigger", "font_smaller", "font_reset",
-    "increase_font_size[:pt]", "decrease_font_size[:pt]",
-    "clear_scrollback", "clear_screen", "reset", "search", "search_next", "search_prev",
-    "prompt_prev", "prompt_next", "select_all", "start_selection",
+    "ignore", "copy_to_clipboard", "copy_url_to_clipboard", "copy_title_to_clipboard",
+    "new_tab", "close_tab", "close_surface", "new_window", "next_tab", "previous_tab",
+    "goto_tab:<n>", "move_tab:<±n>",
+    "increase_font_size[:pt]", "decrease_font_size[:pt]", "set_font_size:<pt>",
+    "reset_font_size",
+    "clear_scrollback", "clear_screen", "reset",
+    "start_search", "end_search", "search_selection", "search:<text>",
+    "navigate_search:<next|previous>", "search", "jump_to_prompt:<±n>",
+    "select_all", "start_selection",
     "last_tab", "close_window", "close_all_tabs", "close_other_tabs", "toggle_tab_bar",
     "scroll_to_top", "scroll_to_bottom", "scroll_page_up", "scroll_page_down",
-    "scroll_line_up", "scroll_line_down",
+    "scroll_page_lines:<±n>", "scroll_page_fractional:<±f>",
     "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
-    "write_screen_file", "write_scrollback_file", "write_selection_file",
-    "write_last_output_file", "open_config", "scroll_to_selection", "clear_selection",
+    "write_screen_file[:open|copy|paste]", "write_scrollback_file[:open|copy|paste]",
+    "write_selection_file[:open|copy|paste]", "write_last_output_file[:open|copy|paste]",
+    "open_config", "scroll_to_selection", "clear_selection",
     "text:\"…\"", "csi:\"…\"", "esc:\"…\"",
     "scroll_to_fraction:<0-1>", "scroll_to_row:<n>",
-    "paste_from_clipboard", "paste_from_selection", "prompt_title", "inspector",
+    "paste_from_clipboard", "paste_from_selection",
+    "prompt_surface_title", "prompt_tab_title",
+    "set_surface_title:<text>", "set_tab_title:<text>",
+    "inspector[:toggle|show|hide]",
     "quit", "toggle_fullscreen", "palette", "settings",
-    "split_right", "split_down", "split_left", "split_up",
     "new_split:<right|down|left|up|auto>",
     "goto_split:<left|right|up|down|previous|next|top|bottom>",
     "resize_split:<left|right|up|down>[,px]",
-    "focus_next_pane", "focus_prev_pane",
+    "goto_split:<previous|next>  (pane focus cycle)",
     "toggle_split_zoom", "equalize_splits",
-    "none | unbind  (disable a chord)",
+    "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
 fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
     match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => true,
-        "false" | "no" | "off" | "0" => false,
+        "true" | "on" => true,
+        "false" | "off" => false,
         _ => {
             errors.push(format!("line {}: bad boolean {value:?}", line + 1));
             false
@@ -1659,7 +1729,7 @@ fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
     let action = match lower.as_str() {
-        "" | "none" | "unbind" => None,
+        "" | "none" => None,
         _ => Some(
             action_from_str(&lower, action_raw)
                 .ok_or_else(|| format!("unknown action {action_raw:?}"))?,
@@ -1717,10 +1787,10 @@ fn normalize_chord(chord: &str) -> Result<String, String> {
         let p = part.trim().to_ascii_lowercase();
         let is_last = i == chord.split('+').count() - 1;
         match p.as_str() {
-            "ctrl" | "control" => mods[0] = true,
-            "alt" | "option" => mods[1] = true,
+            "ctrl" => mods[0] = true,
+            "alt" => mods[1] = true,
             "shift" => mods[2] = true,
-            "super" | "cmd" | "command" | "meta" | "win" => mods[3] = true,
+            "super" => mods[3] = true,
             _ => {
                 if !is_last || key.is_some() {
                     return Err(format!("bad keybind chord {chord:?}"));
@@ -1788,14 +1858,29 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
             let n: usize = name["scroll_to_row:".len()..].parse().ok()?;
             TermAction::ScrollToRow(n)
         }
+        "ignore" => TermAction::Ignore,
+        "copy_to_clipboard" => TermAction::Copy,
+        "copy_url_to_clipboard" => TermAction::CopyUrlToClipboard,
+        "copy_title_to_clipboard" => TermAction::CopyTitleToClipboard,
         "paste_from_clipboard" => TermAction::Paste,
-        "paste_from_selection" | "paste_primary" => TermAction::PasteFromSelection,
-        "prompt_title" => TermAction::PromptTitle,
-        "inspector" | "toggle_inspector" => TermAction::Inspector,
-        "copy" => TermAction::Copy,
-        "paste" => TermAction::Paste,
+        "paste_from_selection" => TermAction::PasteFromSelection,
+        "prompt_surface_title" => TermAction::PromptTitle,
+        "prompt_tab_title" => TermAction::PromptTabTitle,
+        // Ghostty `set_surface_title:text` / `set_tab_title:text` — the
+        // raw payload keeps its case and spaces.
+        _ if name.starts_with("set_surface_title:") => {
+            TermAction::SetSurfaceTitle(raw["set_surface_title:".len()..].to_string())
+        }
+        _ if name.starts_with("set_tab_title:") => {
+            TermAction::SetTabTitle(raw["set_tab_title:".len()..].to_string())
+        }
+        "inspector" => TermAction::Inspector,
+        "inspector:toggle" => TermAction::Inspector,
+        "inspector:show" => TermAction::InspectorSet(true),
+        "inspector:hide" => TermAction::InspectorSet(false),
         "new_tab" => TermAction::NewTab,
         "close_tab" => TermAction::CloseTab,
+        "close_surface" => TermAction::CloseSurface,
         "new_window" => TermAction::NewWindow,
         "toggle_quick_terminal" => TermAction::ToggleQuickTerminal,
         "last_tab" => TermAction::LastTab,
@@ -1804,10 +1889,8 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "close_other_tabs" => TermAction::CloseOtherTabs,
         "toggle_tab_bar" => TermAction::ToggleTabBar,
         "next_tab" => TermAction::NextTab,
-        "prev_tab" => TermAction::PrevTab,
-        "font_bigger" => TermAction::FontBigger,
-        "font_smaller" => TermAction::FontSmaller,
-        "font_reset" | "reset_font_size" => TermAction::FontReset,
+        "previous_tab" => TermAction::PrevTab,
+        "reset_font_size" => TermAction::FontReset,
         // Ghostty `increase_font_size:pt` / `decrease_font_size:pt`;
         // a bare action name steps 1pt.
         _ if name.strip_prefix("increase_font_size").is_some() => {
@@ -1826,47 +1909,81 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
                 .clamp(1, 48);
             TermAction::DecreaseFontSize(pts)
         }
+        // Ghostty `set_font_size:pt` — absolute point size.
+        _ if name.starts_with("set_font_size:") => {
+            let pt: f32 = name["set_font_size:".len()..].parse().ok()?;
+            TermAction::SetFontSize(pt.clamp(6.0, 96.0))
+        }
         "clear_scrollback" => TermAction::ClearScrollback,
         "clear_screen" => TermAction::ClearScreen,
         "reset" => TermAction::Reset,
         "search" => TermAction::Search,
-        "prompt_prev" => TermAction::PromptPrev,
-        "prompt_next" => TermAction::PromptNext,
+        "start_search" => TermAction::StartSearch,
+        "end_search" => TermAction::EndSearch,
+        "search_selection" => TermAction::SearchSelection,
+        // Ghostty `search:text` — sets the search bar's query.
+        _ if name.starts_with("search:") => {
+            TermAction::SearchFor(raw["search:".len()..].to_string())
+        }
+        "navigate_search:next" => TermAction::NavigateSearch(1),
+        "navigate_search:previous" => TermAction::NavigateSearch(-1),
+        // Ghostty `jump_to_prompt:N` — scroll N prompt marks (signed).
+        _ if name.starts_with("jump_to_prompt:") => {
+            let n: i32 = name["jump_to_prompt:".len()..].parse().ok()?;
+            TermAction::JumpToPrompt(n)
+        }
         "select_all" => TermAction::SelectAll,
         "start_selection" => TermAction::StartSelection,
         "scroll_to_top" => TermAction::ScrollToTop,
         "scroll_to_bottom" => TermAction::ScrollToBottom,
         "scroll_page_up" => TermAction::ScrollPageUp,
         "scroll_page_down" => TermAction::ScrollPageDown,
-        "scroll_line_up" => TermAction::ScrollLineUp,
-        "scroll_line_down" => TermAction::ScrollLineDown,
-        "move_tab_left" => TermAction::MoveTabLeft,
-        "move_tab_right" => TermAction::MoveTabRight,
+        // Ghostty `scroll_page_lines:N` — signed line count.
+        _ if name.starts_with("scroll_page_lines:") => {
+            let n: i32 = name["scroll_page_lines:".len()..].parse().ok()?;
+            TermAction::ScrollPageLines(n)
+        }
+        // Ghostty `scroll_page_fractional:f` — a fraction of the page,
+        // -1.0..=1.0.
+        _ if name.starts_with("scroll_page_fractional:") => {
+            let f: f64 = name["scroll_page_fractional:".len()..].parse().ok()?;
+            TermAction::ScrollPageFractional(f.clamp(-1.0, 1.0))
+        }
+        // Ghostty `move_tab:N` — signed slot move.
+        _ if name.starts_with("move_tab:") => {
+            let n: i32 = name["move_tab:".len()..].parse().ok()?;
+            TermAction::MoveTab(n)
+        }
         "url_hints" => TermAction::UrlHints,
         "copy_last_output" => TermAction::CopyLastOutput,
         "open_scrollback_editor" => TermAction::OpenScrollbackEditor,
-        "search_next" => TermAction::SearchNext,
-        "search_prev" => TermAction::SearchPrev,
         "reload_config" => TermAction::ReloadConfig,
         "toggle_split_zoom" => TermAction::PaneZoom,
         "quit" => TermAction::Quit,
-        "split_right" => TermAction::SplitRight,
-        "split_down" => TermAction::SplitDown,
-        "focus_next_pane" => TermAction::FocusNextPane,
-        "focus_prev_pane" => TermAction::FocusPrevPane,
-        "equalize_splits" | "equalise_splits" => TermAction::EqualizeSplits,
+        "equalize_splits" => TermAction::EqualizeSplits,
         "toggle_fullscreen" => TermAction::Fullscreen,
-        "palette" | "command_palette" => TermAction::Palette,
+        "palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
-        "write_screen_file" => TermAction::WriteScreenFile,
-        "write_scrollback_file" => TermAction::WriteScrollbackFile,
-        "write_selection_file" => TermAction::WriteSelectionFile,
-        "write_last_output_file" => TermAction::WriteLastOutputFile,
+        // Ghostty `write_*_file[:open|copy|paste]` — the suffix names
+        // what to do with the written temp file.
+        _ if name.starts_with("write_screen_file") => {
+            TermAction::WriteScreenFile(file_sink(&name["write_screen_file".len()..])?)
+        }
+        _ if name.starts_with("write_scrollback_file") => {
+            TermAction::WriteScrollbackFile(file_sink(&name["write_scrollback_file".len()..])?)
+        }
+        _ if name.starts_with("write_selection_file") => {
+            TermAction::WriteSelectionFile(file_sink(&name["write_selection_file".len()..])?)
+        }
+        _ if name.starts_with("write_last_output_file") => {
+            TermAction::WriteLastOutputFile(file_sink(&name["write_last_output_file".len()..])?)
+        }
         "open_config" => TermAction::OpenConfig,
         "scroll_to_selection" => TermAction::ScrollToSelection,
         "clear_selection" => TermAction::ClearSelection,
-        _ if name.strip_prefix("select_tab_").is_some() => {
-            let n: usize = name["select_tab_".len()..].parse().ok()?;
+        // Ghostty `goto_tab:N` — select the Nth tab (1-based).
+        _ if name.starts_with("goto_tab:") => {
+            let n: usize = name["goto_tab:".len()..].parse().ok()?;
             TermAction::SelectTab(n)
         }
         // Ghostty `keybind = ...=new_split:right` — direction arg selects
@@ -1901,7 +2018,7 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
                     horizontal: false,
                     forward: true,
                 },
-                "previous" | "prev" => TermAction::FocusPrevPane,
+                "previous" => TermAction::FocusPrevPane,
                 "next" => TermAction::FocusNextPane,
                 "top" => TermAction::GotoSplit(0),
                 "bottom" => TermAction::GotoSplit(usize::MAX),
@@ -1930,6 +2047,17 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         _ => return None,
     })
+}
+
+/// Ghostty's `:action` suffix on `write_*_file` — `open` is the bare
+/// default; `copy`/`paste` route the file path instead.
+fn file_sink(suffix: &str) -> Option<FileSink> {
+    match suffix {
+        "" | ":open" => Some(FileSink::Open),
+        ":copy" => Some(FileSink::Copy),
+        ":paste" => Some(FileSink::Paste),
+        _ => None,
+    }
 }
 
 /// Canonical `ctrl+alt+shift+super+key` string for a live key press.
@@ -2005,10 +2133,10 @@ impl std::str::FromStr for LinkMod {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => Ok(Self::Ctrl),
+            "ctrl" => Ok(Self::Ctrl),
             "shift" => Ok(Self::Shift),
-            "alt" | "option" => Ok(Self::Alt),
-            "super" | "meta" | "cmd" | "command" => Ok(Self::Super),
+            "alt" => Ok(Self::Alt),
+            "super" => Ok(Self::Super),
             other => Err(format!("bad open-link-modifier {other:?}")),
         }
     }
@@ -2122,7 +2250,7 @@ mod tests {
     fn parses_scalars_and_comments() {
         let text = "# c\n\nfont-size = 14.5\nfont-family = \"JetBrains Mono\"\n\
                     scrollback = 5000\ntheme = solarized-light\n\
-                    copy-on-select = true\ncursor-style = beam\ncursor-style-blink = no\n\
+                    copy-on-select = true\ncursor-style = beam\ncursor-style-blink = false\n\
                     shell = /bin/zsh\n";
         let (cfg, errs) = AppConfig::parse(text);
         assert!(errs.is_empty(), "{errs:?}");
@@ -2152,7 +2280,7 @@ mod tests {
     #[test]
     fn keybind_parses_and_normalizes() {
         let (cfg, errs) = AppConfig::parse(
-            "keybind = ctrl+shift+c=copy\nkeybind = shift+ctrl+v=paste\n\
+            "keybind = ctrl+shift+c=copy_to_clipboard\nkeybind = shift+ctrl+v=paste_from_clipboard\n\
              keybind = ctrl+shift+f4=close_tab\nkeybind = ctrl+shift+x=\n",
         );
         assert!(errs.is_empty(), "{errs:?}");
@@ -2346,7 +2474,10 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::ScrollToSelection));
         assert_eq!(cfg.keybinds[1].1, Some(TermAction::ClearSelection));
-        assert_eq!(cfg.keybinds[2].1, Some(TermAction::WriteLastOutputFile));
+        assert_eq!(
+            cfg.keybinds[2].1,
+            Some(TermAction::WriteLastOutputFile(FileSink::Open))
+        );
         assert_eq!(cfg.keybinds[3].1, Some(TermAction::OpenConfig));
     }
 
@@ -2360,13 +2491,14 @@ mod tests {
     }
 
     #[test]
-    fn select_tab_n_and_prompt_actions() {
+    fn goto_tab_n_and_prompt_actions() {
+        // Reference names: `goto_tab:N` and `jump_to_prompt:±N`.
         let (cfg, errs) = AppConfig::parse(
-            "keybind = ctrl+3=select_tab_3\nkeybind = ctrl+shift+arrowup=prompt_prev",
+            "keybind = ctrl+3=goto_tab:3\nkeybind = ctrl+shift+arrowup=jump_to_prompt:-1",
         );
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::SelectTab(3)));
-        assert_eq!(cfg.keybinds[1].1, Some(TermAction::PromptPrev));
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::JumpToPrompt(-1)));
     }
 
     #[test]
@@ -2442,10 +2574,9 @@ mod tests {
         // Clamped into 0..=1 like Ghostty.
         assert!((cfg.faint_opacity - 1.0).abs() < f32::EPSILON);
 
-        // Deprecated alias maps onto the same field.
-        let (cfg, errs) = AppConfig::parse("bold-is-bright = false");
-        assert!(errs.is_empty(), "{errs:?}");
-        assert_eq!(cfg.bold_color, BoldColor::None);
+        // The legacy alias is gone — `bold-color` is the only name.
+        let (_, errs) = AppConfig::parse("bold-is-bright = false");
+        assert_eq!(errs.len(), 1);
     }
 
     #[test]
@@ -2486,7 +2617,7 @@ mod tests {
     fn color_overrides_parse() {
         let (cfg, errs) = AppConfig::parse(
             "foreground = #ddeeff\nbackground = #101418\n\
-             cursor-color = #fc0\nselection-color = 0xffffff\n\
+             cursor-color = #fc0\nselection-foreground = 0xffffff\n\
              palette = 1=#e06c75\npalette = 0=#000\n",
         );
         assert!(errs.is_empty(), "{errs:?}");
@@ -2505,10 +2636,12 @@ mod tests {
 
     #[test]
     fn scroll_multiplier_and_confirm_close() {
-        let (cfg, errs) = AppConfig::parse("mouse-scroll-multiplier = 3.5\nconfirm-close = no");
+        let (cfg, errs) = AppConfig::parse(
+            "mouse-scroll-multiplier = 3.5\nconfirm-close-surface = false",
+        );
         assert!(errs.is_empty(), "{errs:?}");
         assert!((cfg.mouse_scroll_multiplier - 3.5).abs() < f32::EPSILON);
-        assert!(!cfg.confirm_close);
+        assert_eq!(cfg.confirm_close, ConfirmCloseSurface::False);
         let (_, errs) = AppConfig::parse("mouse-scroll-multiplier = 0");
         assert_eq!(errs.len(), 1);
     }
@@ -2623,14 +2756,15 @@ mod tests {
     fn font_synthetic_tokens_or_into_allow_set() {
         // Each line ORs tokens into the allow-set; an empty value
         // (or a line with no known tokens) allows nothing.
-        let (cfg, errs) =
-            AppConfig::parse("font-synthetic = bold\nfont-synthetic = italic|bold\n");
+        let (cfg, errs) = AppConfig::parse(
+            "font-synthetic-style = bold\nfont-synthetic-style = italic|bold\n",
+        );
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.font_synthetic, Some((true, true)));
-        let (cfg, errs) = AppConfig::parse("font-synthetic = \n");
+        let (cfg, errs) = AppConfig::parse("font-synthetic-style = \n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.font_synthetic, Some((false, false)));
-        let (_, errs) = AppConfig::parse("font-synthetic = wobbly");
+        let (_, errs) = AppConfig::parse("font-synthetic-style = wobbly");
         assert_eq!(errs.len(), 1);
     }
 
@@ -2651,6 +2785,144 @@ mod tests {
         for bad in ["font-codepoint-map = U+ZZZZ=X", "font-codepoint-map = U+2-U+1=X"] {
             let (_, errs) = AppConfig::parse(bad);
             assert_eq!(errs.len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn canonical_tab_and_surface_actions() {
+        // Reference names only: goto_tab/move_tab/previous_tab,
+        // ignore, close_tab vs close_surface.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+g=goto_tab:3\nkeybind = ctrl+alt+m=move_tab:-1\n\
+             keybind = ctrl+alt+p=previous_tab\nkeybind = ctrl+alt+i=ignore\n\
+             keybind = ctrl+alt+c=close_surface\nkeybind = ctrl+alt+t=close_tab",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::SelectTab(3)));
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::MoveTab(-1)));
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::PrevTab));
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::Ignore));
+        assert_eq!(cfg.keybinds[4].1, Some(TermAction::CloseSurface));
+        assert_eq!(cfg.keybinds[5].1, Some(TermAction::CloseTab));
+    }
+
+    #[test]
+    fn middle_click_action_enum() {
+        let (cfg, errs) =
+            AppConfig::parse("middle-click-action = clipboard-paste");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.middle_click_action, MiddleClickAction::ClipboardPaste);
+        let (cfg, errs) = AppConfig::parse("middle-click-action = primary-paste");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.middle_click_action, MiddleClickAction::PrimaryPaste);
+        let (cfg, errs) = AppConfig::parse("middle-click-action = ignore");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.middle_click_action, MiddleClickAction::Ignore);
+        for bad in ["middle-click-action = wobbly", "middle-click-paste = true"] {
+            let (_, errs) = AppConfig::parse(bad);
+            assert_eq!(errs.len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn confirm_close_surface_three_state() {
+        let (cfg, errs) = AppConfig::parse("confirm-close-surface = always");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.confirm_close, ConfirmCloseSurface::Always);
+        let (cfg, errs) = AppConfig::parse("confirm-close-surface = true");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.confirm_close, ConfirmCloseSurface::True);
+        // The reference's names only: `confirm-close` and
+        // `confirm-close-tab` are unknown keys.
+        for bad in ["confirm-close = true", "confirm-close-surface = wobbly"] {
+            let (_, errs) = AppConfig::parse(bad);
+            assert_eq!(errs.len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn bell_features_reference_mapping() {
+        // `attention` drives only the badge channel; `title` only the
+        // title prepend; `no-` forms disable one at a time; `system`
+        // and `audio` both drive the XBell channel.
+        let (cfg, errs) = AppConfig::parse("bell-features = title");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.bell_title);
+        assert!(cfg.bell_attention, "title leaves attention untouched");
+        let (cfg, errs) = AppConfig::parse("bell-features = attention,no-title");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.bell_attention);
+        assert!(!cfg.bell_title);
+        let (cfg, errs) = AppConfig::parse("bell-features = no-attention");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.bell_attention);
+        assert!(cfg.bell_title);
+        let (cfg, errs) = AppConfig::parse("bell-features = system,audio");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.audible_bell);
+        // `border` enables the pane ring; `no-border` turns it back off.
+        let (cfg, errs) = AppConfig::parse("bell-features = border");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.bell_border);
+        let (cfg, errs) = AppConfig::parse("bell-features = border,no-border");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.bell_border);
+        // Empty `bell-features =` turns every channel off.
+        let (cfg, errs) = AppConfig::parse("bell-features =");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.bell_title && !cfg.bell_attention && !cfg.audible_bell);
+        let (_, errs) = AppConfig::parse("bell-features = wobbly");
+        assert_eq!(errs.len(), 1);
+        // `visual` is not a reference item — the pane flash is our own
+        // `visual-bell` option, not part of the `bell-features` set.
+        let (_, errs) = AppConfig::parse("bell-features = visual");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn tab_title_and_copy_title_actions() {
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+1=prompt_tab_title\nkeybind = ctrl+alt+2=set_tab_title:mymark\n\
+             keybind = ctrl+alt+3=set_surface_title:myssn\nkeybind = ctrl+alt+4=set_tab_title:\n\
+             keybind = ctrl+alt+5=copy_title_to_clipboard\nkeybind = ctrl+alt+6=copy_url_to_clipboard",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::PromptTabTitle));
+        assert_eq!(
+            cfg.keybinds[1].1,
+            Some(TermAction::SetTabTitle("mymark".into()))
+        );
+        assert_eq!(
+            cfg.keybinds[2].1,
+            Some(TermAction::SetSurfaceTitle("myssn".into()))
+        );
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::SetTabTitle(String::new())));
+        assert_eq!(cfg.keybinds[4].1, Some(TermAction::CopyTitleToClipboard));
+        assert_eq!(cfg.keybinds[5].1, Some(TermAction::CopyUrlToClipboard));
+    }
+
+    #[test]
+    fn legacy_action_and_key_names_rejected() {
+        // The reference's names only — no legacy aliases.
+        for bad in [
+            "keybind = ctrl+alt+a=select_tab_3",
+            "keybind = ctrl+alt+a=prompt_prev",
+            "keybind = ctrl+alt+a=prompt_next",
+            "keybind = ctrl+alt+a=scroll_line_up",
+            "keybind = ctrl+alt+a=move_tab_left",
+            "keybind = ctrl+alt+a=font_bigger",
+            "keybind = ctrl+alt+a=copy",
+            "keybind = ctrl+alt+a=paste",
+            "keybind = ctrl+alt+a=paste_selection",
+            "word-select-chars = abc",
+            "clipboard-trim = true",
+            "desktop-notifications = true",
+            "audible-bell = true",
+            "visual-bell = true",
+            "font-synthetic = bold",
+        ] {
+            let (_, errs) = AppConfig::parse(bad);
+            assert!(!errs.is_empty(), "{bad} must be rejected");
         }
     }
 }

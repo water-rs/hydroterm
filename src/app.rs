@@ -39,9 +39,6 @@ use crate::surface::TermSurface;
 use crate::terminal::Terminal;
 use waterui::form::picker::picker;
 
-/// Default font size in points (the config file may override).
-pub const FONT_SIZE: f32 = 13.0;
-
 /// Fixed height of the tab strip at every window size.
 const TAB_STRIP_HEIGHT: f32 = 30.0;
 
@@ -139,6 +136,14 @@ pub struct Session {
     /// `sync_size` is a same-size no-op (no ioctl, no SIGWINCH, no
     /// prompt-clear that a never-sent repaint can't refill).
     pub cell_px: std::cell::Cell<(f32, f32)>,
+    /// A zoom action (`increase_font_size` / `decrease_font_size` /
+    /// `set_font_size`) overrode the config size — config reloads must
+    /// not clobber it (Ghostty: `font-size` applies to terminals that
+    /// never changed it; `reset_font_size` clears the flag).
+    pub font_size_override: std::cell::Cell<bool>,
+    /// The open rename prompt writes the owning tab's title rather than
+    /// the surface's (`prompt_tab_title` vs `prompt_surface_title`).
+    pub title_prompt_writes_tab: std::cell::Cell<bool>,
 }
 
 impl Session {
@@ -236,6 +241,8 @@ impl Session {
             title_query: binding(Str::from("")),
             inspector_open: Binding::bool(false),
             inspector_label: binding(Str::from("")),
+            font_size_override: std::cell::Cell::new(false),
+            title_prompt_writes_tab: std::cell::Cell::new(false),
         }
     }
 }
@@ -477,6 +484,13 @@ pub struct PaneTab {
     /// is not selected; cleared when it becomes selected. kitty's
     /// `tab_activity_symbol`.
     pub activity: Binding<bool>,
+    /// `set_tab_title` / `prompt_tab_title` override — while `Some`, the
+    /// title sync writers leave `title` alone (Ghostty: a set tab title
+    /// persists across focus changes within the tab).
+    pub title_override: Binding<Option<Str>>,
+    /// `bell-features` `attention` indicator — mirrors the owning
+    /// session's `notify_badge` so the chip can react to it.
+    pub badge: Binding<bool>,
 }
 
 /// Everything tabs and surfaces share.
@@ -497,6 +511,13 @@ pub struct AppState {
     /// gate on `tab-bar-min-tabs` reactively (NamiList itself is not a
     /// signal).
     pub tab_count: Binding<usize>,
+    /// Live `keybind = global:chord=action` X11 grabs — each entry's
+    /// flag stops its grab thread (dropping the connection releases
+    /// the key). Config reloads diff this against the new keybinds.
+    pub global_grabs: RefCell<Vec<(String, TermAction, std::sync::Arc<AtomicBool>)>>,
+    /// The `quick-terminal-position`/`quick-terminal-size` pair the
+    /// cached quick app was built with — a changed value drops it.
+    applied_quick_geo: RefCell<QuickGeo>,
     /// Live-applied `tab-bar-min-tabs` config value.
     pub tab_bar_min: Binding<usize>,
     /// `toggle_tab_bar` manual override: `Some(true)` forces the strip
@@ -613,6 +634,10 @@ impl AppState {
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
             || matches!(watcher.config.window_theme, crate::config::WindowTheme::Auto);
+        let applied_quick_geo = (
+            watcher.config.quick_terminal_position,
+            watcher.config.quick_terminal_size,
+        );
         let quick_binding = Binding::container(WindowState::Closed);
         let state = Self {
             sessions: Rc::new(RefCell::new(Vec::new())),
@@ -655,6 +680,8 @@ impl AppState {
             quick_state: quick_binding.clone(),
             quick_presentation: WindowPresentation::new(&quick_binding),
             quick_app: RefCell::new(None),
+            global_grabs: RefCell::new(Vec::new()),
+            applied_quick_geo: RefCell::new(applied_quick_geo),
             quick_listener_started: Rc::new(AtomicBool::new(false)),
             quick_task: Rc::new(RefCell::new(None)),
             quick_unavailable: RefCell::new(false),
@@ -737,6 +764,83 @@ impl AppState {
         self.apply_config(&config);
     }
 
+    /// Grab one `global:chord` on the X11 root window and register it
+    /// in `grabs` — shared by `start_global_hotkeys` and reloads.
+    fn grab_global(
+        &self,
+        grabs: &mut Vec<(String, TermAction, std::sync::Arc<AtomicBool>)>,
+        chord: &str,
+        action: &TermAction,
+    ) {
+        let body = &chord["global:".len()..];
+        // Canonical order: ctrl+alt+shift+super+key.
+        let mut mods = [false; 4];
+        let mut key = "";
+        for part in body.split('+') {
+            match part {
+                "ctrl" => mods[0] = true,
+                "alt" => mods[1] = true,
+                "shift" => mods[2] = true,
+                "super" => mods[3] = true,
+                k => key = k,
+            }
+        }
+        let Some(keysym) = crate::quickterm::key_name_to_keysym(key) else {
+            tracing::warn!(chord, "global: unmapped key name");
+            return;
+        };
+        let mod_bits =
+            crate::quickterm::chord_mod_bits(mods[0], mods[1], mods[2], mods[3]);
+        let (tx, rx) = async_channel::unbounded::<TermAction>();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        match crate::quickterm::spawn_hotkey(tx, keysym, mod_bits, action.clone(), stop.clone()) {
+            Some(_) => {
+                grabs.push((chord.to_string(), action.clone(), stop));
+                let app = self.clone();
+                spawn_local(async move {
+                    while let Ok(action) = rx.recv().await {
+                        while rx.try_recv().is_ok() {}
+                        app.run_palette_action(action);
+                    }
+                })
+                .detach();
+            }
+            None => {
+                tracing::warn!(chord, "global: grab failed (taken or no X11)");
+            }
+        }
+    }
+
+    /// Sync `keybind = global:*` grabs with `config.keybinds`: drops
+    /// chords that vanished or changed action (the flag stops the grab
+    /// thread; its connection drop releases the key) and grabs new
+    /// ones (Ghostty re-grabs global binds on config reload).
+    fn regrab_globals(&self, config: &AppConfig) {
+        let mut grabs = self.global_grabs.borrow_mut();
+        grabs.retain(|(chord, action, stop)| {
+            let keep = config
+                .keybinds
+                .iter()
+                .any(|(c, a)| c == chord && a.as_ref() == Some(action));
+            if !keep {
+                stop.store(true, Ordering::SeqCst);
+            }
+            keep
+        });
+        let want: Vec<(String, TermAction)> = config
+            .keybinds
+            .iter()
+            .filter(|(c, _)| c.starts_with("global:"))
+            .filter_map(|(c, a)| a.clone().map(|a| (c.clone(), a)))
+            .collect();
+        for (chord, action) in want {
+            if grabs.iter().any(|(c, a, _)| c == &chord && a == &action) {
+                continue;
+            }
+            self.grab_global(&mut grabs, &chord, &action);
+        }
+    }
+
     /// `reload-config` action: re-read the file and apply it now —
     /// the same code path the mtime watcher uses.
     pub fn reload_config(&self) {
@@ -777,10 +881,36 @@ impl AppState {
     fn apply_config(&self, config: &AppConfig) {
         *self.palette.borrow_mut() = Palette::for_config(config);
         self.tab_bar_min.set(config.tab_bar_min_tabs);
+        // A reload restores the `window-show-tab-bar` threshold — the
+        // `toggle_tab_bar` manual override was documented to hold only
+        // until the next reload.
+        self.tab_bar_forced.set(None);
         self.window_scheme
             .set(crate::theme::scheme_for(&config.window_theme));
+        // `title` — a configured window title re-applies on reload
+        // (Ghostty updates every window's title).
+        if let Some(t) = &config.title {
+            self.window_title.set(self.title_with_subtitle(t));
+        }
+        // `quick-terminal-position`/`quick-terminal-size` are
+        // new-window options — a changed value drops the cached quick
+        // app so the next `toggle_quick_terminal` rebuilds with it.
+        {
+            let geo = (config.quick_terminal_position, config.quick_terminal_size);
+            if *self.applied_quick_geo.borrow() != geo {
+                self.applied_quick_geo.replace(geo);
+                *self.quick_app.borrow_mut() = None;
+            }
+        }
+        // `global:` chords — release removed/changed grabs, grab new
+        // ones (Ghostty re-grabs global binds on config reload).
+        self.regrab_globals(config);
         for s in self.sessions.borrow().iter() {
-            s.font_size.set(config.font_size);
+            // `font-size` applies on reload — but only to terminals
+            // that never took a zoom override (`increase_font_size`, …).
+            if !s.font_size_override.get() {
+                s.font_size.set(config.font_size);
+            }
             s.font_family.set_from(Str::from(config.font_family.clone()));
             s.unfocused_opacity.set(config.unfocused_split_opacity);
             s.context_menu_enabled
@@ -876,7 +1006,13 @@ impl AppState {
             return;
         }
         let (tx, rx) = async_channel::unbounded::<()>();
-        match crate::quickterm::spawn_hotkey(tx, crate::quickterm::XK_F12, 0, ()) {
+        match crate::quickterm::spawn_hotkey(
+            tx,
+            crate::quickterm::XK_F12,
+            0,
+            (),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        ) {
             Some(_) => {
                 let app = self.clone();
                 let task = spawn_local(async move {
@@ -897,54 +1033,11 @@ impl AppState {
     /// Grab each `keybind = global:chord=action` on the X11 root window.
     /// A chord press anywhere fires the action through the same dispatch
     /// as a window-local keybind (focused session first, app-level
-    /// fallback). Idempotent — grabbed once per launch.
+    /// fallback). Grabbed once per launch; config reloads re-sync the
+    /// set through `regrab_globals`.
     fn start_global_hotkeys(&self) {
-        let globals: Vec<(String, Option<TermAction>)> = self
-            .config(|c| {
-                c.keybinds
-                    .iter()
-                    .filter(|(chord, _)| chord.starts_with("global:"))
-                    .cloned()
-                    .collect()
-            });
-        for (chord, action) in globals {
-            let Some(action) = action else { continue };
-            let body = &chord["global:".len()..];
-            // Canonical order: ctrl+alt+shift+super+key.
-            let mut mods = [false; 4];
-            let mut key = "";
-            for part in body.split('+') {
-                match part {
-                    "ctrl" => mods[0] = true,
-                    "alt" => mods[1] = true,
-                    "shift" => mods[2] = true,
-                    "super" => mods[3] = true,
-                    k => key = k,
-                }
-            }
-            let Some(keysym) = crate::quickterm::key_name_to_keysym(key) else {
-                tracing::warn!(chord, "global: unmapped key name");
-                continue;
-            };
-            let mod_bits =
-                crate::quickterm::chord_mod_bits(mods[0], mods[1], mods[2], mods[3]);
-            let (tx, rx) = async_channel::unbounded::<TermAction>();
-            match crate::quickterm::spawn_hotkey(tx, keysym, mod_bits, action) {
-                Some(_) => {
-                    let app = self.clone();
-                    spawn_local(async move {
-                        while let Ok(action) = rx.recv().await {
-                            while rx.try_recv().is_ok() {}
-                            app.run_palette_action(action);
-                        }
-                    })
-                    .detach();
-                }
-                None => {
-                    tracing::warn!(chord, "global: grab failed (taken or no X11)");
-                }
-            }
-        }
+        let config = self.config(|c| c.clone());
+        self.regrab_globals(&config);
     }
 
     /// Build the quick terminal's borderless top-docked window (mounted by
@@ -1030,6 +1123,42 @@ impl AppState {
         w
     }
 
+    /// `window-width`/`window-height`, `window-position-x`/`y` and
+    /// `window-save-state` — the launch-geometry options every window
+    /// gets (the first window in `lib.rs` and `new_window` spawns).
+    pub(crate) fn apply_launch_geometry(state: &AppState, window: &Window) {
+        let rect = if state.config(|c| c.window_save_state) {
+            load_window_state()
+        } else {
+            None
+        };
+        if let Some(rect) = rect {
+            window.frame.set(rect);
+        } else {
+            let (w, h) = state.config(|c| (c.window_width, c.window_height));
+            if w > 0.0 || h > 0.0 {
+                let frame = window.frame.snapshot();
+                let size = *frame.size();
+                window.frame.set(Rect::new(
+                    frame.origin(),
+                    Size::new(
+                        if w > 0.0 { w } else { size.width },
+                        if h > 0.0 { h } else { size.height },
+                    ),
+                ));
+            }
+            let (wx, wy) = state.config(|c| (c.window_x, c.window_y));
+            if wx.is_some() || wy.is_some() {
+                let frame = window.frame.snapshot();
+                let origin = frame.origin();
+                window.frame.set(Rect::new(
+                    Point::new(wx.unwrap_or(origin.x), wy.unwrap_or(origin.y)),
+                    *frame.size(),
+                ));
+            }
+        }
+    }
+
     /// Spawn a whole new OS window with a fresh session set (same config
     /// file, independent tabs and sessions). Uses the runner's
     /// `WindowManager` — `Window::show` mounts a real winit window.
@@ -1055,6 +1184,7 @@ impl AppState {
             WindowStyle::Borderless
         })
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        Self::apply_launch_geometry(&state, &window);
         if state.config(|c| c.window_fullscreen) {
             state
                 .window_state
@@ -1099,6 +1229,19 @@ impl AppState {
         self.session(focused)
     }
 
+    /// Re-grant embedded key focus to `session_id`'s pane after an
+    /// overlay (title prompt, confirm/paste snackbar, palette, search
+    /// field) unmounts. `.focused` only fires on a `focus_owner` change,
+    /// so the widget that held focus unmounting leaves keys orphaned —
+    /// poking None → back re-fires the grant.
+    pub fn refocus(&self, session_id: u64) {
+        let tab_id = self.session_tab.lock().unwrap().get(&session_id).copied();
+        if let Some(tab_id) = tab_id {
+            self.focus_owner.set(None);
+            self.focus_owner.set(Some((tab_id, session_id)));
+        }
+    }
+
     /// Grid dims the new pane will measure — the reference terminal sizes
     /// the PTY at spawn from the GUI's known pane size; doing the same
     /// makes the first `sync_size` a no-op, so no resize ioctl lands
@@ -1137,11 +1280,15 @@ impl AppState {
         let cwd = cwd.or_else(|| cfg.working_directory.clone());
         let session = Rc::new(Session::spawn(id, cwd, &cfg, initial_size));
         // `window-inherit-font-size`: a spawned surface takes the
-        // focused surface's live zoom instead of the config value.
+        // focused surface's live zoom instead of the config value —
+        // and its override flag, so a config reload doesn't reset it.
         if cfg.inherit_font_size
             && let Some(focused) = self.focused_session()
         {
             session.font_size.set(focused.font_size.snapshot());
+            session
+                .font_size_override
+                .set(focused.font_size_override.get());
         }
         self.sessions.borrow_mut().push(session.clone());
         session
@@ -1176,11 +1323,13 @@ impl AppState {
     fn adopt_tab(&self, session: Rc<Session>) -> u64 {
         let tab = PaneTab {
             id: self.alloc_id(),
-            title: session.title.clone(),
+            title: binding(session.title.snapshot()),
             tree: binding(SplitNode::Leaf(session.id)),
             focused: Binding::u64(session.id),
             zoomed: Binding::default(),
             activity: Binding::bool(false),
+            title_override: Binding::default(),
+            badge: Binding::bool(false),
         };
         self.session_tab
             .lock()
@@ -1279,7 +1428,9 @@ impl AppState {
         if self.selected.snapshot() == tab_id {
             self.focus_owner.set(Some((tab_id, session_id)));
         }
-        if let Some(s) = self.session(session_id) {
+        if tab.title_override.snapshot().is_none()
+            && let Some(s) = self.session(session_id)
+        {
             tab.title.set(s.title.snapshot());
         }
     }
@@ -1304,11 +1455,61 @@ impl AppState {
                 .tabs.iter().find(|t| t.id == tab_id)
                 && tab.focused.snapshot() == session_id
             {
-                tab.title.set(title.clone());
+                if tab.title_override.snapshot().is_none() {
+                    tab.title.set(title.clone());
+                }
                 if self.selected.snapshot() == tab_id {
                     self.window_title.set(self.title_with_subtitle(&title));
                 }
             }
+    }
+
+    /// Mirror a session's `notify_badge` onto its owning tab chip
+    /// (`bell-features` `attention` renders as the chip's 🔔 indicator).
+    pub fn tab_badge(&self, session_id: u64, on: bool) {
+        if let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
+            && let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id)
+        {
+            tab.badge.set(on);
+        }
+    }
+
+    /// `set_tab_title:text` / `prompt_tab_title` — a title on the
+    /// session's owning tab that persists across pane-focus changes
+    /// (Ghostty). `None` clears the override; the tab resyncs to the
+    /// focused session's title.
+    pub fn set_tab_title(&self, session_id: u64, title: Option<String>) {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
+        else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        match title {
+            Some(title) => {
+                tab.title_override.set(Some(Str::from(title.clone())));
+                tab.title.set_from(title);
+            }
+            None => {
+                tab.title_override.set(None);
+                if let Some(s) = self.session(tab.focused.snapshot()) {
+                    tab.title.set(s.title.snapshot());
+                }
+            }
+        }
+    }
+
+    /// The id of the tab owning `session_id`.
+    pub fn tab_id_of(&self, session_id: u64) -> Option<u64> {
+        self.session_tab.lock().unwrap().get(&session_id).copied()
+    }
+
+    /// The owning tab's current title for `session_id` (the
+    /// `prompt_tab_title` seed).
+    pub fn tab_title_of(&self, session_id: u64) -> Option<Str> {
+        let tab_id = *self.session_tab.lock().unwrap().get(&session_id)?;
+        self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.title.snapshot())
     }
 
     /// Cycle pane focus within the selected tab.
@@ -1443,21 +1644,29 @@ impl AppState {
     /// first (Enter/“Close” confirms, Escape cancels). An idle shell
     /// (or `confirm-close = false`) closes immediately.
     pub fn try_close_pane(&self, session_id: u64) {
-        let prompted = if self.config(|c| c.confirm_close) {
-            let sessions = self.sessions.borrow();
-            sessions
-                .iter()
-                .find(|s| s.id == session_id)
-                .and_then(|s| {
-                    s.terminal
-                        .foreground_program()
-                        .map(|prog| (Str::from(prog), s.pending_close.clone()))
-                })
-        } else {
-            None
+        use crate::config::ConfirmCloseSurface as C;
+        let mode = self.config(|c| c.confirm_close);
+        let session = self.session(session_id);
+        let pending = session.as_ref().map(|s| s.pending_close.clone());
+        let prog = session.and_then(|s| s.terminal.foreground_program());
+        let prompted = match (mode, pending) {
+            (C::False, _) | (_, None) => None,
+            (C::True, Some(pending)) => {
+                prog.map(|p| (Str::from(p), pending))
+            }
+            (C::Always, Some(pending)) => Some((
+                prog.map(Str::from)
+                    .unwrap_or_else(|| Str::from("a shell session")),
+                pending,
+            )),
         };
         if let Some((label, pending)) = prompted {
-            pending.set(Some((label, false)));
+            // Re-arming while a prompt is already up is a no-op — a
+            // duplicate `set` would remount the snackbar view and stack
+            // a dead copy over the live one.
+            if pending.snapshot().is_none() {
+                pending.set(Some((label, false)));
+            }
             return;
         }
         self.close_pane(session_id);
@@ -1466,9 +1675,11 @@ impl AppState {
     /// `confirm-close` gate on `close_tab` — any busy leaf prompts on
     /// the focused pane's snackbar; confirming closes the whole tab.
     pub fn try_close_tab(&self, tab_id: u64) {
-        let prompted = if self.config(|c| c.confirm_close)
-            && let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id)
-        {
+        use crate::config::ConfirmCloseSurface as C;
+        let mode = self.config(|c| c.confirm_close);
+        let prompted = if mode == C::False {
+            None
+        } else if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
             let sessions = self.sessions.borrow();
             let busy = tab
                 .tree
@@ -1476,20 +1687,29 @@ impl AppState {
                 .leaves()
                 .iter()
                 .filter_map(|sid| sessions.iter().find(|s| s.id == *sid))
-                .find_map(|s| s.terminal.foreground_program().map(|p| (p, s)));
+                .find_map(|s| s.terminal.foreground_program());
             let focus = tab.focused.snapshot();
-            busy.map(|(prog, _)| {
-                let pending = sessions
-                    .iter()
-                    .find(|s| s.id == focus)
-                    .map(|s| s.pending_close.clone());
-                (Str::from(prog), pending)
-            })
+            let pending = sessions
+                .iter()
+                .find(|s| s.id == focus)
+                .map(|s| s.pending_close.clone());
+            match mode {
+                C::Always => pending.map(|pending| {
+                    (
+                        busy.map_or_else(|| Str::from("this tab"), Str::from),
+                        Some(pending),
+                    )
+                }),
+                C::True => busy.map(|prog| (Str::from(prog), pending)),
+                C::False => None,
+            }
         } else {
             None
         };
         if let Some((label, Some(pending))) = prompted {
-            pending.set(Some((label, true)));
+            if pending.snapshot().is_none() {
+                pending.set(Some((label, true)));
+            }
             return;
         }
         self.close_tab(tab_id);
@@ -1844,8 +2064,8 @@ impl View for PaneLeaf {
             hstack((
                 field("find in buffer", &query),
                 text(status.clone()).muted(),
-                text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchPrev)),
-                text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::SearchNext)),
+                text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(-1))),
+                text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(1))),
             ))
             .spacing(6.0)
             .padding_horizontal(8.0)
@@ -2318,6 +2538,8 @@ pub fn tabs_view(state: AppState) -> impl View {
                             when(tab.activity.clone(), || {
                                 text("●").foreground(Accent)
                             }),
+                            // `bell-features` `attention` indicator.
+                            when(tab.badge.clone(), || text("🔔")),
                             text(tab.title.clone()).foreground(label_color),
                             text("×")
                                 .muted()
@@ -2417,7 +2639,9 @@ pub fn tabs_view(state: AppState) -> impl View {
             };
             if t.focused.snapshot() != session_id {
                 t.focused.set(session_id);
-                if let Some(s) = app.session(session_id) {
+                if t.title_override.snapshot().is_none()
+                    && let Some(s) = app.session(session_id)
+                {
                     t.title.set(s.title.snapshot());
                 }
             }
@@ -2425,6 +2649,15 @@ pub fn tabs_view(state: AppState) -> impl View {
     })
     .state(&state)
 }
+
+/// The geometry pair `quick_terminal` snapshots at spawn.
+type QuickGeo = (
+    crate::config::QuickTermPosition,
+    Option<(
+        crate::config::QuickTermSize,
+        Option<crate::config::QuickTermSize>,
+    )>,
+);
 
 /// A command-palette row: display name, chord hint, action.
 pub struct PaletteItem {
@@ -2453,26 +2686,26 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Clear Scrollback", chord: "ctrl+shift+k", action: TermAction::ClearScrollback },
     PaletteItem { name: "Clear Screen", chord: "ctrl+shift+l", action: TermAction::ClearScreen },
     PaletteItem { name: "Reset Terminal", chord: "", action: TermAction::Reset },
-    PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile },
-    PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile },
-    PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile },
-    PaletteItem { name: "Write Last Output to File", chord: "", action: TermAction::WriteLastOutputFile },
+    PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile(crate::keys::FileSink::Open) },
+    PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile(crate::keys::FileSink::Open) },
+    PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile(crate::keys::FileSink::Open) },
+    PaletteItem { name: "Write Last Output to File", chord: "", action: TermAction::WriteLastOutputFile(crate::keys::FileSink::Open) },
     PaletteItem { name: "Scroll to Selection", chord: "", action: TermAction::ScrollToSelection },
     PaletteItem { name: "Clear Selection", chord: "", action: TermAction::ClearSelection },
     PaletteItem { name: "Open Config", chord: "", action: TermAction::OpenConfig },
-    PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::FontBigger },
-    PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::FontSmaller },
+    PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::IncreaseFontSize(1) },
+    PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::DecreaseFontSize(1) },
     PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
-    PaletteItem { name: "Jump to Previous Prompt", chord: "ctrl+shift+up", action: TermAction::PromptPrev },
-    PaletteItem { name: "Jump to Next Prompt", chord: "ctrl+shift+down", action: TermAction::PromptNext },
+    PaletteItem { name: "Jump to Previous Prompt", chord: "ctrl+shift+up", action: TermAction::JumpToPrompt(-1) },
+    PaletteItem { name: "Jump to Next Prompt", chord: "ctrl+shift+down", action: TermAction::JumpToPrompt(1) },
     PaletteItem { name: "Scroll to Top", chord: "ctrl+shift+home", action: TermAction::ScrollToTop },
     PaletteItem { name: "Scroll to Bottom", chord: "ctrl+shift+end", action: TermAction::ScrollToBottom },
     PaletteItem { name: "Scroll Page Up", chord: "shift+pageup", action: TermAction::ScrollPageUp },
     PaletteItem { name: "Scroll Page Down", chord: "shift+pagedown", action: TermAction::ScrollPageDown },
-    PaletteItem { name: "Scroll Line Up", chord: "shift+up", action: TermAction::ScrollLineUp },
-    PaletteItem { name: "Scroll Line Down", chord: "shift+down", action: TermAction::ScrollLineDown },
-    PaletteItem { name: "Move Tab Left", chord: "ctrl+shift+pageup", action: TermAction::MoveTabLeft },
-    PaletteItem { name: "Move Tab Right", chord: "ctrl+shift+pagedown", action: TermAction::MoveTabRight },
+    PaletteItem { name: "Scroll Line Up", chord: "shift+up", action: TermAction::ScrollPageLines(-1) },
+    PaletteItem { name: "Scroll Line Down", chord: "shift+down", action: TermAction::ScrollPageLines(1) },
+    PaletteItem { name: "Move Tab Left", chord: "ctrl+shift+pageup", action: TermAction::MoveTab(-1) },
+    PaletteItem { name: "Move Tab Right", chord: "ctrl+shift+pagedown", action: TermAction::MoveTab(1) },
     PaletteItem { name: "Focus Pane Left", chord: "ctrl+shift+alt+left", action: TermAction::FocusPaneDir { horizontal: true, forward: false } },
     PaletteItem { name: "Focus Pane Right", chord: "ctrl+shift+alt+right", action: TermAction::FocusPaneDir { horizontal: true, forward: true } },
     PaletteItem { name: "Focus Pane Up", chord: "ctrl+shift+alt+up", action: TermAction::FocusPaneDir { horizontal: false, forward: false } },

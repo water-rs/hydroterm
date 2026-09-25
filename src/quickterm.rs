@@ -87,12 +87,15 @@ pub fn chord_mod_bits(ctrl: bool, alt: bool, shift: bool, sup: bool) -> u8 {
 /// key is free — under Wayland, headless, or when another client already
 /// owns the hotkey it returns `None` and the caller marks the feature
 /// unavailable. `mod_bits` are extra modifiers that must be held
-/// (`chord_mod_bits`).
+/// (`chord_mod_bits`). Setting `stop` ends the thread — its connection
+/// drop releases every grab it made (config reloads re-grab `global:`
+/// chords this way).
 pub fn spawn_hotkey<E: Clone + Send + 'static>(
     send: async_channel::Sender<E>,
     keysym: u32,
     mod_bits: u8,
     event: E,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<thread::JoinHandle<()>> {
     let Ok((conn, screen)) = RustConnection::connect(None) else {
         eprintln!("quickterm: X11 connect failed");
@@ -133,11 +136,17 @@ pub fn spawn_hotkey<E: Clone + Send + 'static>(
     conn.flush().ok()?;
     eprintln!("quickterm: grabbed {keysym:#x}+{mod_bits:#x} as keycode {keycode} on root {root:#x}");
     Some(thread::spawn(move || loop {
-        match conn.wait_for_event() {
-            Ok(Event::KeyPress(e)) if e.detail == keycode => {
+        // Poll rather than block on `wait_for_event` so `stop` can tear
+        // the grab down without a wakeup mechanism on this connection.
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        match conn.poll_for_event() {
+            Ok(Some(Event::KeyPress(e))) if e.detail == keycode => {
                 let _ = send.try_send(event.clone());
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            Ok(None) => thread::sleep(std::time::Duration::from_millis(60)),
             Err(_) => break,
         }
     }))

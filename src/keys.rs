@@ -312,8 +312,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
                 NamedKey::PageUp => Some(TermAction::ScrollPageUp),
                 NamedKey::PageDown => Some(TermAction::ScrollPageDown),
                 // Shift+Up/Down scroll one line — xterm/kitty convention.
-                NamedKey::ArrowUp => Some(TermAction::ScrollLineUp),
-                NamedKey::ArrowDown => Some(TermAction::ScrollLineDown),
+                NamedKey::ArrowUp => Some(TermAction::ScrollPageLines(-1)),
+                NamedKey::ArrowDown => Some(TermAction::ScrollPageLines(1)),
                 // Shift+Insert pastes — the xterm/VTE convention.
                 NamedKey::Insert => Some(TermAction::Paste),
                 _ => None,
@@ -426,12 +426,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
     }
     if let Key::Named(named) = key {
         return Some(match named {
-            NamedKey::ArrowUp => TermAction::PromptPrev,
-            NamedKey::ArrowDown => TermAction::PromptNext,
+            NamedKey::ArrowUp => TermAction::JumpToPrompt(-1),
+            NamedKey::ArrowDown => TermAction::JumpToPrompt(1),
             // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
             // convention) — plain Ctrl+PageUp/Down cycles them.
-            NamedKey::PageUp => TermAction::MoveTabLeft,
-            NamedKey::PageDown => TermAction::MoveTabRight,
+            NamedKey::PageUp => TermAction::MoveTab(-1),
+            NamedKey::PageDown => TermAction::MoveTab(1),
             NamedKey::Home => TermAction::ScrollToTop,
             NamedKey::End => TermAction::ScrollToBottom,
             // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
@@ -453,8 +453,8 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "z" => TermAction::PaneZoom,
         "]" | "}" => TermAction::FocusNextPane,
         "[" | "{" => TermAction::FocusPrevPane,
-        "+" | "=" => TermAction::FontBigger,
-        "-" | "_" => TermAction::FontSmaller,
+        "+" | "=" => TermAction::IncreaseFontSize(1),
+        "-" | "_" => TermAction::DecreaseFontSize(1),
         "0" | ")" => TermAction::FontReset,
         "k" => TermAction::ClearScrollback,
         "o" => TermAction::CopyLastOutput,
@@ -515,7 +515,11 @@ pub enum TermAction {
     Copy,
     Paste,
     NewTab,
+    /// Ghostty `close_tab` — close the whole tab (every split in it).
     CloseTab,
+    /// Ghostty `close_surface` — close only the focused pane; a sole
+    /// pane takes its tab with it.
+    CloseSurface,
     /// Open a whole new OS window (its own tabs and sessions).
     NewWindow,
     /// Flip the drop-down quick terminal open/closed (Ghostty
@@ -540,13 +544,14 @@ pub enum TermAction {
     NextTab,
     PrevTab,
     SelectTab(usize),
-    FontBigger,
-    FontSmaller,
+    /// Ghostty `reset_font_size` — restore the configured `font-size`.
     FontReset,
     /// Ghostty `increase_font_size:pt` / `decrease_font_size:pt` —
     /// parameterized zoom steps (whole points).
     IncreaseFontSize(i32),
     DecreaseFontSize(i32),
+    /// Ghostty `set_font_size:pt` — absolute font size (fractional).
+    SetFontSize(f32),
     ClearScrollback,
     /// Ghostty `clear_screen` — erase the display AND the scrollback,
     /// cursor home (no mode reset).
@@ -554,9 +559,9 @@ pub enum TermAction {
     /// Ghostty `reset` — RIS: reset modes + erase everything.
     Reset,
     Search,
-    /// Jump viewport to the previous/next OSC 133 prompt mark.
-    PromptPrev,
-    PromptNext,
+    /// Ghostty `jump_to_prompt:N` — scroll the viewport N prompt marks
+    /// (negative = previous).
+    JumpToPrompt(i32),
     /// Select the whole viewport.
     SelectAll,
     /// Keyboard selection mode (Ghostty `start_selection`): anchor a
@@ -569,12 +574,12 @@ pub enum TermAction {
     /// Scroll one page up/down through scrollback (Shift+PageUp/Down).
     ScrollPageUp,
     ScrollPageDown,
-    /// Scroll one line up/down through scrollback (Shift+Up/Down).
-    ScrollLineUp,
-    ScrollLineDown,
-    /// Move the current tab one slot left/right (Ctrl+Shift+PageUp/Down).
-    MoveTabLeft,
-    MoveTabRight,
+    /// Ghostty `scroll_page_lines:N` — scroll N lines through
+    /// scrollback (negative = up; Shift+Up/Down defaults use ±1).
+    ScrollPageLines(i32),
+    /// Ghostty `move_tab:N` — move the current tab N slots
+    /// (negative = left; Ctrl+Shift+PageUp/Down defaults use ±1).
+    MoveTab(i32),
     /// Focus the neighboring pane in a direction (Ctrl+Alt+Arrow).
     FocusPaneDir {
         /// Left/right (Row splits) when true, up/down (Column) when false.
@@ -613,13 +618,14 @@ pub enum TermAction {
     OpenScrollbackEditor,
     /// `write_screen_file` / `write_scrollback_file` /
     /// `write_selection_file` / `write_last_output_file` (Ghostty
-    /// actions): dump the visible viewport / full scrollback+screen /
-    /// current selection / last command output to a temp file and open it
-    /// in `$VISUAL`/`$EDITOR` in a new tab.
-    WriteScreenFile,
-    WriteScrollbackFile,
-    WriteSelectionFile,
-    WriteLastOutputFile,
+    /// actions, `:action` parameter): dump the visible viewport / full
+    /// scrollback+screen / current selection / last command output to a
+    /// temp file, then `open` it in `$VISUAL`/`$EDITOR` in a new tab,
+    /// `copy` the path to the clipboard, or `paste` the path to the pty.
+    WriteScreenFile(FileSink),
+    WriteScrollbackFile(FileSink),
+    WriteSelectionFile(FileSink),
+    WriteLastOutputFile(FileSink),
     /// Ghostty `open_config` — open the live config file in
     /// `$VISUAL`/`$EDITOR` in a new tab.
     OpenConfig,
@@ -628,9 +634,9 @@ pub enum TermAction {
     ScrollToSelection,
     /// Ghostty `clear_selection` — drop the current selection.
     ClearSelection,
-    /// Step the search match cursor forward / back.
-    SearchNext,
-    SearchPrev,
+    /// Ghostty `navigate_search:next|previous` — step the search match
+    /// cursor forward / back.
+    NavigateSearch(i32),
     /// Shut down all sessions and exit.
     Quit,
     /// Split the focused pane (new pane takes half its slot); Left/Up
@@ -684,11 +690,55 @@ pub enum TermAction {
     /// Ghostty `scroll_to_row` — jump the viewport N rows back into
     /// scrollback (0 = bottom / latest screen row).
     ScrollToRow(usize),
-    /// Ghostty `prompt_title` — interactive rename of the focused
-    /// session's tab title (until the next OSC 0/1/2 override).
+    /// Ghostty `prompt_surface_title` — interactive rename of the
+    /// focused session's title (until the next OSC 0/1/2 override).
     PromptTitle,
-    /// Ghostty `inspector` — overlay chip reporting the attributes of
-    /// the cell under the terminal cursor.
+    /// Ghostty `prompt_tab_title` — interactive rename of the owning
+    /// tab; a tab title persists across pane-focus changes.
+    PromptTabTitle,
+    /// Ghostty `set_surface_title:text` — set the session title
+    /// directly (empty resets to the running program's title).
+    SetSurfaceTitle(String),
+    /// Ghostty `set_tab_title:text` — set a title on the owning tab
+    /// that survives pane-focus changes; empty removes it.
+    SetTabTitle(String),
+    /// Ghostty `inspector` / `inspector:toggle` — overlay chip reporting
+    /// the attributes of the cell under the terminal cursor.
     Inspector,
+    /// `inspector:show` / `inspector:hide`.
+    InspectorSet(bool),
+    /// Ghostty `ignore` — consume the chord and do nothing (bytes do
+    /// NOT reach the pty; `unbind` lets them through).
+    Ignore,
+    /// Ghostty `copy_url_to_clipboard` — copy the URL under the mouse
+    /// cursor (OSC 8 hyperlink or detected) to the clipboard.
+    CopyUrlToClipboard,
+    /// Ghostty `copy_title_to_clipboard` — copy the focused session's
+    /// title to the clipboard.
+    CopyTitleToClipboard,
+    /// Ghostty `start_search` — open the search bar.
+    StartSearch,
+    /// Ghostty `end_search` — close the search bar and drop the query.
+    EndSearch,
+    /// Ghostty `search_selection` — open search seeded with the
+    /// current selection text.
+    SearchSelection,
+    /// Ghostty `search:text` — set the search query (empty cancels).
+    SearchFor(String),
+    /// Ghostty `scroll_page_fractional:f` — scroll a fraction of the
+    /// page (negative = up).
+    ScrollPageFractional(f64),
+}
+
+/// Ghostty's `:action` suffix for `write_*_file` — what to do with the
+/// written temp file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSink {
+    /// Open it in `$VISUAL`/`$EDITOR` inside a new tab (default).
+    Open,
+    /// Copy the file path to the clipboard.
+    Copy,
+    /// Paste the file path into the terminal.
+    Paste,
 }
 

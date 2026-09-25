@@ -36,7 +36,8 @@ use waterui::prelude::*;
 use waterui::window::Window;
 use waterui::window::WindowState::Fullscreen;
 use waterui::window::WindowStyle::{Borderless, Titled};
-use waterui_core::layout::{Point, Rect, Size};
+use crate::app::AppState;
+
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...] [+ACTION]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
@@ -109,9 +110,8 @@ pub fn app(env: Environment) -> App {
     let state = app::AppState::new(config_path, command);
     // water-rs/cli#188: the app gives the runtime its color scheme through
     // the Environment — a `Computed` driven by `window-theme`, so a config
-    // reload flips the chrome scheme without a restart. On hydrolysis pins
-    // that install a default scheme after `app()` this is overwritten
-    // (framework defect, WATERUI_FEEDBACK #46).
+    // reload flips the chrome scheme without a restart. Requires hydrolysis
+    // >= e00b1f0 (#206: framework defaults < style tokens < app env).
     Plugin::install(
         Theme::new().color_scheme(state.window_scheme.clone()),
         &mut env,
@@ -139,41 +139,9 @@ pub fn app(env: Environment) -> App {
     .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
     // Window geometry: `window-save-state` restores the persisted frame;
     // otherwise `window-width`/`window-height` adjust the seeded 800x600
-    // (keeping whatever origin the framework chose — position before map
-    // is dropped by the WM anyway, hydrolysis#105).
-    let rect = if state.config(|c| c.window_save_state) {
-        app::load_window_state()
-    } else {
-        None
-    };
-    if let Some(rect) = rect {
-        window.frame.set(rect);
-    } else {
-        let (w, h) = state.config(|c| (c.window_width, c.window_height));
-        if w > 0.0 || h > 0.0 {
-            let frame = window.frame.snapshot();
-            let size = *frame.size();
-            window.frame.set(Rect::new(
-                frame.origin(),
-                Size::new(
-                    if w > 0.0 { w } else { size.width },
-                    if h > 0.0 { h } else { size.height },
-                ),
-            ));
-        }
-        // `window-position-x`/`window-position-y`: launch position
-        // (hydrolysis#123 carries window-position support; KWin may
-        // still place the window).
-        let (wx, wy) = state.config(|c| (c.window_x, c.window_y));
-        if wx.is_some() || wy.is_some() {
-            let frame = window.frame.snapshot();
-            let origin = frame.origin();
-            window.frame.set(Rect::new(
-                Point::new(wx.unwrap_or(origin.x), wy.unwrap_or(origin.y)),
-                *frame.size(),
-            ));
-        }
-    }
+    // and `window-position-x`/`y` the origin (shared with `new_window`;
+    // position before map is dropped by the WM anyway, hydrolysis#105).
+    AppState::apply_launch_geometry(&state, &window);
     *state.window_frame.borrow_mut() = Some(window.frame.clone());
     // `window-fullscreen`: every window starts fullscreen (same binding
     // F11 toggles, so it can be toggled back out).

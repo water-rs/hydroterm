@@ -117,6 +117,9 @@ pub struct DrawContext<'a> {
     pub font_synthetic_italic: bool,
     /// `visual-bell-color` — bell flash overlay; `None` = foreground.
     pub bell_color: Option<Rgb>,
+    /// `bell-features` `border` — ring around the alerted pane until it
+    /// is re-focused or receives input (Ghostty).
+    pub bell_border: bool,
     /// `font-thicken` — every glyph run is emboldened (Ghostty
     /// `font-thicken`).
     pub font_thicken: bool,
@@ -577,6 +580,22 @@ pub fn draw_term(
             )),
             None,
             &rect(0.0, 0.0, ctx.width, ctx.height),
+        );
+    }
+
+    // -- Bell border ----------------------------------------------------------
+    // `bell-features` `border` — a ring around the alerted pane that stays
+    // up until it is re-focused or receives input (Ghostty).
+    if ctx.bell_border {
+        scene.stroke(
+            &Stroke::new(3.0),
+            Affine::IDENTITY,
+            &Brush::Solid(peniko_alpha(
+                ctx.bell_color.unwrap_or(ctx.palette.accent),
+                1.0,
+            )),
+            None,
+            &rect(1.5, 1.5, ctx.width - 1.5, ctx.height - 1.5).to_path(0.0),
         );
     }
 }
