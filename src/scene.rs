@@ -648,23 +648,23 @@ fn draw_decorations(
 
     let stroke_w = (m.stroke * ctx.underline_adjust.1).max(1.0) as f64;
     let underline_y = baseline_y as f64 + m.underline_pos as f64 + ctx.underline_adjust.0 as f64;
+    // Straight decorations are square-ended rects centered on the line y, so
+    // the run's first and last cells bound them exactly.
+    let band = |y: f64| Rect::new(x as f64, y - stroke_w / 2.0, (x + w) as f64, y + stroke_w / 2.0);
 
     if style.deco & DECO_UNDERLINE != 0 {
-        let mut p = BezPath::new();
-        p.move_to((x as f64, underline_y));
-        p.line_to(((x + w) as f64, underline_y));
-        scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, &brush, None, &p);
+        let p = band(underline_y).to_path(0.0);
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
     }
     if style.deco & DECO_DOUBLE != 0 {
         for dy in [0.0, stroke_w * 2.0] {
-            let mut p = BezPath::new();
-            p.move_to((x as f64, underline_y + dy));
-            p.line_to(((x + w) as f64, underline_y + dy));
-            scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, &brush, None, &p);
+            let p = band(underline_y + dy).to_path(0.0);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
         }
     }
     if style.deco & DECO_CURL != 0 {
-        // Squiggly underline: ~1.5px amplitude, half-cell period.
+        // Squiggly underline: ~1.5px amplitude, half-cell period. Butt caps so
+        // the path ends inside the run's cells.
         let mut p = BezPath::new();
         p.move_to((x as f64, underline_y));
         let period = cw as f64 * 0.9;
@@ -678,7 +678,15 @@ fn draw_decorations(
             xx = nx;
             up = !up;
         }
-        scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, &brush, None, &p);
+        scene.stroke(
+            &Stroke::new(stroke_w)
+                .with_start_cap(kurbo::Cap::Butt)
+                .with_end_cap(kurbo::Cap::Butt),
+            Affine::IDENTITY,
+            &brush,
+            None,
+            &p,
+        );
     }
     if style.deco & (DECO_DOTTED | DECO_DASHED) != 0 {
         let dash = if style.deco & DECO_DOTTED != 0 {
@@ -700,10 +708,9 @@ fn draw_decorations(
     if style.deco & DECO_STRIKE != 0 {
         let y = baseline_y as f64 - m.strikeout_pos as f64 - ctx.strikethrough_adjust.0 as f64;
         let w_stroke = (m.stroke * ctx.strikethrough_adjust.1).max(1.0) as f64;
-        let mut p = BezPath::new();
-        p.move_to((x as f64, y));
-        p.line_to(((x + w) as f64, y));
-        scene.stroke(&Stroke::new(w_stroke), Affine::IDENTITY, &brush, None, &p);
+        let p = Rect::new(x as f64, y - w_stroke / 2.0, (x + w) as f64, y + w_stroke / 2.0)
+            .to_path(0.0);
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
     }
 }
 

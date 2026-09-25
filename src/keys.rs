@@ -510,7 +510,7 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
 }
 
 /// Actions the app performs rather than forwarding as bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TermAction {
     Copy,
     Paste,
@@ -649,5 +649,27 @@ pub enum TermAction {
     Palette,
     /// Open the settings page.
     Settings,
+    /// Ghostty `keybind = chord=text:"…"` — write literal bytes to the
+    /// focused pane as if typed.
+    TypeText(String),
+    /// Ghostty `keybind = chord=esc:"…"` — write `\e` + payload.
+    EscSeq(String),
+    /// Ghostty `keybind = chord=csi:"…"` — write `\e[` + payload.
+    CsiSeq(String),
+    /// Ghostty `paste_from_selection` — paste the PRIMARY selection
+    /// (the clipboard `paste` covers `paste_from_clipboard`).
+    PasteFromSelection,
+    /// Ghostty `scroll_to_fraction` — jump the viewport to a fraction
+    /// of the scrollback (0.0 = bottom / latest, 1.0 = top / oldest).
+    ScrollToFraction(f64),
+    /// Ghostty `scroll_to_row` — jump the viewport N rows back into
+    /// scrollback (0 = bottom / latest screen row).
+    ScrollToRow(usize),
+    /// Ghostty `prompt_title` — interactive rename of the focused
+    /// session's tab title (until the next OSC 0/1/2 override).
+    PromptTitle,
+    /// Ghostty `inspector` — overlay chip reporting the attributes of
+    /// the cell under the terminal cursor.
+    Inspector,
 }
 

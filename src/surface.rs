@@ -22,7 +22,7 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, Processor};
 use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::task::spawn_local;
@@ -880,6 +880,61 @@ impl TermSurface {
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
             TermAction::Palette => self.app.toggle_palette(),
             TermAction::Settings => self.app.toggle_settings(),
+            // `text:`/`esc:`/`csi:` payloads — literal bytes on the pty,
+            // same write path as typed input.
+            TermAction::TypeText(s) => self.write(s.into_bytes()),
+            TermAction::EscSeq(s) => {
+                let mut b = vec![b'\x1b'];
+                b.extend_from_slice(s.as_bytes());
+                self.write(b);
+            }
+            TermAction::CsiSeq(s) => {
+                let mut b = vec![b'\x1b', b'['];
+                b.extend_from_slice(s.as_bytes());
+                self.write(b);
+            }
+            TermAction::PasteFromSelection => {
+                let bracketed = self
+                    .session
+                    .terminal
+                    .term
+                    .lock()
+                    .mode()
+                    .contains(TermMode::BRACKETED_PASTE);
+                if let Some(t) = self.primary_text() {
+                    self.paste_text(&t, bracketed);
+                }
+            }
+            // No `Scroll::Row` variant in the pinned alacritty — the
+            // targets convert to a delta off `display_offset`.
+            TermAction::ScrollToFraction(f) => {
+                let mut term = self.session.terminal.term.lock();
+                let history = term.grid().history_size();
+                let target = (history as f64 * f).round() as usize;
+                let delta = target as i32 - term.grid().display_offset() as i32;
+                if delta != 0 {
+                    term.scroll_display(Scroll::Delta(delta));
+                }
+            }
+            TermAction::ScrollToRow(n) => {
+                let mut term = self.session.terminal.term.lock();
+                let history = term.grid().history_size();
+                let target = n.min(history);
+                let delta = target as i32 - term.grid().display_offset() as i32;
+                if delta != 0 {
+                    term.scroll_display(Scroll::Delta(delta));
+                }
+            }
+            TermAction::PromptTitle => {
+                self.session
+                    .title_query
+                    .set(self.session.title.snapshot());
+                self.session.title_prompt_open.set(true);
+            }
+            TermAction::Inspector => {
+                let s = &self.session;
+                s.inspector_open.set(!s.inspector_open.snapshot());
+            }
         }
     }
 
@@ -1228,6 +1283,9 @@ impl TermSurface {
         if pressed && self.search.is_some() && self.search_key(key, mods) {
             return true;
         }
+        if pressed && self.session.title_prompt_open.snapshot() && self.title_prompt_key(key, mods) {
+            return true;
+        }
         // Paste-protection overlay captures Enter/Escape; other keys
         // fall through so the pending paste can't swallow input.
         if pressed && self.session.pending_paste.snapshot().is_some() {
@@ -1374,6 +1432,39 @@ impl TermSurface {
         }
     }
 
+    /// `prompt_title` keys: Enter renames, Escape cancels, Backspace
+    /// edits; text arrives via `on_text` (same unfocusable-TextField
+    /// caveat as the palette — hydrolysis#90 — so the binding is
+    /// driven here).
+    fn title_prompt_key(&mut self, key: &Key, mods: Modifiers) -> bool {
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                let q = self.session.title_query.snapshot();
+                self.app.set_session_title(self.session.id, q);
+                self.session.title_prompt_open.set(false);
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.session.title_prompt_open.set(false);
+                true
+            }
+            Key::Named(NamedKey::Backspace) if mods.is_empty() => {
+                let mut q = self.session.title_query.snapshot().to_string();
+                q.pop();
+                self.session.title_query.set_from(q);
+                true
+            }
+            // Printable chars are consumed here so no PTY bytes escape;
+            // their text arrives via `on_text`.
+            Key::Character(_)
+                if !mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Feed one key into search state. Returns true when consumed.
     fn search_key(&mut self, key: &Key, mods: Modifiers) -> bool {
         match key {
@@ -1475,6 +1566,12 @@ impl TermSurface {
             self.app.palette_query.set_from(q);
             self.app.palette_sel.set(Some(0));
             self.app.palette_scroll.scroll_to(0);
+            return true;
+        }
+        if self.session.title_prompt_open.snapshot() {
+            let mut q = self.session.title_query.snapshot().to_string();
+            q.push_str(text);
+            self.session.title_query.set_from(q);
             return true;
         }
         if self.search.is_some() {
@@ -2137,6 +2234,43 @@ impl TermSurface {
                 self.content_gen.get(),
             );
             let reporting = term.mode().intersects(TermMode::MOUSE_MODE);
+            // `inspector`: re-report the cursor cell's attributes on
+            // every rendered frame — the chip follows edits and cursor
+            // moves with no separate refresh path.
+            if self.session.inspector_open.snapshot() {
+                let cell = &grid[grid.cursor.point];
+                let color = |c: &AnsiColor| match c {
+                    AnsiColor::Spec(rgb) => {
+                        format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b)
+                    }
+                    AnsiColor::Indexed(i) => format!("idx {i}"),
+                    AnsiColor::Named(n) => format!("{n:?}"),
+                };
+                // Internal bits (PROMPT_MARK) are hidden — the chip
+                // reports only the upstream flag vocabulary.
+                let visible = cell.flags.intersection(Flags::all());
+                let flags = if visible.is_empty() {
+                    "none".to_string()
+                } else {
+                    let flags = format!("{visible:?}");
+                    flags
+                        .strip_prefix("Flags(")
+                        .and_then(|f| f.strip_suffix(')'))
+                        .unwrap_or(&flags)
+                        .to_string()
+                };
+                let link = cell
+                    .hyperlink()
+                    .map(|h| h.uri().to_string())
+                    .unwrap_or_else(|| "none".into());
+                self.session.inspector_label.set_from(format!(
+                    "U+{:04X} '{}'  fg {}  bg {}  flags {flags}  link {link}",
+                    cell.c as u32,
+                    cell.c,
+                    color(&cell.fg),
+                    color(&cell.bg),
+                ));
+            }
             drop(term);
             if self.session.mouse_reporting.snapshot() != reporting {
                 self.session.mouse_reporting.set(reporting);

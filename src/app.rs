@@ -122,6 +122,16 @@ pub struct Session {
     pub pending_clipboard_read: Binding<bool>,
     /// The OSC 52 reply formatter captured while the prompt is up.
     pub pending_clipboard_fmt: Rc<RefCell<Option<ClipboardReply>>>,
+    /// Ghostty `prompt_title` — the rename prompt is open over the pane.
+    pub title_prompt_open: Binding<bool>,
+    /// Live rename text — bound to the prompt's `TextField`; seeded
+    /// with the current title when the prompt opens.
+    pub title_query: Binding<Str>,
+    /// Ghostty `inspector` — a chip reports the attributes of the cell
+    /// under the terminal cursor, refreshed every rendered frame.
+    pub inspector_open: Binding<bool>,
+    /// Text of the inspector chip — rewritten each frame while open.
+    pub inspector_label: Binding<Str>,
 }
 
 impl Session {
@@ -204,6 +214,10 @@ impl Session {
             pending_close: Binding::default(),
             pending_clipboard_read: Binding::default(),
             pending_clipboard_fmt: Rc::new(RefCell::new(None)),
+            title_prompt_open: Binding::bool(false),
+            title_query: binding(Str::from("")),
+            inspector_open: Binding::bool(false),
+            inspector_label: binding(Str::from("")),
         }
     }
 }
@@ -1710,12 +1724,49 @@ impl View for PaneLeaf {
             })
             .padding_vertical(8.0),
         ));
+        // `prompt_title` — a rename prompt over the pane. The TextField
+        // can't take keyboard focus (hydrolysis#90), so the surface
+        // routes keys + text into `title_query` and the field mirrors it.
+        let title_prompt_open = session.0.title_prompt_open.clone();
+        let title_query = session.0.title_query.clone();
+        let title_prompt = vstack((
+            Spacer::flexible(),
+            when(title_prompt_open, move || {
+                Card::new(vstack((
+                    text("Rename tab title").muted(),
+                    field("tab title", &title_query),
+                    text("Enter: rename · Esc: cancel").muted(),
+                ))
+                .spacing(8.0))
+                .style(CardStyle::Elevated)
+                .padding_with(24.0)
+            }),
+            Spacer::flexible(),
+        ));
+        // `inspector` — a bottom-edge chip reporting the attributes of
+        // the cell under the terminal cursor; `inspector_label` is
+        // rewritten every rendered frame while the inspector is open.
+        let inspector_open = session.0.inspector_open.clone();
+        let inspector_label = session.0.inspector_label.clone();
+        let inspector_badge = vstack((
+            Spacer::flexible(),
+            when(inspector_open, move || {
+                text(inspector_label.computed())
+                    .foreground(Foreground)
+                    .padding_horizontal(10.0)
+                    .padding_vertical(4.0)
+                    .background(Surface)
+            })
+            .padding_vertical(8.0),
+        ));
         zstack((
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
             close_overlay,
             clip_overlay,
             resize_badge,
+            title_prompt,
+            inspector_badge,
         ))
         .context_menu(menu)
         .state(&session)

@@ -1,0 +1,318 @@
+[package]
+name = "hydroterm-hydrolysis-b3e8833b"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-mutable-globals",
+    "--enable-sign-ext",
+    "--enable-nontrapping-float-to-int",
+    "--enable-reference-types",
+]
+
+[lib]
+name = "hydroterm_hydrolysis_b3e8833b_lib"
+crate-type = [
+    "cdylib",
+    "rlib",
+]
+
+[[bin]]
+name = "hydroterm-hydrolysis-b3e8833b"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[features]
+waterui-mcp-mode = ["dep:waterui-mcp"]
+waterui-preview-mode = []
+waterui-preview-test-mode = []
+
+[dependencies.hydroterm]
+path = ".."
+
+[dependencies.waterui]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+serde = "1"
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.hydrolysis]
+git = "https://github.com/water-rs/hydrolysis"
+rev = "eb962313c6fae7c558056a0c0ac2b5d8a30061e0"
+default-features = false
+features = ["winit"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.hydrolysis-m3]
+git = "https://github.com/water-rs/hydrolysis-m3"
+rev = "94bde7b24339de77c2ea38b4df621e796f086109"
+default-features = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.waterui-core]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.waterui-mcp]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.waterui-preview]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.waterui-preview-protocol]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.waterui-testing]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+default-features = false
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.hydrolysis]
+git = "https://github.com/water-rs/hydrolysis"
+rev = "eb962313c6fae7c558056a0c0ac2b5d8a30061e0"
+default-features = false
+features = ["web"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.hydrolysis-m3]
+git = "https://github.com/water-rs/hydrolysis-m3"
+rev = "94bde7b24339de77c2ea38b4df621e796f086109"
+default-features = false
+
+[workspace]
+
+[patch.crates-io.glifo]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.hydrolysis]
+git = "https://github.com/water-rs/hydrolysis"
+rev = "eb962313c6fae7c558056a0c0ac2b5d8a30061e0"
+
+[patch.crates-io.hydrolysis-m3]
+git = "https://github.com/water-rs/hydrolysis-m3"
+rev = "94bde7b24339de77c2ea38b4df621e796f086109"
+
+[patch.crates-io.nami]
+git = "https://github.com/water-rs/nami"
+rev = "5dc2d92e4ee9a236afdf71aaf4ef5b26a6990425"
+
+[patch.crates-io.nami-core]
+git = "https://github.com/water-rs/nami"
+rev = "5dc2d92e4ee9a236afdf71aaf4ef5b26a6990425"
+
+[patch.crates-io.vello]
+git = "https://github.com/lexoliu/vello"
+rev = "5e5f538556be16527f67379b105af82f408b747d"
+
+[patch.crates-io.vello_common]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.vello_hybrid]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.vello_sparse_shaders]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.waterkit-build]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-clipboard]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-codec]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-core]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-dialog]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-fs]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-location]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-permission]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterkit-video-core]
+git = "https://github.com/water-rs/waterkit"
+rev = "123b0581c908d424826c4f07cd25d5c0cc0d07ec"
+
+[patch.crates-io.waterui]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-assets]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-assets-core]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-assets-macros]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-assets-planner]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-backend-core]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-controls]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-core]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-dylib]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-form]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-graphics]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-icon]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-image]
+git = "https://github.com/water-rs/image"
+rev = "6c0435fe5c8d0f8383c548a147482be2b582f401"
+
+[patch.crates-io.waterui-inspector-protocol]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-internal]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-layout]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-locale]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-macros]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-map]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-mcp]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-mcp-protocol]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-media]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-navigation]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-preview-protocol]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-shape]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-svg]
+git = "https://github.com/water-rs/svg"
+rev = "ef5494479e3fa0ca0218d387ebc476a4eb63ec0e"
+
+[patch.crates-io.waterui-testing]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-text]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-url]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-video]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-watcher-set]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.waterui-webview]
+git = "https://github.com/water-rs/waterui"
+rev = "70c3b7c2f18c636dad17b8fad6f720c0e59f48f5"
+
+[patch.crates-io.xcb]
+git = "https://github.com/rust-x-bindings/rust-xcb"
+rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad"

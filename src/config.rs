@@ -547,7 +547,15 @@ impl AppConfig {
                 continue;
             };
             let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().trim_matches('"');
+            // A fully-quoted scalar unwraps (`shell = "/bin/zsh"`) —
+            // quotes *inside* the value are content, not wrapping:
+            // `keybind = c=text:"a b"` keeps its payload quotes.
+            let value = value.trim();
+            let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            };
             match key.as_str() {
                 "font-size" => match value.parse::<f32>() {
                     Ok(v) if (4.0..=96.0).contains(&v) => cfg.font_size = v,
@@ -1138,6 +1146,9 @@ pub const ACTION_NAMES: &[&str] = &[
     "scroll_line_up", "scroll_line_down",
     "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
     "write_screen_file", "write_scrollback_file", "write_selection_file",
+    "text:\"…\"", "csi:\"…\"", "esc:\"…\"",
+    "scroll_to_fraction:<0-1>", "scroll_to_row:<n>",
+    "paste_from_clipboard", "paste_from_selection", "prompt_title", "inspector",
     "quit", "fullscreen", "palette", "settings",
     "split_right", "split_down", "split_left", "split_up",
     "new_split:<right|down|left|up|auto>",
@@ -1179,15 +1190,56 @@ fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
     } else {
         normalize_chord(raw)?
     };
-    let action = action.trim().to_ascii_lowercase();
-    let action = match action.as_str() {
+    let action_raw = action.trim();
+    let lower = action_raw.to_ascii_lowercase();
+    let action = match lower.as_str() {
         "" | "none" | "unbind" => None,
         _ => Some(
-            action_from_str(&action)
-                .ok_or_else(|| format!("unknown action {action:?}"))?,
+            action_from_str(&lower, action_raw)
+                .ok_or_else(|| format!("unknown action {action_raw:?}"))?,
         ),
     };
     Ok((chord, action))
+}
+
+/// Ghostty payload escapes inside `"…"`: `\n \r \t \e \\ \" \xNN`.
+/// An unquoted payload is taken verbatim.
+fn parse_payload(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return Ok(s.to_string());
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut it = inner.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('e') => out.push('\x1b'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('x') => {
+                let hi = it.next().and_then(|c| c.to_digit(16));
+                let lo = it.next().and_then(|c| c.to_digit(16));
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => out.push(char::from_u32(hi * 16 + lo).unwrap_or('\u{fffd}')),
+                    _ => return Err("bad \\xNN escape in keybind payload".into()),
+                }
+            }
+            other => {
+                out.push('\\');
+                if let Some(o) = other {
+                    out.push(o);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Parse `ctrl+shift+arrowup` / `alt+f4` / `super+v` into the canonical
@@ -1252,8 +1304,28 @@ fn canonical_key_name(name: &str) -> Result<String, String> {
 }
 
 /// Action names for `keybind =` right-hand sides.
-fn action_from_str(name: &str) -> Option<TermAction> {
+fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
     Some(match name {
+        // Ghostty payload actions — `keybind = chord=text:"hi\n"` types
+        // the literal text; `esc:`/`csi:` prepend `\e`/`\e[`. Payload
+        // keeps the config line's case, so these read `raw` not `name`.
+        _ if name.starts_with("text:") => {
+            TermAction::TypeText(parse_payload(&raw[5..]).ok()?)
+        }
+        _ if name.starts_with("csi:") => TermAction::CsiSeq(parse_payload(&raw[4..]).ok()?),
+        _ if name.starts_with("esc:") => TermAction::EscSeq(parse_payload(&raw[4..]).ok()?),
+        _ if name.starts_with("scroll_to_fraction:") => {
+            let f: f64 = name["scroll_to_fraction:".len()..].parse().ok()?;
+            TermAction::ScrollToFraction(f.clamp(0.0, 1.0))
+        }
+        _ if name.starts_with("scroll_to_row:") => {
+            let n: usize = name["scroll_to_row:".len()..].parse().ok()?;
+            TermAction::ScrollToRow(n)
+        }
+        "paste_from_clipboard" => TermAction::Paste,
+        "paste_from_selection" | "paste_primary" => TermAction::PasteFromSelection,
+        "prompt_title" => TermAction::PromptTitle,
+        "inspector" | "toggle_inspector" => TermAction::Inspector,
         "copy" => TermAction::Copy,
         "paste" => TermAction::Paste,
         "new_tab" => TermAction::NewTab,
@@ -1668,6 +1740,25 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::SelectTab(3)));
         assert_eq!(cfg.keybinds[1].1, Some(TermAction::PromptPrev));
+    }
+
+    #[test]
+    fn keybind_payload_actions() {
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+p=text:\"MARK A B\"\nkeybind = ctrl+alt+q=csi:\"18t\"\nkeybind = ctrl+alt+r=esc:\"[H\"\nkeybind = ctrl+alt+s=scroll_to_fraction:0.5\nkeybind = ctrl+alt+w=scroll_to_row:12",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::TypeText("MARK A B".into()))
+        );
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::CsiSeq("18t".into())));
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::EscSeq("[H".into())));
+        assert_eq!(
+            cfg.keybinds[3].1,
+            Some(TermAction::ScrollToFraction(0.5))
+        );
+        assert_eq!(cfg.keybinds[4].1, Some(TermAction::ScrollToRow(12)));
     }
 
     #[test]
