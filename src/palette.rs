@@ -137,28 +137,28 @@ impl Palette {
         }
     }
 
-    /// Resolve a cell's fg/bg honoring INVERSE, BOLD-brightening and DIM,
-    /// consulting the terminal's runtime color overrides. `bold_bright`
-    /// is the `bold-is-bright` config — off keeps bold in the normal slot.
+    /// Resolve a cell's fg/bg honoring INVERSE, `bold-color` and DIM,
+    /// consulting the terminal's runtime color overrides.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         &self,
         colors: &Colors,
         fg: Color,
         bg: Color,
         flags: Flags,
-        bold_bright: bool,
+        bold_color: crate::config::BoldColor,
         min_contrast: f32,
+        faint_opacity: f32,
     ) -> CellColors {
-        let mut fg = self.resolve_fg(
-            colors,
-            fg,
-            flags.contains(Flags::BOLD) && bold_bright,
-            false,
-        );
+        let mut fg = if flags.contains(Flags::BOLD) {
+            self.resolve_bold(colors, fg, bold_color)
+        } else {
+            self.lookup(colors, fg)
+        };
         let mut bg = self.lookup(colors, bg);
 
         if flags.contains(Flags::DIM) {
-            fg = self.dim(fg);
+            fg = self.dim_at(fg, faint_opacity);
         }
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
@@ -169,23 +169,65 @@ impl Palette {
         CellColors { fg, bg }
     }
 
-    /// Foreground resolution: BOLD lifts named colors to their bright slot.
-    pub fn resolve_fg(&self, colors: &Colors, color: Color, bold: bool, dim: bool) -> Rgb {
-        let mut color = color;
-        if bold && let Color::Named(named) = color {
-            color = Color::Named(named.to_bright());
+    /// Bold-cell foreground, Ghostty `bold-color` semantics: a fixed
+    /// `Color` repaints bold cells whose fg is the default color AND
+    /// lifts bold palette colors to their bright slot; `Bright` lifts
+    /// palette colors only; unset (`None`) leaves bold colors alone.
+    fn resolve_bold(
+        &self,
+        colors: &Colors,
+        color: Color,
+        bold_color: crate::config::BoldColor,
+    ) -> Rgb {
+        use crate::config::BoldColor;
+        if bold_color == BoldColor::None {
+            return self.lookup(colors, color);
         }
-        let rgb = self.lookup(colors, color);
-        if dim { self.dim(rgb) } else { rgb }
+        match color {
+            // Ghostty `.none` arm — default fg: `color` variant repaints.
+            Color::Named(NamedColor::Foreground) => match bold_color {
+                BoldColor::Color(c) => c,
+                _ => self.lookup(colors, color),
+            },
+            // Ghostty `.palette` arm — any set `bold-color` lifts the
+            // first eight slots to their bright pair.
+            Color::Named(
+                n @ (NamedColor::Black
+                | NamedColor::Red
+                | NamedColor::Green
+                | NamedColor::Yellow
+                | NamedColor::Blue
+                | NamedColor::Magenta
+                | NamedColor::Cyan
+                | NamedColor::White),
+            ) => self.named(colors, n.to_bright()),
+            Color::Indexed(i) if i < 8 => colors[(i + 8) as usize]
+                .unwrap_or(self.indexed[(i + 8) as usize]),
+            // Ghostty `.rgb` arm — explicit colors keep their value
+            // unless they match the default fg AND `color` is set.
+            _ => {
+                let rgb = self.lookup(colors, color);
+                match bold_color {
+                    BoldColor::Color(c) if rgb == self.foreground => c,
+                    _ => rgb,
+                }
+            }
+        }
     }
 
     /// Blend a color halfway toward the background — the "dim" look.
     pub fn dim(&self, color: Rgb) -> Rgb {
-        let blend = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+        self.dim_at(color, 0.5)
+    }
+
+    /// Blend a color toward the background by `t` (0 = background,
+    /// 1 = full color) — `faint-opacity`'s faint-text blend.
+    pub fn dim_at(&self, color: Rgb, t: f32) -> Rgb {
+        let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
         Rgb {
-            r: blend(color.r, self.background.r),
-            g: blend(color.g, self.background.g),
-            b: blend(color.b, self.background.b),
+            r: blend(self.background.r, color.r),
+            g: blend(self.background.g, color.g),
+            b: blend(self.background.b, color.b),
         }
     }
 

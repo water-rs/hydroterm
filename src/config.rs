@@ -23,6 +23,10 @@ pub enum ThemeRef {
     Auto,
     /// A named theme from the catalog (e.g. `solarized-dark`).
     Named(String),
+    /// `theme = light:<name>,dark:<name>` — a named theme per mode,
+    /// resolved against the same desktop preference as `Auto`
+    /// (Ghostty's light/dark theme pair).
+    Pair { light: String, dark: String },
 }
 
 /// `copy-on-select` routing — where a finished selection lands
@@ -69,6 +73,26 @@ pub enum QuickTermPosition {
     Center,
 }
 
+/// `quick-terminal-size` — one axis extent of the drop-down window:
+/// a percentage of the screen (`50%`) or pixels (`300px`). A bare
+/// number is a config error (Ghostty `quick-terminal-size`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuickTermSize {
+    Percent(f64),
+    Px(f64),
+}
+
+/// `bold-color` — bold-text color override (Ghostty 1.2, replacing
+/// `bold-is-bright`): `Bright` lifts every bold cell to the bright
+/// palette slot; `Color` fixes the default-fg bold color AND lifts
+/// bold palette colors to bright; `None` = no bold recoloring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoldColor {
+    None,
+    Bright,
+    Color(Rgb),
+}
+
 /// `window-new-tab-position` — where a new tab lands in the strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewTabPosition {
@@ -88,6 +112,10 @@ pub struct AppConfig {
     pub theme: ThemeRef,
     /// Where a finished selection is copied (Ghostty `copy-on-select`).
     pub copy_on_select: CopyOnSelect,
+    /// `selection-clear-on-typing` — a keypress that produces PTY data
+    /// (or an IME composition starting) drops the selection (Ghostty
+    /// default true).
+    pub selection_clear_on_typing: bool,
     /// `shell-integration` — which shell gets the injected hooks.
     pub shell_integration: ShellIntegration,
     /// `shell-integration-features` — the integration extras (cursor,
@@ -95,6 +123,11 @@ pub struct AppConfig {
     pub shell_features: ShellFeatures,
     /// `quick-terminal-position` — drop-down dock edge (top default).
     pub quick_terminal_position: QuickTermPosition,
+    /// `quick-terminal-size = <primary>[,<secondary>]` — primary axis
+    /// (height for top/bottom, width for left/right, orientation for
+    /// center); secondary axis is maximized for edge-docked positions
+    /// unless a second value is given.
+    pub quick_terminal_size: Option<(QuickTermSize, Option<QuickTermSize>)>,
     /// `clipboard-trim` — trim whitespace at the ends of copied text.
     pub clipboard_trim: bool,
     /// `desktop-notifications` — OSC 9/777 also posts a freedesktop
@@ -141,9 +174,14 @@ pub struct AppConfig {
     /// Whether programs may write the clipboard through OSC 52
     /// (Ghostty `clipboard-write` allow/deny).
     pub osc52_write: bool,
-    /// Bold text renders with the bright palette slot
-    /// (alacritty `draw_bold_text_with_bright_colors`, default true).
-    pub bold_is_bright: bool,
+    /// `bold-color` — bold-text color override (Ghostty 1.2, replacing
+    /// the deprecated `bold-is-bright`, which maps `true`→`bright`,
+    /// `false`→unset). Default `bright`.
+    pub bold_color: BoldColor,
+    /// `faint-opacity` — opacity of faint (SGR 2) text, 0.0..=1.0
+    /// (Ghostty default 0.5): blends the resolved fg toward the
+    /// background.
+    pub faint_opacity: f32,
     /// Initial working directory when no OSC 7 cwd was reported
     /// (Ghostty `working-directory`); `~` expands at load.
     pub working_directory: Option<PathBuf>,
@@ -335,9 +373,11 @@ impl Default for AppConfig {
             scrollback: 10_000,
             theme: ThemeRef::Named("hydroterm-dark".into()),
             copy_on_select: CopyOnSelect::Both,
+            selection_clear_on_typing: true,
             shell_integration: ShellIntegration::Detect,
             shell_features: ShellFeatures { cursor: true, sudo: true, title: true },
             quick_terminal_position: QuickTermPosition::Top,
+            quick_terminal_size: None,
             clipboard_trim: true,
             desktop_notifications: true,
             cursor_shape: CursorShape::Block,
@@ -356,7 +396,8 @@ impl Default for AppConfig {
             window_padding_y: 0.0,
             term: "xterm-256color".to_string(),
             osc52_write: true,
-            bold_is_bright: true,
+            bold_color: BoldColor::Bright,
+            faint_opacity: 0.5,
             working_directory: None,
             unfocused_split_opacity: 1.0,
             resize_overlay: true,
@@ -440,7 +481,9 @@ osc52-write = allow        # allow | deny — OSC 52 clipboard writes by program
 osc52-read = ask           # allow | ask | deny — OSC 52 clipboard reads by programs
 mouse-shift-override = true # Shift+click/drag selects even while a program owns the mouse
 cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
-bold-is-bright = true       # bold text uses the bright palette slot
+bold-color = bright        # bright | #rrggbb — bold-text color (unset = no override)
+faint-opacity = 0.5        # faint (SGR 2) text opacity, 0.0-1.0
+selection-clear-on-typing = true  # typing drops the selection highlight
 unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
 resize-overlay = true      # cols x rows badge while resizing
 focus-follows-mouse = false
@@ -451,7 +494,9 @@ focus-follows-mouse = false
 # window-inherit-font-size = true  # new tab takes focused pane's live zoom
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
-#        solarized-dark | solarized-light
+#        solarized-dark | solarized-light |
+#        light:<name>,dark:<name>  — a theme per mode
+# theme = light:solarized-light,dark:solarized-dark
 theme = hydroterm-dark
 
 cursor-shape = block        # block | beam | underline | hollow
@@ -501,6 +546,9 @@ confirm-close = true       # ask before closing a running program
 # visual-bell = true      # flash the pane on BEL
 # open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
 # quick-terminal-position = top   # top | bottom | left | right | center
+# quick-terminal-size = 45%       # N% or Npx[, second axis] — primary axis
+#                                  # is height for top/bottom, width for
+#                                  # left/right; edge docks maximize the rest
 # shell-integration-features = cursor,sudo,title   # prefix a feature with no- to disable
 # clipboard-trim = true   # trim whitespace at the ends of copied text
 # keybind = ctrl+shift+q=unbind   # unbind a chord (falls through to literal keys)
@@ -516,6 +564,14 @@ impl AppConfig {
         match &self.theme {
             ThemeRef::Auto => Theme::auto(),
             ThemeRef::Named(name) => Theme::by_name(name).unwrap_or_else(Theme::hydroterm_dark),
+            ThemeRef::Pair { light, dark } => {
+                let name = if crate::theme::system_prefers_light() {
+                    light
+                } else {
+                    dark
+                };
+                Theme::by_name(name).unwrap_or_else(Theme::hydroterm_dark)
+            }
         }
     }
 
@@ -681,10 +737,33 @@ impl AppConfig {
                 }
                 "bold-is-bright" | "bold_is_bright"
                 | "draw-bold-text-with-bright-colors" => match value {
-                    "true" | "yes" | "1" | "on" => cfg.bold_is_bright = true,
-                    "false" | "no" | "0" | "off" => cfg.bold_is_bright = false,
+                    // Deprecated alias for `bold-color` (Ghostty 1.2 shim:
+                    // true → bright, false → unset).
+                    "true" | "yes" | "1" | "on" => cfg.bold_color = BoldColor::Bright,
+                    "false" | "no" | "0" | "off" => cfg.bold_color = BoldColor::None,
                     _ => errors.push(format!("line {}: bad bold-is-bright {value:?}", n + 1)),
                 },
+                "bold-color" => {
+                    if value.eq_ignore_ascii_case("bright") {
+                        cfg.bold_color = BoldColor::Bright;
+                    } else if let Some(rgb) = parse_rgb(value) {
+                        cfg.bold_color = BoldColor::Color(rgb);
+                    } else {
+                        errors.push(format!(
+                            "line {}: bad bold-color {value:?} (bright or #rrggbb)",
+                            n + 1
+                        ));
+                    }
+                }
+                "faint-opacity" => match value.parse::<f32>() {
+                    Ok(v) => cfg.faint_opacity = v.clamp(0.0, 1.0),
+                    Err(_) => {
+                        errors.push(format!("line {}: bad faint-opacity {value:?}", n + 1))
+                    }
+                },
+                "selection-clear-on-typing" => {
+                    cfg.selection_clear_on_typing = bool_value(value, n, &mut errors);
+                }
                 "mouse-hide-while-typing" | "mouse_hide_while_typing" => match value {
                     "true" | "yes" | "1" | "on" => cfg.mouse_hide_typing = true,
                     "false" | "no" | "0" | "off" => cfg.mouse_hide_typing = false,
@@ -693,6 +772,8 @@ impl AppConfig {
                 "theme" => {
                     if value.eq_ignore_ascii_case("auto") {
                         cfg.theme = ThemeRef::Auto;
+                    } else if let Some((light, dark)) = parse_theme_pair(value) {
+                        cfg.theme = ThemeRef::Pair { light, dark };
                     } else if Theme::by_name(value).is_some() {
                         cfg.theme = ThemeRef::Named(value.to_string());
                     } else {
@@ -739,6 +820,10 @@ impl AppConfig {
                         }
                     }
                 }
+                "quick-terminal-size" => match parse_quick_term_size(value) {
+                    Ok(s) => cfg.quick_terminal_size = s,
+                    Err(msg) => errors.push(format!("line {}: {msg}", n + 1)),
+                },
                 "quick-terminal-position" => match value {
                     "top" => cfg.quick_terminal_position = QuickTermPosition::Top,
                     "bottom" => cfg.quick_terminal_position = QuickTermPosition::Bottom,
@@ -1096,6 +1181,61 @@ fn parse_cell_adjust(value: &str) -> Option<CellAdjust> {
     }
     let f: f32 = v.parse().ok()?;
     (-50.0..=100.0).contains(&f).then_some(CellAdjust::Fraction(f / 100.0))
+}
+
+/// `theme = light:<name>,dark:<name>` — Ghostty's per-mode theme pair.
+/// Either order; both keys required; each name must resolve to the
+/// catalog. Returns `Some((light, dark))` only on a full pair.
+fn parse_theme_pair(value: &str) -> Option<(String, String)> {
+    let mut light = None;
+    let mut dark = None;
+    for field in value.split(',') {
+        let field = field.trim();
+        if let Some(v) = field.strip_prefix("light:") {
+            light = Some(v.trim().to_string());
+        } else if let Some(v) = field.strip_prefix("dark:") {
+            dark = Some(v.trim().to_string());
+        }
+    }
+    let (light, dark) = (light?, dark?);
+    if Theme::by_name(&light).is_none() || Theme::by_name(&dark).is_none() {
+        return None;
+    }
+    Some((light, dark))
+}
+
+/// `quick-terminal-size = <a>[,<b>]` — each extent is `N%` or `Npx`;
+/// a bare number is a config error (Ghostty).
+fn parse_quick_term_size(
+    value: &str,
+) -> Result<Option<(QuickTermSize, Option<QuickTermSize>)>, String> {
+    fn one(v: &str) -> Result<QuickTermSize, String> {
+        let v = v.trim();
+        if let Some(p) = v.strip_suffix('%') {
+            return p
+                .trim()
+                .parse::<f64>()
+                .map(QuickTermSize::Percent)
+                .map_err(|_| format!("bad quick-terminal-size {v:?}"));
+        }
+        if let Some(p) = v.strip_suffix("px") {
+            return p
+                .trim()
+                .parse::<f64>()
+                .map(QuickTermSize::Px)
+                .map_err(|_| format!("bad quick-terminal-size {v:?}"));
+        }
+        Err(format!(
+            "quick-terminal-size {v:?} needs a % or px suffix"
+        ))
+    }
+    let mut parts = value.splitn(2, ',');
+    let a = one(parts.next().unwrap_or_default())?;
+    let b = match parts.next() {
+        Some(v) => Some(one(v)?),
+        None => None,
+    };
+    Ok(Some((a, b)))
 }
 
 /// `~/…` expands to `$HOME/…`; anything else passes through verbatim.
@@ -1767,6 +1907,76 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(cfg.theme, ThemeRef::Auto);
         let (_, errs) = AppConfig::parse("theme = midnight-whatever");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn theme_pair_parses() {
+        let (cfg, errs) =
+            AppConfig::parse("theme = light:solarized-light,dark:solarized-dark");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.theme,
+            ThemeRef::Pair {
+                light: "solarized-light".into(),
+                dark: "solarized-dark".into()
+            }
+        );
+        // Reversed order works; a lone half falls back to the unknown
+        // theme error path (not silently a Named theme).
+        let (cfg2, errs2) =
+            AppConfig::parse("theme = dark:solarized-dark,light:solarized-light");
+        assert!(errs2.is_empty(), "{errs2:?}");
+        assert!(matches!(cfg2.theme, ThemeRef::Pair { .. }));
+        let (_, errs3) = AppConfig::parse("theme = light:solarized-light");
+        assert_eq!(errs3.len(), 1);
+    }
+
+    #[test]
+    fn bold_color_faint_opacity_selection_clear_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "bold-color = #ff0088\nfaint-opacity = 0.25\nselection-clear-on-typing = false",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.bold_color,
+            BoldColor::Color(Rgb {
+                r: 0xff,
+                g: 0x00,
+                b: 0x88
+            })
+        );
+        assert!((cfg.faint_opacity - 0.25).abs() < f32::EPSILON);
+        assert!(!cfg.selection_clear_on_typing);
+
+        let (cfg, errs) = AppConfig::parse("bold-color = bright\nfaint-opacity = 9.0");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.bold_color, BoldColor::Bright);
+        // Clamped into 0..=1 like Ghostty.
+        assert!((cfg.faint_opacity - 1.0).abs() < f32::EPSILON);
+
+        // Deprecated alias maps onto the same field.
+        let (cfg, errs) = AppConfig::parse("bold-is-bright = false");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.bold_color, BoldColor::None);
+    }
+
+    #[test]
+    fn quick_terminal_size_parses() {
+        let (cfg, errs) = AppConfig::parse("quick-terminal-size = 30%");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.quick_terminal_size,
+            Some((QuickTermSize::Percent(30.0), None))
+        );
+        let (cfg, errs) = AppConfig::parse("quick-terminal-size = 50%,500px");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.quick_terminal_size,
+            Some((QuickTermSize::Percent(50.0), Some(QuickTermSize::Px(500.0))))
+        );
+        // Bare numbers are a config error (Ghostty).
+        let (_, errs) = AppConfig::parse("quick-terminal-size = 300");
         assert_eq!(errs.len(), 1);
     }
 

@@ -922,13 +922,61 @@ impl AppState {
         // manager places it until that fix lands. No timed re-emit: racing
         // the WM is forbidden workaround, not a fix.
         if let Some((sw, sh)) = crate::quickterm::screen_size() {
-            use crate::config::QuickTermPosition as P;
+            use crate::config::{QuickTermPosition as P, QuickTermSize as S};
+            // `quick-terminal-size = <primary>[,<secondary>]` — the
+            // primary axis is height for top/bottom, width for
+            // left/right, and follows the monitor orientation for
+            // center; the secondary axis is maximized for edge-docked
+            // positions unless a second size is given (Ghostty).
+            let size = self.config(|c| c.quick_terminal_size);
+            let axis = |v: Option<S>, full: f64| match v {
+                Some(S::Percent(p)) => full * p / 100.0,
+                Some(S::Px(px)) => px,
+                None => full,
+            };
             let (x, y, w_px, h_px) = match self.config(|c| c.quick_terminal_position) {
-                P::Top => (0.0, 0.0, sw, sh * 0.45),
-                P::Bottom => (0.0, sh * 0.55, sw, sh * 0.45),
-                P::Left => (0.0, 0.0, sw * 0.40, sh),
-                P::Right => (sw * 0.60, 0.0, sw * 0.40, sh),
-                P::Center => (sw * 0.15, sh * 0.15, sw * 0.70, sh * 0.70),
+                P::Top => {
+                    let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
+                    let w = size
+                        .and_then(|(_, b)| b)
+                        .map_or(sw, |b| axis(Some(b), sw));
+                    ((sw - w) / 2.0, 0.0, w, h)
+                }
+                P::Bottom => {
+                    let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
+                    let w = size
+                        .and_then(|(_, b)| b)
+                        .map_or(sw, |b| axis(Some(b), sw));
+                    ((sw - w) / 2.0, sh - h, w, h)
+                }
+                P::Left => {
+                    let w = size.map_or(sw * 0.40, |(a, _)| axis(Some(a), sw));
+                    let h = size
+                        .and_then(|(_, b)| b)
+                        .map_or(sh, |b| axis(Some(b), sh));
+                    (0.0, (sh - h) / 2.0, w, h)
+                }
+                P::Right => {
+                    let w = size.map_or(sw * 0.40, |(a, _)| axis(Some(a), sw));
+                    let h = size
+                        .and_then(|(_, b)| b)
+                        .map_or(sh, |b| axis(Some(b), sh));
+                    (sw - w, (sh - h) / 2.0, w, h)
+                }
+                P::Center => {
+                    let landscape = sw >= sh;
+                    // For center, the "primary" axis only decides which
+                    // axis a single size configures; each axis defaults
+                    // to 70% when unspecified.
+                    let (a, b) = size.unwrap_or((S::Percent(70.0), Some(S::Percent(70.0))));
+                    let primary = axis(Some(a), if landscape { sh } else { sw });
+                    let (w, h) = if landscape {
+                        (axis(b.or(Some(S::Percent(70.0))), sw), primary)
+                    } else {
+                        (primary, axis(b.or(Some(S::Percent(70.0))), sh))
+                    };
+                    ((sw - w) / 2.0, (sh - h) / 2.0, w, h)
+                }
             };
             w.frame.set(Rect::new(
                 Point::new(x as f32, y as f32),
@@ -2334,6 +2382,9 @@ pub fn theme_index(theme: &crate::config::ThemeRef) -> usize {
             .iter()
             .position(|t| t == name)
             .unwrap_or(0),
+        // A light/dark pair has no picker row — show `auto`, the
+        // nearest semantic (it also follows the desktop scheme).
+        crate::config::ThemeRef::Pair { .. } => 0,
     }
 }
 

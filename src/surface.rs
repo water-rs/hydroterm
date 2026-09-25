@@ -1360,12 +1360,14 @@ impl TermSurface {
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
                 self.write(bytes);
+                self.clear_selection_on_input();
                 self.hide_cursor_on_typing();
                 return self.snap_to_bottom_if_scrolled();
             }
             false
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
             self.write(bytes);
+            self.clear_selection_on_input();
             false
         } else {
             false
@@ -1593,8 +1595,21 @@ impl TermSurface {
             return true;
         }
         self.write(text.as_bytes().to_vec());
+        self.clear_selection_on_input();
         self.hide_cursor_on_typing();
         self.snap_to_bottom_if_scrolled()
+    }
+
+    /// `selection-clear-on-typing` (Ghostty default true): a keypress
+    /// that produced PTY bytes — or the start of an IME composition —
+    /// drops the selection highlight. `= false` keeps it (click and
+    /// Escape still clear manually).
+    fn clear_selection_on_input(&mut self) {
+        if !self.app.config(|c| c.selection_clear_on_typing) {
+            return;
+        }
+        let mut term = self.session.terminal.term.lock();
+        term.selection = None;
     }
 
     /// Keyboard input bound for the PTY snaps the viewport back to the
@@ -2349,7 +2364,8 @@ impl TermSurface {
             bg_opacity,
             hints: &hint_spans,
             hint_digits: &hint_digits,
-            bold_bright: self.app.config(|c| c.bold_is_bright),
+            bold_color: self.app.config(|c| c.bold_color),
+            faint_opacity: self.app.config(|c| c.faint_opacity),
             min_contrast: self.app.config(|c| c.minimum_contrast),
             selection_invert: self.app.config(|c| c.selection_invert),
             hover_link: &self.hover_link,
@@ -2602,6 +2618,7 @@ impl SceneContent for TermSurface {
             SurfaceInputEvent::TextInput(text) => self.on_text(text.as_str()),
             SurfaceInputEvent::CompositionStart => {
                 self.preedit = Some((String::new(), 0));
+                self.clear_selection_on_input();
                 true
             }
             SurfaceInputEvent::CompositionUpdate { text, caret } => {

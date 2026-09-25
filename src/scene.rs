@@ -76,8 +76,11 @@ pub struct DrawContext<'a> {
     pub hints: &'a [HintSpan],
     /// Digits typed so far in hint mode — shown as a status chip.
     pub hint_digits: &'a str,
-    /// `bold-is-bright` config — bold cells lift to the bright slot.
-    pub bold_bright: bool,
+    /// `bold-color` config — bold-cell color override (bright slot,
+    /// a fixed color, or unset).
+    pub bold_color: crate::config::BoldColor,
+    /// `faint-opacity` — opacity of faint (SGR 2) text (1.0 = opaque).
+    pub faint_opacity: f32,
     /// `minimum-contrast` — WCAG ratio floor applied to each cell's
     /// resolved fg against its bg (1.0 = off).
     pub min_contrast: f32,
@@ -258,7 +261,15 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         let is_cursor =
             show_block && p.line == cursor.point.line && p.column == cursor.point.column;
 
-        let pair = palette.resolve(colors, cell.fg, cell.bg, cell.flags, ctx.bold_bright, ctx.min_contrast);
+        let pair = palette.resolve(
+            colors,
+            cell.fg,
+            cell.bg,
+            cell.flags,
+            ctx.bold_color,
+            ctx.min_contrast,
+            ctx.faint_opacity,
+        );
         let (mut fg, mut bg) = (pair.fg, pair.bg);
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;
