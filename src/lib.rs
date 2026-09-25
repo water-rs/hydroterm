@@ -149,8 +149,9 @@ pub fn app(env: Environment) -> App {
                 ),
             ));
         }
-        // `window-x`/`window-y`: launch position (hydrolysis#123 carries
-        // window-position support; KWin may still place the window).
+        // `window-position-x`/`window-position-y`: launch position
+        // (hydrolysis#123 carries window-position support; KWin may
+        // still place the window).
         let (wx, wy) = state.config(|c| (c.window_x, c.window_y));
         if wx.is_some() || wy.is_some() {
             let frame = window.frame.snapshot();

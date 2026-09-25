@@ -34,6 +34,7 @@ use waterui_graphics::{Code, Key, Modifiers, NamedKey};
 use waterui_text::FontCollection;
 
 use crate::app::{AppState, FONT_SIZE, Session};
+use crate::config::MouseShiftCapture;
 use crate::fonts::TermFonts;
 use crate::keys::{TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
 use crate::mouse::{self, CellPos, MouseAction};
@@ -277,6 +278,10 @@ pub struct TermSurface {
     content_gen: Rc<Cell<u64>>,
     /// Dead-man switch for the spawned future — cleared on teardown/None.
     wake_alive: Rc<Cell<bool>>,
+    /// Epoch returned by `set_wake`; passed to `clear_wake` so dropping a
+    /// stale surface after its replacement installed a wake can't erase
+    /// the live callback.
+    wake_epoch: Cell<u64>,
     /// The parked drain future; dropped (detached) on teardown.
     wake_task: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>,
 
@@ -372,6 +377,7 @@ impl TermSurface {
             wake_tx: None,
             content_gen: Rc::new(Cell::new(0)),
             wake_alive: Rc::new(Cell::new(false)),
+            wake_epoch: Cell::new(0),
             wake_task: None,
             focused: false,
             modifiers: Modifiers::empty(),
@@ -756,6 +762,8 @@ impl TermSurface {
             TermAction::ToggleQuickTerminal => self.app.toggle_quick(),
             TermAction::LastTab => self.app.select_last_tab(),
             TermAction::CloseWindow => self.app.close_window(),
+            TermAction::CloseAllTabs => self.app.close_all_tabs(),
+            TermAction::CloseOtherTabs => self.app.close_other_tabs(),
             TermAction::ToggleTabBar => self.app.toggle_tab_bar(),
             TermAction::NextTab => self.app.cycle_tab(1),
             TermAction::PrevTab => self.app.cycle_tab(-1),
@@ -1193,7 +1201,45 @@ impl TermSurface {
                         *self.session.cwd.lock().unwrap() = Some(path);
                     }
                     TapEvent::PromptEnd | TapEvent::CommandStart => {}
-                    TapEvent::CommandEnd(_code) => {}
+                    TapEvent::CommandEnd(_code) => {
+                        // `notify-on-command-finish`: the OSC 133 C→D
+                        // elapsed time decides — shorter commands stay
+                        // quiet (`-after`, default 5s).
+                        let (when, after) = self.app.config(|c| {
+                            (c.notify_on_command_finish, c.notify_on_command_finish_after)
+                        });
+                        let elapsed = self
+                            .session
+                            .terminal
+                            .command_started_at
+                            .lock()
+                            .unwrap()
+                            .map(|t| t.elapsed().as_secs_f64());
+                        let long_enough = elapsed.is_some_and(|e| e >= after);
+                        let unfocused =
+                            self.app.focused_session().is_none_or(|s| s.id != self.session.id);
+                        let fire = long_enough
+                            && match when {
+                                crate::config::NotifyWhen::Always => true,
+                                crate::config::NotifyWhen::Unfocused => unfocused,
+                                crate::config::NotifyWhen::No => false,
+                            };
+                        if fire {
+                            if self.app.config(|c| c.visual_bell) {
+                                self.bell_at = Some(Instant::now());
+                            }
+                            if self.app.config(|c| c.desktop_notifications) {
+                                notify_desktop("hydroterm", "Command finished");
+                            }
+                            if self.app.config(|c| c.bell_attention) {
+                                *self.session.notify_badge.lock().unwrap() = true;
+                                self.app.set_session_title(
+                                    self.session.id,
+                                    Str::from("\u{1f514} Command finished"),
+                                );
+                            }
+                        }
+                    }
                     TapEvent::Notify(title, body) => {
                         // Bell flash + title badge; `desktop-notifications`
                         // gates only the freedesktop notify-send hop.
@@ -1280,23 +1326,31 @@ impl TermSurface {
     /// Recompute the grid from the logical frame size and propagate resizes.
     fn sync_size(&mut self, width: f32, height: f32) {
         let m = self.fonts.metrics;
-        let pad = PADDING * 2.0;
-        let cols = ((width - pad) / m.cell_w).floor().max(2.0) as u16;
-        let lines = ((height - pad) / m.cell_h).floor().max(1.0) as u16;
+        self.session.cell_px.set((m.cell_w, m.cell_h));
+        // `window-padding-x`/`window-padding-y` live inside the surface's
+        // own frame (with the internal `PADDING` margin) so the scene's
+        // `window-padding-color` extension can paint them contiguously.
+        let (wpx, wpy) = self
+            .app
+            .config(|c| (c.window_padding_x, c.window_padding_y));
+        let pad_x = PADDING + wpx;
+        let pad_y = PADDING + wpy;
+        let cols = ((width - pad_x * 2.0) / m.cell_w).floor().max(2.0) as u16;
+        let lines = ((height - pad_y * 2.0) / m.cell_h).floor().max(1.0) as u16;
         // Degenerate frames (window unmapped/collapsed) must not shrink the
         // PTY — a 1-line winsize breaks apps that read TIOCGWINSZ at start.
         // `window-padding-balance`: split the leftover frame space evenly
         // between the two edges; off, it sits on the right/bottom.
         if self.app.config(|c| c.window_padding_balance) {
-            let rem_x = (width - pad - f32::from(cols) * m.cell_w).max(0.0);
-            let rem_y = (height - pad - f32::from(lines) * m.cell_h).max(0.0);
+            let rem_x = (width - pad_x * 2.0 - f32::from(cols) * m.cell_w).max(0.0);
+            let rem_y = (height - pad_y * 2.0 - f32::from(lines) * m.cell_h).max(0.0);
             // Integer pads keep every cell edge on a device-pixel boundary;
             // a fractional offset AA-blends each row/column shared edge.
-            self.pad_x = PADDING + (rem_x / 2.0).round();
-            self.pad_y = PADDING + (rem_y / 2.0).round();
+            self.pad_x = pad_x + (rem_x / 2.0).round();
+            self.pad_y = pad_y + (rem_y / 2.0).round();
         } else {
-            self.pad_x = PADDING;
-            self.pad_y = PADDING;
+            self.pad_x = pad_x;
+            self.pad_y = pad_y;
         }
         if cols > 2 && lines > 1 && (cols != self.cols || lines != self.lines) {
             self.cols = cols;
@@ -1736,11 +1790,11 @@ impl TermSurface {
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
 
-        // `mouse-shift-override`: Shift+click/drag selects even while the
-        // program owns the mouse (Ghostty default true).
-        let shift_override =
-            self.modifiers.contains(Modifiers::SHIFT)
-                && self.app.config(|c| c.mouse_shift_override);
+        // `mouse-shift-capture`: under mouse reporting a shifted press/
+        // drag bypasses the program and selects locally — unless
+        // `always`, which reports the event (shift bit included).
+        let shift_override = self.modifiers.contains(Modifiers::SHIFT)
+            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
         if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             // Drag while held, else any-cell motion tracking (1003) isn't in
             // TermMode — only report while a button is held (button-motion).
@@ -1890,11 +1944,10 @@ impl TermSurface {
         let (col, row) = self.viewport_cell(x, y);
         let mode = *self.session.terminal.term.lock().mode();
 
-        // `mouse-shift-override`: Shift+click/drag selects even while the
-        // program owns the mouse (Ghostty default true).
-        let shift_override =
-            self.modifiers.contains(Modifiers::SHIFT)
-                && self.app.config(|c| c.mouse_shift_override);
+        // `mouse-shift-capture`: same gate as motion — shift bypasses
+        // reporting unless `always`.
+        let shift_override = self.modifiers.contains(Modifiers::SHIFT)
+            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
         if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             let action = if pressed {
                 let b = mouse::press_button(button);
@@ -2301,7 +2354,9 @@ impl TermSurface {
             }
         } * f64::from(self.app.config(|c| c.mouse_scroll_multiplier));
 
-        if mode.intersects(TermMode::MOUSE_MODE) {
+        let shift_override = self.modifiers.contains(Modifiers::SHIFT)
+            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
+        if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             if let Some((btn, count)) = mouse::wheel_button(lines_delta) {
                 for _ in 0..count {
                     if let Some(bytes) =
@@ -2562,7 +2617,10 @@ impl Drop for TermSurface {
         if let Some(tx) = &self.wake_tx {
             let _ = tx.try_send(());
         }
-        self.session.terminal.proxy.set_wake(|| {});
+        self.session
+            .terminal
+            .proxy
+            .clear_wake(self.wake_epoch.get());
     }
 }
 
@@ -2586,6 +2644,9 @@ static LAST_KEY_AT: Mutex<Option<Instant>> = Mutex::new(None);
 impl SceneContent for TermSurface {
     fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
         let draw_start = Instant::now();
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            eprintln!("[scene] s{} @{self:p} {width:.0}x{height:.0}", self.session.id);
+        }
         self.app.poll_config();
         self.drain_events();
         // Rejoin ZWJ-split scalars before the frame is measured or drawn.
@@ -2593,6 +2654,27 @@ impl SceneContent for TermSurface {
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            let term = self.session.terminal.term.lock();
+            let g = term.grid();
+            let mut rows = String::new();
+            for i in 0..g.screen_lines() {
+                let mut s = String::new();
+                for c in 0..g.columns() {
+                    s.push(g[alacritty_terminal::index::Line(i as i32)]
+                        [alacritty_terminal::index::Column(c)]
+                        .c);
+                }
+                rows.push_str(&format!("|{}|", s.trim_end()));
+            }
+            eprintln!(
+                "[grid] s{} off={} hist={} cur={:?} rows={rows}",
+                self.session.id,
+                g.display_offset(),
+                g.history_size(),
+                g.cursor.point
+            );
+        }
         self.session.pane_px.set((width, height));
 
         // A blinking cursor or live bell flash needs the next frame anyway;
@@ -2632,7 +2714,8 @@ impl SceneContent for TermSurface {
                 // future — running on the winit main thread via the local
                 // executor — drains it and calls the real invalidator.
                 let (tx, rx) = async_channel::unbounded::<()>();
-                self.session
+                let epoch = self
+                    .session
                     .terminal
                     .proxy
                     .set_wake({
@@ -2641,6 +2724,7 @@ impl SceneContent for TermSurface {
                             let _ = tx.try_send(());
                         }
                     });
+                self.wake_epoch.set(epoch);
                 self.wake_alive.set(true);
                 // Events queued before this install (a fast child exit,
                 // a clipboard read, ...) arrived while `wake` was a
@@ -2651,6 +2735,7 @@ impl SceneContent for TermSurface {
                 let content_gen = Rc::clone(&self.content_gen);
                 let app = self.app.clone();
                 let session_id = self.session.id;
+                let sniff = std::env::var_os("HYDRO_SNIFF").is_some();
                 self.wake_task = Some(Box::pin(spawn_local(async move {
                     while rx.recv().await.is_ok() {
                         if !alive.get() {
@@ -2659,6 +2744,9 @@ impl SceneContent for TermSurface {
                         // Coalesce bursts: one invalidation per batch.
                         while rx.try_recv().is_ok() {}
                         content_gen.set(content_gen.get() + 1);
+                        if sniff {
+                            eprintln!("[wake] drain s{session_id} gen={}", content_gen.get());
+                        }
                         // `tab-activity`: a parser wake means new output —
                         // dot the owning tab if it is not selected.
                         app.note_activity(session_id);
@@ -2674,7 +2762,10 @@ impl SceneContent for TermSurface {
                 }
                 self.wake_tx = None;
                 self.wake_task = None;
-                self.session.terminal.proxy.set_wake(|| {});
+                self.session
+                    .terminal
+                    .proxy
+                    .clear_wake(self.wake_epoch.get());
             }
         }
     }

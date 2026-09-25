@@ -1110,6 +1110,28 @@ fn paint_pad_extend(
                 &rect(x, band_top, w, h),
             );
         }
+        // Corners take the corner cell's color so the padding is one
+        // contiguous fill from the grid out to the frame edges.
+        if padx > 0.0 {
+            for (cell, x0, w0) in [
+                (&row[0], 0.0_f32, padx),
+                (
+                    &row[cols.min(row.len()).saturating_sub(1)],
+                    grid_right,
+                    ctx.width - grid_right,
+                ),
+            ] {
+                if cell.style.bg != theme_bg {
+                    scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        &Brush::Solid(peniko_alpha(cell.style.bg, ctx.cell_bg_opacity)),
+                        None,
+                        &rect(x0, band_top, w0, h),
+                    );
+                }
+            }
+        }
     }
 }
 

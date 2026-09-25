@@ -99,9 +99,6 @@ pub struct Session {
     /// The window's snackbar manager, captured by the pane's `on_appear` —
     /// used to show (and dismiss) the paste-protection confirmation.
     pub snackbar: RefCell<Option<SnackbarManager>>,
-    /// `window-padding-x`/`window-padding-y` in points — drives the
-    /// `.padding_with` around each pane's surface, live-reloadable.
-    pub window_padding: Binding<(f32, f32)>,
     /// `unfocused-split-opacity` — alpha applied when this pane is not
     /// the tab's focused split; live-reloaded via `poll_config`.
     pub unfocused_opacity: Binding<f32>,
@@ -136,6 +133,11 @@ pub struct Session {
     pub inspector_open: Binding<bool>,
     /// Text of the inspector chip — rewritten each frame while open.
     pub inspector_label: Binding<Str>,
+    /// Live cell metrics in points — set by `sync_size`; `split_pane` and
+    /// `new_tab` read it to size a new pane's PTY at birth so the first
+    /// `sync_size` is a same-size no-op (no ioctl, no SIGWINCH, no
+    /// prompt-clear that a never-sent repaint can't refill).
+    pub cell_px: std::cell::Cell<(f32, f32)>,
 }
 
 impl Session {
@@ -146,7 +148,12 @@ impl Session {
         self.terminal.proxy.request_frame();
     }
 
-    fn spawn(id: u64, cwd: Option<std::path::PathBuf>, cfg: &AppConfig) -> Self {
+    fn spawn(
+        id: u64,
+        cwd: Option<std::path::PathBuf>,
+        cfg: &AppConfig,
+        initial_size: Option<(usize, usize, (u16, u16))>,
+    ) -> Self {
         let config = Config {
             scrolling_history: cfg.scrollback,
             // Loads reach the app's `clipboard-read` policy (allow/ask/deny)
@@ -170,12 +177,15 @@ impl Session {
                 .as_ref()
                 .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
         };
-        // A reasonable initial grid; the surface resizes on its first frame.
+        // Born at the pane's expected grid size when the caller knows it
+        // (split/tab spawn) — otherwise a reasonable initial grid that the
+        // surface resizes on its first frame.
+        let (cols, lines, cell_px) = initial_size.unwrap_or((120, 32, (9, 18)));
         let terminal = Terminal::spawn(
             config.clone(),
-            120,
-            32,
-            (9, 18),
+            cols,
+            lines,
+            cell_px,
             crate::terminal::SpawnOpts {
                 cwd,
                 shell,
@@ -212,11 +222,11 @@ impl Session {
                 cfg.right_click_action == crate::config::RightClickAction::ContextMenu,
             ),
             resize_label: Binding::default(),
+            cell_px: std::cell::Cell::new((0.0, 0.0)),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
             kitty_keyboard: config.kitty_keyboard,
             ran_command: cfg.command.is_some(),
             snackbar: RefCell::new(None),
-            window_padding: binding((cfg.window_padding_x, cfg.window_padding_y)),
             pane_px: Binding::default(),
             pending_close: Binding::default(),
             pending_clipboard_read: Binding::default(),
@@ -756,8 +766,6 @@ impl AppState {
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
-            s.window_padding
-                .set_from((config.window_padding_x, config.window_padding_y));
             s.unfocused_opacity.set(config.unfocused_split_opacity);
             s.context_menu_enabled
                 .set(config.right_click_action == crate::config::RightClickAction::ContextMenu);
@@ -1075,7 +1083,33 @@ impl AppState {
         self.session(focused)
     }
 
-    fn spawn_session(&self, cwd: Option<std::path::PathBuf>) -> Rc<Session> {
+    /// Grid dims the new pane will measure — the reference terminal sizes
+    /// the PTY at spawn from the GUI's known pane size; doing the same
+    /// makes the first `sync_size` a no-op, so no resize ioctl lands
+    /// while the shell is still arming its SIGWINCH handler.
+    fn initial_grid_for(&self, pane_w: f32, pane_h: f32, cell: (f32, f32)) -> (usize, usize, (u16, u16)) {
+        let (wpx, wpy) = self.config(|c| (c.window_padding_x, c.window_padding_y));
+        let pad_x = crate::scene::PADDING + wpx;
+        let pad_y = crate::scene::PADDING + wpy;
+        let cols = ((pane_w - pad_x * 2.0) / cell.0).floor().max(2.0) as usize;
+        let lines = ((pane_h - pad_y * 2.0) / cell.1).floor().max(1.0) as usize;
+        (cols, lines, (cell.0 as u16, cell.1 as u16))
+    }
+
+    /// A focused pane's measured size + cell metrics — the estimate for a
+    /// new surface's grid. `None` before the first pane has laid out.
+    fn focused_grid_estimate(&self) -> Option<(usize, usize, (u16, u16))> {
+        let s = self.focused_session()?;
+        let (w, h) = s.pane_px.snapshot();
+        let cell = s.cell_px.get();
+        (w > 0.0 && cell.0 > 0.0).then(|| self.initial_grid_for(w, h, cell))
+    }
+
+    fn spawn_session(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        initial_size: Option<(usize, usize, (u16, u16))>,
+    ) -> Rc<Session> {
         let id = self.alloc_id();
         let mut cfg = self.cfg.borrow().config.clone();
         // `command` (config file or `-e`) is initial-surface only — a
@@ -1085,7 +1119,7 @@ impl AppState {
         }
         // `working-directory` fills in when no OSC 7 cwd was inherited.
         let cwd = cwd.or_else(|| cfg.working_directory.clone());
-        let session = Rc::new(Session::spawn(id, cwd, &cfg));
+        let session = Rc::new(Session::spawn(id, cwd, &cfg, initial_size));
         // `window-inherit-font-size`: a spawned surface takes the
         // focused surface's live zoom instead of the config value.
         if cfg.inherit_font_size
@@ -1108,7 +1142,7 @@ impl AppState {
                     .and_then(|s| s.cwd.lock().unwrap().clone())
             })
             .flatten();
-        let session = self.spawn_session(cwd);
+        let session = self.spawn_session(cwd, self.focused_grid_estimate());
         self.adopt_tab(session)
     }
 
@@ -1118,7 +1152,7 @@ impl AppState {
         let mut cfg = self.cfg.borrow().config.clone();
         cfg.command = Some(cmd);
         let id = self.alloc_id();
-        let session = Rc::new(Session::spawn(id, None, &cfg));
+        let session = Rc::new(Session::spawn(id, None, &cfg, self.focused_grid_estimate()));
         self.sessions.borrow_mut().push(session.clone());
         self.adopt_tab(session)
     }
@@ -1167,7 +1201,22 @@ impl AppState {
         let cwd = self
             .session(target)
             .and_then(|s| s.cwd.lock().unwrap().clone());
-        let session = self.spawn_session(cwd);
+        // The new pane's slot: half the target's main-axis extent minus
+        // the divider, full extent on the other axis — exact, from the
+        // same math `SplitNode::split` seeds the shares with.
+        let initial_size = self.session(target).and_then(|s| {
+            let (w, h) = s.pane_px.snapshot();
+            let cell = s.cell_px.get();
+            if w <= 0.0 || cell.0 <= 0.0 {
+                return None;
+            }
+            let (nw, nh) = match dir {
+                SplitDir::Row => ((w - DIVIDER_PX) / 2.0, h),
+                SplitDir::Column => (w, (h - DIVIDER_PX) / 2.0),
+            };
+            Some(self.initial_grid_for(nw, nh, cell))
+        });
+        let session = self.spawn_session(cwd, initial_size);
         let slot_px = self
             .session(target)
             .map(|s| {
@@ -1562,6 +1611,26 @@ impl AppState {
         }
     }
 
+    /// Ghostty `close_all_tabs` — same sweep as `close_window`.
+    pub fn close_all_tabs(&self) {
+        self.close_window();
+    }
+
+    /// Ghostty `close_other_tabs` — close every tab but the selected
+    /// one, `confirm-close` prompts where configured.
+    pub fn close_other_tabs(&self) {
+        let sel = self.selected.snapshot();
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.id != sel)
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.try_close_tab(id);
+        }
+    }
+
     /// `toggle_tab_bar`: force the strip on/off until the next toggle;
     /// `tab-bar-min-tabs` governs again once the override is unset
     /// (the toggle flips relative to the strip's current visibility).
@@ -1634,10 +1703,6 @@ impl View for PaneLeaf {
         let query = self.session.search_query.clone();
         let status = self.session.search_status.clone();
         let open = self.session.search_open.clone();
-        let padding = self
-            .session
-            .window_padding
-            .map(|p: (f32, f32)| EdgeInsets::new(p.1, p.1, p.0, p.0));
         let term_surface = TermSurface::new(
             self.session.clone(),
             self.state.clone(),
@@ -1660,8 +1725,7 @@ impl View for PaneLeaf {
             // shell-quoted path into the PTY (Ghostty/kitty behaviour).
             .drop_destination(|session: PaneSession, data: DragData| {
                 session.push_action(TermAction::DropText(data.as_str().to_string()));
-            })
-            .padding_with(padding);
+            });
         let surface = Frame::new(surface);
         // Paste-protection confirm: multi-line clipboard content waits in
         // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
@@ -2399,6 +2463,8 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
     PaletteItem { name: "Last Tab (previously selected)", chord: "", action: TermAction::LastTab },
     PaletteItem { name: "Close Window (all tabs)", chord: "", action: TermAction::CloseWindow },
+    PaletteItem { name: "Close All Tabs", chord: "", action: TermAction::CloseAllTabs },
+    PaletteItem { name: "Close Other Tabs", chord: "", action: TermAction::CloseOtherTabs },
     PaletteItem { name: "Toggle Tab Bar", chord: "", action: TermAction::ToggleTabBar },
     PaletteItem { name: "Start Selection (keyboard select)", chord: "", action: TermAction::StartSelection },
     PaletteItem { name: "Toggle Fullscreen", chord: "f11", action: TermAction::Fullscreen },
@@ -2489,7 +2555,7 @@ impl AppState {
         crate::config::upsert_config_key(&path, "theme", theme);
         crate::config::upsert_config_key(
             &path,
-            "cursor-blink",
+            "cursor-style-blink",
             if blink { "true" } else { "false" },
         );
     }

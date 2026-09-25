@@ -122,8 +122,10 @@ struct ProxyInner {
     /// UI-thread queue for everything the renderer must act on.
     events: Sender<TermEvent>,
     /// Wakes the UI thread — plugged in by the scene content once it has
-    /// its channel installed.
-    wake: Mutex<Box<dyn Fn() + Send + Sync>>,
+    /// its channel installed. Paired with an epoch counter so a surface
+    /// dropped after its replacement installed the next wake cannot
+    /// clobber the live callback.
+    wake: Mutex<(u64, Box<dyn Fn() + Send + Sync>)>,
 }
 
 impl EventProxy {
@@ -132,15 +134,35 @@ impl EventProxy {
         let inner = Arc::new(ProxyInner {
             notifier: OnceLock::new(),
             events,
-            wake: Mutex::new(Box::new(|| {})),
+            wake: Mutex::new((0, Box::new(|| {}))),
         });
         (Self { inner }, rx)
     }
 
     /// Install the wake callback (called by `TermSurface::set_invalidator` —
     /// a cross-thread ping into the main thread's local-executor queue).
-    pub fn set_wake(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.inner.wake.lock().unwrap() = Box::new(f);
+    /// Returns the epoch the caller must pass to `clear_wake` so a stale
+    /// drop order can't erase a newer install.
+    pub fn set_wake(&self, f: impl Fn() + Send + Sync + 'static) -> u64 {
+        let mut slot = self.inner.wake.lock().unwrap();
+        slot.0 += 1;
+        slot.1 = Box::new(f);
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            eprintln!("[wake] install epoch={}", slot.0);
+        }
+        slot.0
+    }
+
+    /// Reset the wake to a no-op only when `epoch` is still the current
+    /// install — surfaces dropped after their replacement leave it live.
+    pub fn clear_wake(&self, epoch: u64) {
+        let mut slot = self.inner.wake.lock().unwrap();
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            eprintln!("[wake] clear epoch={epoch} current={}", slot.0);
+        }
+        if slot.0 == epoch {
+            slot.1 = Box::new(|| {});
+        }
     }
 
     /// Ask the surface to build a frame (e.g. a queued palette action that
@@ -150,7 +172,10 @@ impl EventProxy {
     }
 
     fn wake(&self) {
-        (self.inner.wake.lock().unwrap())();
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            eprintln!("[wake] fire @{self:p}");
+        }
+        (self.inner.wake.lock().unwrap().1)();
     }
 }
 
@@ -225,6 +250,9 @@ pub struct Terminal {
     /// the reference terminal (a shell repaints its prompt until it says
     /// otherwise).
     shell_redraw: Arc<Mutex<ShellRedraw>>,
+    /// `133;C` timestamp — the surface compares it to
+    /// `notify-on-command-finish-after` when `133;D` arrives.
+    pub command_started_at: Arc<Mutex<Option<std::time::Instant>>>,
     pub events: Mutex<Receiver<TermEvent>>,
     /// Duplicated master fd — `tcgetpgrp` answers the slave's foreground
     /// pgroup without taking the reader's term lock.
@@ -313,11 +341,14 @@ impl Terminal {
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
         let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
         let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
+        let command_started_at: Arc<Mutex<Option<std::time::Instant>>> =
+            Arc::default();
         let marks = Marks {
             sem: SemKind::Output,
             prompt_marks: prompt_marks.clone(),
             last_output: last_output.clone(),
             redraw: shell_redraw.clone(),
+            command_started_at: command_started_at.clone(),
             sink: proxy.inner.events.clone(),
         };
         let pty = TapPty::new(pty);
@@ -330,7 +361,7 @@ impl Terminal {
         proxy.inner.notifier.set(IoNotifier(io.clone())).ok();
         let join = io_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
+        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, command_started_at, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
     }
 
     /// The program holding the PTY's foreground process group, or `None`
@@ -355,13 +386,39 @@ impl Terminal {
         let _ = self.io.lock().unwrap().send(Msg::Input(bytes.into()));
     }
 
-    /// Tell the PTY the grid resized.
+    /// Tell the PTY the grid resized. A same-size call is a full no-op —
+    /// the reference's `resize` returns early on identical grid dims, and
+    /// ours must too: clearing the prompt row without a real pty resize
+    /// produces no SIGWINCH repaint to refill it.
     pub fn resize(&self, cols: u16, lines: u16, cell_px: (u16, u16)) {
         {
             let mut term = self.term.lock();
+            if term.grid().columns() == cols as usize
+                && term.grid().screen_lines() == lines as usize
+            {
+                return;
+            }
+            if std::env::var_os("HYDRO_SNIFF").is_some() {
+                eprintln!(
+                    "[resize] shell={} -> {cols}x{lines} redraw={:?} cursor={:?}",
+                    self.shell_pid,
+                    *self.shell_redraw.lock().unwrap(),
+                    term.grid().cursor.point
+                );
+            }
             // Cell-flag marks were stamped at write time on the reader
             // thread, so reflow carries them with the rows they belong to.
             term.resize(TermSize { cols: cols as usize, lines: lines as usize });
+            if std::env::var_os("HYDRO_SNIFF").is_some() {
+                let g = term.grid();
+                let mut s = String::new();
+                for c in 0..g.columns() {
+                    s.push(g[alacritty_terminal::index::Line(0)]
+                        [alacritty_terminal::index::Column(c)]
+                        .c);
+                }
+                eprintln!("[postreflow] shell={} row0=|{}|", self.shell_pid, s.trim_end());
+            }
             clear_prompt_for_redraw(
                 &mut term,
                 &self.last_output,
@@ -431,7 +488,11 @@ fn clear_prompt_for_redraw<T: EventListener>(
     let cursor = grid.cursor.point.line.0;
     let template = grid.cursor.template.clone();
     let last = Column(cols - 1);
-    let clear_rows = |grid: &mut Term<T>, start: i32| {
+    let sniff = std::env::var_os("HYDRO_SNIFF").is_some();
+    let clear_rows = |grid: &mut Term<T>, start: i32, end: i32| {
+        if sniff {
+            eprintln!("[clear] rows {start}..{end} cursor={cursor}");
+        }
         // Sever the wrap join into the region so reflow cannot merge the
         // stale row above it back into the cleared rows, then blank the
         // cells (never erase rows — the shell expects the space).
@@ -439,7 +500,7 @@ fn clear_prompt_for_redraw<T: EventListener>(
             grid.grid_mut()[Line(start - 1)][last].flags_mut().remove(Flags::WRAPLINE);
         }
         let grid = grid.grid_mut();
-        for line in start..grid.screen_lines() as i32 {
+        for line in start..end {
             for col in 0..cols {
                 grid[Line(line)][Column(col)] = template.clone();
             }
@@ -449,7 +510,7 @@ fn clear_prompt_for_redraw<T: EventListener>(
         ShellRedraw::False => unreachable!(),
         // `redraw=last`: only the cursor's row may be cleared — other
         // prompt lines are live text the shell never rewrites.
-        ShellRedraw::Last => clear_rows(term, cursor),
+        ShellRedraw::Last => clear_rows(term, cursor, cursor + 1),
         ShellRedraw::True => {
             // The region ends at the cursor's row; nothing tagged above
             // an unmarked cursor row is this prompt's.
@@ -460,8 +521,9 @@ fn clear_prompt_for_redraw<T: EventListener>(
             while start > 0 && row_has_mark(grid, cols, start - 1) {
                 start -= 1;
             }
+            let end = grid.screen_lines() as i32;
             tracing::debug!(cursor, start, "resize prompt clear");
-            clear_rows(term, start);
+            clear_rows(term, start, end);
         }
     }
 }
@@ -725,6 +787,17 @@ impl EventedPty for TapPty {
 
 impl OnResize for TapPty {
     fn on_resize(&mut self, window_size: WindowSize) {
+        if std::env::var_os("HYDRO_SNIFF").is_some() {
+            use std::os::unix::io::AsRawFd;
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::ioctl(self.inner.file().as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
+            }
+            eprintln!(
+                "[ioctl] pty winsize {}x{} -> {}x{}",
+                ws.ws_row, ws.ws_col, window_size.num_lines, window_size.num_cols
+            );
+        }
         self.inner.on_resize(window_size);
     }
 }
@@ -752,6 +825,9 @@ struct Marks {
     prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
     last_output: Arc<Mutex<OutputSpan>>,
     redraw: Arc<Mutex<ShellRedraw>>,
+    /// Set at `133;C`, consumed at `133;D` — feeds
+    /// `notify-on-command-finish-after`.
+    command_started_at: Arc<Mutex<Option<std::time::Instant>>>,
     sink: Sender<TermEvent>,
 }
 
@@ -774,6 +850,8 @@ impl Marks {
             TapEvent::CommandStart => {
                 self.sem = SemKind::Output;
                 *self.last_output.lock().unwrap() = Some((abs, None));
+                *self.command_started_at.lock().unwrap() =
+                    Some(std::time::Instant::now());
             }
             TapEvent::CommandEnd(_) => {
                 let mut out = self.last_output.lock().unwrap();
@@ -1346,6 +1424,16 @@ impl IoLoop {
                 for ev in &events {
                     self.marks.dispatch(&mut *term, ev);
                 }
+                if std::env::var_os("HYDRO_SNIFF").is_some() && n > 0 {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("/tmp/sniff-{:?}.bin", std::thread::current().id()))
+                        .unwrap();
+                    let _ = f.write_all(&seg[..n]);
+                    let _ = f.write_all(b"\n---SNIFF-SEG---\n");
+                }
                 processed += n;
                 if processed >= MAX_LOCKED_READ {
                     break 'fill;
@@ -1668,6 +1756,10 @@ mod tests {
         });
         assert!(rc.contains(r#"PS1='\[\e]133;B\e\\\]'"#));
         assert!(rc.contains(r#"PS0='\[\e]133;C\e\\\]'"#));
+        // bash repaints only the last prompt row on SIGWINCH — match the
+        // reference's `redraw=last` so resize clearing never blanks rows
+        // the shell will not rewrite.
+        assert!(rc.contains("133;A;redraw=last"));
     }
 
     #[test]
@@ -1711,6 +1803,7 @@ mod tests {
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            command_started_at: Arc::new(Mutex::new(None)),
             sink,
         };
         let mut scanner = OscScanner::new();
@@ -1760,6 +1853,7 @@ mod tests {
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            command_started_at: Arc::new(Mutex::new(None)),
             sink,
         };
         let mut scanner = OscScanner::new();
@@ -1801,6 +1895,98 @@ mod tests {
         assert!(!row_marked(&term, 1), "scrolled output row must stay untagged");
         assert!(row_marked(&term, 2), "prompt row must be tagged");
         assert!(row_marked(&term, 3), "input row must be tagged");
+    }
+
+    /// Split-resize on a `redraw=last` shell (bash): only the cursor's row —
+    /// the live prompt row — may be blanked; the wrapped input line, the
+    /// command output and every row above must survive reflow.
+    #[test]
+    fn resize_last_redraw_keeps_content() {
+        use crate::osctap::OscScanner;
+
+        let mut term = Term::new(Config::default(), &Sz(15, 44), VoidListener);
+        let (sink, _rx) = mpsc::channel();
+        let mut marks = Marks {
+            sem: SemKind::Output,
+            prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_output: Arc::new(Mutex::new(None)),
+            redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            command_started_at: Arc::new(Mutex::new(None)),
+            sink,
+        };
+        let mut scanner = OscScanner::new();
+        let mut parser: Processor = Processor::new();
+        let mut seg = [0u8; 65536];
+
+        let feed = |scanner: &mut OscScanner,
+                    parser: &mut Processor,
+                    marks: &mut Marks,
+                    term: &mut Term<VoidListener>,
+                    seg: &mut [u8],
+                    bytes: &[u8]| {
+            scanner.feed(bytes);
+            while scanner.has_pending() {
+                let (n, events) = scanner.take(seg);
+                if n == 0 && events.is_empty() {
+                    break;
+                }
+                advance_tagged(parser, marks, term, &seg[..n]);
+                for ev in &events {
+                    marks.dispatch(term, ev);
+                }
+            }
+        };
+
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
+            b"\x1b]133;A\x07bash-5.3# \x1b]133;B\x07echo ONE111\x1b]133;C\x07\r\nONE111\r\n\x1b]133;D;0\x07");
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
+            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07");
+
+        let text_of = |term: &Term<VoidListener>, l: i32| -> String {
+            let grid = term.grid();
+            (0..grid.columns())
+                .map(|c| {
+                    let cell = &grid[Line(l)][Column(c)];
+                    if cell.c == ' ' || cell.c == '\0' {
+                        ' '
+                    } else {
+                        cell.c
+                    }
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(text_of(&term, 0), "bash-5.3# echo ONE111");
+        assert_eq!(text_of(&term, 1), "ONE111");
+        assert_eq!(text_of(&term, 2), "bash-5.3#");
+
+        // The split halves the pane: 44 -> 20 columns.
+        term.resize(TermSize { cols: 20, lines: 15 });
+        let hs = term.grid().history_size() as i32;
+        eprintln!("history_size post-resize = {hs}");
+        for l in (-hs)..0 {
+            eprintln!("  scroll {l}: {:?}", text_of(&term, l));
+        }
+        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last);
+
+        let mut rows = Vec::new();
+        let hs = term.grid().history_size() as i32;
+        for l in -hs..term.grid().screen_lines() as i32 {
+            let t = text_of(&term, l);
+            let marked = row_has_mark(term.grid(), 20, l);
+            rows.push(format!("{l}: {t:?} marked={marked}"));
+        }
+        let dump = rows.join("\n");
+        // The wrapped input head may be pushed to scrollback by the
+        // reflow (the wrap adds a row); the tail stays onscreen at the
+        // same logical line. Content must survive in history OR on
+        // screen — it must not be erased.
+        assert!(
+            dump.contains("bash-5.3# echo ONE"),
+            "input head lost:\n{dump}"
+        );
+        assert!(dump.contains("ONE111"), "output lost:\n{dump}");
     }
 
     // -- grapheme fixup -----------------------------------------------------

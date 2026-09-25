@@ -40,6 +40,20 @@ pub enum CopyOnSelect {
     Both,
 }
 
+/// `mouse-shift-capture` — under what circumstances Shift is reported to
+/// the running program in mouse events (Ghostty). `False`/`Never` never
+/// report it, `True` reports it only when the program has no mouse
+/// capture, `Always` always reports it. When Shift is not captured, a
+/// shifted press/drag bypasses the program's mouse reporting and does
+/// the local selection instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseShiftCapture {
+    False,
+    True,
+    Always,
+    Never,
+}
+
 /// `shell-integration` — which spawned shell gets the auto-injected
 /// OSC 133/7 hooks (`detect` = bash/zsh/fish, `none` disables).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +131,18 @@ pub enum NewTabPosition {
     Current,
 }
 
+/// `notify-on-command-finish` — when a shell-integrated command
+/// completes (OSC 133 `D`), whether to raise the 🔔 notification
+/// (Ghostty). `unfocused` fires only when the session isn't the
+/// focused pane of the selected tab (app-level approximation — OS
+/// window focus isn't observable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyWhen {
+    No,
+    Unfocused,
+    Always,
+}
+
 /// `window-padding-color` — how the space around the cell grid is
 /// colored (Ghostty `window-padding-color`, default `background`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +207,12 @@ pub struct AppConfig {
     pub quick_terminal_size: Option<(QuickTermSize, Option<QuickTermSize>)>,
     /// `clipboard-trim` — trim whitespace at the ends of copied text.
     pub clipboard_trim: bool,
+    /// `notify-on-command-finish` — raise the 🔔 notification when a
+    /// command completes (Ghostty; requires OSC 133 marks).
+    pub notify_on_command_finish: NotifyWhen,
+    /// `notify-on-command-finish-after` — minimum command duration
+    /// before it notifies (seconds; Ghostty default 5).
+    pub notify_on_command_finish_after: f64,
     /// `desktop-notifications` — OSC 9/777 also posts a freedesktop
     /// notification via `notify-send` when available.
     pub desktop_notifications: bool,
@@ -216,10 +248,11 @@ pub struct AppConfig {
     /// Hide the pointer while typing; it returns on the next move
     /// (Ghostty `mouse-hide-while-typing`). X11 only — XFixes HideCursor.
     pub mouse_hide_typing: bool,
-    /// `mouse-shift-override` — while a program reports the mouse
-    /// (DECSET 1000/1002/1006), holding Shift bypasses reporting so
-    /// click/drag selects terminal text (Ghostty default true).
-    pub mouse_shift_override: bool,
+    /// `mouse-shift-capture` — while a program reports the mouse
+    /// (DECSET 1000/1002/1006), whether Shift reaches the program or
+    /// bypasses reporting so click/drag selects terminal text
+    /// (Ghostty `mouse-shift-capture`, default `false` = bypass).
+    pub mouse_shift_capture: MouseShiftCapture,
     /// `clipboard-read` — policy for program clipboard reads via
     /// OSC 52 `?` requests (Ghostty `clipboard-read`, default ask).
     pub clipboard_read: ClipboardRead,
@@ -310,7 +343,7 @@ pub struct AppConfig {
     /// Restore the last window geometry on launch and save it as the
     /// window moves/resizes (Ghostty `window-save-state`).
     pub window_save_state: bool,
-    /// Launch every window fullscreen (Ghostty `window-fullscreen`).
+    /// Launch every window fullscreen (Ghostty `fullscreen`).
     pub window_fullscreen: bool,
     /// Keep the surface open after a `command`/`-e` child exits
     /// (Ghostty `wait-after-command`, default false). Interactive
@@ -481,7 +514,9 @@ impl Default for AppConfig {
             background_opacity_cells: false,
             paste_protection: true,
             mouse_hide_typing: true,
-            mouse_shift_override: true,
+            mouse_shift_capture: MouseShiftCapture::False,
+            notify_on_command_finish: NotifyWhen::No,
+            notify_on_command_finish_after: 5.0,
             clipboard_read: ClipboardRead::Ask,
             cursor_invert_fg_bg: true,
             window_padding_x: 0.0,
@@ -591,7 +626,7 @@ font-thicken = false       # overdraw glyph runs to darken strokes
 term = xterm-256color      # $TERM value advertised to programs
 osc52-write = allow        # allow | deny — OSC 52 clipboard writes by programs
 osc52-read = ask           # allow | ask | deny — OSC 52 clipboard reads by programs
-mouse-shift-override = true # Shift+click/drag selects even while a program owns the mouse
+mouse-shift-capture = false # false | true | always | never — whether Shift reaches a mouse-reporting program
 cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
 bold-color = bright        # bright | #rrggbb — bold-text color (unset = no override)
 faint-opacity = 0.5        # faint (SGR 2) text opacity, 0.0-1.0
@@ -616,6 +651,8 @@ cursor-style-blink = true
 copy-on-select = both       # both | clipboard | primary | false
 shell-integration = detect  # detect | none | bash | zsh | fish
 desktop-notifications = true # OSC 9/777 also notify via notify-send
+notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
+notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
 audible-bell = true       # ring the X11 keyboard bell on BEL
 # shell = /bin/bash
 
@@ -634,7 +671,7 @@ audible-bell = true       # ring the X11 keyboard bell on BEL
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
 confirm-close = true       # ask before closing a running program
 # window-width = 800       # initial window size in points (0 = default)
-# window-fullscreen = false  # start windows fullscreen
+# fullscreen = false         # start windows fullscreen
 # window-height = 600
 # window-save-state = true # remember window geometry across launches
 # adjust-cell-width = 10%  # widen cells: N% or Npx
@@ -899,8 +936,37 @@ impl AppConfig {
                     "deny" | "never" | "false" => cfg.clipboard_read = ClipboardRead::Deny,
                     _ => errors.push(format!("line {}: bad osc52-read {value:?}", n + 1)),
                 },
-                "mouse-shift-override" | "mouse_shift_override" => {
-                    cfg.mouse_shift_override = bool_value(value, n, &mut errors);
+                "notify-on-command-finish" => {
+                    cfg.notify_on_command_finish = match value {
+                        "no" | "false" => NotifyWhen::No,
+                        "unfocused" => NotifyWhen::Unfocused,
+                        "always" | "true" => NotifyWhen::Always,
+                        _ => {
+                            errors.push(format!("line {}: bad notify-on-command-finish {value:?}", n + 1));
+                            cfg.notify_on_command_finish
+                        }
+                    };
+                }
+                "notify-on-command-finish-after" => {
+                    match parse_notify_after(value) {
+                        Some(s) => cfg.notify_on_command_finish_after = s,
+                        None => errors.push(format!(
+                            "line {}: bad notify-on-command-finish-after {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "mouse-shift-capture" => {
+                    cfg.mouse_shift_capture = match value {
+                        "false" => MouseShiftCapture::False,
+                        "true" => MouseShiftCapture::True,
+                        "always" => MouseShiftCapture::Always,
+                        "never" => MouseShiftCapture::Never,
+                        _ => {
+                            errors.push(format!("line {}: bad mouse-shift-capture {value:?}", n + 1));
+                            cfg.mouse_shift_capture
+                        }
+                    };
                 }
                 "cursor-invert-fg-bg" | "cursor_invert_fg_bg" => {
                     cfg.cursor_invert_fg_bg = bool_value(value, n, &mut errors);
@@ -1036,15 +1102,15 @@ impl AppConfig {
                     cfg.desktop_notifications = bool_value(value, n, &mut errors);
                 }
                 "audible-bell" => cfg.audible_bell = bool_value(value, n, &mut errors),
-                "cursor-style-blink" | "cursor-blink" => {
+                "cursor-style-blink" => {
                     cfg.cursor_blink = bool_value(value, n, &mut errors)
                 }
-                "cursor-style" | "cursor-shape" => match value {
+                "cursor-style" => match value {
                     "block" => cfg.cursor_shape = CursorShape::Block,
                     "beam" => cfg.cursor_shape = CursorShape::Beam,
                     "underline" => cfg.cursor_shape = CursorShape::Underline,
                     "hollow" | "hollow-block" => cfg.cursor_shape = CursorShape::HollowBlock,
-                    _ => errors.push(format!("line {}: bad cursor-shape {value:?}", n + 1)),
+                    _ => errors.push(format!("line {}: bad cursor-style {value:?}", n + 1)),
                 },
                 "shell" => cfg.shell = (!value.is_empty()).then(|| value.to_string()),
                 "command" => {
@@ -1080,13 +1146,13 @@ impl AppConfig {
                     Ok(v) if (0.0..=4000.0).contains(&v) => cfg.window_height = v,
                     _ => errors.push(format!("line {}: bad window-height {value:?}", n + 1)),
                 },
-                "window-x" | "window_x" => match value.parse::<f32>() {
+                "window-position-x" => match value.parse::<f32>() {
                     Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_x = Some(v),
-                    _ => errors.push(format!("line {}: bad window-x {value:?}", n + 1)),
+                    _ => errors.push(format!("line {}: bad window-position-x {value:?}", n + 1)),
                 },
-                "window-y" | "window_y" => match value.parse::<f32>() {
+                "window-position-y" => match value.parse::<f32>() {
                     Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_y = Some(v),
-                    _ => errors.push(format!("line {}: bad window-y {value:?}", n + 1)),
+                    _ => errors.push(format!("line {}: bad window-position-y {value:?}", n + 1)),
                 },
                 "link-url" | "link_url" => {
                     cfg.link_url = bool_value(value, n, &mut errors);
@@ -1097,9 +1163,9 @@ impl AppConfig {
                         Err(e) => errors.push(format!("line {}: {e}", n + 1)),
                     }
                 }
-                "click-interval" | "click_interval" => match value.parse::<u64>() {
+                "click-repeat-interval" => match value.parse::<u64>() {
                     Ok(v) if (50..=2000).contains(&v) => cfg.click_interval = v,
-                    _ => errors.push(format!("line {}: bad click-interval {value:?}", n + 1)),
+                    _ => errors.push(format!("line {}: bad click-repeat-interval {value:?}", n + 1)),
                 },
                 "selection-invert-fg-bg" | "selection_invert_fg_bg" => {
                     cfg.selection_invert = bool_value(value, n, &mut errors);
@@ -1107,7 +1173,7 @@ impl AppConfig {
                 "window-save-state" | "window_save_state" => {
                     cfg.window_save_state = bool_value(value, n, &mut errors);
                 }
-                "window-fullscreen" | "window_fullscreen" => {
+                "fullscreen" => {
                     cfg.window_fullscreen = bool_value(value, n, &mut errors);
                 }
                 "wait-after-command" | "wait_after_command" => {
@@ -1457,6 +1523,19 @@ fn parse_quick_term_size(
     Ok(Some((a, b)))
 }
 
+/// `notify-on-command-finish-after` duration — `5s`, `500ms`, `1m`,
+/// `1h`, or a bare number of seconds (Ghostty accepts its duration
+/// spellings; we cover the same ground).
+fn parse_notify_after(value: &str) -> Option<f64> {
+    let v = value.trim();
+    for (suffix, scale) in [("ms", 0.001), ("s", 1.0), ("m", 60.0), ("h", 3600.0)] {
+        if let Some(n) = v.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().filter(|x| *x >= 0.0).map(|x| x * scale);
+        }
+    }
+    v.parse::<f64>().ok().filter(|x| *x >= 0.0)
+}
+
 /// `~/…` expands to `$HOME/…`; anything else passes through verbatim.
 fn expand_home(value: &str) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/")
@@ -1519,7 +1598,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "increase_font_size[:pt]", "decrease_font_size[:pt]",
     "clear_scrollback", "clear_screen", "reset", "search", "search_next", "search_prev",
     "prompt_prev", "prompt_next", "select_all", "start_selection",
-    "last_tab", "close_window", "toggle_tab_bar",
+    "last_tab", "close_window", "close_all_tabs", "close_other_tabs", "toggle_tab_bar",
     "scroll_to_top", "scroll_to_bottom", "scroll_page_up", "scroll_page_down",
     "scroll_line_up", "scroll_line_down",
     "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
@@ -1527,7 +1606,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "text:\"…\"", "csi:\"…\"", "esc:\"…\"",
     "scroll_to_fraction:<0-1>", "scroll_to_row:<n>",
     "paste_from_clipboard", "paste_from_selection", "prompt_title", "inspector",
-    "quit", "fullscreen", "palette", "settings",
+    "quit", "toggle_fullscreen", "palette", "settings",
     "split_right", "split_down", "split_left", "split_up",
     "new_split:<right|down|left|up|auto>",
     "goto_split:<left|right|up|down|previous|next|top|bottom>",
@@ -1709,9 +1788,11 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "new_tab" => TermAction::NewTab,
         "close_tab" => TermAction::CloseTab,
         "new_window" => TermAction::NewWindow,
-        "toggle_quick_terminal" | "quick_terminal" => TermAction::ToggleQuickTerminal,
+        "toggle_quick_terminal" => TermAction::ToggleQuickTerminal,
         "last_tab" => TermAction::LastTab,
         "close_window" => TermAction::CloseWindow,
+        "close_all_tabs" => TermAction::CloseAllTabs,
+        "close_other_tabs" => TermAction::CloseOtherTabs,
         "toggle_tab_bar" => TermAction::ToggleTabBar,
         "next_tab" => TermAction::NextTab,
         "prev_tab" => TermAction::PrevTab,
@@ -1758,14 +1839,14 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "search_next" => TermAction::SearchNext,
         "search_prev" => TermAction::SearchPrev,
         "reload_config" => TermAction::ReloadConfig,
-        "toggle_split_zoom" | "toggle_pane_zoom" => TermAction::PaneZoom,
+        "toggle_split_zoom" => TermAction::PaneZoom,
         "quit" => TermAction::Quit,
         "split_right" => TermAction::SplitRight,
         "split_down" => TermAction::SplitDown,
         "focus_next_pane" => TermAction::FocusNextPane,
         "focus_prev_pane" => TermAction::FocusPrevPane,
         "equalize_splits" | "equalise_splits" => TermAction::EqualizeSplits,
-        "fullscreen" => TermAction::Fullscreen,
+        "toggle_fullscreen" => TermAction::Fullscreen,
         "palette" | "command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
         "write_screen_file" => TermAction::WriteScreenFile,
@@ -2028,7 +2109,7 @@ mod tests {
     fn parses_scalars_and_comments() {
         let text = "# c\n\nfont-size = 14.5\nfont-family = \"JetBrains Mono\"\n\
                     scrollback = 5000\ntheme = solarized-light\n\
-                    copy-on-select = true\ncursor-shape = beam\ncursor-blink = no\n\
+                    copy-on-select = true\ncursor-style = beam\ncursor-style-blink = no\n\
                     shell = /bin/zsh\n";
         let (cfg, errs) = AppConfig::parse(text);
         assert!(errs.is_empty(), "{errs:?}");
@@ -2113,16 +2194,14 @@ mod tests {
 
     #[test]
     fn cursor_style_reference_names() {
-        // Ghostty `cursor-style` / `cursor-style-blink` are the reference
-        // names; our `cursor-shape` / `cursor-blink` stay as aliases.
+        // Ghostty `cursor-style` / `cursor-style-blink` are the only
+        // names — no legacy spellings.
         let (cfg, errs) = AppConfig::parse("cursor-style = beam\ncursor-style-blink = false");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.cursor_shape, CursorShape::Beam);
         assert!(!cfg.cursor_blink);
-        let (cfg2, errs2) = AppConfig::parse("cursor-shape = underline\ncursor-blink = true");
-        assert!(errs2.is_empty(), "{errs2:?}");
-        assert_eq!(cfg2.cursor_shape, CursorShape::Underline);
-        assert!(cfg2.cursor_blink);
+        let (_, errs2) = AppConfig::parse("cursor-shape = underline\ncursor-blink = true");
+        assert_eq!(errs2.len(), 2, "legacy names must be rejected: {errs2:?}");
     }
 
     #[test]
@@ -2157,6 +2236,91 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("keybind = ctrl+alt+z=new_split:auto");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::SplitAuto));
+    }
+
+    #[test]
+    fn r38_reference_names() {
+        // `window-position-x`/`y` are the reference's names — `window-x`/
+        // `window-y` are rejected, not aliased.
+        let (cfg, errs) =
+            AppConfig::parse("window-position-x = 120\nwindow-position-y = 90");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.window_x, Some(120.0));
+        assert_eq!(cfg.window_y, Some(90.0));
+        let (_, errs2) = AppConfig::parse("window-x = 120\nwindow-y = 90");
+        assert_eq!(errs2.len(), 2, "legacy names rejected: {errs2:?}");
+
+        // `click-repeat-interval` is the reference's name —
+        // `click-interval` is rejected.
+        let (cfg, errs) = AppConfig::parse("click-repeat-interval = 250");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.click_interval, 250);
+        let (_, errs3) = AppConfig::parse("click-interval = 250");
+        assert_eq!(errs3.len(), 1, "legacy name rejected: {errs3:?}");
+    }
+
+    #[test]
+    fn mouse_shift_capture_parse() {
+        // `mouse-shift-capture` is the reference's 4-state key —
+        // the bool `mouse-shift-override` is gone.
+        for (value, want) in [
+            ("false", MouseShiftCapture::False),
+            ("true", MouseShiftCapture::True),
+            ("always", MouseShiftCapture::Always),
+            ("never", MouseShiftCapture::Never),
+        ] {
+            let (cfg, errs) = AppConfig::parse(&format!("mouse-shift-capture = {value}"));
+            assert!(errs.is_empty(), "{value}: {errs:?}");
+            assert_eq!(cfg.mouse_shift_capture, want, "{value}");
+        }
+        let (_, errs) = AppConfig::parse("mouse-shift-override = true");
+        assert_eq!(errs.len(), 1, "legacy name rejected: {errs:?}");
+        let (_, errs) = AppConfig::parse("mouse-shift-capture = bogus");
+        assert!(!errs.is_empty());
+        // Default matches the reference: `false`.
+        let (d, _) = AppConfig::parse("");
+        assert_eq!(d.mouse_shift_capture, MouseShiftCapture::False);
+    }
+
+    #[test]
+    fn notify_on_command_finish_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "notify-on-command-finish = always\nnotify-on-command-finish-after = 500ms",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.notify_on_command_finish, NotifyWhen::Always);
+        assert_eq!(cfg.notify_on_command_finish_after, 0.5);
+        for (value, want) in [("5s", 5.0), ("2m", 120.0), ("1h", 3600.0), ("3", 3.0)] {
+            assert_eq!(parse_notify_after(value), Some(want), "{value}");
+        }
+        assert_eq!(parse_notify_after("bogus"), None);
+        let (cfg2, _) = AppConfig::parse("notify-on-command-finish = unfocused");
+        assert_eq!(cfg2.notify_on_command_finish, NotifyWhen::Unfocused);
+        let (d, _) = AppConfig::parse("");
+        assert_eq!(d.notify_on_command_finish, NotifyWhen::No);
+        assert_eq!(d.notify_on_command_finish_after, 5.0);
+    }
+
+    #[test]
+    fn canonical_close_and_toggle_actions() {
+        // Reference names: `toggle_fullscreen`, `close_all_tabs`,
+        // `close_other_tabs`. The old `fullscreen`/`quick_terminal`/
+        // `toggle_pane_zoom` spellings are rejected, not aliased.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = f11=toggle_fullscreen\nkeybind = ctrl+alt+w=close_all_tabs\nkeybind = ctrl+alt+o=close_other_tabs",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::Fullscreen));
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::CloseAllTabs));
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::CloseOtherTabs));
+        for legacy in [
+            "keybind = f11=fullscreen",
+            "keybind = f12=quick_terminal",
+            "keybind = ctrl+alt+z=toggle_pane_zoom",
+        ] {
+            let (_, errs) = AppConfig::parse(legacy);
+            assert_eq!(errs.len(), 1, "{legacy} rejected: {errs:?}");
+        }
     }
 
     #[test]
@@ -2328,12 +2492,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "# comment\nfont-size = 13\ntheme = auto\n").unwrap();
         upsert_config_key(&path, "theme", "solarized-dark");
-        upsert_config_key(&path, "cursor-blink", "true");
+        upsert_config_key(&path, "cursor-style-blink", "true");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# comment"));
         assert!(text.contains("font-size = 13"));
         assert!(text.contains("theme = solarized-dark"));
-        assert!(text.contains("cursor-blink = true"));
+        assert!(text.contains("cursor-style-blink = true"));
         assert!(!text.contains("theme = auto"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2351,23 +2515,27 @@ mod tests {
 
     #[test]
     fn parses_window_fullscreen() {
-        let (cfg, errs) = AppConfig::parse("window-fullscreen = true\n");
+        // `fullscreen` is the reference's key — `window-fullscreen`
+        // is rejected, not aliased.
+        let (cfg, errs) = AppConfig::parse("fullscreen = true\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.window_fullscreen);
+        let (_, errs2) = AppConfig::parse("window-fullscreen = true\n");
+        assert_eq!(errs2.len(), 1, "legacy name rejected: {errs2:?}");
     }
 
     #[test]
     fn parses_r19_keys() {
         let (cfg, errs) = AppConfig::parse(
-            "mouse-shift-override = false\nclipboard-read = deny\ncursor-invert-fg-bg = false\n",
+            "mouse-shift-capture = always\nclipboard-read = deny\ncursor-invert-fg-bg = false\n",
         );
         assert!(errs.is_empty(), "{errs:?}");
-        assert!(!cfg.mouse_shift_override);
+        assert_eq!(cfg.mouse_shift_capture, MouseShiftCapture::Always);
         assert_eq!(cfg.clipboard_read, ClipboardRead::Deny);
         assert!(!cfg.cursor_invert_fg_bg);
-        // Defaults are the Ghostty ones: override on, ask, invert on.
+        // Defaults are the Ghostty ones: capture off, ask, invert on.
         let (d, _) = AppConfig::parse("");
-        assert!(d.mouse_shift_override);
+        assert_eq!(d.mouse_shift_capture, MouseShiftCapture::False);
         assert_eq!(d.clipboard_read, ClipboardRead::Ask);
         assert!(d.cursor_invert_fg_bg);
     }

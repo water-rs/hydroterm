@@ -528,6 +528,12 @@ pub enum TermAction {
     /// Close every tab in this window (Ghostty `close_window`), with
     /// `confirm-close` prompts where configured.
     CloseWindow,
+    /// Close every tab in this window (Ghostty `close_all_tabs`) —
+    /// same effect as `close_window`, kept as the reference's name.
+    CloseAllTabs,
+    /// Close every tab except the selected one (Ghostty
+    /// `close_other_tabs`), `confirm-close` prompts where configured.
+    CloseOtherTabs,
     /// Show/hide the tab strip on demand, overriding `tab-bar-min-tabs`
     /// until the next config reload (kitty `toggle_tab_bar`).
     ToggleTabBar,
