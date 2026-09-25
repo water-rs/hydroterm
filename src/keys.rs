@@ -621,6 +621,9 @@ pub enum TermAction {
     /// insert the new pane ahead of the target like Ghostty's
     /// `new_split:left`/`up`.
     SplitRight,
+    /// Ghostty `new_split:auto` — pick Row/Column by the pane's
+    /// aspect ratio (wider than tall → right, else down).
+    SplitAuto,
     SplitDown,
     SplitLeft,
     SplitUp,

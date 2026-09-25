@@ -237,6 +237,17 @@ pub enum SplitDir {
     Column,
 }
 
+/// Ghostty `new_split:auto` — split along the pane's long axis so both
+/// children stay closer to square: a pane wider than it is tall splits
+/// side-by-side (right), a taller one splits top-to-bottom (down).
+pub fn auto_split_dir(width: f32, height: f32) -> SplitDir {
+    if width >= height {
+        SplitDir::Row
+    } else {
+        SplitDir::Column
+    }
+}
+
 /// Pane layout tree inside one tab. Leaves hold session ids.
 #[derive(Clone)]
 pub enum SplitNode {
@@ -2592,8 +2603,17 @@ fn settings_view(state: AppState) -> impl View {
 
 #[cfg(test)]
 mod tests {
-    use super::{SplitDir, SplitNode};
+    use super::{SplitDir, SplitNode, auto_split_dir};
     use nami::Signal;
+
+    #[test]
+    fn auto_split_picks_by_aspect() {
+        // Ghostty `new_split:auto` — a wider-than-tall pane splits to the
+        // right (Row), a taller-than-wide pane splits down (Column).
+        assert_eq!(auto_split_dir(200.0, 100.0), SplitDir::Row);
+        assert_eq!(auto_split_dir(100.0, 200.0), SplitDir::Column);
+        assert_eq!(auto_split_dir(100.0, 100.0), SplitDir::Row);
+    }
 
     /// [0 | 1] split side-by-side, then 1 split down → [0 | {1 / 2}].
     fn nested() -> SplitNode {

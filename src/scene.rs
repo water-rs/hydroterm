@@ -2,7 +2,8 @@
 //! with font fallback + ligature shaping, decorations (underline variants,
 //! strikethrough), the selection overlay, the cursor, and the scrollbar.
 
-use alacritty_terminal::index::Point;
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
@@ -119,6 +120,12 @@ pub struct DrawContext<'a> {
     /// `font-thicken` — every glyph run is emboldened (Ghostty
     /// `font-thicken`).
     pub font_thicken: bool,
+    /// `background-opacity-cells` — alpha applied to cells with an
+    /// explicit background color (1.0 = opaque = default).
+    pub cell_bg_opacity: f32,
+    /// `window-padding-color` — whether edge cell colors extend into
+    /// the padding around the grid.
+    pub pad_mode: crate::config::WindowPaddingColor,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,11 +446,16 @@ pub fn draw_term(
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
-                &Brush::Solid(peniko(bgc)),
+                &Brush::Solid(peniko_alpha(bgc, ctx.cell_bg_opacity)),
                 None,
                 &rect(x, y, w, ch),
             );
         }
+    }
+
+    // -- `window-padding-color`: edge colors extended into the padding --
+    if ctx.pad_mode != crate::config::WindowPaddingColor::Background {
+        paint_pad_extend(scene, term, &grid, theme_bg, ctx);
     }
 
     // -- Search highlights --------------------------------------------------
@@ -984,4 +996,141 @@ fn draw_scrollbar(scene: &mut dyn Scene2D, ctx: &DrawContext<'_>) {
         None,
         &rect(ctx.width - 4.0, bar_y, 3.0, bar_h),
     );
+}
+
+// ---------------------------------------------------------------------------
+// `window-padding-color`: edge cell colors extended into the padding
+// ---------------------------------------------------------------------------
+
+/// Perfect-fit powerline range (nerd-font triangles/arrows) — a row
+/// containing one skips vertical padding extension on the primary
+/// screen, like the reference's powerline veto.
+fn has_powerline(grid: &alacritty_terminal::grid::Grid<Cell>, cols: usize, line: i32) -> bool {
+    (0..cols).any(|c| ('\u{e0b0}'..='\u{e0bf}').contains(&grid[Line(line)][Column(c)].c))
+}
+
+/// May the vertical (top/bottom) padding bands take the nearest row's
+/// color? `background` never extends; `extend-always` always does;
+/// `extend` vetoes on the primary screen when the nearest row has any
+/// default-background cells, is a prompt row, or has a powerline
+/// glyph — the alternate screen always extends.
+pub(crate) fn pad_vertical_ok(
+    mode: crate::config::WindowPaddingColor,
+    alt_screen: bool,
+    has_default_bg: bool,
+    is_prompt: bool,
+    has_powerline: bool,
+) -> bool {
+    match mode {
+        crate::config::WindowPaddingColor::Background => false,
+        crate::config::WindowPaddingColor::ExtendAlways => true,
+        crate::config::WindowPaddingColor::Extend => {
+            alt_screen || !(has_default_bg || is_prompt || has_powerline)
+        }
+    }
+}
+
+/// Paint the padding strips with the adjacent cells' colors
+/// (`window-padding-color = extend|extend-always`).
+fn paint_pad_extend(
+    scene: &mut dyn Scene2D,
+    term: &Term<EventProxy>,
+    grid: &Grid,
+    theme_bg: Rgb,
+    ctx: &DrawContext<'_>,
+) {
+    let m = ctx.fonts.metrics;
+    let (cw, ch, padx, pady) = (m.cell_w, m.cell_h, ctx.pad_x, ctx.pad_y);
+    let alt = term.mode().contains(TermMode::ALT_SCREEN);
+    let display_offset = term.grid().display_offset() as i32;
+    let cols = term.grid().columns();
+
+    // Side strips: each row takes its edge cell's background.
+    let grid_right = col_x(padx, cw, grid.num_cols);
+    for (row_i, row) in grid.rows.iter().enumerate() {
+        if row.is_empty() {
+            continue;
+        }
+        let y = row_y(pady, ch, row_i);
+        if padx > 0.0 {
+            let bg = row[0].style.bg;
+            if bg != theme_bg {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &Brush::Solid(peniko_alpha(bg, ctx.cell_bg_opacity)),
+                    None,
+                    &rect(0.0, y, padx, ch),
+                );
+            }
+        }
+        if grid_right < ctx.width {
+            let bg = row[row.len() - 1].style.bg;
+            if bg != theme_bg {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &Brush::Solid(peniko_alpha(bg, ctx.cell_bg_opacity)),
+                    None,
+                    &rect(grid_right, y, ctx.width - grid_right, ch),
+                );
+            }
+        }
+    }
+
+    // Top/bottom bands: per-column extension of the nearest row's bg.
+    let last = grid.rows.len().saturating_sub(1);
+    for (row_i, band_top) in [(0usize, 0.0f32), (last, row_y(pady, ch, last) + ch)] {
+        let h = if row_i == 0 { pady } else { ctx.height - band_top };
+        if h <= 0.0 {
+            continue;
+        }
+        let Some(row) = grid.rows.get(row_i) else { continue };
+        if row.is_empty() {
+            continue;
+        }
+        let line = row_i as i32 - display_offset;
+        let has_default = style_runs(row).iter().any(|(_, _, s)| s.bg == theme_bg);
+        let is_prompt = crate::terminal::row_has_mark(term.grid(), cols, line);
+        let powerline = has_powerline(term.grid(), cols, line);
+        if !pad_vertical_ok(ctx.pad_mode, alt, has_default, is_prompt, powerline) {
+            continue;
+        }
+        for (start, end, style) in style_runs(row) {
+            if style.bg == theme_bg {
+                continue;
+            }
+            let x = col_x(padx, cw, start);
+            let w = (end - start) as f32 * cw;
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &Brush::Solid(peniko_alpha(style.bg, ctx.cell_bg_opacity)),
+                None,
+                &rect(x, band_top, w, h),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WindowPaddingColor;
+
+    #[test]
+    fn pad_vertical_veto_matrix() {
+        // `background` never extends; `extend-always` always does.
+        assert!(!pad_vertical_ok(WindowPaddingColor::Background, true, false, false, false));
+        assert!(pad_vertical_ok(WindowPaddingColor::ExtendAlways, false, true, true, true));
+        // `extend`: alternate screen always extends.
+        assert!(pad_vertical_ok(WindowPaddingColor::Extend, true, true, true, true));
+        // Primary screen: veto on any default-bg cell, prompt row, or
+        // powerline glyph.
+        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, true, false, false));
+        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, false, true, false));
+        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, false, false, true));
+        // A fully-colored non-prompt row extends.
+        assert!(pad_vertical_ok(WindowPaddingColor::Extend, false, false, false, false));
+    }
 }

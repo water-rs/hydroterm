@@ -117,6 +117,22 @@ pub enum NewTabPosition {
     Current,
 }
 
+/// `window-padding-color` — how the space around the cell grid is
+/// colored (Ghostty `window-padding-color`, default `background`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPaddingColor {
+    /// Padding always takes the theme background.
+    Background,
+    /// Each padding cell extends the color of the cell next to it. On
+    /// the primary screen, vertical extension is skipped when the
+    /// nearest row has any default-background cells, is a prompt row,
+    /// or contains a perfect-fit powerline glyph — the alternate
+    /// screen extends unconditionally.
+    Extend,
+    /// Always extend, ignoring the primary-screen heuristics.
+    ExtendAlways,
+}
+
 /// Fully-resolved settings — defaults plus file overrides.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -188,6 +204,11 @@ pub struct AppConfig {
     /// transparent when this starts below 1.0 — raising it live works;
     /// dropping it on an opaque-start window just darkens.
     pub background_opacity: f32,
+    /// `background-opacity-cells` — when true the `background-opacity`
+    /// alpha also applies to cells with an explicit (non-default)
+    /// background color; false keeps cell backgrounds opaque over a
+    /// translucent base (Ghostty `background-opacity-cells`).
+    pub background_opacity_cells: bool,
     /// Guard multi-line clipboard pastes behind a confirmation overlay
     /// (Ghostty `clipboard-paste-protection`). Bracketed-paste-armed
     /// programs skip the guard — wrapped text can't execute mid-paste.
@@ -214,6 +235,9 @@ pub struct AppConfig {
     /// (Ghostty `window-padding-balance`, default false = leftover
     /// sits on the right/bottom).
     pub window_padding_balance: bool,
+    /// `window-padding-color` — what the padding area is painted with
+    /// (Ghostty `window-padding-color`, default `background`).
+    pub window_padding_color: WindowPaddingColor,
     /// `middle-click-paste` — paste the PRIMARY selection on a middle
     /// click (Ghostty `middle-click-paste`, default true).
     pub middle_click_paste: bool,
@@ -454,6 +478,7 @@ impl Default for AppConfig {
             audible_bell: true,
             bell_attention: true,
             background_opacity: 1.0,
+            background_opacity_cells: false,
             paste_protection: true,
             mouse_hide_typing: true,
             mouse_shift_override: true,
@@ -462,6 +487,7 @@ impl Default for AppConfig {
             window_padding_x: 0.0,
             window_padding_y: 0.0,
             window_padding_balance: false,
+            window_padding_color: WindowPaddingColor::Background,
             middle_click_paste: true,
             right_click_action: RightClickAction::ContextMenu,
             term: "xterm-256color".to_string(),
@@ -538,6 +564,13 @@ pub fn default_path() -> PathBuf {
     base.unwrap_or_else(|| PathBuf::from("/tmp")).join("hydroterm/config")
 }
 
+/// `background-opacity-cells` mapping: the alpha applied to cells with
+/// an explicit background (Ghostty — `background-opacity` reaches cell
+/// backgrounds only when the flag is on; otherwise they stay opaque).
+pub fn cell_bg_alpha(cells_on: bool, opacity: f32) -> f32 {
+    if cells_on { opacity } else { 1.0 }
+}
+
 /// Template written when no config file exists yet.
 const TEMPLATE: &str = "\
 # hydroterm configuration — key = value, one per line.
@@ -578,8 +611,8 @@ focus-follows-mouse = false
 # theme = light:solarized-light,dark:solarized-dark
 theme = hydroterm-dark
 
-cursor-shape = block        # block | beam | underline | hollow
-cursor-blink = true
+cursor-style = block        # block | beam | underline | hollow
+cursor-style-blink = true
 copy-on-select = both       # both | clipboard | primary | false
 shell-integration = detect  # detect | none | bash | zsh | fish
 desktop-notifications = true # OSC 9/777 also notify via notify-send
@@ -1003,8 +1036,10 @@ impl AppConfig {
                     cfg.desktop_notifications = bool_value(value, n, &mut errors);
                 }
                 "audible-bell" => cfg.audible_bell = bool_value(value, n, &mut errors),
-                "cursor-blink" => cfg.cursor_blink = bool_value(value, n, &mut errors),
-                "cursor-shape" => match value {
+                "cursor-style-blink" | "cursor-blink" => {
+                    cfg.cursor_blink = bool_value(value, n, &mut errors)
+                }
+                "cursor-style" | "cursor-shape" => match value {
                     "block" => cfg.cursor_shape = CursorShape::Block,
                     "beam" => cfg.cursor_shape = CursorShape::Beam,
                     "underline" => cfg.cursor_shape = CursorShape::Underline,
@@ -1158,6 +1193,15 @@ impl AppConfig {
                     Some(rgb) => cfg.cursor_text = Some(rgb),
                     None => errors.push(format!("line {}: bad cursor-text {value:?}", n + 1)),
                 },
+                "background-opacity-cells" | "background_opacity_cells" => {
+                    cfg.background_opacity_cells = bool_value(value, n, &mut errors)
+                }
+                "window-padding-color" | "window_padding_color" => match value {
+                    "background" => cfg.window_padding_color = WindowPaddingColor::Background,
+                    "extend" => cfg.window_padding_color = WindowPaddingColor::Extend,
+                    "extend-always" => cfg.window_padding_color = WindowPaddingColor::ExtendAlways,
+                    _ => errors.push(format!("line {}: bad window-padding-color {value:?}", n + 1)),
+                },
                 "scroll-on-input" | "scroll_on_input" => {
                     cfg.scroll_on_input = bool_value(value, n, &mut errors);
                 }
@@ -1265,6 +1309,12 @@ impl AppConfig {
                         "line {}: bad minimum-contrast {value:?} (want 1.0-21.0)",
                         n + 1
                     )),
+                },
+                "window-show-tab-bar" | "window_show_tab_bar" => match value {
+                    "always" => cfg.tab_bar_min_tabs = 1,
+                    "auto" => cfg.tab_bar_min_tabs = 2,
+                    "never" => cfg.tab_bar_min_tabs = usize::MAX,
+                    _ => errors.push(format!("line {}: bad window-show-tab-bar {value:?}", n + 1)),
                 },
                 "tab-bar-min-tabs" | "tab_bar_min_tabs" => match value.parse::<usize>() {
                     Ok(v) if v <= 64 => cfg.tab_bar_min_tabs = v,
@@ -1726,10 +1776,11 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
             TermAction::SelectTab(n)
         }
         // Ghostty `keybind = ...=new_split:right` — direction arg selects
-        // which side the new pane lands on (`auto` = right).
+        // which side the new pane lands on (`auto` picks by pane aspect).
         _ if name.strip_prefix("new_split:").is_some() => {
             match &name["new_split:".len()..] {
-                "right" | "auto" => TermAction::SplitRight,
+                "right" => TermAction::SplitRight,
+                "auto" => TermAction::SplitAuto,
                 "down" => TermAction::SplitDown,
                 "left" => TermAction::SplitLeft,
                 "up" => TermAction::SplitUp,
@@ -2058,6 +2109,54 @@ mod tests {
             cfg2.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
             Some((true, Some(TermAction::IncreaseFontSize(10))))
         );
+    }
+
+    #[test]
+    fn cursor_style_reference_names() {
+        // Ghostty `cursor-style` / `cursor-style-blink` are the reference
+        // names; our `cursor-shape` / `cursor-blink` stay as aliases.
+        let (cfg, errs) = AppConfig::parse("cursor-style = beam\ncursor-style-blink = false");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.cursor_shape, CursorShape::Beam);
+        assert!(!cfg.cursor_blink);
+        let (cfg2, errs2) = AppConfig::parse("cursor-shape = underline\ncursor-blink = true");
+        assert!(errs2.is_empty(), "{errs2:?}");
+        assert_eq!(cfg2.cursor_shape, CursorShape::Underline);
+        assert!(cfg2.cursor_blink);
+    }
+
+    #[test]
+    fn window_show_tab_bar_parse() {
+        for (value, want) in [("always", 1), ("auto", 2), ("never", usize::MAX)] {
+            let (cfg, errs) = AppConfig::parse(&format!("window-show-tab-bar = {value}"));
+            assert!(errs.is_empty(), "{value}: {errs:?}");
+            assert_eq!(cfg.tab_bar_min_tabs, want, "{value}");
+        }
+        let (_cfg, errs) = AppConfig::parse("window-show-tab-bar = bogus");
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn padding_color_and_opacity_cells_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "window-padding-color = extend\nbackground-opacity-cells = true",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.window_padding_color, WindowPaddingColor::Extend);
+        assert!(cfg.background_opacity_cells);
+        assert_eq!(cell_bg_alpha(true, 0.5), 0.5);
+        assert_eq!(cell_bg_alpha(false, 0.5), 1.0);
+        let (cfg2, _) = AppConfig::parse("window-padding-color = extend-always");
+        assert_eq!(cfg2.window_padding_color, WindowPaddingColor::ExtendAlways);
+        let (_c3, errs3) = AppConfig::parse("window-padding-color = bogus");
+        assert!(!errs3.is_empty());
+    }
+
+    #[test]
+    fn new_split_auto_parses() {
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+alt+z=new_split:auto");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::SplitAuto));
     }
 
     #[test]

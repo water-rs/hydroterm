@@ -385,7 +385,7 @@ impl Terminal {
 /// Does any cell on `line` still carry [`PROMPT_MARK`]? A rewrite or erase
 /// resets the cell's flags, so a rewritten row drops its mark — correct:
 /// the mark belongs to the write, like the reference's row kind.
-fn row_has_mark(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
+pub(crate) fn row_has_mark(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
     (0..cols).any(|c| grid[Line(line)][Column(c)].flags.contains(PROMPT_MARK))
 }
 

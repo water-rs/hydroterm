@@ -888,6 +888,11 @@ impl TermSurface {
             TermAction::SearchNext => self.search_step(1),
             TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
+            TermAction::SplitAuto => {
+                let (w, h) = self.session.pane_px.snapshot();
+                self.app
+                    .split_pane(crate::app::auto_split_dir(w, h), self.session.id, false);
+            }
             TermAction::SplitRight => {
                 self.app.split_pane(crate::app::SplitDir::Row, self.session.id, false);
             }
@@ -2463,6 +2468,12 @@ impl TermSurface {
             search_active: &active,
             bell_flash: bell_alpha,
             bg_opacity,
+            cell_bg_opacity: self
+                .app
+                .config(|c| {
+                    crate::config::cell_bg_alpha(c.background_opacity_cells, c.background_opacity)
+                }),
+            pad_mode: self.app.config(|c| c.window_padding_color),
             hints: &hint_spans,
             hint_digits: &hint_digits,
             pad_x: self.pad_x,
