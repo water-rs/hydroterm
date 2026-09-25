@@ -1593,7 +1593,30 @@ impl View for PaneLeaf {
     fn body(self, env: &Environment) -> impl View {
         let menu_enabled = self.session.context_menu_enabled.clone();
         let env = env.clone();
-        let assemble = std::rc::Rc::new(move |with_menu: bool| -> AnyView {
+        // `right-click-action = context-menu` — the pane's `.context_menu`
+        // item list collapses to empty while the program reports mouse
+        // input (a secondary click is program input under DECSET
+        // 1000/1002/1006). Built outside `assemble` so the `when` below
+        // can attach the modifier on the menu branch — the zstack isn't
+        // Clone, so the attach wraps the branch's returned AnyView.
+        let reporting = self.session.mouse_reporting.clone();
+        let menu = zip(reporting, menu_enabled.clone())
+            .map(|(reporting, menu_enabled)| -> Vec<MenuItem> {
+                if reporting || !menu_enabled {
+                    Vec::new()
+                } else {
+                    vec![
+                        "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)).into(),
+                        "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)).into(),
+                        "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)).into(),
+                        "Clear".action(|s: PaneSession| s.push_action(TermAction::ClearScrollback)).into(),
+                        "Search".action(|s: PaneSession| s.push_action(TermAction::Search)).into(),
+                    ]
+                }
+            })
+            .computed();
+        let session_state = PaneSession(self.session.clone());
+        let assemble = std::rc::Rc::new(move || -> AnyView {
         // Search bar: a real WaterUI row that appears above the surface —
         // the field is a sibling, so toggling it never remounts the
         // SceneView or drops its keyboard focus.
@@ -1629,7 +1652,6 @@ impl View for PaneLeaf {
             })
             .padding_with(padding);
         let surface = Frame::new(surface);
-        let reporting = self.session.mouse_reporting.clone();
         // Paste-protection confirm: multi-line clipboard content waits in
         // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
         let pending = self.session.pending_paste.clone();
@@ -1739,32 +1761,12 @@ impl View for PaneLeaf {
             .padding_vertical(4.0)
         })
         .anyview();
-        // The menu is attached only while the program is not reporting
-        // mouse input — under DECSET 1000/1002/1006 a secondary click is
-        // program input, so the item list collapses to empty and the
-        // click falls through to the surface (hydrolysis hit-testing).
-        let menu_enabled = session.0.context_menu_enabled.clone();
-        let menu = zip(reporting, menu_enabled)
-            .map(|(reporting, menu_enabled)| -> Vec<MenuItem> {
-                if reporting || !menu_enabled {
-                    Vec::new()
-                } else {
-                    vec![
-                        "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)).into(),
-                        "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)).into(),
-                        "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)).into(),
-                        "Clear".action(|s: PaneSession| s.push_action(TermAction::ClearScrollback)).into(),
-                        "Search".action(|s: PaneSession| s.push_action(TermAction::Search)).into(),
-                    ]
-                }
-            })
-            .computed();
         // `unfocused-split-opacity`: the focused pane stays opaque, every
         // other leaf in this tab fades to the configured alpha — a
         // signal-driven dim like Ghostty's.
         let session_id = session.0.id;
         let pane_alpha = zip(
-            self.focused.clone().equal_to(session_id),
+            self.focused.equal_to(session_id),
             session.0.unfocused_opacity.clone(),
         )
         .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
@@ -1829,21 +1831,22 @@ impl View for PaneLeaf {
             title_prompt,
             inspector_badge,
         ));
+        stack.state(&session).anyview()
+        });
         // `right-click-action`: only `context-menu` attaches the framework
         // modifier — an attached modifier registers a menu target that
         // claims every secondary click (debug builds also mount the
         // inspect item even over an empty item list), so copy / paste /
         // ignore must carry no target at all and let the scene's own
         // Secondary arm handle the button.
-        if with_menu {
-            stack.context_menu(menu).state(&session).anyview()
-        } else {
-            stack.state(&session).anyview()
-        }
-        });
-        let otherwise_assemble = assemble.clone();
-        when(menu_enabled, move || assemble(true))
-            .otherwise(move || otherwise_assemble(false))
+        let assemble_menu = assemble.clone();
+        let menu_items = menu.clone();
+        when(menu_enabled, move || {
+            assemble_menu()
+                .context_menu(menu_items.clone())
+                .state(&session_state)
+        })
+        .otherwise(move || assemble())
     }
 }
 

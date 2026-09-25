@@ -254,6 +254,8 @@ pub struct TermSurface {
     /// `font-family-bold` / `-italic` / `-bold-italic` last applied —
     /// re-resolved inside `sync_fonts` only when one changes.
     style_prefs: (Option<String>, Option<String>, Option<String>),
+    font_style_pref: Option<String>,
+    codepoint_map_pref: Vec<(u32, u32, String)>,
 
     // geometry (grid size in cells, logical units at draw time)
     cols: u16,
@@ -346,13 +348,19 @@ impl TermSurface {
                 c.font_family_bold_italic.clone(),
             )
         });
+        let font_style_pref = app.config(|c| c.font_style.clone());
+        let codepoint_map_pref = app.config(|c| c.font_codepoint_map.clone());
         let mut fonts = TermFonts::load(fonts, font_size, &family_pref);
         fonts.set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
+        fonts.set_font_style(&font_style_pref);
+        fonts.set_codepoint_map(&codepoint_map_pref);
         Self {
             session,
             app,
             fonts,
             style_prefs,
+            font_style_pref,
+            codepoint_map_pref,
             palette,
             font_size_pt: font_size,
             family_pref,
@@ -620,10 +628,14 @@ impl TermSurface {
 
     /// Open the link under `point`: an OSC8 hyperlink first, then a
     /// plain-text URL scanned off the row (like xterm/kitty Ctrl+click).
+    /// `link-url = false` gates only the detected-URL scan.
     fn open_link_at(&self, point: Point) -> bool {
         let term = self.session.terminal.term.lock();
         let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
         let uri = uri.or_else(|| {
+            if !self.app.config(|c| c.link_url) {
+                return None;
+            }
             // Scan the logical line (soft wraps joined) so a link that
             // wraps across rows still resolves; the click's char index
             // is the mark of the cell under it.
@@ -1224,6 +1236,16 @@ impl TermSurface {
                 .set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
             self.style_prefs = style_prefs;
         }
+        let font_style_pref = self.app.config(|c| c.font_style.clone());
+        if font_style_pref != self.font_style_pref {
+            self.fonts.set_font_style(&font_style_pref);
+            self.font_style_pref = font_style_pref;
+        }
+        let codepoint_map_pref = self.app.config(|c| c.font_codepoint_map.clone());
+        if codepoint_map_pref != self.codepoint_map_pref {
+            self.fonts.set_codepoint_map(&codepoint_map_pref);
+            self.codepoint_map_pref = codepoint_map_pref;
+        }
         let want = self.session.font_size.snapshot();
         if (want - self.font_size_pt).abs() > f32::EPSILON {
             self.font_size_pt = want;
@@ -1800,6 +1822,11 @@ impl TermSurface {
                 Vec::new()
             };
         }
+        // `link-url = false` disables detected URLs; OSC8 hyperlinks
+        // (explicit markup) still resolve above, like Ghostty.
+        if !self.app.config(|c| c.link_url) {
+            return Vec::new();
+        }
         let lm = logical_line_at(grid, point.line.0);
         let cols = grid.columns();
         let offset = grid.display_offset() as i32;
@@ -1985,6 +2012,9 @@ impl TermSurface {
     /// Numbered spans are collected at activation time; any further input
     /// or scroll clears the mode (the grid may have moved).
     fn url_hints(&mut self) {
+        if !self.app.config(|c| c.link_url) {
+            return;
+        }
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
         let (cols, history, lines) = (grid.columns(), grid.history_size(), grid.screen_lines());
@@ -2427,6 +2457,13 @@ impl TermSurface {
             hint_digits: &hint_digits,
             pad_x: self.pad_x,
             pad_y: self.pad_y,
+            font_synthetic_bold: self
+                .app
+                .config(|c| c.font_synthetic.unwrap_or((true, true)).0),
+            font_synthetic_italic: self
+                .app
+                .config(|c| c.font_synthetic.unwrap_or((true, true)).1),
+            bell_color: self.app.config(|c| c.visual_bell_color),
             font_thicken: self.app.config(|c| c.font_thicken),
             bold_color: self.app.config(|c| c.bold_color),
             faint_opacity: self.app.config(|c| c.faint_opacity),

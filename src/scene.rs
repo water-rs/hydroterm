@@ -110,6 +110,12 @@ pub struct DrawContext<'a> {
     /// the leftover space when `window-padding-balance` centers the grid.
     pub pad_x: f32,
     pub pad_y: f32,
+    /// `font-synthetic` — allow fontique embolden / oblique synthesis
+    /// (default both); `font-thicken` stays independent.
+    pub font_synthetic_bold: bool,
+    pub font_synthetic_italic: bool,
+    /// `visual-bell-color` — bell flash overlay; `None` = foreground.
+    pub bell_color: Option<Rgb>,
     /// `font-thicken` — every glyph run is emboldened (Ghostty
     /// `font-thicken`).
     pub font_thicken: bool,
@@ -538,7 +544,10 @@ pub fn draw_term(
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(ctx.palette.foreground, ctx.bell_flash)),
+            &Brush::Solid(peniko_alpha(
+                ctx.bell_color.unwrap_or(ctx.palette.foreground),
+                ctx.bell_flash,
+            )),
             None,
             &rect(0.0, 0.0, ctx.width, ctx.height),
         );
@@ -618,7 +627,9 @@ fn draw_text_run(
 
             let synthesis = crate::fonts::RunStyle::from(run.synthesis());
             let mut transform = Affine::translate((0.0, baseline_y as f64));
-            if let Some(deg) = synthesis.skew {
+            if ctx.font_synthetic_italic
+                && let Some(deg) = synthesis.skew
+            {
                 transform *= Affine::skew(f64::from(-deg).to_radians(), 0.0);
             }
             let out = GlyphRun {
@@ -636,7 +647,7 @@ fn draw_text_run(
             // Faux bold: redraw with a half-cell-fraction offset, like the
             // offset emboldening native text stacks apply. `font-thicken`
             // applies the same overdraw to every run.
-            if synthesis.embolden || ctx.font_thicken {
+            if (synthesis.embolden && ctx.font_synthetic_bold) || ctx.font_thicken {
                 let bold_run = GlyphRun {
                     transform: Affine::translate((0.6, baseline_y as f64)),
                     ..out

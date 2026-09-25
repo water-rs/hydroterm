@@ -87,6 +87,11 @@ pub struct TermFonts {
     baseline_adjust: crate::config::CellAdjust,
     /// `font-feature` entries applied to every shaped run.
     features: Vec<FontFeature>,
+    /// `font-codepoint-map` — chars inside a range shape with this
+    /// family instead of the run's family; first match wins.
+    codepoint_map: Vec<(std::ops::RangeInclusive<u32>, FontFamily<'static>)>,
+    /// `font-style` — the plain run's default weight and style.
+    font_style: (FontWeight, FontStyle),
     pub metrics: CellMetrics,
 }
 
@@ -163,10 +168,64 @@ impl TermFonts {
             cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
             baseline_adjust: crate::config::CellAdjust::None,
             features: Vec::new(),
+            codepoint_map: Vec::new(),
+            font_style: (FontWeight::new(400.0), FontStyle::Normal),
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
         fonts
+    }
+
+    /// Set `font-codepoint-map` — each entry's family resolved like
+    /// `font-family`; an uninstalled name drops that entry. Re-measure
+    /// since a mapped face can advance differently.
+    pub fn set_codepoint_map(&mut self, entries: &[(u32, u32, String)]) {
+        self.collection.use_fonts(|fonts| {
+            self.codepoint_map = entries
+                .iter()
+                .filter_map(|(lo, hi, fam)| {
+                    resolve_family_name(fonts, fam).map(|name| {
+                        (
+                            *lo..=*hi,
+                            FontFamily::List(std::borrow::Cow::Owned(vec![
+                                name,
+                                FontFamilyName::Generic(GenericFamily::Emoji),
+                            ])),
+                        )
+                    })
+                })
+                .collect();
+        });
+        self.metrics = self.probe_metrics();
+    }
+
+    /// Set `font-style` — parse the named style (`Italic`, `Bold`,
+    /// `Bold Italic`, `Light`, `Medium`, `SemiBold`) into the plain
+    /// run's default weight and style.
+    pub fn set_font_style(&mut self, style: &Option<String>) {
+        let lower = style.as_deref().map(str::to_ascii_lowercase);
+        let s = lower.as_deref().unwrap_or("");
+        let weight = if s.contains("bold") {
+            700.0
+        } else if s.contains("light") {
+            300.0
+        } else if s.contains("semibold") || s.contains("semi-bold") {
+            600.0
+        } else if s.contains("medium") {
+            500.0
+        } else {
+            400.0
+        };
+        let italic = s.contains("italic") || s.contains("oblique");
+        self.font_style = (
+            FontWeight::new(weight),
+            if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+        );
+        self.metrics = self.probe_metrics();
     }
 
     /// Set the per-style family overrides (Ghostty `font-family-bold`
@@ -269,18 +328,56 @@ impl TermFonts {
             builder.push_default(StyleProperty::Brush([255, 255, 255, 255]));
             builder.push_default(StyleProperty::FontSize(size));
             builder.push_default(StyleProperty::FontFamily(family));
-            builder.push_default(StyleProperty::FontWeight(FontWeight::new(
-                if bold { 700.0 } else { 400.0 },
-            )));
-            builder.push_default(StyleProperty::FontStyle(if italic {
-                FontStyle::Italic
+            // `font-style` supplies the regular run's own weight/style;
+            // SGR bold/italic keeps its fixed mapping.
+            let (weight, style) = if bold || italic {
+                (
+                    FontWeight::new(if bold { 700.0 } else { 400.0 }),
+                    if italic {
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    },
+                )
             } else {
-                FontStyle::Normal
-            }));
+                self.font_style
+            };
+            builder.push_default(StyleProperty::FontWeight(weight));
+            builder.push_default(StyleProperty::FontStyle(style));
             if !self.features.is_empty() {
                 builder.push_default(StyleProperty::FontFeatures(
                     FontFeatures::List(std::borrow::Cow::Owned(self.features.clone())),
                 ));
+            }
+            if !self.codepoint_map.is_empty() {
+                // Group consecutive chars that resolve to the same map
+                // entry (or none) into one range each — first match wins.
+                let mut run_start = 0usize;
+                let mut run_map: Option<usize> = None;
+                for (bi, ch) in text.char_indices() {
+                    let idx = self
+                        .codepoint_map
+                        .iter()
+                        .position(|(r, _)| r.contains(&(ch as u32)));
+                    if idx != run_map {
+                        if let Some(mi) = run_map {
+                            builder.push(
+                                StyleProperty::FontFamily(
+                                    self.codepoint_map[mi].1.clone(),
+                                ),
+                                run_start..bi,
+                            );
+                        }
+                        run_map = idx;
+                        run_start = bi;
+                    }
+                }
+                if let Some(mi) = run_map {
+                    builder.push(
+                        StyleProperty::FontFamily(self.codepoint_map[mi].1.clone()),
+                        run_start..text.len(),
+                    );
+                }
             }
             let mut layout = builder.build(text);
             layout.break_all_lines(None);

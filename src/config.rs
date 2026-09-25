@@ -128,6 +128,17 @@ pub struct AppConfig {
     pub font_family_bold: Option<String>,
     pub font_family_italic: Option<String>,
     pub font_family_bold_italic: Option<String>,
+    /// Named style of the primary family applied to regular text
+    /// (Ghostty `font-style` — e.g. `Italic`, `Bold Italic`, `Light`).
+    pub font_style: Option<String>,
+    /// Allow fontique's synthesis for missing faces (Ghostty
+    /// `font-synthetic`): `(embolden, oblique)`; `None` = both allowed
+    /// (default). Each `font-synthetic = bold|italic|bold-italic` line
+    /// ORs into the allow set; any line starts the set empty.
+    pub font_synthetic: Option<(bool, bool)>,
+    /// Per-codepoint family overrides (Ghostty `font-codepoint-map`):
+    /// `U+AAAA[-U+BBBB]=Family Name` repeated; first match wins.
+    pub font_codepoint_map: Vec<(u32, u32, String)>,
     /// `font-thicken` — overdraw every glyph run to darken strokes
     /// (Ghostty `font-thicken`, default false).
     pub font_thicken: bool,
@@ -254,6 +265,10 @@ pub struct AppConfig {
     /// `None` = let the window manager choose. Applied once at launch.
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
+    /// `link-url` — detect plain-text URLs on screen: Ctrl+hover
+    /// underline + click-to-open + URL hints (Ghostty `link-url`,
+    /// default true). `= false` disables all three paths.
+    pub link_url: bool,
     /// Modifier that must be held for click-to-open-link (Ghostty
     /// `open-link-modifier`-style); default Control.
     pub open_link_modifier: LinkMod,
@@ -372,6 +387,9 @@ pub struct AppConfig {
     /// `visual-bell` — flash the pane surface on BEL (default true).
     /// `audible-bell` rings the X11 keyboard bell; both independent.
     pub visual_bell: bool,
+    /// `visual-bell-color` — the bell flash overlay color (Ghostty);
+    /// `None` = the theme foreground.
+    pub visual_bell_color: Option<Rgb>,
     /// `open-link-with` — program run to open links. `{}` in an argument
     /// is replaced by the URL; otherwise the URL is appended as the
     /// last argument. Unset → `xdg-open`.
@@ -408,6 +426,9 @@ impl Default for AppConfig {
             font_family_bold: None,
             font_family_italic: None,
             font_family_bold_italic: None,
+            font_style: None,
+            font_synthetic: None,
+            font_codepoint_map: Vec::new(),
             font_thicken: false,
             scrollback: 10_000,
             theme: ThemeRef::Named("hydroterm-dark".into()),
@@ -492,8 +513,10 @@ impl Default for AppConfig {
             inherit_font_size: true,
             scroll_to_cursor: true,
             tab_bar_min_tabs: 1,
+            link_url: true,
             word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
             visual_bell: true,
+            visual_bell_color: None,
             open_link_with: None,
         }
     }
@@ -578,6 +601,9 @@ confirm-close = true       # ask before closing a running program
 # adjust-cell-height = 2px
 # adjust-font-baseline = 0px   # +Npx raises the text baseline; N% or Npx
 # font-feature = -calt         # OpenType toggle: -tag off, +tag/tag/tag=N on
+# font-style = Italic        # named style of font-family for regular text
+# font-synthetic = bold      # allow embolden synthesis; repeat for italic
+# font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono  # per-codepoint family
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
@@ -673,6 +699,34 @@ impl AppConfig {
                     cfg.font_family_bold_italic = Some(value.to_string());
                 }
                 "font-thicken" => cfg.font_thicken = bool_value(value, n, &mut errors),
+                "font-style" | "font_style" => cfg.font_style = Some(value.to_string()),
+                "font-synthetic" | "font_synthetic" => {
+                    let (b, i) = cfg.font_synthetic.get_or_insert((false, false));
+                    for tok in value.split('|').map(|t| t.trim().to_ascii_lowercase()) {
+                        match tok.as_str() {
+                            "bold" => *b = true,
+                            "italic" | "oblique" => *i = true,
+                            "bold-italic" | "bolditalic" => {
+                                *b = true;
+                                *i = true;
+                            }
+                            "" => {}
+                            _ => errors.push(format!(
+                                "line {}: bad font-synthetic token {tok:?}",
+                                n + 1
+                            )),
+                        }
+                    }
+                }
+                "font-codepoint-map" | "font_codepoint_map" => {
+                    match parse_codepoint_map(value) {
+                        Some((lo, hi, fam)) => cfg.font_codepoint_map.push((lo, hi, fam)),
+                        None => errors.push(format!(
+                            "line {}: bad font-codepoint-map {value:?} (want U+AAAA[-U+BBBB]=Family)",
+                            n + 1
+                        )),
+                    }
+                }
                 "middle-click-paste" | "middle_click_paste" => {
                     cfg.middle_click_paste = bool_value(value, n, &mut errors);
                 }
@@ -970,6 +1024,9 @@ impl AppConfig {
                     Ok(v) if (-2000.0..=8000.0).contains(&v) => cfg.window_y = Some(v),
                     _ => errors.push(format!("line {}: bad window-y {value:?}", n + 1)),
                 },
+                "link-url" | "link_url" => {
+                    cfg.link_url = bool_value(value, n, &mut errors);
+                }
                 "open-link-modifier" | "open_link_modifier" => {
                     match value.parse::<LinkMod>() {
                         Ok(m) => cfg.open_link_modifier = m,
@@ -1191,6 +1248,13 @@ impl AppConfig {
                 "visual-bell" | "visual_bell" => {
                     cfg.visual_bell = bool_value(value, n, &mut errors);
                 }
+                "visual-bell-color" | "visual_bell_color" => match parse_rgb(value) {
+                    Some(rgb) => cfg.visual_bell_color = Some(rgb),
+                    None => errors.push(format!(
+                        "line {}: bad visual-bell-color {value:?}",
+                        n + 1
+                    )),
+                },
                 "open-link-with" | "open_link_with" => {
                     cfg.open_link_with = (!value.is_empty()).then(|| value.to_string());
                 }
@@ -1326,6 +1390,25 @@ fn expand_home(value: &str) -> PathBuf {
 
 /// `#rgb` / `#rrggbb` / `0xrrggbb` → a terminal RGB. No names,
 /// no alpha — those live in the theme, not the override keys.
+/// Parse `U+AAAA[-U+BBBB]=Family Name` (Ghostty `font-codepoint-map`).
+fn parse_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
+    let (range, family) = value.split_once('=')?;
+    let family = family.trim();
+    if family.is_empty() {
+        return None;
+    }
+    let hex = |s: &str| -> Option<u32> {
+        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
+    };
+    let mut parts = range.splitn(2, '-');
+    let lo = hex(parts.next()?)?;
+    let hi = match parts.next() {
+        Some(h) => hex(h)?,
+        None => lo,
+    };
+    (hi >= lo).then(|| (lo, hi, family.to_string()))
+}
+
 fn parse_rgb(value: &str) -> Option<Rgb> {
     let hex = value
         .strip_prefix('#')
@@ -2202,5 +2285,40 @@ mod tests {
         assert!((cfg.minimum_contrast - 4.5).abs() < f32::EPSILON);
         let (_, errs) = AppConfig::parse("minimum-contrast = 0.5");
         assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn font_synthetic_tokens_or_into_allow_set() {
+        // Each line ORs tokens into the allow-set; an empty value
+        // (or a line with no known tokens) allows nothing.
+        let (cfg, errs) =
+            AppConfig::parse("font-synthetic = bold\nfont-synthetic = italic|bold\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.font_synthetic, Some((true, true)));
+        let (cfg, errs) = AppConfig::parse("font-synthetic = \n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.font_synthetic, Some((false, false)));
+        let (_, errs) = AppConfig::parse("font-synthetic = wobbly");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn codepoint_map_parses_ranges() {
+        let (cfg, errs) = AppConfig::parse(
+            "font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono\n\
+             font-codepoint-map = U+1F600=Noto Color Emoji\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.font_codepoint_map,
+            vec![
+                (0x2500, 0x257F, "DejaVu Sans Mono".to_string()),
+                (0x1F600, 0x1F600, "Noto Color Emoji".to_string()),
+            ]
+        );
+        for bad in ["font-codepoint-map = U+ZZZZ=X", "font-codepoint-map = U+2-U+1=X"] {
+            let (_, errs) = AppConfig::parse(bad);
+            assert_eq!(errs.len(), 1, "{bad}");
+        }
     }
 }
