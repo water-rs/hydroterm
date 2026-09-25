@@ -653,6 +653,61 @@ impl TermSurface {
     }
 
     /// Apply a chord action (copy/paste/tabs/font/search).
+    /// `keybind = all:` — apply the per-surface part of the action to
+    /// every session (Ghostty: an `all:` bind fires on all surfaces).
+    /// Session-model actions apply to each session; anything else runs
+    /// once through `do_action`.
+    fn do_action_all(&mut self, action: TermAction) {
+        match action {
+            TermAction::FontBigger | TermAction::FontSmaller | TermAction::FontReset => {
+                for s in self.app.all_sessions().iter() {
+                    let cur = s.font_size.snapshot();
+                    let next = match action {
+                        TermAction::FontBigger => (cur + 1.0).min(96.0),
+                        TermAction::FontSmaller => (cur - 1.0).max(6.0),
+                        _ => FONT_SIZE,
+                    };
+                    s.font_size.set(next);
+                }
+            }
+            TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
+                let delta = if matches!(action, TermAction::DecreaseFontSize(_)) {
+                    -pts as f32
+                } else {
+                    pts as f32
+                };
+                for s in self.app.all_sessions().iter() {
+                    let cur = s.font_size.snapshot();
+                    s.font_size.set((cur + delta).clamp(6.0, 96.0));
+                }
+            }
+            TermAction::ClearScrollback => {
+                for s in self.app.all_sessions().iter() {
+                    let mut term = s.terminal.term.lock();
+                    term.grid_mut().clear_history();
+                    term.scroll_display(Scroll::Bottom);
+                }
+            }
+            TermAction::ClearScreen => {
+                for s in self.app.all_sessions().iter() {
+                    let mut term = s.terminal.term.lock();
+                    let mut p: Processor = Processor::new();
+                    p.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
+                    term.scroll_display(Scroll::Bottom);
+                }
+            }
+            TermAction::Reset => {
+                for s in self.app.all_sessions().iter() {
+                    let mut term = s.terminal.term.lock();
+                    let mut p: Processor = Processor::new();
+                    p.advance(&mut *term, b"\x1bc");
+                    term.scroll_display(Scroll::Bottom);
+                }
+            }
+            _ => self.do_action(action),
+        }
+    }
+
     fn do_action(&mut self, action: TermAction) {
         match action {
             TermAction::Copy => self.copy_selection(),
@@ -1228,11 +1283,15 @@ impl TermSurface {
             // unbound keypress reaches the shell as its raw escape.
             let mut unbound = false;
             match self.app.config(|c| c.lookup_keybind(key, mods)) {
-                Some(Some(action)) => {
-                    self.do_action(action);
+                Some((all, Some(action))) => {
+                    if all {
+                        self.do_action_all(action);
+                    } else {
+                        self.do_action(action);
+                    }
                     return true;
                 }
-                Some(None) => unbound = true, // explicitly disabled
+                Some((_, None)) => unbound = true, // explicitly disabled
                 None => {}
             }
             if !unbound
@@ -2162,6 +2221,21 @@ impl TermSurface {
             hover_link: &self.hover_link,
             bg_image,
             unfocused_fill: self.app.config(|c| c.unfocused_split_fill),
+            cursor_thickness: self
+                .app
+                .config(|c| if c.adjust_cursor_thickness == 0 { 1.0 } else { c.adjust_cursor_thickness as f32 / 100.0 }),
+            underline_adjust: self.app.config(|c| {
+                (
+                    c.adjust_underline_position as f32,
+                    if c.adjust_underline_thickness == 0 { 1.0 } else { c.adjust_underline_thickness as f32 / 100.0 },
+                )
+            }),
+            strikethrough_adjust: self.app.config(|c| {
+                (
+                    c.adjust_strikethrough_position as f32,
+                    if c.adjust_strikethrough_thickness == 0 { 1.0 } else { c.adjust_strikethrough_thickness as f32 / 100.0 },
+                )
+            }),
         };
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
@@ -2439,8 +2513,11 @@ impl SceneContent for TermSurface {
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
         let bottom = grid.screen_lines() as i32 - 1;
+        // A minimal pane (1 row) must not walk scrollback rows that do not
+        // exist — `bounds_to_string` indexes storage directly.
+        let start = bottom.saturating_sub(5).max(-(grid.history_size() as i32));
         Some(term.bounds_to_string(
-            Point::new(Line(bottom.saturating_sub(5)), Column(0)),
+            Point::new(Line(start), Column(0)),
             Point::new(Line(bottom), grid.last_column()),
         ))
     }

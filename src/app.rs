@@ -576,9 +576,17 @@ impl AppState {
             tab_bar_forced: Binding::default(),
             last_tab_id: Rc::new(std::cell::Cell::new(0)),
             focus_owner: Binding::default(),
-            window_title: binding(Str::from(
-                watcher.config.title.clone().unwrap_or_else(|| "hydroterm".into()),
-            )),
+            window_title: binding({
+                let base = watcher
+                    .config
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "hydroterm".into());
+                match &watcher.config.window_subtitle {
+                    Some(s) => Str::from(format!("{base} — {s}")),
+                    None => Str::from(base.to_string()),
+                }
+            }),
             window_state: binding(WindowState::Normal),
             window_frame: Rc::new(RefCell::new(None)),
             cfg: Rc::new(RefCell::new(watcher)),
@@ -966,6 +974,12 @@ impl AppState {
             .cloned()
     }
 
+    /// Every live session — `keybind = all:` applies a per-surface
+    /// action to each one.
+    pub fn all_sessions(&self) -> Vec<Rc<Session>> {
+        self.sessions.borrow().iter().cloned().collect()
+    }
+
     fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -1123,6 +1137,15 @@ impl AppState {
         }
     }
 
+    /// `window-subtitle` — the fixed subtitle appended to the window
+    /// title (`base — subtitle`); empty config leaves the title alone.
+    pub fn title_with_subtitle(&self, base: &str) -> Str {
+        match &self.cfg.borrow().config.window_subtitle {
+            Some(s) => Str::from(format!("{base} — {s}")),
+            None => Str::from(base.to_string()),
+        }
+    }
+
     /// Update a session's title; mirrors onto its tab and the window
     /// title when the session is focused in the selected tab.
     pub fn set_session_title(&self, session_id: u64, title: Str) {
@@ -1136,7 +1159,7 @@ impl AppState {
             {
                 tab.title.set(title.clone());
                 if self.selected.snapshot() == tab_id {
-                    self.window_title.set(title);
+                    self.window_title.set(self.title_with_subtitle(&title));
                 }
             }
     }

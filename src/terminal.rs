@@ -29,7 +29,11 @@ type OutputSpan = Option<(i64, Option<i64>)>;
 use alacritty_terminal::grid::{Grid, GridCell};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::vte::ansi::{self, Rgb};
+use alacritty_terminal::vte::ansi::{
+    self, Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Hyperlink,
+    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys,
+    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+};
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::osctap::{OscScanner, ShellRedraw, TapEvent};
@@ -311,7 +315,6 @@ impl Terminal {
         let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
         let marks = Marks {
             sem: SemKind::Output,
-            top: 0,
             prompt_marks: prompt_marks.clone(),
             last_output: last_output.clone(),
             redraw: shell_redraw.clone(),
@@ -741,14 +744,11 @@ enum SemKind {
     Input,
 }
 
-/// Reader-side semantic state: which kind the cursor writes, the top row of
-/// the current prompt/input span, and the shared recorders the rest of the
-/// app reads (`prompt_marks`, `last_output`, `redraw`).
+/// Reader-side semantic state: which kind the cursor writes plus the
+/// shared recorders the rest of the app reads (`prompt_marks`,
+/// `last_output`, `redraw`).
 struct Marks {
     sem: SemKind,
-    /// Screen row the current prompt/input span began at — re-anchored at
-    /// each `133;A` and lowered if the cursor ever backs above it.
-    top: i32,
     prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
     last_output: Arc<Mutex<OutputSpan>>,
     redraw: Arc<Mutex<ShellRedraw>>,
@@ -765,7 +765,6 @@ impl Marks {
         match ev {
             TapEvent::PromptStart => {
                 self.sem = SemKind::Prompt;
-                self.top = term.grid().cursor.point.line.0;
                 let mut marks = self.prompt_marks.lock().unwrap();
                 if marks.last() != Some(&abs) {
                     marks.push(abs);
@@ -794,26 +793,352 @@ impl Marks {
         let _ = self.sink.send(TermEvent::Tap(ev.clone()));
     }
 
-    /// Tag the rows the cursor occupies after a parser advance while the
-    /// semantic state is prompt or input — the write-time counterpart of
-    /// the reference's per-row `semantic_prompt` kind. Cell writes/erases
-    /// drop the flag, so a stale tag dies with its text; the alternate
-    /// screen is skipped since its rows never join reflow.
-    fn tag<T: EventListener>(&mut self, term: &mut Term<T>) {
-        if !matches!(self.sem, SemKind::Prompt | SemKind::Input)
-            || term.mode().contains(TermMode::ALT_SCREEN)
+}
+
+/// `Handler` wrapper that stamps [`PROMPT_MARK`] on the cells each `input`
+/// write touches, while the semantic state is prompt or input — the
+/// reference terminal's model: the row kind is set by the write itself, so
+/// scrolling can't displace it. `input` is the only `Handler` method that
+/// writes printable cells; everything else forwards to `Term` unchanged.
+struct MarkingTerm<'a, T: EventListener> {
+    term: &'a mut Term<T>,
+    marks: &'a mut Marks,
+}
+
+impl<T: EventListener> ansi::Handler for MarkingTerm<'_, T> {
+    fn input(&mut self, c: char) {
+        let before = self.term.grid().cursor.point;
+        self.term.input(c);
+        if !matches!(self.marks.sem, SemKind::Prompt | SemKind::Input)
+            || self.term.mode().contains(TermMode::ALT_SCREEN)
         {
             return;
         }
-        let cur = term.grid().cursor.point.line.0;
-        self.top = self.top.min(cur);
-        let cols = term.grid().columns();
-        for l in self.top..=cur {
-            for c in 0..cols {
-                term.grid_mut()[Line(l)][Column(c)].flags.insert(PROMPT_MARK);
+        let after = self.term.grid().cursor.point;
+        if after.line.0 > before.line.0 {
+            // The write wrapped to the next row — it touched the head of
+            // `after.line` only (a pending-wrap `before` cell was stamped
+            // by its own input call).
+            for col in 0..after.column.0 {
+                self.term.grid_mut()[after.line][Column(col)]
+                    .flags
+                    .insert(PROMPT_MARK);
             }
+        } else if after.column.0 > before.column.0 {
+            for col in before.column.0..after.column.0 {
+                self.term.grid_mut()[before.line][Column(col)]
+                    .flags
+                    .insert(PROMPT_MARK);
+            }
+        } else if after.column.0 < before.column.0 {
+            // Wrap + scroll at the bottom margin: the cursor stayed on the
+            // last screen row but the write landed at its head.
+            for col in 0..after.column.0 {
+                self.term.grid_mut()[after.line][Column(col)]
+                    .flags
+                    .insert(PROMPT_MARK);
+            }
+        } else {
+            // Autoprint at the last column: the cell was written and the
+            // cursor stays pending-wrap on it.
+            self.term.grid_mut()[before.line][before.column]
+                .flags
+                .insert(PROMPT_MARK);
         }
     }
+
+    #[inline]
+    fn set_title(&mut self, a0: Option<String>) {
+        self.term.set_title(a0);
+    }
+    #[inline]
+    fn set_cursor_style(&mut self, a0: Option<CursorStyle>) {
+        self.term.set_cursor_style(a0);
+    }
+    #[inline]
+    fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.term.set_cursor_shape(shape);
+    }
+    #[inline]
+    fn goto(&mut self, line: i32, col: usize) {
+        self.term.goto(line, col);
+    }
+    #[inline]
+    fn goto_line(&mut self, line: i32) {
+        self.term.goto_line(line);
+    }
+    #[inline]
+    fn goto_col(&mut self, col: usize) {
+        self.term.goto_col(col);
+    }
+    #[inline]
+    fn insert_blank(&mut self, a0: usize) {
+        self.term.insert_blank(a0);
+    }
+    #[inline]
+    fn move_up(&mut self, a0: usize) {
+        self.term.move_up(a0);
+    }
+    #[inline]
+    fn move_down(&mut self, a0: usize) {
+        self.term.move_down(a0);
+    }
+    #[inline]
+    fn identify_terminal(&mut self, intermediate: Option<char>) {
+        self.term.identify_terminal(intermediate);
+    }
+    #[inline]
+    fn device_status(&mut self, a0: usize) {
+        self.term.device_status(a0);
+    }
+    #[inline]
+    fn move_forward(&mut self, col: usize) {
+        self.term.move_forward(col);
+    }
+    #[inline]
+    fn move_backward(&mut self, col: usize) {
+        self.term.move_backward(col);
+    }
+    #[inline]
+    fn move_down_and_cr(&mut self, row: usize) {
+        self.term.move_down_and_cr(row);
+    }
+    #[inline]
+    fn move_up_and_cr(&mut self, row: usize) {
+        self.term.move_up_and_cr(row);
+    }
+    #[inline]
+    fn put_tab(&mut self, count: u16) {
+        self.term.put_tab(count);
+    }
+    #[inline]
+    fn backspace(&mut self) {
+        self.term.backspace();
+    }
+    #[inline]
+    fn carriage_return(&mut self) {
+        self.term.carriage_return();
+    }
+    #[inline]
+    fn linefeed(&mut self) {
+        self.term.linefeed();
+    }
+    #[inline]
+    fn bell(&mut self) {
+        self.term.bell();
+    }
+    #[inline]
+    fn substitute(&mut self) {
+        self.term.substitute();
+    }
+    #[inline]
+    fn newline(&mut self) {
+        self.term.newline();
+    }
+    #[inline]
+    fn set_horizontal_tabstop(&mut self) {
+        self.term.set_horizontal_tabstop();
+    }
+    #[inline]
+    fn scroll_up(&mut self, a0: usize) {
+        self.term.scroll_up(a0);
+    }
+    #[inline]
+    fn scroll_down(&mut self, a0: usize) {
+        self.term.scroll_down(a0);
+    }
+    #[inline]
+    fn insert_blank_lines(&mut self, a0: usize) {
+        self.term.insert_blank_lines(a0);
+    }
+    #[inline]
+    fn delete_lines(&mut self, a0: usize) {
+        self.term.delete_lines(a0);
+    }
+    #[inline]
+    fn erase_chars(&mut self, a0: usize) {
+        self.term.erase_chars(a0);
+    }
+    #[inline]
+    fn delete_chars(&mut self, a0: usize) {
+        self.term.delete_chars(a0);
+    }
+    #[inline]
+    fn move_backward_tabs(&mut self, count: u16) {
+        self.term.move_backward_tabs(count);
+    }
+    #[inline]
+    fn move_forward_tabs(&mut self, count: u16) {
+        self.term.move_forward_tabs(count);
+    }
+    #[inline]
+    fn save_cursor_position(&mut self) {
+        self.term.save_cursor_position();
+    }
+    #[inline]
+    fn restore_cursor_position(&mut self) {
+        self.term.restore_cursor_position();
+    }
+    #[inline]
+    fn clear_line(&mut self, mode: LineClearMode) {
+        self.term.clear_line(mode);
+    }
+    #[inline]
+    fn clear_screen(&mut self, mode: ClearMode) {
+        self.term.clear_screen(mode);
+    }
+    #[inline]
+    fn clear_tabs(&mut self, mode: TabulationClearMode) {
+        self.term.clear_tabs(mode);
+    }
+    #[inline]
+    fn set_tabs(&mut self, interval: u16) {
+        self.term.set_tabs(interval);
+    }
+    #[inline]
+    fn reset_state(&mut self) {
+        self.term.reset_state();
+    }
+    #[inline]
+    fn reverse_index(&mut self) {
+        self.term.reverse_index();
+    }
+    #[inline]
+    fn terminal_attribute(&mut self, attr: Attr) {
+        self.term.terminal_attribute(attr);
+    }
+    #[inline]
+    fn set_mode(&mut self, mode: Mode) {
+        self.term.set_mode(mode);
+    }
+    #[inline]
+    fn unset_mode(&mut self, mode: Mode) {
+        self.term.unset_mode(mode);
+    }
+    #[inline]
+    fn report_mode(&mut self, mode: Mode) {
+        self.term.report_mode(mode);
+    }
+    #[inline]
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        self.term.set_private_mode(mode);
+    }
+    #[inline]
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        self.term.unset_private_mode(mode);
+    }
+    #[inline]
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        self.term.report_private_mode(mode);
+    }
+    #[inline]
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        self.term.set_scrolling_region(top, bottom);
+    }
+    #[inline]
+    fn set_keypad_application_mode(&mut self) {
+        self.term.set_keypad_application_mode();
+    }
+    #[inline]
+    fn unset_keypad_application_mode(&mut self) {
+        self.term.unset_keypad_application_mode();
+    }
+    #[inline]
+    fn set_active_charset(&mut self, a0: CharsetIndex) {
+        self.term.set_active_charset(a0);
+    }
+    #[inline]
+    fn configure_charset(&mut self, a0: CharsetIndex, a1: StandardCharset) {
+        self.term.configure_charset(a0, a1);
+    }
+    #[inline]
+    fn set_color(&mut self, a0: usize, a1: Rgb) {
+        self.term.set_color(a0, a1);
+    }
+    #[inline]
+    fn dynamic_color_sequence(&mut self, a0: String, a1: usize, a2: &str) {
+        self.term.dynamic_color_sequence(a0, a1, a2);
+    }
+    #[inline]
+    fn reset_color(&mut self, a0: usize) {
+        self.term.reset_color(a0);
+    }
+    #[inline]
+    fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
+        self.term.clipboard_store(a0, a1);
+    }
+    #[inline]
+    fn clipboard_load(&mut self, a0: u8, a1: &str) {
+        self.term.clipboard_load(a0, a1);
+    }
+    #[inline]
+    fn decaln(&mut self) {
+        self.term.decaln();
+    }
+    #[inline]
+    fn push_title(&mut self) {
+        self.term.push_title();
+    }
+    #[inline]
+    fn pop_title(&mut self) {
+        self.term.pop_title();
+    }
+    #[inline]
+    fn text_area_size_pixels(&mut self) {
+        self.term.text_area_size_pixels();
+    }
+    #[inline]
+    fn text_area_size_chars(&mut self) {
+        self.term.text_area_size_chars();
+    }
+    #[inline]
+    fn set_hyperlink(&mut self, a0: Option<Hyperlink>) {
+        self.term.set_hyperlink(a0);
+    }
+    #[inline]
+    fn set_mouse_cursor_icon(&mut self, a0: ansi::cursor_icon::CursorIcon) {
+        self.term.set_mouse_cursor_icon(a0);
+    }
+    #[inline]
+    fn report_keyboard_mode(&mut self) {
+        self.term.report_keyboard_mode();
+    }
+    #[inline]
+    fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
+        self.term.push_keyboard_mode(mode);
+    }
+    #[inline]
+    fn pop_keyboard_modes(&mut self, to_pop: u16) {
+        self.term.pop_keyboard_modes(to_pop);
+    }
+    #[inline]
+    fn set_keyboard_mode(&mut self, mode: KeyboardModes, behavior: KeyboardModesApplyBehavior) {
+        self.term.set_keyboard_mode(mode, behavior);
+    }
+    #[inline]
+    fn set_modify_other_keys(&mut self, mode: ModifyOtherKeys) {
+        self.term.set_modify_other_keys(mode);
+    }
+    #[inline]
+    fn report_modify_other_keys(&mut self) {
+        self.term.report_modify_other_keys();
+    }
+    #[inline]
+    fn set_scp(&mut self, char_path: ScpCharPath, update_mode: ScpUpdateMode) {
+        self.term.set_scp(char_path, update_mode);
+    }
+}
+
+/// Advance the parser with prompt/input tagging — the single call site the
+/// I/O loop and tests share.
+fn advance_tagged<T: EventListener>(
+    parser: &mut ansi::Processor,
+    marks: &mut Marks,
+    term: &mut Term<T>,
+    bytes: &[u8],
+) {
+    let mut handler = MarkingTerm { term, marks };
+    parser.advance(&mut handler, bytes);
 }
 
 /// Channel endpoint handed to `Terminal` — mirrors the crate's
@@ -1017,11 +1342,10 @@ impl IoLoop {
                 if n == 0 && events.is_empty() {
                     break;
                 }
-                parser.advance(&mut **term, &seg[..n]);
+                advance_tagged(parser, &mut self.marks, &mut *term, &seg[..n]);
                 for ev in &events {
                     self.marks.dispatch(&mut *term, ev);
                 }
-                self.marks.tag(&mut *term);
                 processed += n;
                 if processed >= MAX_LOCKED_READ {
                     break 'fill;
@@ -1384,7 +1708,6 @@ mod tests {
         let (sink, _rx) = mpsc::channel();
         let mut marks = Marks {
             sem: SemKind::Output,
-            top: 0,
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
@@ -1402,21 +1725,82 @@ mod tests {
             if n == 0 && events.is_empty() {
                 break;
             }
-            parser.advance(&mut term, &seg[..n]);
+            advance_tagged(&mut parser, &mut marks, &mut term, &seg[..n]);
             for ev in &events {
                 marks.dispatch(&mut term, ev);
             }
-            marks.tag(&mut term);
         }
 
-        for c in 0..80 {
-            let col = Column(c);
-            assert!(!term.grid()[Line(0)][col].flags.contains(PROMPT_MARK));
-            assert!(term.grid()[Line(1)][col].flags.contains(PROMPT_MARK));
-            assert!(!term.grid()[Line(2)][col].flags.contains(PROMPT_MARK));
+        let row_marked = |term: &Term<VoidListener>, l: i32| {
+            (0..80).any(|c| term.grid()[Line(l)][Column(c)].flags.contains(PROMPT_MARK))
+        };
+        // Exactly the cells the prompt write touched carry the mark.
+        for c in 0..5 {
+            assert!(term.grid()[Line(1)][Column(c)].flags.contains(PROMPT_MARK));
         }
+        assert!(!term.grid()[Line(1)][Column(5)].flags.contains(PROMPT_MARK));
+        assert!(!row_marked(&term, 0), "output row must stay untagged");
+        assert!(row_marked(&term, 1), "prompt row must be tagged");
+        assert!(!row_marked(&term, 2), "row below must stay untagged");
         // The mark row recorded at A is the prompt row, not the stale cursor.
         assert_eq!(marks.prompt_marks.lock().unwrap().as_slice(), &[1]);
+    }
+
+    /// Prompt on the bottom row, input wraps and scrolls the screen: the
+    /// marks are set by the writes themselves, so the scrolled-up prompt
+    /// row and the new input row — and only those — stay tagged.
+    #[test]
+    fn prompt_mark_scroll_wrap() {
+        use crate::osctap::OscScanner;
+
+        let mut term = Term::new(Config::default(), &Sz(4, 8), VoidListener);
+        let (sink, _rx) = mpsc::channel();
+        let mut marks = Marks {
+            sem: SemKind::Output,
+            prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_output: Arc::new(Mutex::new(None)),
+            redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            sink,
+        };
+        let mut scanner = OscScanner::new();
+        let mut parser: Processor = Processor::new();
+        let mut seg = [0u8; 65536];
+
+        let feed = |scanner: &mut OscScanner,
+                    parser: &mut Processor,
+                    marks: &mut Marks,
+                    term: &mut Term<VoidListener>,
+                    seg: &mut [u8],
+                    bytes: &[u8]| {
+            scanner.feed(bytes);
+            while scanner.has_pending() {
+                let (n, events) = scanner.take(seg);
+                if n == 0 && events.is_empty() {
+                    break;
+                }
+                advance_tagged(parser, marks, term, &seg[..n]);
+                for ev in &events {
+                    marks.dispatch(term, ev);
+                }
+            }
+        };
+
+        // Fill the screen so the prompt lands on the last row.
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"o1\r\no2\r\no3\r\n");
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"\x1b]133;A\x07P$ \x1b]133;B\x07");
+        assert_eq!(term.grid().cursor.point.line.0, 3);
+        // Input wraps past the last column → the screen scrolls.
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"abcdef");
+
+        // After the scroll: row 2 holds the prompt text, row 3 the wrapped
+        // input tail — only those rows may carry a mark.
+        let row_marked = |term: &Term<VoidListener>, l: i32| {
+            (0..8).any(|c| term.grid()[Line(l)][Column(c)].flags.contains(PROMPT_MARK))
+        };
+        assert!(!row_marked(&term, 0), "scrolled output row must stay untagged");
+        assert!(!row_marked(&term, 1), "scrolled output row must stay untagged");
+        assert!(row_marked(&term, 2), "prompt row must be tagged");
+        assert!(row_marked(&term, 3), "input row must be tagged");
     }
 
     // -- grapheme fixup -----------------------------------------------------

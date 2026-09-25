@@ -228,6 +228,22 @@ pub struct AppConfig {
     /// accept `N%` (of the measured cell) or `Npx` (absolute points).
     pub cell_width_adjust: CellAdjust,
     pub cell_height_adjust: CellAdjust,
+    /// Cursor thickness multiplier for beam/underline shapes, percent
+    /// (Ghostty `adjust-cursor-thickness`); 0 = the framework default.
+    pub adjust_cursor_thickness: u16,
+    /// Underline offset in points from the font's own position and a
+    /// thickness multiplier percent (Ghostty `adjust-underline-position`
+    /// / `adjust-underline-thickness`); 0 keeps the font values.
+    pub adjust_underline_position: i16,
+    pub adjust_underline_thickness: u16,
+    /// Strikethrough offset/thickness, same shape as the underline pair
+    /// (Ghostty `adjust-strikethrough-position` / `-thickness`).
+    pub adjust_strikethrough_position: i16,
+    pub adjust_strikethrough_thickness: u16,
+    /// `window-subtitle` — fixed text appended to the window title after
+    /// a separator; the OSC-driven part still leads (Ghostty
+    /// `window-subtitle`).
+    pub window_subtitle: Option<String>,
     /// `adjust-font-baseline`: shifts the text baseline, measured as the
     /// distance from the cell bottom (`Npx` or `N%` of that distance).
     /// Positive values move the baseline up (Ghostty semantics).
@@ -373,6 +389,12 @@ impl Default for AppConfig {
             env: Vec::new(),
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
+            adjust_cursor_thickness: 0,
+            adjust_underline_position: 0,
+            adjust_underline_thickness: 0,
+            adjust_strikethrough_position: 0,
+            adjust_strikethrough_thickness: 0,
+            window_subtitle: None,
             font_baseline_adjust: CellAdjust::None,
             font_features: Vec::new(),
             minimum_contrast: 1.0,
@@ -497,15 +519,17 @@ impl AppConfig {
         }
     }
 
-    /// Find a configured binding for this key press. `Some(Some)` = bound
-    /// action, `Some(None)` = explicitly disabled, `None` = no entry.
-    pub fn lookup_keybind(&self, key: &Key, mods: Modifiers) -> Option<Option<TermAction>> {
+    /// Find a configured binding for this key press. `Some((all, action))`:
+    /// `all` marks a `keybind = all:` entry (apply to every surface), the
+    /// `None` action is an explicit `unbind`, `None` overall = no entry.
+    pub fn lookup_keybind(&self, key: &Key, mods: Modifiers) -> Option<(bool, Option<TermAction>)> {
         let chord = chord_of(key, mods)?;
+        let all_chord = format!("all:{chord}");
         self.keybinds
             .iter()
             .rev() // last wins
-            .find(|(c, _)| *c == chord)
-            .map(|(_, a)| a.clone())
+            .find(|(c, _)| *c == chord || *c == all_chord)
+            .map(|(c, a)| (c.starts_with("all:"), a.clone()))
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -916,6 +940,54 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "adjust-cursor-thickness" | "cursor-thickness" => {
+                    match value.parse::<u16>() {
+                        Ok(p) => cfg.adjust_cursor_thickness = p,
+                        Err(_) => errors.push(format!(
+                            "line {}: bad adjust-cursor-thickness {value:?} (want percent)",
+                            n + 1
+                        )),
+                    }
+                }
+                "adjust-underline-position" => match value.parse::<i16>() {
+                    Ok(p) => cfg.adjust_underline_position = p,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad adjust-underline-position {value:?} (want points)",
+                        n + 1
+                    )),
+                },
+                "adjust-underline-thickness" => match value.parse::<u16>() {
+                    Ok(p) => cfg.adjust_underline_thickness = p,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad adjust-underline-thickness {value:?} (want percent)",
+                        n + 1
+                    )),
+                },
+                "adjust-strikethrough-position" | "adjust-strikeout-position" => {
+                    match value.parse::<i16>() {
+                        Ok(p) => cfg.adjust_strikethrough_position = p,
+                        Err(_) => errors.push(format!(
+                            "line {}: bad adjust-strikethrough-position {value:?} (want points)",
+                            n + 1
+                        )),
+                    }
+                }
+                "adjust-strikethrough-thickness" | "adjust-strikeout-thickness" => {
+                    match value.parse::<u16>() {
+                        Ok(p) => cfg.adjust_strikethrough_thickness = p,
+                        Err(_) => errors.push(format!(
+                            "line {}: bad adjust-strikethrough-thickness {value:?} (want percent)",
+                            n + 1
+                        )),
+                    }
+                }
+                "window-subtitle" => {
+                    if value.is_empty() {
+                        cfg.window_subtitle = None;
+                    } else {
+                        cfg.window_subtitle = Some(value.to_string());
+                    }
+                }
                 "font-feature" | "font_feature" => {
                     for spec in value.split(',') {
                         let spec = spec.trim();
@@ -1097,12 +1169,15 @@ fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
     // (Ghostty `keybind = global:chord=action`). Kept inside `keybinds`
     // with a `global:` tag; `lookup_keybind` never produces it.
     let raw = chord.trim();
-    let chord = match raw
-        .to_ascii_lowercase()
-        .strip_prefix("global:")
-    {
-        Some(rest) => format!("global:{}", normalize_chord(rest)?),
-        None => normalize_chord(raw)?,
+    let lower = raw.to_ascii_lowercase();
+    let chord = if let Some(rest) = lower.strip_prefix("global:") {
+        format!("global:{}", normalize_chord(rest)?)
+    } else if let Some(rest) = lower.strip_prefix("all:") {
+        // `all:` — the bind applies its action to every surface
+        // (Ghostty `keybind = all:chord=action`).
+        format!("all:{}", normalize_chord(rest)?)
+    } else {
+        normalize_chord(raw)?
     };
     let action = action.trim().to_ascii_lowercase();
     let action = match action.as_str() {
@@ -1552,15 +1627,36 @@ mod tests {
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("c".into()), ctrl_shift),
-            Some(None)
+            Some((false, None))
         );
         assert_eq!(
             cfg.lookup_keybind(&Key::Named(NamedKey::F4), Modifiers::ALT),
-            Some(Some(TermAction::Quit))
+            Some((false, Some(TermAction::Quit)))
         );
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("v".into()), ctrl_shift),
             None
+        );
+    }
+
+    #[test]
+    fn keybind_all_scope_marks_the_hit() {
+        let (cfg, errs) =
+            AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10\nkeybind = ctrl+alt+g=quit");
+        assert!(errs.is_empty(), "{errs:?}");
+        let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
+        // `all:` and the plain bind are distinct entries; last wins — the
+        // plain chord shadows the all: bind on the same modifiers.
+        assert_eq!(
+            cfg.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
+            Some((false, Some(TermAction::Quit)))
+        );
+        let (cfg2, errs2) =
+            AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
+        assert!(errs2.is_empty(), "{errs2:?}");
+        assert_eq!(
+            cfg2.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
+            Some((true, Some(TermAction::IncreaseFontSize(10))))
         );
     }
 

@@ -94,6 +94,15 @@ pub struct DrawContext<'a> {
     /// `unfocused-split-fill` — replaces the pane's default background
     /// while it is unfocused (cells with explicit backgrounds keep them).
     pub unfocused_fill: Option<Rgb>,
+    /// Cursor thickness multiplier (Ghostty `adjust-cursor-thickness`);
+    /// 1.0 = the default beam/underline size.
+    pub cursor_thickness: f32,
+    /// Points added to the font's underline offset and a stroke
+    /// multiplier (Ghostty `adjust-underline-position` / `-thickness`).
+    pub underline_adjust: (f32, f32),
+    /// Same pair for strikethrough (Ghostty
+    /// `adjust-strikethrough-position` / `-thickness`).
+    pub strikethrough_adjust: (f32, f32),
 }
 
 // ---------------------------------------------------------------------------
@@ -637,8 +646,8 @@ fn draw_decorations(
     let w = (end - start) as f32 * cw;
     let brush = Brush::Solid(peniko(style.ul_color.unwrap_or(style.fg)));
 
-    let stroke_w = m.stroke as f64;
-    let underline_y = baseline_y as f64 + m.underline_pos as f64;
+    let stroke_w = (m.stroke * ctx.underline_adjust.1).max(1.0) as f64;
+    let underline_y = baseline_y as f64 + m.underline_pos as f64 + ctx.underline_adjust.0 as f64;
 
     if style.deco & DECO_UNDERLINE != 0 {
         let mut p = BezPath::new();
@@ -689,11 +698,12 @@ fn draw_decorations(
         );
     }
     if style.deco & DECO_STRIKE != 0 {
-        let y = baseline_y as f64 - m.strikeout_pos as f64;
+        let y = baseline_y as f64 - m.strikeout_pos as f64 - ctx.strikethrough_adjust.0 as f64;
+        let w_stroke = (m.stroke * ctx.strikethrough_adjust.1).max(1.0) as f64;
         let mut p = BezPath::new();
         p.move_to((x as f64, y));
         p.line_to(((x + w) as f64, y));
-        scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, &brush, None, &p);
+        scene.stroke(&Stroke::new(w_stroke), Affine::IDENTITY, &brush, None, &p);
     }
 }
 
@@ -734,18 +744,20 @@ fn draw_cursor(
         }
         CursorShape::Underline => {
             if ctx.blink_on || !cursor.blinking {
+                let t = (3.0 * ctx.cursor_thickness).max(1.0);
                 scene.fill(
                     Fill::NonZero,
                     Affine::IDENTITY,
                     &brush,
                     None,
-                    &rect(x, y + ch - 3.0, cw, 3.0),
+                    &rect(x, y + ch - t, cw, t),
                 );
             }
         }
         CursorShape::Beam => {
             if ctx.blink_on || !cursor.blinking {
-                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect(x, y, 2.0, ch));
+                let t = (2.0 * ctx.cursor_thickness).max(1.0);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect(x, y, t, ch));
             }
         }
         CursorShape::HollowBlock => {
