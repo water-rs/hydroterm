@@ -612,12 +612,22 @@ pub enum TermAction {
     /// `$VISUAL`/`$EDITOR` inside a new tab (kitty/WezTerm style).
     OpenScrollbackEditor,
     /// `write_screen_file` / `write_scrollback_file` /
-    /// `write_selection_file` (Ghostty actions): dump the visible
-    /// viewport / full scrollback+screen / current selection to a temp
-    /// file and open it in `$VISUAL`/`$EDITOR` in a new tab.
+    /// `write_selection_file` / `write_last_output_file` (Ghostty
+    /// actions): dump the visible viewport / full scrollback+screen /
+    /// current selection / last command output to a temp file and open it
+    /// in `$VISUAL`/`$EDITOR` in a new tab.
     WriteScreenFile,
     WriteScrollbackFile,
     WriteSelectionFile,
+    WriteLastOutputFile,
+    /// Ghostty `open_config` — open the live config file in
+    /// `$VISUAL`/`$EDITOR` in a new tab.
+    OpenConfig,
+    /// Ghostty `scroll_to_selection` — scroll the viewport so the
+    /// selection's start is the top row.
+    ScrollToSelection,
+    /// Ghostty `clear_selection` — drop the current selection.
+    ClearSelection,
     /// Step the search match cursor forward / back.
     SearchNext,
     SearchPrev,

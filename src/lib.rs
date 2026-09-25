@@ -30,6 +30,8 @@ mod theme;
 mod xcursor;
 
 use waterui::app::App;
+use waterui::theme::Theme;
+use waterui::Plugin;
 use waterui::prelude::*;
 use waterui::window::Window;
 use waterui::window::WindowState::Fullscreen;
@@ -102,8 +104,18 @@ fn cli_action(name: &str, config_path: Option<&std::path::Path>) -> ! {
 /// binary calls this too; the `water`-generated backend's `main` receives it
 /// through the `{{crate}}::app(env)` contract.
 pub fn app(env: Environment) -> App {
+    let mut env = env;
     let (config_path, command) = cli();
     let state = app::AppState::new(config_path, command);
+    // water-rs/cli#188: the app gives the runtime its color scheme through
+    // the Environment — a `Computed` driven by `window-theme`, so a config
+    // reload flips the chrome scheme without a restart. On hydrolysis pins
+    // that install a default scheme after `app()` this is overwritten
+    // (framework defect, WATERUI_FEEDBACK #46).
+    Plugin::install(
+        Theme::new().color_scheme(state.window_scheme.clone()),
+        &mut env,
+    );
     let title = state.window_title.clone();
     // A background Color below full opacity flips hydrolysis into a
     // transparent winit window; at 1.0 the window stays opaque.
@@ -171,31 +183,12 @@ pub fn app(env: Environment) -> App {
     App::new_with_windows([window], env)
 }
 
-/// The Material 3 style `hydrolysis::run` takes for `config`'s `window-theme`.
-/// The generated backend's `main` fixes `Material3::defaults()` (the `auto`
-/// scheme); `hydroterm`'s own binary asks here so `light`/`dark` pin
-/// statically. The style object is per-run: a `window-theme` change applies
-/// at the next launch, not via hot reload.
-#[must_use]
-pub fn material_style(config: &config::AppConfig) -> hydrolysis_m3::Material3 {
-    match config.window_theme {
-        config::WindowTheme::Auto => hydrolysis_m3::Material3::defaults(),
-        config::WindowTheme::Light => {
-            hydrolysis_m3::Material3::with_colors(
-                hydrolysis_m3::MaterialColorScheme::baseline_light(),
-            )
-        }
-        config::WindowTheme::Dark => hydrolysis_m3::Material3::dark(),
-    }
-}
-
-/// The `hydroterm` binary's entry: parse the CLI, style by `window-theme`,
-/// run on hydrolysis. The `water`-generated backend takes `app(env)` and
-/// its own `Material3::defaults()` instead.
+/// The `hydroterm` binary's entry: identical to the generated backend's
+/// `main` — `app(env)` carries the `window-theme` scheme in the
+/// environment; the style is `Material3::defaults()` on both paths.
 pub fn run() {
-    let (config_path, _) = cli();
-    let path = config_path.unwrap_or_else(config::default_path);
-    let (config, _) = config::AppConfig::load(&path);
-    let style = material_style(&config);
-    hydrolysis::run(app(Environment::new()), style);
+    hydrolysis::run(
+        app(Environment::new()),
+        hydrolysis_m3::Material3::defaults(),
+    );
 }

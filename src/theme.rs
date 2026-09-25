@@ -1,6 +1,7 @@
 //! Named color themes — ANSI 16 + foreground/background/cursor/selection.
 
 use alacritty_terminal::vte::ansi::Rgb;
+use waterui::theme::ColorScheme;
 
 /// One complete color scheme.
 pub struct Theme {
@@ -9,9 +10,6 @@ pub struct Theme {
     pub cursor: Rgb,
     /// Dim foreground used when no dim override exists.
     pub dim_foreground: Rgb,
-    pub selection_bg: Rgb,
-    /// `None` keeps the cell's own fg under selection.
-    pub selection_fg: Option<Rgb>,
     /// Badge/chip background (URL hints, toasts) — the accent slot.
     pub accent: Rgb,
     /// Text drawn on `accent` — chosen for contrast against it.
@@ -51,8 +49,6 @@ impl Theme {
             background: rgb(0x1d, 0x1f, 0x21),
             cursor: rgb(0xc5, 0xc8, 0xc6),
             dim_foreground: rgb(0x62, 0x64, 0x63),
-            selection_bg: rgb(0x37, 0x3b, 0x41),
-            selection_fg: None,
             accent: rgb(0x81, 0xa2, 0xbe),
             accent_fg: rgb(0x1d, 0x1f, 0x21),
             ansi: [
@@ -83,8 +79,6 @@ impl Theme {
             background: rgb(0xff, 0xff, 0xff),
             cursor: rgb(0x4d, 0x4d, 0x4c),
             dim_foreground: rgb(0x8e, 0x90, 0x8c),
-            selection_bg: rgb(0xd6, 0xd6, 0xd6),
-            selection_fg: None,
             accent: rgb(0x42, 0x71, 0xae),
             accent_fg: rgb(0xff, 0xff, 0xff),
             ansi: [
@@ -115,8 +109,6 @@ impl Theme {
             background: rgb(0x00, 0x2b, 0x36),
             cursor: rgb(0x83, 0x94, 0x96),
             dim_foreground: rgb(0x58, 0x6e, 0x75),
-            selection_bg: rgb(0x07, 0x36, 0x42),
-            selection_fg: Some(rgb(0x93, 0xa1, 0xa1)),
             accent: rgb(0x26, 0x8b, 0xd2),
             accent_fg: rgb(0xfd, 0xf6, 0xe3),
             ansi: [
@@ -147,8 +139,6 @@ impl Theme {
             background: rgb(0xfd, 0xf6, 0xe3),
             cursor: rgb(0x65, 0x7b, 0x83),
             dim_foreground: rgb(0x93, 0xa1, 0xa1),
-            selection_bg: rgb(0xee, 0xe8, 0xd5),
-            selection_fg: Some(rgb(0x58, 0x6e, 0x75)),
             accent: rgb(0x26, 0x8b, 0xd2),
             accent_fg: rgb(0xfd, 0xf6, 0xe3),
             ansi: [
@@ -192,6 +182,25 @@ pub fn system_prefers_light() -> bool {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("prefer-light"))
         .unwrap_or(false)
+}
+
+/// `window-theme` → the WaterUI color scheme installed into the environment
+/// as `Theme::color_scheme` (water-rs/cli#188). `auto` resolves the desktop
+/// preference at call time, so a config reload re-reads it.
+pub fn scheme_for(
+    window_theme: &crate::config::WindowTheme,
+) -> ColorScheme {
+    match window_theme {
+        crate::config::WindowTheme::Light => ColorScheme::Light,
+        crate::config::WindowTheme::Dark => ColorScheme::Dark,
+        crate::config::WindowTheme::Auto => {
+            if system_prefers_light() {
+                ColorScheme::Light
+            } else {
+                ColorScheme::Dark
+            }
+        }
+    }
 }
 
 

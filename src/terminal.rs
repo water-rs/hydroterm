@@ -408,6 +408,7 @@ impl Terminal {
             }
             // Cell-flag marks were stamped at write time on the reader
             // thread, so reflow carries them with the rows they belong to.
+            let pre_prompt_text = cursor_row_text(&term);
             term.resize(TermSize { cols: cols as usize, lines: lines as usize });
             if std::env::var_os("HYDRO_SNIFF").is_some() {
                 let g = term.grid();
@@ -423,6 +424,7 @@ impl Terminal {
                 &mut term,
                 &self.last_output,
                 *self.shell_redraw.lock().unwrap(),
+                pre_prompt_text,
             );
         }
         let _ = self.io.lock().unwrap().send(Msg::Resize(WindowSize {
@@ -453,7 +455,9 @@ pub(crate) fn row_has_mark(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
 ///
 /// * `redraw` (`133;A;redraw=`) says how much the shell repaints:
 ///   `False` clears nothing; `Last` (bash) clears only the cursor's row —
-///   blanking other prompt lines would erase text bash never rewrites;
+///   and only when the reflow changed what that row shows, since bash's
+///   WINCH repaint is deferred to the next input event (clearing an
+///   undisturbed row would blank the live prompt until a keypress);
 ///   `True` (the default) clears from the prompt's first row to the page
 ///   end.
 /// * A `C` mark awaiting its `D` means a command is still running — the
@@ -473,6 +477,7 @@ fn clear_prompt_for_redraw<T: EventListener>(
     term: &mut Term<T>,
     output: &Mutex<OutputSpan>,
     redraw: ShellRedraw,
+    pre_prompt_text: String,
 ) {
     if redraw == ShellRedraw::False {
         return;
@@ -509,8 +514,16 @@ fn clear_prompt_for_redraw<T: EventListener>(
     match redraw {
         ShellRedraw::False => unreachable!(),
         // `redraw=last`: only the cursor's row may be cleared — other
-        // prompt lines are live text the shell never rewrites.
-        ShellRedraw::Last => clear_rows(term, cursor, cursor + 1),
+        // prompt lines are live text the shell never rewrites. And the
+        // cursor row only when the reflow displaced its content: bash
+        // redraws the last prompt line on SIGWINCH but deferred to the
+        // next input event, so clearing an undisturbed row blanks the
+        // live prompt until a keypress — an empty tab reads as dead.
+        ShellRedraw::Last => {
+            if cursor_row_text(term) != pre_prompt_text {
+                clear_rows(term, cursor, cursor + 1);
+            }
+        }
         ShellRedraw::True => {
             // The region ends at the cursor's row; nothing tagged above
             // an unmarked cursor row is this prompt's.
@@ -526,6 +539,18 @@ fn clear_prompt_for_redraw<T: EventListener>(
             clear_rows(term, start, end);
         }
     }
+}
+
+/// The cursor row's trimmed text — the line `redraw=last` shells redraw
+/// on WINCH, used to tell an undisturbed prompt from a displaced one.
+fn cursor_row_text<T: EventListener>(term: &Term<T>) -> String {
+    let grid = term.grid();
+    let line = grid.cursor.point.line;
+    let mut s = String::new();
+    for col in 0..grid.columns() {
+        s.push(grid[line][Column(col)].c);
+    }
+    s.trim_end().to_owned()
 }
 
 /// The user's `$SHELL` plus args/env that inject shell integration where
@@ -1962,13 +1987,14 @@ mod tests {
         assert_eq!(text_of(&term, 2), "bash-5.3#");
 
         // The split halves the pane: 44 -> 20 columns.
+        let pre = cursor_row_text(&term);
         term.resize(TermSize { cols: 20, lines: 15 });
         let hs = term.grid().history_size() as i32;
         eprintln!("history_size post-resize = {hs}");
         for l in (-hs)..0 {
             eprintln!("  scroll {l}: {:?}", text_of(&term, l));
         }
-        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last);
+        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
 
         let mut rows = Vec::new();
         let hs = term.grid().history_size() as i32;
@@ -1987,6 +2013,81 @@ mod tests {
             "input head lost:\n{dump}"
         );
         assert!(dump.contains("ONE111"), "output lost:\n{dump}");
+    }
+
+    /// `redraw=last` clear is gated on displacement: bash's WINCH repaint
+    /// is deferred to the next input event, so blanking a prompt row the
+    /// reflow left identical would hide the live prompt until a keypress
+    /// (an empty tab reads dead). The clear must still fire when reflow
+    /// did displace the row's content.
+    #[test]
+    fn resize_last_redraw_gate_on_displacement() {
+        use crate::osctap::OscScanner;
+
+        let mut term = Term::new(Config::default(), &Sz(15, 44), VoidListener);
+        let (sink, _rx) = mpsc::channel();
+        let mut marks = Marks {
+            sem: SemKind::Output,
+            prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_output: Arc::new(Mutex::new(None)),
+            redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            command_started_at: Arc::new(Mutex::new(None)),
+            sink,
+        };
+        let mut scanner = OscScanner::new();
+        let mut parser: Processor = Processor::new();
+        let mut seg = [0u8; 65536];
+        let feed = |scanner: &mut OscScanner,
+                    parser: &mut Processor,
+                    marks: &mut Marks,
+                    term: &mut Term<VoidListener>,
+                    seg: &mut [u8],
+                    bytes: &[u8]| {
+            scanner.feed(bytes);
+            while scanner.has_pending() {
+                let (n, events) = scanner.take(seg);
+                if n == 0 && events.is_empty() {
+                    break;
+                }
+                advance_tagged(parser, marks, term, &seg[..n]);
+                for ev in &events {
+                    marks.dispatch(term, ev);
+                }
+            }
+        };
+        let text_of = |term: &Term<VoidListener>, l: i32| -> String {
+            let grid = term.grid();
+            (0..grid.columns())
+                .map(|c| {
+                    let cell = &grid[Line(l)][Column(c)];
+                    if cell.c == ' ' || cell.c == '\0' { ' ' } else { cell.c }
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // Short prompt at the bottom: shrink leaves its row identical —
+        // the clear must NOT fire (bash would not repaint until a key).
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
+            b"o1\r\no2\r\no3\r\no4\r\no5\r\no6\r\no7\r\no8\r\no9\r\no10\r\no11\r\no12\r\no13\r\no14\r\n");
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
+            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07");
+        assert_eq!(text_of(&term, 14), "bash-5.3#");
+        let pre = cursor_row_text(&term);
+        term.resize(TermSize { cols: 20, lines: 15 });
+        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
+        assert_eq!(text_of(&term, 14), "bash-5.3#", "undisturbed prompt must survive");
+
+        // Input long enough to wrap at the new width: shrink displaces
+        // the cursor row's content — the clear fires (bash repaints the
+        // last line on its next input event).
+        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
+            b"abcdefghijklmnopqrstuvwxyzabcdef");
+        let pre = cursor_row_text(&term);
+        term.resize(TermSize { cols: 16, lines: 15 });
+        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
+        assert_eq!(text_of(&term, 14), "", "displaced prompt row must be cleared");
     }
 
     // -- grapheme fixup -----------------------------------------------------

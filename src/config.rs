@@ -259,6 +259,10 @@ pub struct AppConfig {
     /// `cursor-invert-fg-bg` — the block cursor swaps the cell's
     /// fg/bg so the glyph under it stays readable (Ghostty default on).
     pub cursor_invert_fg_bg: bool,
+    /// `cursor-click-to-move` — a click on the cursor's row emits
+    /// left/right arrow sequences repositioning the input cursor
+    /// (Ghostty `cursor-click-to-move`, default off).
+    pub cursor_click_to_move: bool,
     /// Blank space around the cell grid in points (Ghostty
     /// `window-padding-x` / `window-padding-y`); live-reloaded.
     pub window_padding_x: f32,
@@ -519,6 +523,7 @@ impl Default for AppConfig {
             notify_on_command_finish_after: 5.0,
             clipboard_read: ClipboardRead::Ask,
             cursor_invert_fg_bg: true,
+            cursor_click_to_move: false,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
             window_padding_balance: false,
@@ -970,6 +975,9 @@ impl AppConfig {
                 }
                 "cursor-invert-fg-bg" | "cursor_invert_fg_bg" => {
                     cfg.cursor_invert_fg_bg = bool_value(value, n, &mut errors);
+                }
+                "cursor-click-to-move" | "cursor_click_to_move" => {
+                    cfg.cursor_click_to_move = bool_value(value, n, &mut errors);
                 }
                 "bold-is-bright" | "bold_is_bright"
                 | "draw-bold-text-with-bright-colors" => match value {
@@ -1603,6 +1611,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "scroll_line_up", "scroll_line_down",
     "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
     "write_screen_file", "write_scrollback_file", "write_selection_file",
+    "write_last_output_file", "open_config", "scroll_to_selection", "clear_selection",
     "text:\"…\"", "csi:\"…\"", "esc:\"…\"",
     "scroll_to_fraction:<0-1>", "scroll_to_row:<n>",
     "paste_from_clipboard", "paste_from_selection", "prompt_title", "inspector",
@@ -1852,6 +1861,10 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "write_screen_file" => TermAction::WriteScreenFile,
         "write_scrollback_file" => TermAction::WriteScrollbackFile,
         "write_selection_file" => TermAction::WriteSelectionFile,
+        "write_last_output_file" => TermAction::WriteLastOutputFile,
+        "open_config" => TermAction::OpenConfig,
+        "scroll_to_selection" => TermAction::ScrollToSelection,
+        "clear_selection" => TermAction::ClearSelection,
         _ if name.strip_prefix("select_tab_").is_some() => {
             let n: usize = name["select_tab_".len()..].parse().ok()?;
             TermAction::SelectTab(n)
@@ -2321,6 +2334,29 @@ mod tests {
             let (_, errs) = AppConfig::parse(legacy);
             assert_eq!(errs.len(), 1, "{legacy} rejected: {errs:?}");
         }
+    }
+
+    #[test]
+    fn selection_and_editor_actions() {
+        // r39 rows: scroll_to_selection, clear_selection,
+        // write_last_output_file, open_config — reference action names.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+s=scroll_to_selection\nkeybind = ctrl+alt+c=clear_selection\nkeybind = ctrl+alt+l=write_last_output_file\nkeybind = ctrl+alt+,=open_config",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::ScrollToSelection));
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::ClearSelection));
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::WriteLastOutputFile));
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::OpenConfig));
+    }
+
+    #[test]
+    fn cursor_click_to_move_parse() {
+        let (cfg, errs) = AppConfig::parse("cursor-click-to-move = true");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.cursor_click_to_move);
+        let (d, _) = AppConfig::parse("");
+        assert!(!d.cursor_click_to_move);
     }
 
     #[test]

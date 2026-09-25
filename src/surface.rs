@@ -893,6 +893,26 @@ impl TermSurface {
             TermAction::WriteScreenFile => self.write_screen_file(),
             TermAction::WriteScrollbackFile => self.write_scrollback_file(),
             TermAction::WriteSelectionFile => self.write_selection_file(),
+            TermAction::WriteLastOutputFile => {
+                if let Some(text) = self.last_output_text() {
+                    self.write_buffer_to_editor(text, "last-output");
+                }
+            }
+            TermAction::OpenConfig => self.open_config(),
+            TermAction::ScrollToSelection => {
+                let mut term = self.session.terminal.term.lock();
+                let (history, offset) =
+                    (term.grid().history_size(), term.grid().display_offset());
+                if let Some(range) = term.selection.as_ref().and_then(|s| s.to_range(&term)) {
+                    let delta =
+                        scroll_to_selection_delta(range.start.line.0, history, offset);
+                    term.scroll_display(Scroll::Delta(delta));
+                }
+            }
+            TermAction::ClearSelection => {
+                self.session.terminal.term.lock().selection = None;
+                self.keysel = None;
+            }
             TermAction::SearchNext => self.search_step(1),
             TermAction::SearchPrev => self.search_step(-1),
             TermAction::Quit => self.app.quit(),
@@ -2058,6 +2078,20 @@ impl TermSurface {
             if term.selection.as_ref().is_some_and(|s| s.is_empty()) {
                 // Click without drag (tiny movement) clears the selection.
                 term.selection = None;
+                // `cursor-click-to-move`: a click on the cursor's row
+                // emits left/right arrows so the line editor moves its
+                // input cursor (Ghostty `cursor-click-to-move`).
+                if self.app.config(|c| c.cursor_click_to_move)
+                    && term.grid().display_offset() == 0
+                {
+                    let cur = term.grid().cursor.point;
+                    if row as i64 == i64::from(cur.line.0) && col != cur.column.0 {
+                        let delta = col as i64 - cur.column.0 as i64;
+                        let bytes = cursor_click_seq(delta);
+                        drop(term);
+                        self.write(bytes);
+                    }
+                }
             } else {
                 let mode = self.app.config(|c| c.copy_on_select);
                 if mode != crate::config::CopyOnSelect::Disabled {
@@ -2219,17 +2253,17 @@ impl TermSurface {
         true
     }
 
-    /// Copy the output of the last command — the rows between its
-    /// OSC 133 `C` and `D` marks (`last_output`, reader-thread recorded).
-    fn copy_last_output(&mut self) {
+    /// The text between the last command's OSC 133 `C` and `D` marks
+    /// (`last_output`, reader-thread recorded). A still-running command
+    /// has no `D` — the span runs to the live bottom.
+    fn last_output_text(&mut self) -> Option<String> {
         let span = *self.session.terminal.last_output.lock().unwrap();
-        let Some((start_abs, end_abs)) = span else { return };
+        let (start_abs, end_abs) = span?;
         let mut term = self.session.terminal.term.lock();
         let history = term.grid().history_size() as i64;
-        // A still-running command has no `D` — copy to the live bottom.
         let end_abs = end_abs.unwrap_or(history + term.grid().screen_lines() as i64 - 1);
         if end_abs < start_abs {
-            return;
+            return None;
         }
         let saved = term.selection.take();
         let start = Point::new(
@@ -2245,12 +2279,28 @@ impl TermSurface {
         term.selection = Some(sel);
         let text = term.selection_to_string();
         term.selection = saved;
-        drop(term);
-        if let (Some(text), Some(clip)) = (text, self.clipboard.as_mut())
+        text
+    }
+
+    /// Copy the last command's output to the clipboard.
+    fn copy_last_output(&mut self) {
+        if let (Some(text), Some(clip)) = (self.last_output_text(), self.clipboard.as_mut())
             && !text.is_empty()
         {
             let _ = clip.set_text(&text);
         }
+    }
+
+    /// `open_config` — open the live config file in `$VISUAL`/`$EDITOR`
+    /// in a new tab (Ghostty action).
+    fn open_config(&mut self) {
+        let path = self.app.cfg.borrow().path.clone();
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let mut cmd: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
+        cmd.push(path.to_string_lossy().into_owned());
+        self.app.new_tab_command(cmd);
     }
 
     /// Dump scrollback + screen to a temp file and open `$VISUAL`/`$EDITOR`
@@ -3009,6 +3059,28 @@ fn drop_payload(text: &str) -> String {
     out
 }
 
+/// `scroll_to_selection` — the `Scroll::Delta` that puts the
+/// selection's start line at the top of the viewport: `start.line` is
+/// grid-relative (negative in scrollback) and `display_offset` counts
+/// lines scrolled above the live view, so the target offset is
+/// `-start.line` clamped to the scrollback bounds.
+fn scroll_to_selection_delta(start_line: i32, history: usize, display_offset: usize) -> i32 {
+    let target = i64::from(-start_line).clamp(0, history as i64);
+    (target - display_offset as i64) as i32
+}
+
+/// `cursor-click-to-move` — `delta` = click_col − cursor_col: positive
+/// emits `delta` right-arrow sequences (`CSI C`), negative left (`CSI D`).
+/// Individual arrows so line editors move their input cursor naturally.
+fn cursor_click_seq(delta: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let seq: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+    for _ in 0..delta.abs() {
+        out.extend_from_slice(seq);
+    }
+    out
+}
+
 /// Shell-quote a path so a dropped filename survives as one argument:
 /// alnum and `._/~-` stay bare, anything else wraps in single quotes
 /// with `'`\'' escaping (the POSIX idiom).
@@ -3210,5 +3282,29 @@ mod tests {
         let lm = logical_line_at(grid, 0);
         let query: Vec<char> = "好a".chars().flat_map(char::to_lowercase).collect();
         assert_eq!(line_map_matches(&lm, &query, grid.columns()), vec![vec![(2, 5, 0)]]);
+    }
+
+    /// `scroll_to_selection`: the delta puts the selection start at the
+    /// viewport top — positive scrolls up into scrollback, negative back
+    /// toward live, clamped to the scrollback bounds.
+    #[test]
+    fn scroll_to_selection_delta_math() {
+        // history 100, offset 40: start at grid line -80 → target 80.
+        assert_eq!(scroll_to_selection_delta(-80, 100, 40), 40);
+        // Start inside the screen (line 5) while scrolled → scroll to live.
+        assert_eq!(scroll_to_selection_delta(5, 100, 40), -40);
+        // Start above scrollback top clamps to the top.
+        assert_eq!(scroll_to_selection_delta(-200, 100, 40), 60);
+        // Already at the target → no movement.
+        assert_eq!(scroll_to_selection_delta(-60, 100, 60), 0);
+    }
+
+    /// `cursor-click-to-move`: right clicks emit `\e[C`, left `\e[D`,
+    /// one sequence per column of delta.
+    #[test]
+    fn cursor_click_seq_emits_arrows() {
+        assert_eq!(cursor_click_seq(3), b"\x1b[C\x1b[C\x1b[C".to_vec());
+        assert_eq!(cursor_click_seq(-2), b"\x1b[D\x1b[D".to_vec());
+        assert!(cursor_click_seq(0).is_empty());
     }
 }

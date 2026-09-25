@@ -15,6 +15,7 @@ use nami::collection::{Collection, List as NamiList};
 use nami::zip::zip;
 use nami::{Binding, Signal, binding};
 use waterui::state;
+use waterui::theme::ColorScheme;
 use waterui::Identifiable;
 use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
@@ -517,6 +518,10 @@ pub struct AppState {
     /// back on Moved/Resize) — captured in `main` so the save-state poller
     /// can persist it.
     pub window_frame: Rc<RefCell<Option<Binding<Rect>>>>,
+    /// `window-theme` mapped to the WaterUI color scheme — `hydroterm::app`
+    /// installs this binding as the environment's `Theme::color_scheme`, so
+    /// a config reload switches the chrome scheme live (cli#188 contract).
+    pub window_scheme: Binding<ColorScheme>,
     /// Config file state (parsed values + mtime watch).
     pub cfg: Rc<RefCell<ConfigWatcher>>,
     /// The active palette — swapped wholesale on theme reload.
@@ -606,7 +611,8 @@ impl AppState {
         }
         let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
-        let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto);
+        let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
+            || matches!(watcher.config.window_theme, crate::config::WindowTheme::Auto);
         let quick_binding = Binding::container(WindowState::Closed);
         let state = Self {
             sessions: Rc::new(RefCell::new(Vec::new())),
@@ -631,6 +637,9 @@ impl AppState {
             }),
             window_state: binding(WindowState::Normal),
             window_frame: Rc::new(RefCell::new(None)),
+            window_scheme: Binding::container(crate::theme::scheme_for(
+                &watcher.config.window_theme,
+            )),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
             env: Rc::new(std::cell::OnceCell::new()),
@@ -662,9 +671,10 @@ impl AppState {
         }
         // `-e` applies to the first session only (like xterm/kitty).
         state.cfg.borrow_mut().config.command = None;
-        // `theme = auto`: watch the desktop color-scheme. gsettings
-        // `monitor` prints a line per change; flag dirty + poke every
-        // live surface so `poll_config` re-resolves on its next frame.
+        // `theme = auto` / `window-theme = auto`: watch the desktop
+        // color-scheme. gsettings `monitor` prints a line per change;
+        // flag dirty + poke every live surface so `poll_config`
+        // re-resolves on its next frame.
         #[cfg(target_os = "linux")]
         if theme_is_auto {
             let dirty = state.theme_dirty.clone();
@@ -709,6 +719,10 @@ impl AppState {
         if self.theme_dirty.swap(false, Ordering::Relaxed) {
             let config = &self.cfg.borrow().config;
             *self.palette.borrow_mut() = Palette::for_config(config);
+            if matches!(config.window_theme, crate::config::WindowTheme::Auto) {
+                self.window_scheme
+                    .set(crate::theme::scheme_for(&config.window_theme));
+            }
         }
         let (config, errors) = {
             let mut w = self.cfg.borrow_mut();
@@ -763,6 +777,8 @@ impl AppState {
     fn apply_config(&self, config: &AppConfig) {
         *self.palette.borrow_mut() = Palette::for_config(config);
         self.tab_bar_min.set(config.tab_bar_min_tabs);
+        self.window_scheme
+            .set(crate::theme::scheme_for(&config.window_theme));
         for s in self.sessions.borrow().iter() {
             s.font_size.set(config.font_size);
             s.font_family.set_from(Str::from(config.font_family.clone()));
@@ -2440,6 +2456,10 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile },
     PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile },
     PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile },
+    PaletteItem { name: "Write Last Output to File", chord: "", action: TermAction::WriteLastOutputFile },
+    PaletteItem { name: "Scroll to Selection", chord: "", action: TermAction::ScrollToSelection },
+    PaletteItem { name: "Clear Selection", chord: "", action: TermAction::ClearSelection },
+    PaletteItem { name: "Open Config", chord: "", action: TermAction::OpenConfig },
     PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::FontBigger },
     PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::FontSmaller },
     PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
