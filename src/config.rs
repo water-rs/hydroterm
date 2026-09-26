@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use keyboard_types::{Key, Modifiers, NamedKey};
 
-use crate::keys::{FileSink, TermAction};
+use crate::keys::{AdjustSel, FileSink, TermAction};
 use crate::theme::Theme;
 
 /// Which theme a `theme =` value resolves to.
@@ -401,9 +401,13 @@ pub struct AppConfig {
     /// `title` — initial window/tab title; programs can still override
     /// it via OSC 0/1/2 (Ghostty `title`).
     pub title: Option<String>,
-    /// Snap to the live edge when a key writes bytes to the PTY
-    /// (Ghostty `scroll-on-input`-style; default on).
-    pub scroll_on_input: bool,
+    /// `scroll-to-bottom` items (Ghostty): `keystroke` snaps to the
+    /// live edge when a key writes bytes to the PTY (default on);
+    /// `output` snaps on new program output while scrolled (default
+    /// off — the reference documents the item but has not wired it;
+    /// ours is implemented).
+    pub scroll_bottom_keystroke: bool,
+    pub scroll_bottom_output: bool,
     /// Alpha of the block cursor fill (Ghostty `cursor-opacity`, 0–1).
     pub cursor_opacity: f32,
     /// `env = NAME=VALUE` lines injected into spawned shells' environment.
@@ -470,7 +474,7 @@ pub struct AppConfig {
     /// Snap the viewport to the cursor when an interaction that can move
     /// it lands while scrolled back — paste, IME commit, program-input
     /// keys (Ghostty folds this into input snapping; ours gates the
-    /// non-key-bytes paths; `scroll-on-input` covers key bytes).
+    /// non-key-bytes paths; `scroll-to-bottom = keystroke` covers key bytes).
     pub scroll_to_cursor: bool,
     /// `tab-bar-min-tabs` — hide the tab strip while fewer than this many
     /// tabs exist (Ghostty `window-show-tab-bar = auto` ⇔ 2). Default 1
@@ -593,7 +597,8 @@ impl Default for AppConfig {
             unfocused_split_fill: None,
             title: None,
             cursor_text: None,
-            scroll_on_input: true,
+            scroll_bottom_keystroke: true,
+            scroll_bottom_output: false,
             cursor_opacity: 1.0,
             env: Vec::new(),
             cell_width_adjust: CellAdjust::None,
@@ -728,6 +733,9 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # scroll_to_bottom, quit, new_split:right|down, goto_split:dir
 # keybind = ctrl+alt+a=select_all
 # keybind = global:ctrl+alt+u=toggle_quick_terminal   # X11 root grab — fires anywhere
+# keybind = performable:ctrl+c=copy_to_clipboard      # fires only while copyable;
+#                                                      # falls through to ^C otherwise
+# scroll-to-bottom = keystroke,output   # keystroke on by default; output off
 # tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
 # selection-word-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
 # open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
@@ -761,17 +769,34 @@ impl AppConfig {
         }
     }
 
-    /// Find a configured binding for this key press. `Some((all, action))`:
-    /// `all` marks a `keybind = all:` entry (apply to every surface), the
-    /// `None` action is an explicit `unbind`, `None` overall = no entry.
-    pub fn lookup_keybind(&self, key: &Key, mods: Modifiers) -> Option<(bool, Option<TermAction>)> {
+    /// Find a configured binding for this key press. `Some((flags,
+    /// action))` where flags bit 0 marks a `keybind = all:` entry (apply
+    /// to every surface) and bit 1 a `performable:` entry (fire only
+    /// while the action is performable); the `None` action is an
+    /// explicit `unbind`, `None` overall = no entry.
+    pub fn lookup_keybind(
+        &self,
+        key: &Key,
+        mods: Modifiers,
+    ) -> Option<(bool, bool, Option<TermAction>)> {
         let chord = chord_of(key, mods)?;
-        let all_chord = format!("all:{chord}");
+        let candidates = [
+            format!("performable:{chord}"),
+            format!("performable:all:{chord}"),
+            format!("all:{chord}"),
+            chord,
+        ];
         self.keybinds
             .iter()
             .rev() // last wins
-            .find(|(c, _)| *c == chord || *c == all_chord)
-            .map(|(c, a)| (c.starts_with("all:"), a.clone()))
+            .find(|(c, _)| candidates.iter().any(|k| c == k))
+            .map(|(c, a)| {
+                (
+                    c.contains("all:"),
+                    c.starts_with("performable:"),
+                    a.clone(),
+                )
+            })
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -1343,8 +1368,32 @@ impl AppConfig {
                     "extend-always" => cfg.window_padding_color = WindowPaddingColor::ExtendAlways,
                     _ => errors.push(format!("line {}: bad window-padding-color {value:?}", n + 1)),
                 },
-                "scroll-on-input" => {
-                    cfg.scroll_on_input = bool_value(value, n, &mut errors);
+                // Ghostty `scroll-to-bottom = keystroke,output` — a
+                // comma set with `no-` negations (empty = nothing
+                // scrolls you).
+                "scroll-to-bottom" => {
+                    if value.trim().is_empty() {
+                        cfg.scroll_bottom_keystroke = false;
+                        cfg.scroll_bottom_output = false;
+                    }
+                    for item in value.split(',') {
+                        let item = item.trim();
+                        if item.is_empty() {
+                            continue;
+                        }
+                        let (on, name) = match item.strip_prefix("no-") {
+                            Some(rest) => (false, rest),
+                            None => (true, item),
+                        };
+                        match name {
+                            "keystroke" => cfg.scroll_bottom_keystroke = on,
+                            "output" => cfg.scroll_bottom_output = on,
+                            _ => errors.push(format!(
+                                "line {}: bad scroll-to-bottom item {item:?}",
+                                n + 1
+                            )),
+                        }
+                    }
                 }
                 "cursor-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.cursor_opacity = v,
@@ -1686,7 +1735,9 @@ pub const ACTION_NAMES: &[&str] = &[
     "prompt_surface_title", "prompt_tab_title",
     "set_surface_title:<text>", "set_tab_title:<text>",
     "inspector[:toggle|show|hide]",
-    "quit", "toggle_fullscreen", "palette", "settings",
+    "toggle_mouse_visibility",
+    "adjust_selection:<left|right|up|down|home|end|page_up|page_down|escape>",
+    "quit", "toggle_fullscreen", "toggle_command_palette", "settings",
     "new_split:<right|down|left|up|auto>",
     "goto_split:<left|right|up|down|previous|next|top|bottom>",
     "resize_split:<left|right|up|down>[,px]",
@@ -1717,14 +1768,22 @@ fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
     // with a `global:` tag; `lookup_keybind` never produces it.
     let raw = chord.trim();
     let lower = raw.to_ascii_lowercase();
+    // `performable:` — the bind only fires while its action is performable
+    // (Ghostty `keybind = performable:chord=action`); otherwise the
+    // keypress falls through to normal input as if unbound.
+    let (perf, lower) = match lower.strip_prefix("performable:") {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, lower),
+    };
+    let tag = if perf { "performable:" } else { "" };
     let chord = if let Some(rest) = lower.strip_prefix("global:") {
-        format!("global:{}", normalize_chord(rest)?)
+        format!("{tag}global:{}", normalize_chord(rest)?)
     } else if let Some(rest) = lower.strip_prefix("all:") {
         // `all:` — the bind applies its action to every surface
         // (Ghostty `keybind = all:chord=action`).
-        format!("all:{}", normalize_chord(rest)?)
+        format!("{tag}all:{}", normalize_chord(rest)?)
     } else {
-        normalize_chord(raw)?
+        format!("{tag}{}", normalize_chord(&lower)?)
     };
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
@@ -1927,6 +1986,24 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         "navigate_search:next" => TermAction::NavigateSearch(1),
         "navigate_search:previous" => TermAction::NavigateSearch(-1),
+        "toggle_mouse_visibility" => TermAction::ToggleMouseVisibility,
+        // Ghostty `adjust_selection:left|right|up|down|home|end|
+        // page_up|page_down|escape` — keyboard selection moves.
+        _ if name.starts_with("adjust_selection:") => {
+            let d = &name["adjust_selection:".len()..];
+            TermAction::AdjustSelection(match d {
+                "left" => AdjustSel::Left,
+                "right" => AdjustSel::Right,
+                "up" => AdjustSel::Up,
+                "down" => AdjustSel::Down,
+                "home" => AdjustSel::Home,
+                "end" => AdjustSel::End,
+                "page_up" => AdjustSel::PageUp,
+                "page_down" => AdjustSel::PageDown,
+                "escape" => AdjustSel::Escape,
+                _ => return None,
+            })
+        }
         // Ghostty `jump_to_prompt:N` — scroll N prompt marks (signed).
         _ if name.starts_with("jump_to_prompt:") => {
             let n: i32 = name["jump_to_prompt:".len()..].parse().ok()?;
@@ -1962,7 +2039,7 @@ fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "quit" => TermAction::Quit,
         "equalize_splits" => TermAction::EqualizeSplits,
         "toggle_fullscreen" => TermAction::Fullscreen,
-        "palette" => TermAction::Palette,
+        "toggle_command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
         // Ghostty `write_*_file[:open|copy|paste]` — the suffix names
         // what to do with the written temp file.
@@ -2300,11 +2377,11 @@ mod tests {
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("c".into()), ctrl_shift),
-            Some((false, None))
+            Some((false, false, None))
         );
         assert_eq!(
             cfg.lookup_keybind(&Key::Named(NamedKey::F4), Modifiers::ALT),
-            Some((false, Some(TermAction::Quit)))
+            Some((false, false, Some(TermAction::Quit)))
         );
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("v".into()), ctrl_shift),
@@ -2322,14 +2399,44 @@ mod tests {
         // plain chord shadows the all: bind on the same modifiers.
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
-            Some((false, Some(TermAction::Quit)))
+            Some((false, false, Some(TermAction::Quit)))
         );
         let (cfg2, errs2) =
             AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
         assert!(errs2.is_empty(), "{errs2:?}");
         assert_eq!(
             cfg2.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
-            Some((true, Some(TermAction::IncreaseFontSize(10))))
+            Some((true, false, Some(TermAction::IncreaseFontSize(10))))
+        );
+    }
+
+    #[test]
+    fn performable_prefix_parses_and_marks_the_hit() {
+        // `keybind = performable:chord=action` — Ghostty's modifier that
+        // fires the bind only while the action is performable.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = performable:ctrl+c=copy_to_clipboard\n\
+             keybind = performable:all:ctrl+alt+h=clear_scrollback",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        let ctrl = Modifiers::CONTROL;
+        assert_eq!(
+            cfg.lookup_keybind(&Key::Character("c".into()), ctrl),
+            Some((false, true, Some(TermAction::Copy)))
+        );
+        let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
+        assert_eq!(
+            cfg.lookup_keybind(&Key::Character("h".into()), ctrl_alt),
+            Some((true, true, Some(TermAction::ClearScrollback)))
+        );
+        // A plain bind on the same chord still wins by list order.
+        let (cfg2, errs2) = AppConfig::parse(
+            "keybind = performable:ctrl+c=copy_to_clipboard\nkeybind = ctrl+c=quit",
+        );
+        assert!(errs2.is_empty(), "{errs2:?}");
+        assert_eq!(
+            cfg2.lookup_keybind(&Key::Character("c".into()), ctrl),
+            Some((false, false, Some(TermAction::Quit)))
         );
     }
 
@@ -2488,6 +2595,56 @@ mod tests {
         assert!(cfg.cursor_click_to_move);
         let (d, _) = AppConfig::parse("");
         assert!(!d.cursor_click_to_move);
+    }
+
+    #[test]
+    fn r41_reference_names() {
+        // `adjust_selection:*` full direction set (Ghostty names).
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+arrowleft=adjust_selection:left\n\
+             keybind = ctrl+alt+arrowdown=adjust_selection:down\n\
+             keybind = ctrl+alt+pageup=adjust_selection:page_up\n\
+             keybind = ctrl+alt+escape=adjust_selection:escape",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::AdjustSelection(AdjustSel::Left))
+        );
+        assert_eq!(
+            cfg.keybinds[3].1,
+            Some(TermAction::AdjustSelection(AdjustSel::Escape))
+        );
+        // `toggle_mouse_visibility` + canonical `toggle_command_palette`;
+        // the bare `palette` action name is rejected.
+        let (cfg2, errs2) = AppConfig::parse(
+            "keybind = f6=toggle_mouse_visibility\nkeybind = ctrl+shift+p=toggle_command_palette",
+        );
+        assert!(errs2.is_empty(), "{errs2:?}");
+        assert_eq!(cfg2.keybinds[0].1, Some(TermAction::ToggleMouseVisibility));
+        assert_eq!(cfg2.keybinds[1].1, Some(TermAction::Palette));
+        let (_, errs3) = AppConfig::parse("keybind = ctrl+shift+p=palette");
+        assert_eq!(errs3.len(), 1, "palette rejected: {errs3:?}");
+        // `scroll-to-bottom` item set: defaults keystroke on, output off;
+        // `no-` negates, empty clears, unknown items error.
+        let (d, _) = AppConfig::parse("");
+        assert!(d.scroll_bottom_keystroke && !d.scroll_bottom_output);
+        let (cfg4, errs4) = AppConfig::parse(
+            "scroll-to-bottom = keystroke,output",
+        );
+        assert!(errs4.is_empty(), "{errs4:?}");
+        assert!(cfg4.scroll_bottom_keystroke && cfg4.scroll_bottom_output);
+        let (cfg5, _) = AppConfig::parse("scroll-to-bottom = no-keystroke");
+        assert!(!cfg5.scroll_bottom_keystroke && !cfg5.scroll_bottom_output);
+        let (cfg6, _) = AppConfig::parse("scroll-to-bottom = output");
+        assert!(cfg6.scroll_bottom_keystroke && cfg6.scroll_bottom_output);
+        let (cfg7, _) = AppConfig::parse("scroll-to-bottom = ");
+        assert!(!cfg7.scroll_bottom_keystroke && !cfg7.scroll_bottom_output);
+        let (_, errs8) = AppConfig::parse("scroll-to-bottom = bogus");
+        assert_eq!(errs8.len(), 1, "{errs8:?}");
+        // `scroll-on-input` is not a reference name — rejected.
+        let (_, errs9) = AppConfig::parse("scroll-on-input = false");
+        assert_eq!(errs9.len(), 1, "{errs9:?}");
     }
 
     #[test]

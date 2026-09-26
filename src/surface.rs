@@ -315,6 +315,12 @@ pub struct TermSurface {
     cursor_hider: Option<crate::xcursor::CursorHider>,
     /// Set when the hider was attempted — avoid reconnecting per frame.
     cursor_hider_tried: bool,
+    /// `toggle_mouse_visibility` manual hide state — survives pointer
+    /// motion until toggled off (Ghostty).
+    pointer_hidden: bool,
+    /// `content_gen` seen by the last `build()` — `scroll-to-bottom
+    /// output` snaps when the term publishes new cells while scrolled.
+    last_output_gen: Cell<u64>,
     /// Linux PRIMARY selection (X11, or Wayland data-control where the
     /// compositor offers it) — waterkit-clipboard's `PrimarySelection`;
     /// claims on copy-on-select, middle-click reads it.
@@ -400,6 +406,8 @@ impl TermSurface {
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
             cursor_hider: None,
             cursor_hider_tried: false,
+            pointer_hidden: false,
+            last_output_gen: Cell::new(0),
             primary: waterkit_clipboard::PrimarySelection::new().ok(),
             pointer_at: (0.0, 0.0),
             hover_link: Vec::new(),
@@ -1130,6 +1138,49 @@ impl TermSurface {
                     let _ = clip.set_text(self.session.title.snapshot().as_ref());
                 }
             }
+            TermAction::ToggleMouseVisibility => {
+                // Ghostty `toggle_mouse_visibility` — manual hide/show
+                // that survives pointer motion until toggled back.
+                self.pointer_hidden = !self.pointer_hidden;
+                if !self.cursor_hider_tried {
+                    self.cursor_hider_tried = true;
+                    self.cursor_hider = crate::xcursor::CursorHider::new();
+                }
+                if let Some(h) = &mut self.cursor_hider {
+                    if self.pointer_hidden {
+                        h.hide();
+                    } else {
+                        h.show();
+                    }
+                }
+            }
+            // Ghostty `adjust_selection:dir` — drive the keyboard
+            // selection from a keybind: no active selection starts one
+            // anchored at the cursor; `escape` clears and exits.
+            TermAction::AdjustSelection(dir) => {
+                use crate::keys::AdjustSel as D;
+                if dir == D::Escape {
+                    self.session.terminal.term.lock().selection = None;
+                    self.keysel = None;
+                    return;
+                }
+                if self.keysel.is_none() {
+                    let cur = self.session.terminal.term.lock().grid().cursor.point;
+                    self.keysel = Some((cur, cur));
+                }
+                let key = match dir {
+                    D::Left => Key::Named(NamedKey::ArrowLeft),
+                    D::Right => Key::Named(NamedKey::ArrowRight),
+                    D::Up => Key::Named(NamedKey::ArrowUp),
+                    D::Down => Key::Named(NamedKey::ArrowDown),
+                    D::Home => Key::Named(NamedKey::Home),
+                    D::End => Key::Named(NamedKey::End),
+                    D::PageUp => Key::Named(NamedKey::PageUp),
+                    D::PageDown => Key::Named(NamedKey::PageDown),
+                    D::Escape => unreachable!(),
+                };
+                self.keysel_key(&key);
+            }
         }
     }
 
@@ -1658,15 +1709,22 @@ impl TermSurface {
             // unbound keypress reaches the shell as its raw escape.
             let mut unbound = false;
             match self.app.config(|c| c.lookup_keybind(key, mods)) {
-                Some((all, Some(action))) => {
-                    if all {
-                        self.do_action_all(action);
+                Some((all, performable, Some(action))) => {
+                    // `performable:` — an unperformable bind does not
+                    // consume the press; it falls through to the default
+                    // chord table and literal bytes (Ghostty).
+                    if performable && !self.action_performable(&action) {
+                        // fall through
                     } else {
-                        self.do_action(action);
+                        if all {
+                            self.do_action_all(action);
+                        } else {
+                            self.do_action(action);
+                        }
+                        return true;
                     }
-                    return true;
                 }
-                Some((_, None)) => unbound = true, // explicitly disabled
+                Some((_, _, None)) => unbound = true, // explicitly disabled
                 None => {}
             }
             if !unbound
@@ -1869,6 +1927,65 @@ impl TermSurface {
         }
     }
 
+    /// `performable:` keybind gate — whether the action can be
+    /// performed right now (Ghostty): an unperformable bind does not
+    /// consume the keypress and the event falls through to normal
+    /// input as if the bind were absent.
+    fn action_performable(&mut self, action: &TermAction) -> bool {
+        match action {
+            // Selection-scoped actions need a live selection.
+            TermAction::Copy
+            | TermAction::ClearSelection
+            | TermAction::SearchSelection
+            | TermAction::ScrollToSelection
+            | TermAction::WriteSelectionFile(_) => {
+                self.session.terminal.term.lock().selection.is_some()
+            }
+            // Last-output copy needs the OSC 133 mark trail.
+            TermAction::CopyLastOutput | TermAction::WriteLastOutputFile(_) => {
+                !self
+                    .session
+                    .terminal
+                    .prompt_marks
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            }
+            // URL copy needs a link under the pointer.
+            TermAction::CopyUrlToClipboard => {
+                let (x, y) = self.pointer_at;
+                self.link_at(self.grid_point(x, y)).is_some()
+            }
+            // Paste reads each clipboard synchronously.
+            TermAction::Paste => !self.clipboard_text().is_empty(),
+            TermAction::PasteFromSelection => self.primary_text().is_some(),
+            // Scroll actions need scrollback to move through.
+            TermAction::ScrollPageUp
+            | TermAction::ScrollPageDown
+            | TermAction::ScrollPageLines(_)
+            | TermAction::ScrollPageFractional(_)
+            | TermAction::ScrollToTop
+            | TermAction::ScrollToBottom
+            | TermAction::ScrollToRow(_)
+            | TermAction::ScrollToFraction(_)
+            | TermAction::JumpToPrompt(_)
+            | TermAction::ClearScrollback => {
+                self.session
+                    .terminal
+                    .term
+                    .lock()
+                    .grid()
+                    .history_size()
+                    > 0
+            }
+            TermAction::NavigateSearch(_) | TermAction::EndSearch => {
+                self.search.is_some()
+            }
+            // Everything else is performable whenever dispatched.
+            _ => true,
+        }
+    }
+
     /// `mouse-hide-while-typing`: hide the pointer on real typed input.
     /// The hider connects lazily (X11 only) and the toggle is live.
     fn hide_cursor_on_typing(&mut self) {
@@ -1942,11 +2059,11 @@ impl TermSurface {
     }
 
     /// Keyboard input bound for the PTY snaps the viewport back to the
-    /// live edge — the alacritty/kitty convention; `scroll-on-input =
-    /// false` leaves the viewport where the user scrolled it.
+    /// live edge — the alacritty/kitty convention; `scroll-to-bottom`
+    /// without `keystroke` leaves the viewport where the user scrolled it.
     /// Returns true when the viewport moved (needs a frame).
     fn snap_to_bottom_if_scrolled(&mut self) -> bool {
-        if !self.app.config(|c| c.scroll_on_input) {
+        if !self.app.config(|c| c.scroll_bottom_keystroke) {
             return false;
         }
         self.snap_viewport_to_bottom()
@@ -1955,7 +2072,7 @@ impl TermSurface {
     /// Paste-like interactions (`paste_text` — menu paste, Shift+Insert,
     /// middle-click PRIMARY, drop, confirmed paste) snap the viewport to
     /// the cursor under `scroll-to-cursor` — a separate gate from
-    /// `scroll-on-input`, which covers key bytes only.
+    /// `scroll-to-bottom`'s `keystroke` item, which covers key bytes only.
     fn snap_to_cursor_if_scrolled(&mut self) -> bool {
         if !self.app.config(|c| c.scroll_to_cursor) {
             return false;
@@ -2377,6 +2494,19 @@ impl TermSurface {
             Key::Named(NamedKey::PageDown) => {
                 cur.line = Line((cur.line.0 + rows).min(rows - 1))
             }
+            // Modifier presses are inert: the chord's own Shift/Ctrl/Alt
+            // key-downs arrive as separate events before the real key,
+            // and must not exit the mode they are part of.
+            Key::Named(
+                NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Meta
+                | NamedKey::CapsLock
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock,
+            ) => return true,
             // Any other key exits the mode and falls through.
             _ => {
                 self.keysel = None;
@@ -2633,6 +2763,17 @@ impl TermSurface {
 
     /// Draw the terminal into the frame's scene.
     fn build(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) {
+        // `scroll-to-bottom = output` — new program output while
+        // scrolled snaps the viewport to the live edge before the
+        // frame's grid read (Ghostty; the reference documents the
+        // `output` item but has not wired it).
+        let output_gen = self.content_gen.get();
+        if output_gen != self.last_output_gen.get() {
+            self.last_output_gen.set(output_gen);
+            if self.app.config(|c| c.scroll_bottom_output) {
+                self.snap_viewport_to_bottom();
+            }
+        }
         {
             // Grid fingerprint for the frame — the open search re-runs
             // when reflow (resize/font zoom) or new output moved its
@@ -3047,14 +3188,16 @@ impl SceneContent for TermSurface {
                 false
             }
             SurfaceInputEvent::PointerMove { position } => {
-                if let Some(h) = &mut self.cursor_hider {
+                // `toggle_mouse_visibility` keeps the pointer hidden
+                // across motion until the action toggles it back.
+                if !self.pointer_hidden && let Some(h) = &mut self.cursor_hider {
                     h.show();
                 }
                 self.on_pointer_move(position.x, position.y);
                 true
             }
             SurfaceInputEvent::PointerButton { pressed, button, position } => {
-                if let Some(h) = &mut self.cursor_hider {
+                if !self.pointer_hidden && let Some(h) = &mut self.cursor_hider {
                     h.show();
                 }
                 self.on_pointer_button(*pressed, *button, position.x, position.y);
@@ -3065,9 +3208,19 @@ impl SceneContent for TermSurface {
                 true
             }
             SurfaceInputEvent::Key { pressed, key, code, modifiers, repeat: _ } => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!(
+                        "[key] pressed={pressed} key={key:?} code={code:?} mods={modifiers:?}"
+                    );
+                }
                 self.on_key(*pressed, key, *code, *modifiers)
             }
-            SurfaceInputEvent::TextInput(text) => self.on_text(text.as_str()),
+            SurfaceInputEvent::TextInput(text) => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[text] {text:?}");
+                }
+                self.on_text(text.as_str())
+            }
             SurfaceInputEvent::CompositionStart => {
                 self.preedit = Some((String::new(), 0));
                 self.clear_selection_on_input();

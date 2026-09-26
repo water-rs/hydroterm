@@ -1661,9 +1661,12 @@ impl AppState {
             )),
         };
         if let Some((label, pending)) = prompted {
-            // Re-arming while a prompt is already up is a no-op — a
-            // duplicate `set` would remount the snackbar view and stack
-            // a dead copy over the live one.
+            // Re-arming while a prompt is already up is a no-op: a second
+            // real `ctrl+shift+w` is a legitimate repeat press, and a chord
+            // that straddles a window focus gain is also re-delivered by the
+            // platform layer (winit FocusIn key replay — WATERUI_FEEDBACK
+            // #47). Either way a duplicate `set` remounts the snackbar and
+            // stacks a dead copy over the live one.
             if pending.snapshot().is_none() {
                 pending.set(Some((label, false)));
             }

@@ -716,6 +716,14 @@ pub enum TermAction {
     /// Ghostty `copy_title_to_clipboard` — copy the focused session's
     /// title to the clipboard.
     CopyTitleToClipboard,
+    /// Ghostty `toggle_mouse_visibility` — hide/show the pointer
+    /// cursor; unlike `mouse-hide-while-typing` the hidden state
+    /// survives pointer motion until toggled back.
+    ToggleMouseVisibility,
+    /// Ghostty `adjust_selection:dir` — move the active end of the
+    /// keyboard selection; with no selection active it starts one at
+    /// the cursor cell; `escape` clears the selection.
+    AdjustSelection(AdjustSel),
     /// Ghostty `start_search` — open the search bar.
     StartSearch,
     /// Ghostty `end_search` — close the search bar and drop the query.
@@ -728,6 +736,25 @@ pub enum TermAction {
     /// Ghostty `scroll_page_fractional:f` — scroll a fraction of the
     /// page (negative = up).
     ScrollPageFractional(f64),
+}
+
+/// Ghostty `adjust_selection:dir` direction set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustSel {
+    /// One cell left / right.
+    Left,
+    Right,
+    /// One row up / down.
+    Up,
+    Down,
+    /// Line start / end.
+    Home,
+    End,
+    /// One viewport up / down.
+    PageUp,
+    PageDown,
+    /// Clear the selection and leave keyboard selection.
+    Escape,
 }
 
 /// Ghostty's `:action` suffix for `write_*_file` — what to do with the
