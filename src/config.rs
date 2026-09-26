@@ -367,6 +367,9 @@ pub struct AppConfig {
     pub selection_color: Option<Rgb>,
     /// `palette = 1=#ff0000` — indexed 0-255 slot overrides.
     pub palette_overrides: Vec<(u8, Rgb)>,
+    /// `command-palette-entry` — custom rows appended to the command
+    /// palette (Ghostty, repeat key).
+    pub palette_entries: Vec<PaletteEntryCfg>,
     /// Wheel scroll speed multiplier (Ghostty `mouse-scroll-multiplier`).
     pub mouse_scroll_multiplier: f32,
     /// Ask before closing a pane/tab whose PTY foreground is a program
@@ -599,6 +602,7 @@ impl Default for AppConfig {
             cursor_color: None,
             selection_color: None,
             palette_overrides: Vec::new(),
+            palette_entries: Vec::new(),
             mouse_scroll_multiplier: 1.0,
             confirm_close: ConfirmCloseSurface::True,
             window_width: 0.0,
@@ -728,6 +732,7 @@ notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m
 # unfocused-split-fill = #2a2a2a   # bg of unfocused splits
 # title = my-terminal              # initial window title (OSC can override)
 # palette = 1=#e06c75   # indexed slot 0-255
+# command-palette-entry = title:Foo, description:Bar, action:goto_tab:1  # extra palette row
 
 mouse-scroll-multiplier = 1.0   # wheel scroll speed
 confirm-close-surface = true  # ask before closing a running program (true|false|always)
@@ -1004,6 +1009,10 @@ impl AppConfig {
                         "line {}: bad palette {value:?} (want N=#rrggbb)",
                         n + 1
                     )),
+                },
+                "command-palette-entry" => match parse_palette_entry(value) {
+                    Ok(entry) => cfg.palette_entries.push(entry),
+                    Err(e) => errors.push(format!("line {}: {e}", n + 1)),
                 },
                 "mouse-scroll-multiplier" => {
                     match value.parse::<f32>() {
@@ -1821,12 +1830,81 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
     Ok((chord, action))
 }
 
+/// A `command-palette-entry` config row (Ghostty): the palette title,
+/// the description shown in the chord slot, and the action string,
+/// resolved through the same action table keybinds use.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaletteEntryCfg {
+    pub title: String,
+    pub description: String,
+    pub action: String,
+}
+
+/// Split an entry value on top-level commas — a double-quoted span may
+/// hold a comma (`action:text:"a,b"`) and backslash escapes.
+fn split_entry_fields(s: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => esc = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                fields.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(&s[start..]);
+    fields
+}
+
+/// Parse `title:T, description:D, action:A` — Ghostty's
+/// `command-palette-entry` fields; `title` and `action` are required.
+/// Each value passes through `parse_payload`, so a quoted value may
+/// carry escapes and commas.
+fn parse_palette_entry(value: &str) -> Result<PaletteEntryCfg, String> {
+    let mut title = None;
+    let mut description = String::new();
+    let mut action = None;
+    for field in split_entry_fields(value) {
+        let Some((k, v)) = field.split_once(':') else {
+            return Err(format!(
+                "bad command-palette-entry field {field:?} (want name:value)"
+            ));
+        };
+        let v = parse_payload(v.trim())?;
+        match k.trim() {
+            "title" => title = Some(v),
+            "description" => description = v,
+            "action" => action = Some(v),
+            other => {
+                return Err(format!("unknown command-palette-entry field {other:?}"));
+            }
+        }
+    }
+    Ok(PaletteEntryCfg {
+        title: title.ok_or("command-palette-entry needs title:")?,
+        description,
+        action: action.ok_or("command-palette-entry needs action:")?,
+    })
+}
+
 /// Ghostty payload escapes inside `"…"`: `\n \r \t \e \\ \" \xNN`.
 /// An unquoted payload is taken verbatim.
 fn parse_payload(raw: &str) -> Result<String, String> {
     let s = raw.trim();
     let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-        return Ok(s.to_string());
+        // Unquoted payloads return the value verbatim — a `\n` an escape
+        // decoded to is meaningful and must not be trimmed away.
+        return Ok(raw.to_string());
     };
     let mut out = String::with_capacity(inner.len());
     let mut it = inner.chars().peekable();
@@ -1922,8 +2000,9 @@ fn canonical_key_name(name: &str) -> Result<String, String> {
     Err(format!("unknown key name {name:?}"))
 }
 
-/// Action names for `keybind =` right-hand sides.
-fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
+/// Action names for `keybind =` right-hand sides — also resolves
+/// `command-palette-entry` `action:` payloads (same table).
+pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
     Some(match name {
         // Ghostty payload actions — `keybind = chord=text:"hi\n"` types
         // the literal text; `esc:`/`csi:` prepend `\e`/`\e[`. Payload
@@ -3149,5 +3228,30 @@ mod tests {
             let (_, errs) = AppConfig::parse(bad);
             assert!(!errs.is_empty(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn palette_entry_parses_reference_fields() {
+        let (cfg, errs) = AppConfig::parse(
+            "command-palette-entry = title:Say hi, description:Types a greeting, action:\"text:printf q\\n\"\ncommand-palette-entry = title:Tab two, action:goto_tab:2",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.palette_entries.len(), 2);
+        assert_eq!(cfg.palette_entries[0].title, "Say hi");
+        assert_eq!(cfg.palette_entries[0].description, "Types a greeting");
+        // Entry actions resolve through the same table keybinds use.
+        assert_eq!(
+            action_from_str(
+                &cfg.palette_entries[0].action.to_ascii_lowercase(),
+                &cfg.palette_entries[0].action,
+            ),
+            Some(TermAction::TypeText("printf q\n".to_string()))
+        );
+        assert_eq!(
+            action_from_str(&cfg.palette_entries[1].action, &cfg.palette_entries[1].action),
+            Some(TermAction::SelectTab(2))
+        );
+        let (_, errs) = AppConfig::parse("command-palette-entry = title:NoAction");
+        assert_eq!(errs.len(), 1);
     }
 }

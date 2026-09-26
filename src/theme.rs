@@ -184,6 +184,20 @@ pub fn system_prefers_light() -> bool {
         .unwrap_or(false)
 }
 
+/// Freedesktop dark-scheme probe (gsettings); false when gsettings or
+/// the key is absent — resolving `auto` to light unless the desktop
+/// explicitly asks for dark. (Probing `prefer-light` instead falls back
+/// to dark on schema-less desktops, which put dark M3 chrome on a light
+/// `theme =` palette — the r44 contrast defect.)
+pub fn system_prefers_dark() -> bool {
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("prefer-dark"))
+        .unwrap_or(false)
+}
+
 /// `window-theme` → the WaterUI color scheme installed into the environment
 /// as `Theme::color_scheme` (water-rs/cli#188). `auto` resolves the desktop
 /// preference at call time, so a config reload re-reads it.
@@ -194,10 +208,10 @@ pub fn scheme_for(
         crate::config::WindowTheme::Light => ColorScheme::Light,
         crate::config::WindowTheme::Dark => ColorScheme::Dark,
         crate::config::WindowTheme::Auto => {
-            if system_prefers_light() {
-                ColorScheme::Light
-            } else {
+            if system_prefers_dark() {
                 ColorScheme::Dark
+            } else {
+                ColorScheme::Light
             }
         }
     }

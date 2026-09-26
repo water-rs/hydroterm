@@ -1366,11 +1366,13 @@ impl TermSurface {
                         ring_bell(&mut self.bell_ring_at);
                     }
                     // `bell-features` `attention` — the tab badge is the
-                    // request-attention channel (Ghostty sends a WM
-                    // urgency hint; ours is the 🔔 badge).
+                    // request-attention channel. Ghostty also raises the
+                    // WM urgency hint; no waterui/hydrolysis surface
+                    // reaches `request_user_attention` — WATERUI_FEEDBACK
+                    // #51, unimplemented rather than faked.
                     if self.app.config(|c| c.bell_attention) {
                         *self.session.notify_badge.lock().unwrap() = true;
-                            self.app.tab_badge(self.session.id, true);
+                        self.app.tab_badge(self.session.id, true);
                     }
                     // `bell-features` `border` — a ring around the pane
                     // until it's re-focused or receives input (Ghostty).
@@ -1774,7 +1776,7 @@ impl TermSurface {
             }
             Key::Named(NamedKey::ArrowDown) => {
                 let query = self.app.palette_query.snapshot().to_string();
-                let n = crate::app::palette_matches(&query).len();
+                let n = crate::app::palette_matches(&self.app, &query).len();
                 if n > 0 {
                     self.app.palette_sel.with_mut(|s| {
                         let cur = s.unwrap_or(0);

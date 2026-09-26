@@ -27,7 +27,7 @@ use waterui::task::{sleep, spawn_local};
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
-use waterui::accessibility::{AccessibilityRole, AccessibilityState};
+use waterui::accessibility::{AccessibilityChildren, AccessibilityRole, AccessibilityState};
 use waterui::drag_drop::DragData;
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
@@ -2572,15 +2572,33 @@ pub fn tabs_view(state: AppState) -> impl View {
                     );
                     vstack((
                         hstack((
-                            // `tab-activity` dot: parser output landed while
-                            // the tab was not selected (kitty
-                            // `tab_activity_symbol`).
-                            when(tab.activity.clone(), || {
-                                text("●").foreground(Accent)
-                            }),
-                            // `bell-features` `attention` indicator.
-                            when(tab.badge.clone(), || text("🔔")),
-                            text(tab.title.clone()).foreground(label_color),
+                            // The tab control is the title cluster
+                            // alone: it carries the role, an explicit
+                            // name, and suppresses its descendant text
+                            // nodes so screen readers announce the chip
+                            // once (composed controls double-expose
+                            // computed names — WATERUI_FEEDBACK #53).
+                            hstack((
+                                // `tab-activity` dot: parser output landed
+                                // while the tab was not selected (kitty
+                                // `tab_activity_symbol`).
+                                when(tab.activity.clone(), || {
+                                    text("●").foreground(Accent)
+                                }),
+                                // `bell-features` `attention` indicator.
+                                when(tab.badge.clone(), || text("🔔")),
+                                text(tab.title.clone()).foreground(label_color),
+                            ))
+                            .on_tap(move |app: AppState| app.selected.set(tab_id))
+                            .a11y_role(AccessibilityRole::Tab)
+                            .a11y_label(tab.title.clone())
+                            .a11y_children(AccessibilityChildren::ExcludeDescendants)
+                            .a11y_state_signal(
+                                active.map(|a| AccessibilityState::new().selected(a)),
+                            ),
+                            // The close control is the chip's sibling, not a
+                            // descendant of the Tab node — it keeps its own
+                            // Button node.
                             text("×")
                                 .muted()
                                 .padding_with([3.0, 0.0, 4.0, 4.0])
@@ -2593,11 +2611,6 @@ pub fn tabs_view(state: AppState) -> impl View {
                     ))
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
-                    .on_tap(move |app: AppState| app.selected.set(tab_id))
-                    .a11y_role(AccessibilityRole::Tab)
-                    .a11y_state_signal(
-                        active.map(|a| AccessibilityState::new().selected(a)),
-                    )
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.
                     .draggable(drag_drop::DragData::text(format!(
@@ -2796,12 +2809,45 @@ pub fn theme_index(theme: &crate::config::ThemeRef) -> usize {
     }
 }
 
-/// Substring-filter the palette items (empty query → all).
-pub fn palette_matches(query: &str) -> Vec<&'static PaletteItem> {
-    let q = query.trim().to_lowercase();
-    PALETTE_ITEMS
+/// One palette row as rendered: name, the right-hand hint (chord for
+/// built-ins, description for config entries), and the action.
+#[derive(Clone)]
+pub struct PaletteRow {
+    pub name: Str,
+    pub hint: Str,
+    pub action: TermAction,
+}
+
+/// Built-in `PALETTE_ITEMS` plus the config's `command-palette-entry`
+/// rows (Ghostty: custom rows sort after the built-ins).
+pub fn palette_rows(state: &AppState) -> Vec<PaletteRow> {
+    let mut rows: Vec<PaletteRow> = PALETTE_ITEMS
         .iter()
-        .filter(|item| q.is_empty() || item.name.to_lowercase().contains(&q))
+        .map(|item| PaletteRow {
+            name: Str::from(item.name),
+            hint: Str::from(item.chord),
+            action: item.action.clone(),
+        })
+        .collect();
+    for entry in state.config(|c| c.palette_entries.clone()) {
+        let lower = entry.action.to_ascii_lowercase();
+        if let Some(action) = crate::config::action_from_str(&lower, &entry.action) {
+            rows.push(PaletteRow {
+                name: Str::from(entry.title),
+                hint: Str::from(entry.description),
+                action,
+            });
+        }
+    }
+    rows
+}
+
+/// Substring-filter the palette rows (empty query → all).
+pub fn palette_matches(state: &AppState, query: &str) -> Vec<PaletteRow> {
+    let q = query.trim().to_lowercase();
+    palette_rows(state)
+        .into_iter()
+        .filter(|row| q.is_empty() || row.name.as_str().to_lowercase().contains(&q))
         .collect()
 }
 
@@ -2822,7 +2868,7 @@ impl AppState {
     /// a row tap).
     pub fn run_palette_at(&self, i: usize) {
         let q = self.palette_query.snapshot().to_string();
-        let matches = palette_matches(&q);
+        let matches = palette_matches(self, &q);
         let Some(item) = matches.as_slice().get(i) else {
             self.palette_open.set(false);
             return;
@@ -2898,25 +2944,27 @@ fn palette_view(state: AppState) -> impl View {
     let list = watch(query, {
         let state = state.clone();
         move |q: Str| {
-            let items: Vec<&'static PaletteItem> = palette_matches(q.as_str());
+            let items = palette_matches(&state, q.as_str());
             let indices: Vec<SelfId<usize>> = (0..items.len()).map(SelfId::new).collect();
             List::for_each(indices, {
                 let items = items.clone();
                 move |i: SelfId<usize>| {
                     let i = *i;
-                    let item = items[i];
+                    let item = items[i].clone();
                     // Rows activate through `button` — the List puts
                     // ButtonStyle::Plain + ListRowChrome into the row env, so a
                     // row tap is the framework's own button path (a bare
                     // `.on_tap` on row content does not fire).
-                    let row = button(Label::new(item.name, {
-                        let name = item.name;
-                        let chord = item.chord;
-                        move || hstack((
-                            text(name).foreground(Foreground),
-                            Spacer::flexible(),
-                            text(chord).muted(),
-                        ))
+                    let row = button(Label::new(item.name.clone(), {
+                        let name = item.name.clone();
+                        let chord = item.hint.clone();
+                        move || {
+                            hstack((
+                                text(name.clone()).foreground(Foreground),
+                                Spacer::flexible(),
+                                text(chord.clone()).muted(),
+                            ))
+                        }
                     }))
                     .action(move |app: AppState| app.run_palette_at(i));
                     ListItem::new(row)
