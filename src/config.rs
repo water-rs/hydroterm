@@ -183,6 +183,26 @@ pub enum WindowPaddingColor {
     ExtendAlways,
 }
 
+/// One parsed `keybind` trigger: the normalized `ctrl+alt+shift+super+key`
+/// chord plus Ghostty's prefix flags (combinable in any order, e.g.
+/// `keybind = global:unconsumed:ctrl+a=reload_config`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeybindTrigger {
+    pub chord: String,
+    /// `global:` — grabbed on the X11 root so it fires while unfocused.
+    /// Also matches the local keybind table (the grab eats the key when
+    /// live, so no double-fire). Always consumes the press.
+    pub global: bool,
+    /// `all:` — apply the action to every surface. Always consumes.
+    pub all: bool,
+    /// `unconsumed:` — fire the action AND still send the encoded key to
+    /// the program. A no-op under `global:`/`all:` (they always
+    /// consume — Ghostty `Binding.zig` Flags.consumed).
+    pub unconsumed: bool,
+    /// `performable:` — only fire while the action is performable.
+    pub performable: bool,
+}
+
 /// Fully-resolved settings — defaults plus file overrides.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -248,7 +268,7 @@ pub struct AppConfig {
     /// `-e` / `--` command for the initial session.
     pub command: Option<Vec<String>>,
     /// `keybind = <chord>=<action>` entries; `None` action = disabled.
-    pub keybinds: Vec<(String, Option<TermAction>)>,
+    pub keybinds: Vec<(KeybindTrigger, Option<TermAction>)>,
     /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
     pub audible_bell: bool,
     /// `bell-features` `attention` arm — the tab's 🔔 notification badge on
@@ -735,6 +755,7 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # keybind = global:ctrl+alt+u=toggle_quick_terminal   # X11 root grab — fires anywhere
 # keybind = performable:ctrl+c=copy_to_clipboard      # fires only while copyable;
 #                                                      # falls through to ^C otherwise
+# keybind = unconsumed:alt+z=set_tab_title:hi          # fires AND ^[z reaches shell
 # scroll-to-bottom = keystroke,output   # keystroke on by default; output off
 # tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
 # selection-word-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
@@ -769,34 +790,23 @@ impl AppConfig {
         }
     }
 
-    /// Find a configured binding for this key press. `Some((flags,
-    /// action))` where flags bit 0 marks a `keybind = all:` entry (apply
-    /// to every surface) and bit 1 a `performable:` entry (fire only
-    /// while the action is performable); the `None` action is an
-    /// explicit `unbind`, `None` overall = no entry.
+    /// Find a configured binding for this key press. `Some((trigger,
+    /// action))` where the trigger carries the Ghostty prefix flags
+    /// (`global:`/`all:`/`unconsumed:`/`performable:`); the `None`
+    /// action is an explicit `unbind`, `None` overall = no entry.
+    /// `global:` binds match here too — while the root grab is live the
+    /// grabbed key never reaches the window, so there is no double-fire.
     pub fn lookup_keybind(
         &self,
         key: &Key,
         mods: Modifiers,
-    ) -> Option<(bool, bool, Option<TermAction>)> {
+    ) -> Option<(KeybindTrigger, Option<TermAction>)> {
         let chord = chord_of(key, mods)?;
-        let candidates = [
-            format!("performable:{chord}"),
-            format!("performable:all:{chord}"),
-            format!("all:{chord}"),
-            chord,
-        ];
         self.keybinds
             .iter()
             .rev() // last wins
-            .find(|(c, _)| candidates.iter().any(|k| c == k))
-            .map(|(c, a)| {
-                (
-                    c.contains("all:"),
-                    c.starts_with("performable:"),
-                    a.clone(),
-                )
-            })
+            .find(|(t, _)| t.chord == chord)
+            .map(|(t, a)| (t.clone(), a.clone()))
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -1525,7 +1535,13 @@ impl AppConfig {
                     cfg.open_link_with = (!value.is_empty()).then(|| value.to_string());
                 }
                 "keybind" => match parse_keybind(value) {
-                    Ok((chord, action)) => cfg.keybinds.push((chord, action)),
+                    // Ghostty: triggers ignore prefixes — a later
+                    // `keybind` on the same chord replaces the earlier
+                    // entry wholesale, flags included.
+                    Ok((trig, action)) => {
+                        cfg.keybinds.retain(|(t, _)| t.chord != trig.chord);
+                        cfg.keybinds.push((trig, action));
+                    }
                     Err(e) => errors.push(format!("line {}: {e}", n + 1)),
                 },
                 _ => errors.push(format!("line {}: unknown key {key:?}", n + 1)),
@@ -1757,33 +1773,41 @@ fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
     }
 }
 
-/// `ctrl+shift+c=copy` → ("ctrl+shift+c", Some(Copy)); an empty action or
+/// `ctrl+shift+c=copy` → (trigger, Some(Copy)); an empty action or
 /// `none`/`unbind` disables the chord.
-fn parse_keybind(value: &str) -> Result<(String, Option<TermAction>), String> {
+fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), String> {
     let (chord, action) = value
         .split_once('=')
         .ok_or_else(|| format!("keybind needs `<chord>=<action>`: {value:?}"))?;
-    // `global:` — an X11 root grab, fired while any window has focus
-    // (Ghostty `keybind = global:chord=action`). Kept inside `keybinds`
-    // with a `global:` tag; `lookup_keybind` never produces it.
     let raw = chord.trim();
     let lower = raw.to_ascii_lowercase();
-    // `performable:` — the bind only fires while its action is performable
-    // (Ghostty `keybind = performable:chord=action`); otherwise the
-    // keypress falls through to normal input as if unbound.
-    let (perf, lower) = match lower.strip_prefix("performable:") {
-        Some(rest) => (true, rest.to_string()),
-        None => (false, lower),
-    };
-    let tag = if perf { "performable:" } else { "" };
-    let chord = if let Some(rest) = lower.strip_prefix("global:") {
-        format!("{tag}global:{}", normalize_chord(rest)?)
-    } else if let Some(rest) = lower.strip_prefix("all:") {
-        // `all:` — the bind applies its action to every surface
-        // (Ghostty `keybind = all:chord=action`).
-        format!("{tag}all:{}", normalize_chord(rest)?)
-    } else {
-        format!("{tag}{}", normalize_chord(&lower)?)
+    // Ghostty trigger prefixes — any order, each at most once:
+    // `global:` (X11 root grab), `all:` (every surface), `unconsumed:`
+    // (fire the action and still send the encoded key), `performable:`
+    // (fire only while performable). e.g. `global:unconsumed:ctrl+a`.
+    let (mut global, mut all, mut unconsumed, mut performable) =
+        (false, false, false, false);
+    let mut rest = lower.as_str();
+    while let Some((prefix, tail)) = rest.split_once(':') {
+        let flag = match prefix {
+            "global" => &mut global,
+            "all" => &mut all,
+            "unconsumed" => &mut unconsumed,
+            "performable" => &mut performable,
+            _ => break,
+        };
+        if *flag {
+            return Err(format!("keybind {raw:?}: duplicate `{prefix}:` prefix"));
+        }
+        *flag = true;
+        rest = tail;
+    }
+    let chord = KeybindTrigger {
+        chord: normalize_chord(rest)?,
+        global,
+        all,
+        unconsumed,
+        performable,
     };
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
@@ -2363,9 +2387,9 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds.len(), 4);
         // Modifier order normalized — shift+ctrl+v and ctrl+shift+v collide.
-        assert_eq!(cfg.keybinds[0].0, "ctrl+shift+c");
-        assert_eq!(cfg.keybinds[1].0, "ctrl+shift+v");
-        assert_eq!(cfg.keybinds[2].0, "ctrl+shift+f4");
+        assert_eq!(cfg.keybinds[0].0.chord, "ctrl+shift+c");
+        assert_eq!(cfg.keybinds[1].0.chord, "ctrl+shift+v");
+        assert_eq!(cfg.keybinds[2].0.chord, "ctrl+shift+f4");
         assert_eq!(cfg.keybinds[2].1, Some(TermAction::CloseTab));
         assert_eq!(cfg.keybinds[3].1, None); // disabled
     }
@@ -2375,13 +2399,15 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("keybind = ctrl+shift+c=\nkeybind = alt+f4=quit");
         assert!(errs.is_empty());
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
+        let hit = cfg
+            .lookup_keybind(&Key::Character("c".into()), ctrl_shift)
+            .unwrap();
+        assert!(!hit.0.all && !hit.0.performable && !hit.0.unconsumed && hit.1.is_none());
         assert_eq!(
-            cfg.lookup_keybind(&Key::Character("c".into()), ctrl_shift),
-            Some((false, false, None))
-        );
-        assert_eq!(
-            cfg.lookup_keybind(&Key::Named(NamedKey::F4), Modifiers::ALT),
-            Some((false, false, Some(TermAction::Quit)))
+            cfg.lookup_keybind(&Key::Named(NamedKey::F4), Modifiers::ALT)
+                .unwrap()
+                .1,
+            Some(TermAction::Quit)
         );
         assert_eq!(
             cfg.lookup_keybind(&Key::Character("v".into()), ctrl_shift),
@@ -2395,19 +2421,20 @@ mod tests {
             AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10\nkeybind = ctrl+alt+g=quit");
         assert!(errs.is_empty(), "{errs:?}");
         let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
-        // `all:` and the plain bind are distinct entries; last wins — the
-        // plain chord shadows the all: bind on the same modifiers.
-        assert_eq!(
-            cfg.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
-            Some((false, false, Some(TermAction::Quit)))
-        );
+        // Ghostty: triggers ignore prefixes — the later `ctrl+alt+g`
+        // replaces the `all:` entry wholesale, flags included.
+        let hit = cfg
+            .lookup_keybind(&Key::Character("g".into()), ctrl_alt)
+            .unwrap();
+        assert!(!hit.0.all && hit.1 == Some(TermAction::Quit));
+        assert_eq!(cfg.keybinds.len(), 1);
         let (cfg2, errs2) =
             AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
         assert!(errs2.is_empty(), "{errs2:?}");
-        assert_eq!(
-            cfg2.lookup_keybind(&Key::Character("g".into()), ctrl_alt),
-            Some((true, false, Some(TermAction::IncreaseFontSize(10))))
-        );
+        let hit = cfg2
+            .lookup_keybind(&Key::Character("g".into()), ctrl_alt)
+            .unwrap();
+        assert!(hit.0.all && hit.1 == Some(TermAction::IncreaseFontSize(10)));
     }
 
     #[test]
@@ -2420,24 +2447,65 @@ mod tests {
         );
         assert!(errs.is_empty(), "{errs:?}");
         let ctrl = Modifiers::CONTROL;
-        assert_eq!(
-            cfg.lookup_keybind(&Key::Character("c".into()), ctrl),
-            Some((false, true, Some(TermAction::Copy)))
-        );
+        let hit = cfg
+            .lookup_keybind(&Key::Character("c".into()), ctrl)
+            .unwrap();
+        assert!(hit.0.performable && hit.1 == Some(TermAction::Copy));
         let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
-        assert_eq!(
-            cfg.lookup_keybind(&Key::Character("h".into()), ctrl_alt),
-            Some((true, true, Some(TermAction::ClearScrollback)))
+        let hit = cfg
+            .lookup_keybind(&Key::Character("h".into()), ctrl_alt)
+            .unwrap();
+        assert!(
+            hit.0.all && hit.0.performable && hit.1 == Some(TermAction::ClearScrollback)
         );
         // A plain bind on the same chord still wins by list order.
         let (cfg2, errs2) = AppConfig::parse(
             "keybind = performable:ctrl+c=copy_to_clipboard\nkeybind = ctrl+c=quit",
         );
         assert!(errs2.is_empty(), "{errs2:?}");
-        assert_eq!(
-            cfg2.lookup_keybind(&Key::Character("c".into()), ctrl),
-            Some((false, false, Some(TermAction::Quit)))
+        let hit = cfg2
+            .lookup_keybind(&Key::Character("c".into()), ctrl)
+            .unwrap();
+        assert!(
+            !hit.0.performable && !hit.0.all && hit.1 == Some(TermAction::Quit)
         );
+    }
+
+    #[test]
+    fn unconsumed_prefix_parses_and_dedupes() {
+        // `keybind = unconsumed:chord=action` (Ghostty) — the bind fires
+        // and the press still encodes to the program. Prefixes combine
+        // in any order; a duplicate prefix is an error.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = unconsumed:ctrl+a=reload_config\n\
+             keybind = global:unconsumed:ctrl+b=quit\n\
+             keybind = unconsumed:global:ctrl+c=paste_from_clipboard",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        let ctrl = Modifiers::CONTROL;
+        let (t, a) = cfg
+            .lookup_keybind(&Key::Character("a".into()), ctrl)
+            .unwrap();
+        assert!(t.unconsumed && !t.global && a == Some(TermAction::ReloadConfig));
+        for k in ["b", "c"] {
+            let (t, _) = cfg
+                .lookup_keybind(&Key::Character(k.into()), ctrl)
+                .unwrap();
+            assert!(t.unconsumed && t.global);
+        }
+        let (cfg2, errs2) = AppConfig::parse("keybind = unconsumed:unconsumed:ctrl+a=quit");
+        assert!(!errs2.is_empty());
+        drop(cfg2);
+        // Later same-chord bind replaces the earlier entry wholesale.
+        let (cfg3, errs3) = AppConfig::parse(
+            "keybind = unconsumed:ctrl+a=reload_config\nkeybind = ctrl+a=quit",
+        );
+        assert!(errs3.is_empty());
+        assert_eq!(cfg3.keybinds.len(), 1);
+        let (t, a) = cfg3
+            .lookup_keybind(&Key::Character("a".into()), ctrl)
+            .unwrap();
+        assert!(!t.unconsumed && a == Some(TermAction::Quit));
     }
 
     #[test]

@@ -44,6 +44,8 @@ use waterui::form::picker::picker;
 const TAB_STRIP_HEIGHT: f32 = 30.0;
 /// Payload prefix for internal tab-chip drags — must never reach a pane's
 /// drop handler, where it would be pasted into the PTY as shell text.
+/// Workaround for `DragData` having only Text/Url payloads; remove once
+/// typed drag payloads land (water-rs/waterui#1254).
 const TAB_DRAG_PREFIX: &str = "hydroterm-tab:";
 
 /// Shared per-session UI state: the bindings a pane surface reads, plus
@@ -776,8 +778,8 @@ impl AppState {
         chord: &str,
         action: &TermAction,
     ) {
-        let body = &chord["global:".len()..];
         // Canonical order: ctrl+alt+shift+super+key.
+        let body = chord;
         let mut mods = [false; 4];
         let mut key = "";
         for part in body.split('+') {
@@ -825,7 +827,7 @@ impl AppState {
             let keep = config
                 .keybinds
                 .iter()
-                .any(|(c, a)| c == chord && a.as_ref() == Some(action));
+                .any(|(t, a)| t.global && t.chord == *chord && a.as_ref() == Some(action));
             if !keep {
                 stop.store(true, Ordering::SeqCst);
             }
@@ -834,8 +836,8 @@ impl AppState {
         let want: Vec<(String, TermAction)> = config
             .keybinds
             .iter()
-            .filter(|(c, _)| c.starts_with("global:"))
-            .filter_map(|(c, a)| a.clone().map(|a| (c.clone(), a)))
+            .filter(|(t, _)| t.global)
+            .filter_map(|(t, a)| a.clone().map(|a| (t.chord.clone(), a)))
             .collect();
         for (chord, action) in want {
             if grabs.iter().any(|(c, a, _)| c == &chord && a == &action) {
@@ -1243,6 +1245,21 @@ impl AppState {
         if let Some(tab_id) = tab_id {
             self.focus_owner.set(None);
             self.focus_owner.set(Some((tab_id, session_id)));
+        }
+    }
+
+    /// Refocus the selected tab's focused pane — used by overlay tap
+    /// handlers that must return embedded keys to the surface after a
+    /// press landed off it (off-surface presses clear embedded focus).
+    pub fn refocus_selected(&self) {
+        let tab_id = self.selected.snapshot();
+        if let Some(session_id) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.focused.snapshot())
+        {
+            self.refocus(session_id);
         }
     }
 
@@ -2072,7 +2089,11 @@ impl View for PaneLeaf {
         .anyview();
         let bar = when(open, move || {
             hstack((
-                field("find in buffer", &query),
+                // Hit-transparent: a clicked-in field would take real key
+                // focus and swallow Escape/Enter/arrows before the surface
+                // sees them (no bubbling — WATERUI_FEEDBACK #50). The
+                // surface owns all editing through `search_query`.
+                field("find in buffer", &query).hittable(false),
                 text(status.clone()).muted(),
                 text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(-1))),
                 text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(1))),
@@ -2080,6 +2101,10 @@ impl View for PaneLeaf {
             .spacing(6.0)
             .padding_horizontal(8.0)
             .padding_vertical(4.0)
+            // The bar is part of the pane's keyboard world: a click
+            // anywhere on it returns embedded focus to the surface (the
+            // field itself is hit-transparent, WATERUI_FEEDBACK #50).
+            .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id))
         })
         .anyview();
         // `unfocused-split-opacity`: the focused pane stays opaque, every
@@ -2118,7 +2143,9 @@ impl View for PaneLeaf {
             when(title_prompt_open, move || {
                 Card::new(vstack((
                     text("Rename tab title").muted(),
-                    field("tab title", &title_query),
+                    // Same hit-transparent rule as the search field
+                    // (WATERUI_FEEDBACK #50).
+                    field("tab title", &title_query).hittable(false),
                     text("Enter: rename · Esc: cancel").muted(),
                 ))
                 .spacing(8.0))
@@ -2126,7 +2153,10 @@ impl View for PaneLeaf {
                 .padding_with(24.0)
             }),
             Spacer::flexible(),
-        ));
+        ))
+        // Click on the prompt overlay returns keys to the pane (the field
+        // is hit-transparent — WATERUI_FEEDBACK #50).
+        .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id));
         // `inspector` — a bottom-edge chip reporting the attributes of
         // the cell under the terminal cursor; `inspector_label` is
         // rewritten every rendered frame while the inspector is open.
@@ -2897,12 +2927,23 @@ fn palette_view(state: AppState) -> impl View {
             .anyview()
         }
     });
-    let panel = vstack((field("type a command", &state.palette_query), list))
-        .spacing(4.0)
-        .padding()
-        .max_height(430.0)
-        .background(Surface);
-    vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
+    // Hit-transparent like the search/title fields (WATERUI_FEEDBACK #50).
+    let panel = vstack((
+        field("type a command", &state.palette_query).hittable(false),
+        list,
+    ))
+    .spacing(4.0)
+    .padding()
+    .max_height(430.0)
+    .background(Surface)
+    // A click on the panel returns embedded focus to the live pane —
+    // without it the dead region would clear focus and trap the keys.
+    .on_tap(|app: AppState| app.refocus_selected());
+    // The dim scrim is part of the palette's world too — a click on it
+    // returns keys to the pane rather than dropping focus to nothing.
+    vstack((panel, Spacer::flexible()))
+        .background(Srgb::BLACK.with_opacity(0.45))
+        .on_tap(|app: AppState| app.refocus_selected())
 }
 
 /// The settings page: font size stepper, theme picker, cursor-blink

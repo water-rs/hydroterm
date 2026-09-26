@@ -1708,26 +1708,36 @@ impl TermSurface {
             // through to literal bytes — the reference's semantics: an
             // unbound keypress reaches the shell as its raw escape.
             let mut unbound = false;
+            // `unconsumed:` — the bind fires and the press still encodes
+            // to the program, skipping the default chord table (the
+            // user's bind occupies this slot). `global:`/`all:` always
+            // consume (Ghostty).
+            let mut fired_unconsumed = false;
             match self.app.config(|c| c.lookup_keybind(key, mods)) {
-                Some((all, performable, Some(action))) => {
+                Some((trig, Some(action))) => {
                     // `performable:` — an unperformable bind does not
                     // consume the press; it falls through to the default
                     // chord table and literal bytes (Ghostty).
-                    if performable && !self.action_performable(&action) {
+                    if trig.performable && !self.action_performable(&action) {
                         // fall through
                     } else {
-                        if all {
+                        if trig.all {
                             self.do_action_all(action);
                         } else {
                             self.do_action(action);
                         }
-                        return true;
+                        if trig.unconsumed && !trig.all && !trig.global {
+                            fired_unconsumed = true;
+                        } else {
+                            return true;
+                        }
                     }
                 }
-                Some((_, _, None)) => unbound = true, // explicitly disabled
+                Some((_, None)) => unbound = true, // explicitly disabled
                 None => {}
             }
             if !unbound
+                && !fired_unconsumed
                 && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
             {
                 self.do_action(action);
@@ -3222,20 +3232,32 @@ impl SceneContent for TermSurface {
                 self.on_text(text.as_str())
             }
             SurfaceInputEvent::CompositionStart => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[ime] start");
+                }
                 self.preedit = Some((String::new(), 0));
                 self.clear_selection_on_input();
                 true
             }
             SurfaceInputEvent::CompositionUpdate { text, caret } => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[ime] update text={text:?} caret={caret:?}");
+                }
                 self.preedit = Some((text.to_string(), caret.unwrap_or(text.len())));
                 true
             }
             SurfaceInputEvent::CompositionCommit(text) => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[ime] commit {text:?}");
+                }
                 self.preedit = None;
                 let _ = self.on_text(text.as_str());
                 true
             }
             SurfaceInputEvent::CompositionCancel => {
+                if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                    eprintln!("[ime] cancel");
+                }
                 self.preedit = None;
                 true
             }
