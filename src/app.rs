@@ -27,6 +27,7 @@ use waterui::task::{sleep, spawn_local};
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
+use waterui::accessibility::{AccessibilityRole, AccessibilityState};
 use waterui::drag_drop::DragData;
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use waterui_graphics::color::{Color, Srgb, signal_color};
@@ -41,6 +42,9 @@ use waterui::form::picker::picker;
 
 /// Fixed height of the tab strip at every window size.
 const TAB_STRIP_HEIGHT: f32 = 30.0;
+/// Payload prefix for internal tab-chip drags — must never reach a pane's
+/// drop handler, where it would be pasted into the PTY as shell text.
+const TAB_DRAG_PREFIX: &str = "hydroterm-tab:";
 
 /// Shared per-session UI state: the bindings a pane surface reads, plus
 /// the owning `Terminal` (PTY + grid).
@@ -1963,7 +1967,10 @@ impl View for PaneLeaf {
             // Drag-and-drop: a file dropped on the pane pastes its
             // shell-quoted path into the PTY (Ghostty/kitty behaviour).
             .drop_destination(|session: PaneSession, data: DragData| {
-                session.push_action(TermAction::DropText(data.as_str().to_string()));
+                let text = data.as_str();
+                if !text.starts_with(TAB_DRAG_PREFIX) {
+                    session.push_action(TermAction::DropText(text.to_string()));
+                }
             });
         let surface = Frame::new(surface);
         // Paste-protection confirm: multi-line clipboard content waits in
@@ -2547,6 +2554,8 @@ pub fn tabs_view(state: AppState) -> impl View {
                             text("×")
                                 .muted()
                                 .padding_with([3.0, 0.0, 4.0, 4.0])
+                                .a11y_label("Close tab")
+                                .a11y_role(AccessibilityRole::Button)
                                 .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
                         ))
                         .padding_with([4.0, 0.0, 8.0, 4.0]),
@@ -2555,15 +2564,19 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
                     .on_tap(move |app: AppState| app.selected.set(tab_id))
+                    .a11y_role(AccessibilityRole::Tab)
+                    .a11y_state_signal(
+                        active.map(|a| AccessibilityState::new().selected(a)),
+                    )
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.
                     .draggable(drag_drop::DragData::text(format!(
-                        "hydroterm-tab:{tab_id}"
+                        "{TAB_DRAG_PREFIX}{tab_id}"
                     )))
                     .drop_destination(move |app: AppState, data: drag_drop::DragData| {
                         if let Some(id) = data
                             .as_str()
-                            .strip_prefix("hydroterm-tab:")
+                            .strip_prefix(TAB_DRAG_PREFIX)
                             .and_then(|s| s.parse::<u64>().ok())
                         {
                             app.move_tab_before(id, tab_id);
@@ -2572,11 +2585,13 @@ pub fn tabs_view(state: AppState) -> impl View {
                 })
             };
             hstack((
-                strip,
+                strip.a11y_role(AccessibilityRole::TabList),
                 text("+")
                     .muted()
                     .padding_horizontal(4.0)
                     .height(TAB_STRIP_HEIGHT)
+                    .a11y_label("New tab")
+                    .a11y_role(AccessibilityRole::Button)
                     .on_tap(|app: AppState| _ = app.new_tab()),
             ))
             .spacing(4.0)
