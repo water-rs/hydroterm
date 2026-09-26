@@ -26,6 +26,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, Processor};
 use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::task::spawn_local;
+use waterui::window::WindowState;
 use waterui_core::Str;
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::scene2d::Scene2D;
@@ -47,8 +48,7 @@ use crate::terminal::TermEvent;
 const BLINK_HALF: Duration = Duration::from_millis(530);
 /// Bell flash decay time.
 const BELL_FLASH_SECS: f32 = 0.15;
-/// How long the cols×rows resize badge stays after the last change.
-const RESIZE_LABEL_MS: Duration = Duration::from_millis(900);
+
 /// Overlay alpha of a bell flash: a step flash at full strength for the
 /// whole `BELL_FLASH_SECS` duration — kitty's `visual_bell` semantics,
 /// clearly visible rather than a faint decaying hint.
@@ -217,6 +217,36 @@ fn ring_bell(last: &mut Option<Instant>) {
     let _ = std::process::Command::new("xkbbell").spawn();
 }
 
+/// `osc-color-report-format = 8-bit`: rewrite every `rgb:XXXX/YYYY/ZZZZ`
+/// in a color-report reply to `rgb:XX/YY/ZZ` (unscaled — each component
+/// keeps its most significant byte, Ghostty `osc_color_report_format`).
+fn color_reply_8bit(reply: &str) -> String {
+    let mut out = String::with_capacity(reply.len());
+    let mut rest = reply;
+    while let Some(pos) = rest.find("rgb:") {
+        out.push_str(&rest[..pos + 4]);
+        rest = &rest[pos + 4..];
+        for i in 0..3 {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_hexdigit()))
+                .unwrap_or(rest.len());
+            let comp = &rest[..end];
+            out.push_str(&comp[..comp.len().min(2)]);
+            rest = &rest[end..];
+            if i < 2 {
+                if let Some(sep) = rest.strip_prefix('/') {
+                    out.push('/');
+                    rest = sep;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// In-surface text search state (Ctrl+Shift+F).
 struct Search {
     query: String,
@@ -301,6 +331,9 @@ pub struct TermSurface {
     bell_border: bool,
     /// Last grid-size change for the `resize-overlay` badge decay.
     resize_at: Option<Instant>,
+    /// Resizes seen on this surface — `resize-overlay = after-first`
+    /// suppresses the very first one (the initial layout).
+    resize_count: u32,
     /// Last time the X11 bell actually rang (throttle).
     bell_ring_at: Option<Instant>,
     blink_epoch: Instant,
@@ -398,6 +431,7 @@ impl TermSurface {
             bell_at: None,
             bell_border: false,
             resize_at: None,
+            resize_count: 0,
             bell_ring_at: None,
             blink_epoch: Instant::now(),
             search: None,
@@ -1312,11 +1346,10 @@ impl TermSurface {
                         false => Str::from(title),
                     };
                     *self.session.base_title.lock().unwrap() = t.clone();
-                    // A 🔔 badge holds the title until user attention clears
-                    // it — the real title keeps accumulating in base_title.
-                    if !*self.session.notify_badge.lock().unwrap() {
-                        self.app.set_session_title(self.session.id, t);
-                    }
+                    // Armed 🔔 badge: `set_session_title` re-applies the
+                    // window-title prefix itself; session/tab titles stay
+                    // clean (the chip shows the badge, not the prefix).
+                    self.app.set_session_title(self.session.id, t);
                 }
                 TermEvent::ClipboardStore(_ty, text) => {
                     // `osc52-write` config (Ghostty clipboard-write): deny
@@ -1347,7 +1380,16 @@ impl TermSurface {
                 }
                 TermEvent::ColorRequest(index, fmt) => {
                     let rgb = self.palette.borrow().at(index);
-                    self.write(fmt(rgb).into_bytes());
+                    let reply = fmt(rgb);
+                    match self.app.config(|c| c.osc_color_report_format) {
+                        crate::config::OscColorReportFormat::None => {}
+                        crate::config::OscColorReportFormat::Bits8 => {
+                            self.write(color_reply_8bit(&reply).into_bytes());
+                        }
+                        crate::config::OscColorReportFormat::Bits16 => {
+                            self.write(reply.into_bytes());
+                        }
+                    }
                 }
                 TermEvent::TextAreaSizeRequest(fmt) => {
                     let ws = WindowSize {
@@ -1365,13 +1407,18 @@ impl TermSurface {
                     if self.app.config(|c| c.audible_bell) {
                         ring_bell(&mut self.bell_ring_at);
                     }
-                    // `bell-features` `attention` — the tab badge is the
-                    // request-attention channel. Ghostty also raises the
-                    // WM urgency hint; no waterui/hydrolysis surface
-                    // reaches `request_user_attention` — WATERUI_FEEDBACK
-                    // #51, unimplemented rather than faked.
-                    if self.app.config(|c| c.bell_attention) {
+                    // `bell-features` `attention`/`title` — each is an
+                    // attention alert cleared by `clear_notify_badge`.
+                    // Ghostty's `attention` also raises the WM urgency
+                    // hint; no waterui/hydrolysis surface reaches
+                    // `request_user_attention` — WATERUI_FEEDBACK #51,
+                    // unimplemented rather than faked.
+                    let attention = self.app.config(|c| c.bell_attention);
+                    let title = self.app.config(|c| c.bell_title);
+                    if attention || title {
                         *self.session.notify_badge.lock().unwrap() = true;
+                    }
+                    if attention {
                         self.app.tab_badge(self.session.id, true);
                     }
                     // `bell-features` `border` — a ring around the pane
@@ -1380,13 +1427,10 @@ impl TermSurface {
                         self.bell_border = true;
                     }
                     // `bell-features` `title` — prepend 🔔 to the
-                    // window/tab title (Ghostty).
-                    if self.app.config(|c| c.bell_title) {
-                        let base = self.session.base_title.lock().unwrap().clone();
-                        self.app.set_session_title(
-                            self.session.id,
-                            Str::from(format!("\u{1f514} {base}")),
-                        );
+                    // WINDOW title only; the tab chip's mark is the
+                    // badge (one attention indicator per surface).
+                    if title {
+                        self.app.bell_title(self.session.id);
                     }
                 }
                 TermEvent::ChildExit(_status) => {
@@ -1585,8 +1629,15 @@ impl TermSurface {
                 .resize(cols, lines, (m.cell_w as u16, m.cell_h as u16));
             // `resize-overlay`: show the new grid size for a beat after
             // the last change — the Instant decays inside build_scene,
-            // same pattern as the bell flash.
-            if self.app.config(|c| c.resize_overlay) {
+            // same pattern as the bell flash. `after-first` skips this
+            // surface's very first resize (its initial layout).
+            self.resize_count += 1;
+            let show = match self.app.config(|c| c.resize_overlay) {
+                crate::config::ResizeOverlay::Always => true,
+                crate::config::ResizeOverlay::AfterFirst => self.resize_count > 1,
+                crate::config::ResizeOverlay::Never => false,
+            };
+            if show {
                 self.resize_at = Some(Instant::now());
                 self.session
                     .resize_label
@@ -1606,6 +1657,14 @@ impl TermSurface {
         self.focused = gained;
         if gained {
             self.app.focus_pane(self.session.id);
+        } else if self.app.is_quick_app()
+            && self.app.config(|c| c.quick_terminal_autohide)
+        {
+            // `quick-terminal-autohide`: the drop-down's surface losing
+            // window focus closes the window (Ghostty). This runs at
+            // Focus(false), so the closed state takes effect only when
+            // focus actually leaves — not while the window is fading out.
+            self.app.quick_state.set(WindowState::Closed);
         }
         let mode = *self.session.terminal.term.lock().mode();
         if mode.contains(TermMode::FOCUS_IN_OUT) {
@@ -1622,9 +1681,8 @@ impl TermSurface {
         if *badge {
             *badge = false;
             self.app.tab_badge(self.session.id, false);
-            let t = self.session.base_title.lock().unwrap().clone();
             drop(badge);
-            self.app.set_session_title(self.session.id, t);
+            self.app.bell_title(self.session.id);
         }
     }
 
@@ -3075,11 +3133,12 @@ impl SceneContent for TermSurface {
         let bell_live = self
             .bell_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(BELL_FLASH_SECS));
-        // The resize badge stays up for RESIZE_LABEL_MS after the last
-        // size change, then clears itself.
+        // The resize badge stays up for `resize-overlay-duration`
+        // after the last size change, then clears itself.
+        let resize_ms = self.app.config(|c| c.resize_overlay_ms);
         let resize_live = self
             .resize_at
-            .is_some_and(|t| t.elapsed() < RESIZE_LABEL_MS);
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(resize_ms));
         if !resize_live && self.resize_at.is_some() {
             self.resize_at = None;
             self.session.resize_label.set(None);

@@ -30,6 +30,9 @@ use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::accessibility::{AccessibilityChildren, AccessibilityRole, AccessibilityState};
 use waterui::drag_drop::DragData;
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
+use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
+use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
+use waterui::shape::{FixedRoundedRectangle, ShapeExt};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
 
@@ -629,9 +632,10 @@ impl AppState {
     pub fn new(config_path: Option<std::path::PathBuf>, command: Option<Vec<String>>) -> Self {
         let mut watcher = ConfigWatcher::new(config_path);
         if command.is_some() {
-            // `-e` wins over a config-file `command =`; neither survives
-            // past the first session (initial-surface semantics).
-            watcher.config.command = command;
+            // `-e` is the CLI spelling of `initial-command` (first
+            // surface only); it does not replace the `command` config,
+            // which keeps applying to every later surface.
+            watcher.config.initial_command = command;
         }
         for e in &watcher.errors {
             eprintln!("hydroterm config: {e}");
@@ -702,8 +706,10 @@ impl AppState {
         if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
             state.focus_owner.set(Some((first_tab, t.focused.snapshot())));
         }
-        // `-e` applies to the first session only (like xterm/kitty).
-        state.cfg.borrow_mut().config.command = None;
+        // `initial-command` is consumed by the first session (like
+        // xterm/kitty `-e`); `command` stays — it applies to every
+        // new surface.
+        state.cfg.borrow_mut().config.initial_command = None;
         // `theme = auto` / `window-theme = auto`: watch the desktop
         // color-scheme. gsettings `monitor` prints a line per change;
         // flag dirty + poke every live surface so `poll_config`
@@ -986,9 +992,19 @@ impl AppState {
         }
         let mut app = AppState::new(Some(self.cfg.borrow().path.clone()), None);
         app.is_quick = true;
+        // Share the host's `quick_state`: `quick-terminal-autohide` on a
+        // drop-down surface writes it and the `conditional_window` reads
+        // it — a private binding would leave the window visible.
+        app.quick_state = self.quick_state.clone();
         let app = Rc::new(app);
         *self.quick_app.borrow_mut() = Some(app.clone());
         app
+    }
+
+    /// True for the drop-down window's own AppState — its surfaces check
+    /// this for `quick-terminal-autohide` on Focus(false).
+    pub fn is_quick_app(&self) -> bool {
+        self.is_quick
     }
 
     /// Flip the drop-down window open/closed (the X11 hotkey calls this).
@@ -1292,10 +1308,14 @@ impl AppState {
     ) -> Rc<Session> {
         let id = self.alloc_id();
         let mut cfg = self.cfg.borrow().config.clone();
-        // `command` (config file or `-e`) is initial-surface only — a
-        // hot reload re-populating it must not hijack later spawns.
+        // First surface: `initial-command` (`-e`) wins over `command`.
+        // `command` applies to every new surface (Ghostty semantics), so
+        // a config reload re-populating it is correct on later spawns.
         if self.initial_spawn.replace(true) {
-            cfg.command = None;
+            cfg.initial_command = None;
+        }
+        if let Some(initial) = cfg.initial_command.take() {
+            cfg.command = Some(initial);
         }
         // `working-directory` fills in when no OSC 7 cwd was inherited.
         let cwd = cwd.or_else(|| cfg.working_directory.clone());
@@ -1466,7 +1486,9 @@ impl AppState {
     }
 
     /// Update a session's title; mirrors onto its tab and the window
-    /// title when the session is focused in the selected tab.
+    /// title when the session is focused in the selected tab. The
+    /// window title keeps its 🔔 prefix while the session's attention
+    /// badge is armed (the tab chip shows the badge, not the prefix).
     pub fn set_session_title(&self, session_id: u64, title: Str) {
         if let Some(s) = self.session(session_id) {
             s.title.set(title.clone());
@@ -1480,9 +1502,53 @@ impl AppState {
                     tab.title.set(title.clone());
                 }
                 if self.selected.snapshot() == tab_id {
-                    self.window_title.set(self.title_with_subtitle(&title));
+                    let shown = self.bell_prefixed_title(session_id, &title);
+                    self.window_title.set(shown);
                 }
             }
+    }
+
+    /// `bell-features` `title` — the 🔔 prefix applies to the WINDOW
+    /// title only; the tab chip's attention state is its 🔔 badge (one
+    /// mark per surface). While armed, later OSC title changes keep the
+    /// prefix (applied here in `set_session_title`). Call after the
+    /// session's `notify_badge` flag is already in its new state.
+    pub fn bell_title(&self, session_id: u64) {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
+        else {
+            return;
+        };
+        if self.selected.snapshot() != tab_id {
+            return;
+        }
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        if tab.focused.snapshot() != session_id {
+            return;
+        }
+        let Some(s) = self.session(session_id) else { return };
+        let base = s.base_title.lock().unwrap().clone();
+        self.window_title
+            .set(self.bell_prefixed_title(session_id, &base));
+    }
+
+    /// `title` with the 🔔 prefix when the session's badge is armed and
+    /// `bell-features` `title` is on; plus the `window-subtitle` suffix.
+    fn bell_prefixed_title(&self, session_id: u64, title: &Str) -> Str {
+        let armed = self
+            .session(session_id)
+            .is_some_and(|s| *s.notify_badge.lock().unwrap());
+        #[expect(
+            if_else_view,
+            reason = "the arms produce a Str, not a View — when().otherwise() is not applicable"
+        )]
+        let prefixed = if armed && self.config(|c| c.bell_title) {
+            Str::from(format!("\u{1f514} {title}"))
+        } else {
+            title.clone()
+        };
+        self.title_with_subtitle(&prefixed)
     }
 
     /// Mirror a session's `notify_badge` onto its owning tab chip
@@ -2116,14 +2182,25 @@ impl View for PaneLeaf {
             session.0.unfocused_opacity.clone(),
         )
         .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
-        // `resize-overlay`: a cols×rows chip at the pane's bottom edge
-        // while the terminal resizes; `resize_label` is Some only in
-        // the display window. A Spacer above the `when` pushes the chip
-        // to the pane's bottom edge.
+        // `resize-overlay`: a cols×rows chip inside the pane while the
+        // terminal resizes; `resize_label` is Some only in the display
+        // window. `resize-overlay-position` anchors the chip — an
+        // `absolute` layer + `position_in` gives the exact anchor (a
+        // `vstack` sized to its chip would center in the `zstack` and
+        // make left/right unreachable). Position is read at pane build.
         let resize_label = session.0.resize_label.clone();
         let show_resize = resize_label.is_some();
-        let resize_badge = vstack((
-            Spacer::flexible(),
+        use crate::config::ResizeOverlayPosition as ROP;
+        let chip_anchor = match self.state.config(|c| c.resize_overlay_position) {
+            ROP::Center => UnitPoint::CENTER,
+            ROP::TopLeft => UnitPoint::TOP_LEADING,
+            ROP::TopCenter => UnitPoint::TOP,
+            ROP::TopRight => UnitPoint::TOP_TRAILING,
+            ROP::BottomLeft => UnitPoint::BOTTOM_LEADING,
+            ROP::BottomCenter => UnitPoint::BOTTOM,
+            ROP::BottomRight => UnitPoint::BOTTOM_TRAILING,
+        };
+        let resize_badge = absolute((
             when(show_resize, move || {
                 text(resize_label.unwrap_or_default().computed())
                     .foreground(Foreground)
@@ -2131,7 +2208,8 @@ impl View for PaneLeaf {
                     .padding_vertical(4.0)
                     .background(Surface)
             })
-            .padding_vertical(8.0),
+            .padding_with(8.0)
+            .position_in(chip_anchor),
         ));
         // `prompt_title` — a rename prompt over the pane. The TextField
         // can't take keyboard focus (hydrolysis#90), so the surface
@@ -2599,12 +2677,14 @@ pub fn tabs_view(state: AppState) -> impl View {
                             // The close control is the chip's sibling, not a
                             // descendant of the Tab node — it keeps its own
                             // Button node.
-                            text("×")
-                                .muted()
-                                .padding_with([3.0, 0.0, 4.0, 4.0])
-                                .a11y_label("Close tab")
-                                .a11y_role(AccessibilityRole::Button)
-                                .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
+                            hydrolysis_m3::plain_tooltip("Close tab").for_target(
+                                text("×")
+                                    .muted()
+                                    .padding_with([3.0, 0.0, 4.0, 4.0])
+                                    .a11y_label("Close tab")
+                                    .a11y_role(AccessibilityRole::Button)
+                                    .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
+                            ),
                         ))
                         .padding_with([4.0, 0.0, 8.0, 4.0]),
                         Frame::new(indicator_color).height(3.0),
@@ -2629,13 +2709,15 @@ pub fn tabs_view(state: AppState) -> impl View {
             };
             hstack((
                 strip.a11y_role(AccessibilityRole::TabList),
-                text("+")
-                    .muted()
-                    .padding_horizontal(4.0)
-                    .height(TAB_STRIP_HEIGHT)
-                    .a11y_label("New tab")
-                    .a11y_role(AccessibilityRole::Button)
-                    .on_tap(|app: AppState| _ = app.new_tab()),
+                hydrolysis_m3::plain_tooltip("New tab").for_target(
+                    text("+")
+                        .muted()
+                        .padding_horizontal(4.0)
+                        .height(TAB_STRIP_HEIGHT)
+                        .a11y_label("New tab")
+                        .a11y_role(AccessibilityRole::Button)
+                        .on_tap(|app: AppState| _ = app.new_tab()),
+                ),
             ))
             .spacing(4.0)
             .padding()
@@ -2936,9 +3018,29 @@ impl AppState {
     }
 }
 
-/// The palette overlay: a field + filtered action list, stacked over the
-/// tabs and a dimming mask. Up/Down moves the selection (the surface's
-/// key path), Enter runs the selected match; a row tap runs it directly.
+/// Command-palette card geometry: an M3 elevated dialog treatment —
+/// `surface-container-high` fill, elevation Level 3, the 28dp dialog
+/// corner radius, and the `scrim` role at M3's 0.32 opacity dimming the
+/// whole window behind the card. The card keeps its own width (the M3
+/// dialog maximum, 560) centered near the top of the window; its height
+/// follows the visible result count up to a maximum, past which the
+/// result `List` scrolls.
+const PALETTE_CARD_WIDTH: f32 = 560.0;
+const PALETTE_CARD_RADIUS: f32 = 28.0;
+/// Field + padding share of the card's fixed chrome height.
+const PALETTE_CHROME_H: f32 = 72.0;
+/// Height budget per visible result row (measured list-row pitch).
+const PALETTE_ROW_H: f32 = 64.0;
+const PALETTE_CARD_MAX_H: f32 = 440.0;
+/// Distance between the window's top edge and the card's.
+const PALETTE_TOP_OFFSET: f32 = 72.0;
+/// `scrim` role opacity — M3 `SCRIM_OPACITY` (`theme::colors`, private).
+const PALETTE_SCRIM_OPACITY: f32 = 0.32;
+
+/// The palette overlay: a content-sized M3 card (field + filtered action
+/// list) centered near the top over a window-wide scrim. Up/Down moves
+/// the selection (the surface's key path), Enter runs the selected
+/// match; a row tap runs it directly.
 fn palette_view(state: AppState) -> impl View {
     let query = state.palette_query.clone();
     let list = watch(query, {
@@ -2975,23 +3077,41 @@ fn palette_view(state: AppState) -> impl View {
             .anyview()
         }
     });
-    // Hit-transparent like the search/title fields (WATERUI_FEEDBACK #50).
-    let panel = vstack((
+    // Card height follows the number of visible results, capped at
+    // PALETTE_CARD_MAX_H; the List scrolls past it. `max_height` takes a
+    // signal, so the cap is re-measured per query edit.
+    let card_max_h = state.palette_query.map({
+        let state = state.clone();
+        move |q: Str| {
+            let rows = palette_matches(&state, q.as_str()).len() as f32;
+            (PALETTE_CHROME_H + rows * PALETTE_ROW_H).min(PALETTE_CARD_MAX_H)
+        }
+    });
+    // Hit-transparent field like the search/title fields (WATERUI_FEEDBACK #50).
+    let card = vstack((
         field("type a command", &state.palette_query).hittable(false),
         list,
     ))
     .spacing(4.0)
     .padding()
-    .max_height(430.0)
-    .background(Surface)
-    // A click on the panel returns embedded focus to the live pane —
+    .max_width(PALETTE_CARD_WIDTH)
+    .max_height(card_max_h)
+    .background(FixedRoundedRectangle::new(PALETTE_CARD_RADIUS).fill(SurfaceContainerHigh))
+    // A click on the card returns embedded focus to the live pane —
     // without it the dead region would clear focus and trap the keys.
     .on_tap(|app: AppState| app.refocus_selected());
-    // The dim scrim is part of the palette's world too — a click on it
-    // returns keys to the pane rather than dropping focus to nothing.
-    vstack((panel, Spacer::flexible()))
-        .background(Srgb::BLACK.with_opacity(0.45))
-        .on_tap(|app: AppState| app.refocus_selected())
+    let card =
+        material_elevation(MaterialElevationLevel::LEVEL3, PALETTE_CARD_RADIUS, card)
+            .position_in_offset(UnitPoint::TOP, UnitPoint::TOP, 0.0, PALETTE_TOP_OFFSET);
+    absolute((
+        // M3 `scrim` role over the whole window; a click on it returns
+        // keys to the pane rather than dropping focus to nothing.
+        Scrim
+            .with_opacity(PALETTE_SCRIM_OPACITY)
+            .on_tap(|app: AppState| app.refocus_selected())
+            .a11y_hidden(true),
+        card,
+    ))
 }
 
 /// The settings page: font size stepper, theme picker, cursor-blink

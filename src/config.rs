@@ -183,6 +183,43 @@ pub enum WindowPaddingColor {
     ExtendAlways,
 }
 
+/// `resize-overlay` — when the cols×rows chip shows during a resize
+/// (Ghostty 3-state enum; `true`/`false` parse as the deprecated
+/// `always`/`never` spellings this repo accepted before the enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeOverlay {
+    /// Never show the chip.
+    Never,
+    /// Show on every resize, including the first layout.
+    Always,
+    /// Skip the surface's initial-layout resize (Ghostty default).
+    AfterFirst,
+}
+
+/// `resize-overlay-position` — where in the pane the chip sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeOverlayPosition {
+    Center,
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+/// `osc-color-report-format` — component width in OSC 4/10/11/12
+/// report replies (`none` suppresses the reply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscColorReportFormat {
+    /// No reply.
+    None,
+    /// `rgb:rr/gg/bb` (8-bit, unscaled).
+    Bits8,
+    /// `rgb:rrrr/gggg/bbbb` (16-bit, scaled — the default).
+    Bits16,
+}
+
 /// One parsed `keybind` trigger: the normalized `ctrl+alt+shift+super+key`
 /// chord plus Ghostty's prefix flags (combinable in any order, e.g.
 /// `keybind = global:unconsumed:ctrl+a=reload_config`).
@@ -242,6 +279,10 @@ pub struct AppConfig {
     /// `shell-integration-features` — the integration extras (cursor,
     /// sudo, title); each can be turned off with `no-<feature>`.
     pub shell_features: ShellFeatures,
+    /// Hide the quick terminal when its window loses focus
+    /// (Ghostty `quick-terminal-autohide`; default false on Linux,
+    /// matching the reference's OS-dependent default).
+    pub quick_terminal_autohide: bool,
     /// `quick-terminal-position` — drop-down dock edge (top default).
     pub quick_terminal_position: QuickTermPosition,
     /// `quick-terminal-size = <primary>[,<secondary>]` — primary axis
@@ -265,8 +306,16 @@ pub struct AppConfig {
     pub cursor_blink: bool,
     /// Shell program override; `None` = `$SHELL` with integration.
     pub shell: Option<String>,
-    /// `-e` / `--` command for the initial session.
+    /// `command` — program for every new surface (Ghostty semantics:
+    /// `direct:` splits verbatim argv, `shell:`/bare go through
+    /// `sh -c`). `-e` maps to `initial-command`, not this.
     pub command: Option<Vec<String>>,
+    /// `initial-command` — program for the first surface only
+    /// (Ghostty `initial-command`); `-e`/`--` lands here.
+    pub initial_command: Option<Vec<String>>,
+    /// `osc-color-report-format` — component width in OSC 4/10/11/12
+    /// report replies.
+    pub osc_color_report_format: OscColorReportFormat,
     /// `keybind = <chord>=<action>` entries; `None` action = disabled.
     pub keybinds: Vec<(KeybindTrigger, Option<TermAction>)>,
     /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
@@ -349,9 +398,15 @@ pub struct AppConfig {
     /// Alpha applied to a pane that is not the focused split
     /// (Ghostty `unfocused-split-opacity`), clamped to 0.0..=1.0.
     pub unfocused_split_opacity: f32,
-    /// Show a cols×rows badge while the window resizes
-    /// (Ghostty `resize-overlay`).
-    pub resize_overlay: bool,
+    /// When to show the cols×rows badge while a pane resizes
+    /// (Ghostty `resize-overlay`, default `after-first`).
+    pub resize_overlay: ResizeOverlay,
+    /// Where in the pane the badge sits
+    /// (Ghostty `resize-overlay-position`, default `center`).
+    pub resize_overlay_position: ResizeOverlayPosition,
+    /// How long the badge stays after the last size change, in
+    /// milliseconds (Ghostty `resize-overlay-duration`, default 750).
+    pub resize_overlay_ms: u64,
     /// Pointer entering a pane records it as the focused split
     /// (Ghostty `focus-follows-mouse`). App-level record only —
     /// GUI key focus still needs a press until hydrolysis#126.
@@ -554,6 +609,9 @@ impl Default for AppConfig {
             font_codepoint_map: Vec::new(),
             font_thicken: false,
             scrollback: 10_000,
+            osc_color_report_format: OscColorReportFormat::Bits16,
+            initial_command: None,
+            quick_terminal_autohide: false,
             theme: ThemeRef::Named("hydroterm-dark".into()),
             copy_on_select: CopyOnSelect::Both,
             selection_clear_on_typing: true,
@@ -595,7 +653,9 @@ impl Default for AppConfig {
             faint_opacity: 0.5,
             working_directory: None,
             unfocused_split_opacity: 1.0,
-            resize_overlay: true,
+            resize_overlay: ResizeOverlay::AfterFirst,
+            resize_overlay_position: ResizeOverlayPosition::Center,
+            resize_overlay_ms: 750,
             focus_follows_mouse: false,
             foreground: None,
             background: None,
@@ -698,9 +758,14 @@ bold-color = bright        # bright | #rrggbb — bold-text color (unset = no ov
 faint-opacity = 0.5        # faint (SGR 2) text opacity, 0.0-1.0
 selection-clear-on-typing = true  # typing drops the selection highlight
 unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
-resize-overlay = true      # cols x rows badge while resizing
+resize-overlay = after-first   # never | always | after-first — cols x rows chip while resizing
+# resize-overlay-position = center   # center | top-left | top-center | top-right | bottom-left | bottom-center | bottom-right
+# resize-overlay-duration = 750ms    # compound units: 1h30m, 45s, 250ms
 focus-follows-mouse = false
-# command = tmux attach    # program for the initial session (`-e` wins)
+# command = tmux attach    # program for every new surface (direct:/shell: prefixes)
+# initial-command = neofetch  # program for the first surface only (`-e` lands here)
+# quick-terminal-autohide = false   # hide the drop-down when its window loses focus
+# osc-color-report-format = 16-bit  # 8-bit | 16-bit | none — OSC 4/10/11/12 reply width
 # working-directory = ~/projects   # initial cwd when no OSC 7 report
 # window-new-tab-position = end    # end | current — where new tabs insert
 # window-inherit-working-directory = true  # new tab takes focused pane's OSC 7 cwd
@@ -928,10 +993,28 @@ impl AppConfig {
                         }
                     };
                 }
-                "scrollback" => match value.parse::<usize>() {
-                    Ok(v) => cfg.scrollback = v.min(1_000_000),
-                    Err(_) => errors.push(format!("line {}: bad scrollback {value:?}", n + 1)),
-                },
+                // `scrollback-limit-lines` is the reference's canonical
+                // name (1.4 renamed `scrollback-limit` to `-bytes` and
+                // split units); our line cap shares the slot.
+                "scrollback" | "scrollback-limit-lines" | "scrollback-limit" => {
+                    match value.parse::<usize>() {
+                        Ok(v) => cfg.scrollback = v.min(1_000_000),
+                        Err(_) => errors.push(format!(
+                            "line {}: bad scrollback {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "scrollback-limit-bytes" => {
+                    // Byte cap is alacritty's — we carry a line cap only;
+                    // parse so the key isn't an unknown-key error.
+                    if value.parse::<usize>().is_err() {
+                        errors.push(format!(
+                            "line {}: bad scrollback-limit-bytes {value:?}",
+                            n + 1
+                        ));
+                    }
+                }
                 "background-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
                     _ => errors.push(format!("line {}: bad background-opacity {value:?}", n + 1)),
@@ -1235,9 +1318,10 @@ impl AppConfig {
                 },
                 "shell" => cfg.shell = (!value.is_empty()).then(|| value.to_string()),
                 "command" => {
-                    let argv: Vec<String> =
-                        value.split_whitespace().map(String::from).collect();
-                    cfg.command = (!argv.is_empty()).then_some(argv);
+                    cfg.command = parse_command(value);
+                }
+                "initial-command" => {
+                    cfg.initial_command = parse_command(value);
                 }
                 "working-directory" => {
                     cfg.working_directory = (!value.is_empty()).then(|| expand_home(value));
@@ -1253,8 +1337,60 @@ impl AppConfig {
                         )),
                     }
                 }
-                "resize-overlay" => {
-                    cfg.resize_overlay = bool_value(value, n, &mut errors);
+                "resize-overlay" => match value {
+                    "never" | "false" => cfg.resize_overlay = ResizeOverlay::Never,
+                    "always" | "true" => cfg.resize_overlay = ResizeOverlay::Always,
+                    "after-first" => cfg.resize_overlay = ResizeOverlay::AfterFirst,
+                    _ => errors.push(format!(
+                        "line {}: bad resize-overlay {value:?} (want never|always|after-first)",
+                        n + 1
+                    )),
+                },
+                "resize-overlay-position" => match value {
+                    "center" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::Center;
+                    }
+                    "top-left" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::TopLeft;
+                    }
+                    "top-center" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::TopCenter;
+                    }
+                    "top-right" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::TopRight;
+                    }
+                    "bottom-left" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::BottomLeft;
+                    }
+                    "bottom-center" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::BottomCenter;
+                    }
+                    "bottom-right" => {
+                        cfg.resize_overlay_position = ResizeOverlayPosition::BottomRight;
+                    }
+                    _ => errors.push(format!(
+                        "line {}: bad resize-overlay-position {value:?}",
+                        n + 1
+                    )),
+                },
+                "resize-overlay-duration" => match parse_duration_ms(value) {
+                    Some(ms) => cfg.resize_overlay_ms = ms,
+                    None => errors.push(format!(
+                        "line {}: bad resize-overlay-duration {value:?} (want e.g. 750ms)",
+                        n + 1
+                    )),
+                },
+                "osc-color-report-format" => match value {
+                    "none" => cfg.osc_color_report_format = OscColorReportFormat::None,
+                    "8-bit" => cfg.osc_color_report_format = OscColorReportFormat::Bits8,
+                    "16-bit" => cfg.osc_color_report_format = OscColorReportFormat::Bits16,
+                    _ => errors.push(format!(
+                        "line {}: bad osc-color-report-format {value:?}",
+                        n + 1
+                    )),
+                },
+                "quick-terminal-autohide" => {
+                    cfg.quick_terminal_autohide = bool_value(value, n, &mut errors);
                 }
                 "focus-follows-mouse" => {
                     cfg.focus_follows_mouse = bool_value(value, n, &mut errors);
@@ -1770,6 +1906,56 @@ pub const ACTION_NAMES: &[&str] = &[
     "toggle_split_zoom", "equalize_splits",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
+
+/// Ghostty `command`/`initial-command` value → argv: `direct:` splits
+/// verbatim argv, `shell:` or a bare value goes through `sh -c`
+/// (the reference's `Command` union — bare values are shell-expanded).
+fn parse_command(value: &str) -> Option<Vec<String>> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Some(rest) = v.strip_prefix("direct:") {
+        let argv: Vec<String> = rest.split_whitespace().map(String::from).collect();
+        return (!argv.is_empty()).then_some(argv);
+    }
+    let script = v.strip_prefix("shell:").map(str::trim).unwrap_or(v);
+    Some(vec!["/bin/sh".into(), "-c".into(), script.to_string()])
+}
+
+/// `1h30m`-style compound duration → milliseconds (Ghostty `Duration`
+/// — every number+unit pair adds in; sub-ms units round to 0).
+fn parse_duration_ms(value: &str) -> Option<u64> {
+    let mut rest = value.trim();
+    let mut total: u64 = 0;
+    let mut seen = false;
+    while !rest.is_empty() {
+        let dlen = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        if dlen == 0 {
+            return None;
+        }
+        let n: u64 = rest[..dlen].parse().ok()?;
+        let after_num = &rest[dlen..];
+        let ulen = after_num
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(after_num.len());
+        let ms_per = match after_num[..ulen].trim() {
+            "y" => 365 * 86_400_000u64,
+            "w" => 7 * 86_400_000u64,
+            "d" => 86_400_000u64,
+            "h" => 3_600_000,
+            "m" => 60_000,
+            "s" => 1_000,
+            "ms" => 1,
+            "us" | "µs" | "ns" => 0,
+            _ => return None,
+        };
+        total = total.saturating_add(n.saturating_mul(ms_per));
+        seen = true;
+        rest = after_num[ulen..].trim_start();
+    }
+    seen.then_some(total)
+}
 
 fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
     match value.to_ascii_lowercase().as_str() {
@@ -3253,5 +3439,79 @@ mod tests {
         );
         let (_, errs) = AppConfig::parse("command-palette-entry = title:NoAction");
         assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn command_parses_reference_prefixes() {
+        let (cfg, errs) = AppConfig::parse(
+            "command = shell:printf hi; exec $SHELL\ninitial-command = direct:echo -n x",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        // `shell:` and bare values go through `sh -c`; `direct:` is argv.
+        assert_eq!(
+            cfg.command.unwrap(),
+            ["/bin/sh", "-c", "printf hi; exec $SHELL"]
+        );
+        assert_eq!(cfg.initial_command.unwrap(), ["echo", "-n", "x"]);
+        let (cfg, errs) = AppConfig::parse("command = tmux attach");
+        assert!(errs.is_empty());
+        assert_eq!(cfg.command.unwrap(), ["/bin/sh", "-c", "tmux attach"]);
+        // An empty value clears the option.
+        let (cfg, errs) = AppConfig::parse("command = ");
+        assert!(errs.is_empty());
+        assert!(cfg.command.is_none());
+    }
+
+    #[test]
+    fn resize_overlay_parses_reference_enum() {
+        let (cfg, errs) = AppConfig::parse(
+            "resize-overlay = after-first\nresize-overlay-position = top-right\nresize-overlay-duration = 1h30m45s750ms",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.resize_overlay, ResizeOverlay::AfterFirst);
+        assert_eq!(cfg.resize_overlay_position, ResizeOverlayPosition::TopRight);
+        // 1h + 30m + 45s + 750ms compounds.
+        assert_eq!(cfg.resize_overlay_ms, 3_600_000 + 1_800_000 + 45_000 + 750);
+        // Deprecated bool spellings still parse (always/never).
+        let (cfg, errs) = AppConfig::parse("resize-overlay = false\nresize-overlay = always");
+        assert!(errs.is_empty());
+        assert_eq!(cfg.resize_overlay, ResizeOverlay::Always);
+        let (_, errs) = AppConfig::parse("resize-overlay = purple\nresize-overlay-duration = soon");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        for pos in [
+            "center", "top-left", "top-center", "top-right",
+            "bottom-left", "bottom-center", "bottom-right",
+        ] {
+            let (cfg, errs) = AppConfig::parse(&format!("resize-overlay-position = {pos}"));
+            assert!(errs.is_empty(), "{pos}: {errs:?}");
+            let _ = cfg;
+        }
+    }
+
+    #[test]
+    fn osc_color_report_format_parses() {
+        let (cfg, errs) = AppConfig::parse("osc-color-report-format = 8-bit");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.osc_color_report_format, OscColorReportFormat::Bits8);
+        let (cfg, errs) = AppConfig::parse("osc-color-report-format = none");
+        assert!(errs.is_empty());
+        assert_eq!(cfg.osc_color_report_format, OscColorReportFormat::None);
+        let (cfg, _) = AppConfig::parse("");
+        assert_eq!(cfg.osc_color_report_format, OscColorReportFormat::Bits16);
+        let (_, errs) = AppConfig::parse("osc-color-report-format = 32-bit");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn scrollback_limit_aliases_parse() {
+        // `scrollback-limit-lines` is the reference's canonical name;
+        // `scrollback-limit` (1.3 name) aliases too.
+        for key in ["scrollback", "scrollback-limit", "scrollback-limit-lines"] {
+            let (cfg, errs) = AppConfig::parse(&format!("{key} = 5000"));
+            assert!(errs.is_empty(), "{key}: {errs:?}");
+            assert_eq!(cfg.scrollback, 5000);
+        }
+        let (_, errs) = AppConfig::parse("scrollback-limit-bytes = 1048576");
+        assert!(errs.is_empty());
     }
 }
