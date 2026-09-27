@@ -439,6 +439,18 @@ impl Terminal {
     pub fn shutdown(&self) {
         let _ = self.io.lock().unwrap().send(Msg::Shutdown);
     }
+
+    /// Feed bytes through a fresh parser into the grid as if the program
+    /// had emitted them — `undo` replays a closed surface's serialized
+    /// scrollback this way, before the new shell's first prompt lands.
+    /// A complete dump is a whole stream, so a fresh `Processor` parses
+    /// it correctly; ordering against live PTY output is safe because
+    /// the reader takes the same term lock.
+    pub fn inject_output(&self, bytes: &[u8]) {
+        let mut term = self.term.lock();
+        let mut p: ansi::Processor = ansi::Processor::new();
+        p.advance(&mut *term, bytes);
+    }
 }
 
 /// Does any cell on `line` still carry [`PROMPT_MARK`]? A rewrite or erase

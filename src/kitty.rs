@@ -1,13 +1,17 @@
 //! kitty graphics protocol subset: `ESC _ G <keys>;<base64> ST`.
 //!
-//! Supported: `a=T` (transmit+display) and `a=t`/`a=q`, formats `f=100`
-//! (PNG), `f=32` (RGBA) and `f=24` (RGB) with `s=`/`v=` pixel dims,
-//! `m=` chunk assembly, `i=`/`I=` image ids, `c=`/`r=` cell spans,
-//! `a=d` delete (by `i=` or all), `q=` quiet, `t=f` regular-file
-//! medium (payload is the base64 of the path). Placement anchors to the
-//! cursor row at transmit time and scrolls with the buffer.
-//! Not supported: unicode placements (`p=`, `u=`), `z=` layers,
-//! `t=t`/`t=s`/`t=o` shared mediums, `x`/`y`/`w`/`h` crops, `a=f`/`a=p`.
+//! Supported: `a=T` transmit+display, `a=t` transmit-only (payload held
+//! under `i=` for later `a=p` puts), `a=p` put-from-id, `a=d` delete
+//! (selectors `d=i|p|z|c|a`), `a=q` query, `q=` quiet; formats `f=100`
+//! (PNG), `f=32` (RGBA) and `f=24` (RGB) with `s=`/`v=` pixel dims;
+//! `m=` chunk assembly; `i=`/`I=` image ids, `p=` placement ids;
+//! `c=`/`r=` cell spans, `z=` layering (negative below the text),
+//! `x`/`y`/`w`/`h` source crops on both `a=T` and `a=p`; `t=d` inline,
+//! `t=f` regular-file and `t=s` POSIX-shm mediums. Placement anchors
+//! to the cursor row at put time and scrolls with the buffer.
+//! Not supported: unicode placements (`u=`, `U=`/`U?` virtual
+//! placements), `t=t` shared memory, `t=o` file-descriptor passing,
+//! `a=f` frame animation, `C=`/`o=`/`H=`/`V=`/relative extents.
 
 use std::collections::BTreeMap;
 
@@ -110,10 +114,21 @@ pub struct KittyImage {
     pub px_h: u32,
 }
 
+/// A transmitted image payload kept by id — `a=p` placements draw
+/// from it without re-sending data.
+struct StoredImage {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
 /// Per-session image store + in-flight chunked transmission.
 #[derive(Default)]
 pub struct KittyStore {
+    /// Placements (`a=T` or `a=p`) — what the renderer draws.
     pub images: Vec<KittyImage>,
+    /// Transmitted payloads by image id (`a=t`/`a=T` populate it).
+    data: BTreeMap<u32, StoredImage>,
     pending: Option<(BTreeMap<char, String>, String)>,
 }
 
@@ -153,18 +168,55 @@ impl KittyStore {
                 (cmd.id(), "OK".to_string())
             }
             "q" => (cmd.id(), "OK".to_string()),
-            "t" | "T" | "" => self.place(&cmd, line, col),
+            // `a=t` transmits only — kitty keeps the payload under `i=`
+            // and displays nothing until a later `a=p`.
+            "t" => match self.decode(&cmd) {
+                Ok(stored) => {
+                    self.data.insert(cmd.id(), stored);
+                    (cmd.id(), "OK".to_string())
+                }
+                Err(e) => (cmd.id(), e),
+            },
+            "T" | "" => self.place(&cmd, line, col),
+            // `a=p` puts a previously transmitted image at the cursor —
+            // the payload is empty; `i=` selects the stored image.
+            "p" => self.put(&cmd, line, col),
             _ => (cmd.id(), "EINVAL:unsupported action".to_string()),
         }
+    }
+
+    /// `a=p` — display a stored image. `i=` (image id) is required;
+    /// `p=` names the placement, `x`/`y`/`w`/`h` crop the stored
+    /// pixels, `c`/`r`/`z` size and layer it.
+    fn put(&mut self, cmd: &KittyCmd, line: i64, col: usize) -> Handled {
+        let Some(stored) = self.data.get(&cmd.id()) else {
+            return (cmd.id(), "ENOENT:image id".to_string());
+        };
+        let (px, w, h) = (stored.rgba.clone(), stored.w, stored.h);
+        let (px, w, h) = match (cmd.num('w'), cmd.num('h')) {
+            (Some(cw), Some(ch)) => {
+                let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
+                match crop_rgba(&px, w, h, cx, cy, cw, ch) {
+                    Some(c) => c,
+                    None => return (cmd.id(), "EINVAL:crop".to_string()),
+                }
+            }
+            _ => (px, w, h),
+        };
+        self.push_image(cmd, line, col, px, w, h);
+        (cmd.id(), "OK".to_string())
     }
 
     /// `a=d` delete: `d=` selects the target — a(ll), i(image id), p(placement
     /// under an id), z(z-index), c(placements intersecting the cursor cell).
     fn delete(&mut self, cmd: &KittyCmd, line: i64, col: usize) {
         match cmd.get('d').unwrap_or("a") {
+            // Deleting by image id also drops the stored payload — `a=p`
+            // has nothing left to place.
             "i" => {
                 if let Some(id) = cmd.num('i') {
                     self.images.retain(|img| img.id != id);
+                    self.data.remove(&id);
                 }
             }
             "p" => {
@@ -186,28 +238,49 @@ impl KittyStore {
             // 'a' and any unknown selector: keep the pre-selector behavior —
             // `i=` narrows to one id, otherwise clear the whole store.
             _ => match cmd.num('i') {
-                Some(id) => self.images.retain(|img| img.id != id),
-                None => self.images.clear(),
+                Some(id) => {
+                    self.images.retain(|img| img.id != id);
+                    self.data.remove(&id);
+                }
+                None => {
+                    self.images.clear();
+                    self.data.clear();
+                }
             },
         }
     }
 
+    /// `a=T` (and bare transmits) — decode, store under `i=`, and place.
     fn place(&mut self, cmd: &KittyCmd, line: i64, col: usize) -> Handled {
+        match self.decode(cmd) {
+            Ok(stored) => {
+                let (px, w, h) = (stored.rgba.clone(), stored.w, stored.h);
+                self.data.insert(cmd.id(), stored);
+                self.push_image(cmd, line, col, px, w, h);
+                (cmd.id(), "OK".to_string())
+            }
+            Err(e) => (cmd.id(), e),
+        }
+    }
+
+    /// Payload → RGBA + source dims, honoring `t=` medium, `f=` format
+    /// and the `x`/`y`/`w`/`h` source crop.
+    fn decode(&mut self, cmd: &KittyCmd) -> Result<StoredImage, String> {
         let raw = match cmd.get('t').unwrap_or("d") {
             "d" => match b64_decode(&cmd.data) {
                 Some(raw) => raw,
-                None => return (cmd.id(), "EBADMSG:base64".to_string()),
+                None => return Err("EBADMSG:base64".to_string()),
             },
             // `t=f`: the payload is the base64 of the file's path.
             "f" => {
                 let Some(path) =
                     b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
-                    return (cmd.id(), "EBADMSG:path".to_string());
+                    return Err("EBADMSG:path".to_string());
                 };
                 match std::fs::read(path.trim()) {
                     Ok(raw) => raw,
-                    Err(e) => return (cmd.id(), format!("ENOENT:{e}")),
+                    Err(e) => return Err(format!("ENOENT:{e}")),
                 }
             }
             // `t=s`: payload is the base64 of a POSIX shm name (leading `/`);
@@ -216,18 +289,18 @@ impl KittyStore {
                 let Some(name) =
                     b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
-                    return (cmd.id(), "EBADMSG:shm name".to_string());
+                    return Err("EBADMSG:shm name".to_string());
                 };
                 let name = name.trim();
                 if name.contains("..") || !name.starts_with('/') {
-                    return (cmd.id(), "EINVAL:shm name".to_string());
+                    return Err("EINVAL:shm name".to_string());
                 }
                 match std::fs::read(format!("/dev/shm{name}")) {
                     Ok(raw) => raw,
-                    Err(e) => return (cmd.id(), format!("ENOENT:{e}")),
+                    Err(e) => return Err(format!("ENOENT:{e}")),
                 }
             }
-            _ => return (cmd.id(), "EINVAL:unsupported medium".to_string()),
+            _ => return Err("EINVAL:unsupported medium".to_string()),
         };
         let fmt = cmd.get('f').unwrap_or("100");
         let rgba: Option<(Vec<u8>, u32, u32)> = match fmt {
@@ -242,7 +315,7 @@ impl KittyStore {
                         } else if bpp == 4 {
                             Some((raw[..(w * h * 4) as usize].to_vec(), w, h))
                         } else {
-                            let mut out = Vec::with_capacity((w * h * 4) as usize);
+                            let mut out = Vec::with_capacity((w * h * 3) as usize);
                             for px in raw[..(w * h * 3) as usize].chunks_exact(3) {
                                 out.extend_from_slice(px);
                                 out.push(255);
@@ -256,7 +329,7 @@ impl KittyStore {
             _ => None,
         };
         let Some((px, w, h)) = rgba else {
-            return (cmd.id(), "EINVAL:decode".to_string());
+            return Err("EINVAL:decode".to_string());
         };
         // `x,y,w,h` source crop (kitty places a sub-rectangle).
         let (px, w, h) = match (cmd.num('w'), cmd.num('h')) {
@@ -264,11 +337,21 @@ impl KittyStore {
                 let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
                 match crop_rgba(&px, w, h, cx, cy, cw, ch) {
                     Some(c) => c,
-                    None => return (cmd.id(), "EINVAL:crop".to_string()),
+                    None => return Err("EINVAL:crop".to_string()),
                 }
             }
             _ => (px, w, h),
         };
+        Ok(StoredImage {
+            rgba: px,
+            w,
+            h,
+        })
+    }
+
+    /// One placement — `id`/`p=` replace any existing placement of the
+    /// same pair; `c`/`r`/`z` size and layer it.
+    fn push_image(&mut self, cmd: &KittyCmd, line: i64, col: usize, px: Vec<u8>, w: u32, h: u32) {
         let image = ImageData {
             data: Blob::new(std::sync::Arc::new(px)),
             format: ImageFormat::Rgba8,
@@ -278,7 +361,6 @@ impl KittyStore {
         };
         let id = cmd.id();
         let placement = cmd.num('p').unwrap_or(0);
-        // Replace an existing placement of the same image id only.
         self.images
             .retain(|img| !(img.id == id && img.placement == placement));
         self.images.push(KittyImage {
@@ -293,7 +375,6 @@ impl KittyStore {
             px_w: w,
             px_h: h,
         });
-        (id, "OK".to_string())
     }
 }
 

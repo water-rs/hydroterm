@@ -158,6 +158,23 @@ the trip. Skill installed at `~/.claude/skills/waterui/` from pin
   server.
 - `when(cond, fn)`, `vstack`/`hstack`/`zstack` basics — correct.
 
+## Documentation gaps hit this round (r47)
+
+7. **`.state(&x)` ordering relative to event handlers is undocumented and
+   silently wrong.** Nothing in the skill (or anywhere) explains that a
+   `State`-injecting modifier only extends the environment of the node's
+   *descendants* — `v.state(&b).on_hover_exit(h)` compiles, then panics at
+   runtime on the first event ("not found at position 0" via
+   `apply_on_event` capturing `env` before the injection, hydrolysis
+   `metadata.rs:855` → waterui `handler.rs:31` `extract_or_panic`). The
+   natural reading — set the state, then attach the handler — is the
+   broken one. Correct form: `.on_hover_exit(h).state(&b)` (state
+   outermost). Filed as WATERUI_FEEDBACK #61. Fix: a short
+   "environment injection ordering" paragraph in the skill wherever
+   `.state`/`State<T>` handlers are introduced — "`.state` must wrap the
+   modifiers whose handlers extract it; handlers attached on the same
+   node *after* `.state` see an env without it".
+
 ## Lint candidates
 
 Patterns from this repo where a water-rs/lints rule would have caught a
@@ -189,3 +206,33 @@ patched in-repo.
   real positives on the tab-chip hover handlers — fixed per suggestion:
   `.state(&hovered)` + `State(h): State<Binding<bool>>` params, and
   `signal_color(hover_bg)` without `.computed()`.
+
+- *(r47)* Candidate: **`RefCell<Vec<T>>` (or any non-`Rc`-shared
+  `RefCell`/`Cell`) field inside a `#[derive(Clone)]` struct silently
+  forks state.** `AppState` derives `Clone` and is cloned into every
+  view/handler; `closed_stack: RefCell<Vec<ClosedTab>>` meant "the" undo
+  stack but each clone owned a deep-copied `Vec` — `capture_closed`
+  pushed into clone A while `undo_close` popped clone B, so undo was a
+  silent no-op. The correct field is `Rc<RefCell<Vec<ClosedTab>>>`
+  (already the convention for `sessions`). A lint could flag
+  `RefCell<Vec<_>>`/`RefCell<HashMap<_,_>>` fields in structs deriving
+  `Clone` where sibling fields use `Rc<RefCell<_>>` — the pattern is
+  almost certainly a missed sharing intent.
+
+- *(r47)* `Water.lock` + `lock_sha256` semantics, learned by reading
+  cli-src `src/project_model/framework.rs`: `Water.lock` must be a
+  byte-copy of the waterui repo's `Cargo.lock` at the pinned revision
+  (from `~/.cargo/git/checkouts/waterui-*/<rev>/Cargo.lock`), and
+  `Water.toml`'s `lock_sha256` is the sha256 of those remote bytes.
+  `validate_dependencies` walks the resolved graph: every
+  framework-sourced or ecosystem-named package must appear in the
+  `allowed` set (Water.lock entries remapped through `[framework.
+  patches]` revs — which must equal the framework lock's own git
+  sources) or have a `sanctioned_source` — a `[framework.packages.X]`
+  `git+rev` or `=version` pin matching OUR resolved version, not the
+  framework's. Practical consequence: `hydrolysis`/`hydrolysis-m3` must
+  be pinned to the framework manifest's submodule gitlinks (e.g.
+  `926424bc`/`631ba9d6`), NOT the repos' standalone dev heads, or the
+  compat check fails on transitive-version mismatches. `water build
+  --platform linux` targets gtk4; the hydrolysis path is `water run`
+  with no `--platform` flag.

@@ -217,6 +217,166 @@ fn ring_bell(last: &mut Option<Instant>) {
     let _ = std::process::Command::new("xkbbell").spawn();
 }
 
+/// `undo` serializer — the session's whole grid (scrollback + screen)
+/// as a byte stream cell-faithful enough to replay: characters plus
+/// SGR color/attribute runs, WRAPLINE rows joined (no newline), and
+/// wide-char spacer cells skipped. Read from `History(-…)` through the
+/// last screen line; trailing unstyled spaces are trimmed per row.
+/// Replay via `Terminal::inject_output` lands the text above the new
+/// shell's first prompt.
+pub(crate) fn dump_grid_ansi(session: &Session) -> Vec<u8> {
+    use alacritty_terminal::vte::ansi::NamedColor;
+    let term = session.terminal.term.lock();
+    let grid = term.grid();
+    let history = grid.history_size() as i32;
+    let lines = grid.screen_lines() as i32;
+    let cols = grid.columns();
+    let style = Flags::BOLD
+        | Flags::DIM
+        | Flags::ITALIC
+        | Flags::UNDERLINE
+        | Flags::INVERSE
+        | Flags::STRIKEOUT
+        | Flags::HIDDEN;
+    let mut out: Vec<u8> = Vec::new();
+    let mut cur_flags = Flags::empty();
+    let mut cur_fg = AnsiColor::Named(NamedColor::Foreground);
+    let mut cur_bg = AnsiColor::Named(NamedColor::Background);
+    for l in -history..lines {
+        let row = &grid[Line(l)];
+        // Last significant column: a cell matters if it isn't a blank
+        // with default bg and no style.
+        let mut last = cols;
+        for c in (0..cols).rev() {
+            let cell = &row[Column(c)];
+            let styled = cell.bg != AnsiColor::Named(NamedColor::Background)
+                || !cell.flags.is_empty();
+            if cell.c != ' ' || styled {
+                break;
+            }
+            last = c;
+        }
+        for c in 0..last {
+            let cell = &row[Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let flags = cell.flags & style;
+            if flags != cur_flags || cell.fg != cur_fg || cell.bg != cur_bg {
+                out.extend_from_slice(b"\x1b[0m");
+                let mut codes = String::new();
+                for (flag, code) in [
+                    (Flags::BOLD, "1"),
+                    (Flags::DIM, "2"),
+                    (Flags::ITALIC, "3"),
+                    (Flags::UNDERLINE, "4"),
+                    (Flags::INVERSE, "7"),
+                    (Flags::HIDDEN, "8"),
+                    (Flags::STRIKEOUT, "9"),
+                ] {
+                    if flags.contains(flag) {
+                        codes.push_str(code);
+                        codes.push(';');
+                    }
+                }
+                push_color(&mut codes, cell.fg, false);
+                push_color(&mut codes, cell.bg, true);
+                while codes.ends_with(';') {
+                    codes.pop();
+                }
+                if !codes.is_empty() {
+                    out.extend_from_slice(format!("\x1b[{codes}m").as_bytes());
+                }
+                cur_flags = flags;
+                cur_fg = cell.fg;
+                cur_bg = cell.bg;
+            }
+            let mut b = [0u8; 4];
+            out.extend_from_slice(cell.c.encode_utf8(&mut b).as_bytes());
+            if let Some(zs) = cell.zerowidth() {
+                for &z in zs {
+                    out.extend_from_slice(z.encode_utf8(&mut b).as_bytes());
+                }
+            }
+        }
+        // A row whose last cell carries WRAPLINE continues on the next
+        // grid row — join them instead of emitting a newline.
+        let wrapped = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        if !wrapped {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    out
+}
+
+/// SGR operand for one cell color: `38`/`48` + `;5;n` for indexed /
+/// named palette colors, `;2;r;g;b` for RGB. Named "default" colors
+/// (Foreground/Background) emit 39/49.
+fn push_color(codes: &mut String, color: AnsiColor, bg: bool) {
+    use alacritty_terminal::vte::ansi::NamedColor;
+    let base = if bg { "48" } else { "38" };
+    let mut index = |n: u8| {
+        codes.push_str(base);
+        codes.push_str(";5;");
+        codes.push_str(&n.to_string());
+        codes.push(';');
+    };
+    match color {
+        AnsiColor::Named(n) => match n {
+            NamedColor::Foreground
+            | NamedColor::BrightForeground
+            | NamedColor::DimForeground => {
+                codes.push_str(if bg { "49" } else { "39" });
+                codes.push(';');
+            }
+            NamedColor::Background => {
+                codes.push_str(if bg { "49" } else { "39" });
+                codes.push(';');
+            }
+            NamedColor::Cursor => {
+                codes.push_str(if bg { "49" } else { "39" });
+                codes.push(';');
+            }
+            NamedColor::Black => index(0),
+            NamedColor::Red => index(1),
+            NamedColor::Green => index(2),
+            NamedColor::Yellow => index(3),
+            NamedColor::Blue => index(4),
+            NamedColor::Magenta => index(5),
+            NamedColor::Cyan => index(6),
+            NamedColor::White => index(7),
+            NamedColor::DimBlack => index(0),
+            NamedColor::DimRed => index(1),
+            NamedColor::DimGreen => index(2),
+            NamedColor::DimYellow => index(3),
+            NamedColor::DimBlue => index(4),
+            NamedColor::DimMagenta => index(5),
+            NamedColor::DimCyan => index(6),
+            NamedColor::DimWhite => index(7),
+            NamedColor::BrightBlack => index(8),
+            NamedColor::BrightRed => index(9),
+            NamedColor::BrightGreen => index(10),
+            NamedColor::BrightYellow => index(11),
+            NamedColor::BrightBlue => index(12),
+            NamedColor::BrightMagenta => index(13),
+            NamedColor::BrightCyan => index(14),
+            NamedColor::BrightWhite => index(15),
+        },
+        AnsiColor::Indexed(n) => index(n),
+        AnsiColor::Spec(rgb) => {
+            codes.push_str(base);
+            codes.push_str(";2;");
+            codes.push_str(&rgb.r.to_string());
+            codes.push(';');
+            codes.push_str(&rgb.g.to_string());
+            codes.push(';');
+            codes.push_str(&rgb.b.to_string());
+            codes.push(';');
+        }
+    }
+}
+
 /// `osc-color-report-format = 8-bit`: rewrite every `rgb:XXXX/YYYY/ZZZZ`
 /// in a color-report reply to `rgb:XX/YY/ZZ` (unscaled — each component
 /// keeps its most significant byte, Ghostty `osc_color_report_format`).
@@ -797,6 +957,13 @@ impl TermSurface {
                     term.scroll_display(Scroll::Bottom);
                 }
             }
+            // `all:` on a sequence applies each member's all-surface
+            // semantics (font/scrollback actions hit every pane).
+            TermAction::Sequence(actions) => {
+                for a in actions {
+                    self.do_action_all(a);
+                }
+            }
             _ => self.do_action(action),
         }
     }
@@ -932,6 +1099,15 @@ impl TermSurface {
                     }
                 }
             }
+            // `sequence:` — run each member through this dispatch.
+            TermAction::Sequence(actions) => {
+                for a in actions {
+                    self.do_action(a);
+                }
+            }
+            TermAction::Undo => self.app.undo_close(),
+            TermAction::ToggleMark => self.toggle_mark(),
+            TermAction::JumpToMark(dir) => self.jump_mark(dir),
             TermAction::SelectAll => {
                 let mut term = self.session.terminal.term.lock();
                 let history = term.grid().history_size();
@@ -1245,6 +1421,46 @@ impl TermSurface {
                     (offset == 0 && marks.len() >= 2)
                         .then(|| marks[marks.len() - 2])
                 })
+        } else {
+            marks.iter().copied().filter(|&m| m > top).min()
+        };
+        let Some(abs) = target else { return };
+        let want = (history - abs).clamp(0, history) as i32;
+        let delta = want - offset as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    /// `toggle_mark` — toggle a mark on the cursor's absolute row
+    /// (`history_size + screen line`, the `prompt_marks` convention;
+    /// Ghostty marks are invisible — no glyph is drawn).
+    fn toggle_mark(&mut self) {
+        let term = self.session.terminal.term.lock();
+        let abs = term.grid().history_size() as i64 + term.grid().cursor.point.line.0 as i64;
+        drop(term);
+        let mut marks = self.session.marks.lock().unwrap();
+        if let Some(pos) = marks.iter().position(|&m| m == abs) {
+            marks.remove(pos);
+        } else {
+            marks.push(abs);
+            marks.sort_unstable();
+        }
+    }
+
+    /// `jump_to_mark:previous|next` — scroll so the nearest toggled mark
+    /// sits at the viewport top (same math as `jump_prompt`).
+    fn jump_mark(&mut self, dir: i32) {
+        let marks = self.session.marks.lock().unwrap();
+        let mut term = self.session.terminal.term.lock();
+        let history = term.grid().history_size() as i64;
+        let offset = term.grid().display_offset() as i64;
+        if marks.is_empty() {
+            return;
+        }
+        let top = history - offset;
+        let target = if dir < 0 {
+            marks.iter().copied().filter(|&m| m < top).max()
         } else {
             marks.iter().copied().filter(|&m| m > top).min()
         };

@@ -1904,6 +1904,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "resize_split:<left|right|up|down>[,px]",
     "goto_split:<previous|next>  (pane focus cycle)",
     "toggle_split_zoom", "equalize_splits",
+    "sequence:<a,b,…>  (run every action on one chord)",
+    "undo", "toggle_mark", "jump_to_mark:<previous|next>",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
@@ -2125,6 +2127,33 @@ fn parse_payload(raw: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Split a `sequence:` action list on top-level commas — a comma inside
+/// a `"…"` payload (e.g. `text:"a,b"`) does not split, `\` escapes a
+/// literal quote.
+fn split_sequence(inner: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+}
+
 /// Parse `ctrl+shift+arrowup` / `alt+f4` / `super+v` into the canonical
 /// `ctrl+alt+shift+super+key` string.
 fn normalize_chord(chord: &str) -> Result<String, String> {
@@ -2198,6 +2227,18 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         _ if name.starts_with("csi:") => TermAction::CsiSeq(parse_payload(&raw[4..]).ok()?),
         _ if name.starts_with("esc:") => TermAction::EscSeq(parse_payload(&raw[4..]).ok()?),
+        // Ghostty `sequence:a,b` — every action runs in order on one
+        // chord. Commas inside a `text:"…,…"` payload don't split.
+        _ if name.starts_with("sequence:") => {
+            let inner = &raw["sequence:".len()..];
+            let parts = split_sequence(inner);
+            if parts.is_empty() {
+                return None;
+            }
+            let actions: Option<Vec<TermAction>> =
+                parts.iter().map(|p| action_from_str(&p.to_lowercase(), p)).collect();
+            TermAction::Sequence(actions?)
+        }
         _ if name.starts_with("scroll_to_fraction:") => {
             let f: f64 = name["scroll_to_fraction:".len()..].parse().ok()?;
             TermAction::ScrollToFraction(f.clamp(0.0, 1.0))
@@ -2221,6 +2262,16 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         _ if name.starts_with("set_tab_title:") => {
             TermAction::SetTabTitle(raw["set_tab_title:".len()..].to_string())
+        }
+        "undo" => TermAction::Undo,
+        "toggle_mark" => TermAction::ToggleMark,
+        // Ghostty `jump_to_mark:previous|next`.
+        _ if name.starts_with("jump_to_mark:") => {
+            match &name["jump_to_mark:".len()..] {
+                "previous" | "prev" => TermAction::JumpToMark(-1),
+                "next" => TermAction::JumpToMark(1),
+                _ => return None,
+            }
         }
         "inspector" => TermAction::Inspector,
         "inspector:toggle" => TermAction::Inspector,
@@ -3008,6 +3059,33 @@ mod tests {
             Some(TermAction::ScrollToFraction(0.5))
         );
         assert_eq!(cfg.keybinds[4].1, Some(TermAction::ScrollToRow(12)));
+    }
+
+    #[test]
+    fn sequence_parses_and_splits() {
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+s=sequence:text:\"SEQ1\",copy_to_clipboard\nkeybind = ctrl+alt+t=sequence:text:\"a,b\",text:\"c\"\nkeybind = ctrl+alt+u=undo\nkeybind = ctrl+alt+m=toggle_mark\nkeybind = ctrl+alt+j=jump_to_mark:previous\nkeybind = ctrl+alt+k=jump_to_mark:next",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::Sequence(vec![
+                TermAction::TypeText("SEQ1".into()),
+                TermAction::Copy,
+            ]))
+        );
+        // A comma inside a quoted payload is not a separator.
+        assert_eq!(
+            cfg.keybinds[1].1,
+            Some(TermAction::Sequence(vec![
+                TermAction::TypeText("a,b".into()),
+                TermAction::TypeText("c".into()),
+            ]))
+        );
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::Undo));
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::ToggleMark));
+        assert_eq!(cfg.keybinds[4].1, Some(TermAction::JumpToMark(-1)));
+        assert_eq!(cfg.keybinds[5].1, Some(TermAction::JumpToMark(1)));
     }
 
     #[test]

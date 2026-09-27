@@ -39,7 +39,7 @@ use waterui_text::FontCollection;
 use crate::config::{AppConfig, ConfigWatcher};
 use crate::keys::TermAction;
 use crate::palette::Palette;
-use crate::surface::TermSurface;
+use crate::surface::{TermSurface, dump_grid_ansi};
 use crate::terminal::Terminal;
 use waterui::form::picker::picker;
 
@@ -158,6 +158,11 @@ pub struct Session {
     /// The open rename prompt writes the owning tab's title rather than
     /// the surface's (`prompt_tab_title` vs `prompt_surface_title`).
     pub title_prompt_writes_tab: std::cell::Cell<bool>,
+    /// `toggle_mark` rows — absolute grid rows (`history_size + screen
+    /// line`, the same convention `prompt_marks` uses; rows drift when
+    /// scrollback overflows and drops its oldest lines). Invisible —
+    /// Ghostty renders no marker.
+    pub marks: std::sync::Mutex<Vec<i64>>,
 }
 
 /// Pointer-time snapshot for the pane context menu — the URL under the
@@ -270,8 +275,35 @@ impl Session {
             inspector_label: binding(Str::from("")),
             font_size_override: std::cell::Cell::new(false),
             title_prompt_writes_tab: std::cell::Cell::new(false),
+            marks: std::sync::Mutex::new(Vec::new()),
         }
     }
+}
+
+/// A closed tab restorable by `undo` (Ghostty): the tab title, the
+/// split shape, and per-pane cwd + SGR-serialized grid bytes.
+#[derive(Clone)]
+pub struct ClosedTab {
+    title: String,
+    panes: Vec<ClosedPane>,
+    tree: ClosedNode,
+}
+
+#[derive(Clone)]
+pub struct ClosedPane {
+    cwd: Option<std::path::PathBuf>,
+    dump: Vec<u8>,
+}
+
+/// `SplitNode` shape with leaves as indexes into `ClosedTab::panes`.
+#[derive(Clone)]
+enum ClosedNode {
+    Leaf(usize),
+    Split {
+        dir: SplitDir,
+        sizes: Vec<f32>,
+        children: Vec<ClosedNode>,
+    },
 }
 
 /// Split axis: `Row` stacks panes side by side (split-right),
@@ -612,6 +644,10 @@ pub struct AppState {
     pub quick_unavailable: RefCell<bool>,
     /// True for the drop-down's own AppState: it neither hosts a quick
     /// window itself nor spawns a second key grab.
+    /// Ghostty `undo` — the most recently closed tabs, newest last.
+    /// Capped at 8 entries; each pane carries its cwd and its grid
+    /// serialized with SGR attributes (replay = cell-faithful).
+    closed_stack: Rc<RefCell<Vec<ClosedTab>>>,
     /// True after the first `spawn_session` — `command` is consumed as
     /// initial-surface-only and never re-applied by a hot reload.
     initial_spawn: std::cell::Cell<bool>,
@@ -648,6 +684,17 @@ impl AppState {
     // not Send+Sync — `Binding` is not Send+Sync by design.
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(config_path: Option<std::path::PathBuf>, command: Option<Vec<String>>) -> Self {
+        Self::new_inner(config_path, command, true)
+    }
+
+    /// `spawn_initial` = whether the state opens a first tab — a
+    /// `detach_tab_to_window` state arrives with its moved tab and must
+    /// not.
+    fn new_inner(
+        config_path: Option<std::path::PathBuf>,
+        command: Option<Vec<String>>,
+        spawn_initial: bool,
+    ) -> Self {
         let mut watcher = ConfigWatcher::new(config_path);
         if command.is_some() {
             // `-e` is the CLI spelling of `initial-command` (first
@@ -713,16 +760,20 @@ impl AppState {
             quick_listener_started: Rc::new(AtomicBool::new(false)),
             quick_task: Rc::new(RefCell::new(None)),
             quick_unavailable: RefCell::new(false),
+            closed_stack: Rc::new(RefCell::new(Vec::new())),
             initial_spawn: std::cell::Cell::new(false),
             is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         };
-        let first_tab = state.new_tab();
-        // Seed the embedded-focus owner so `.focused` grants key focus to
-        // the first pane at mount — the launch dead-keys fix (#29).
-        if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
-            state.focus_owner.set(Some((first_tab, t.focused.snapshot())));
+        if spawn_initial {
+            let first_tab = state.new_tab();
+            // Seed the embedded-focus owner so `.focused` grants key
+            // focus to the first pane at mount — the launch dead-keys
+            // fix (#29).
+            if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
+                state.focus_owner.set(Some((first_tab, t.focused.snapshot())));
+            }
         }
         // `initial-command` is consumed by the first session (like
         // xterm/kitty `-e`); `command` stays — it applies to every
@@ -1230,6 +1281,84 @@ impl AppState {
                 .window_state
                 .set(WindowState::Fullscreen);
         }
+        window.show(env);
+    }
+
+    /// Tab tear-off (Ghostty drag-out): move a live tab — its sessions
+    /// keep running — into a brand-new window. No-op on the window's
+    /// last tab: detaching it would just recreate the same state.
+    pub fn detach_tab_to_window(&self, tab_id: u64) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let Some(env) = self.env.get() else { return };
+        let tabs = self.tabs.snapshot();
+        let Some(pos) = tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let tab = tabs[pos].clone();
+        let leaves = tab.tree.snapshot().leaves();
+        let focused = tab.focused.snapshot();
+        // Detach from this window: keep the sessions alive (unlike
+        // `close_tab`), just drop the mappings and the list entry.
+        {
+            let mut map = self.session_tab.lock().unwrap();
+            for sid in &leaves {
+                map.remove(sid);
+            }
+        }
+        let _ = self.tabs.remove(pos);
+        self.tab_count.set(self.tabs.len());
+        if self.selected.snapshot() == tab_id
+            && let Some(next) = self.tabs.iter().next()
+        {
+            self.selected.set(next.id);
+        }
+        // New window, fresh state; the moved sessions join it. Session
+        // ids came from this window's counter, so advance the new one
+        // past them (and the tab id) — otherwise later allocations can
+        // collide with the adopted ids.
+        // The moved tab arrives whole — `new_inner(.., false)` skips the
+        // initial spawn (which would also re-run `initial-command`).
+        let state = AppState::new_inner(Some(self.cfg.borrow().path.clone()), None, false);
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            let mut map = state.session_tab.lock().unwrap();
+            let mut moved = Vec::new();
+            for sid in &leaves {
+                if let Some(i) = sessions.iter().position(|s| s.id == *sid) {
+                    moved.push(sessions.remove(i));
+                    map.insert(*sid, tab.id);
+                }
+            }
+            state.sessions.borrow_mut().extend(moved.iter().cloned());
+        }
+        let mut id_floor = tab.id;
+        for s in state.sessions.borrow().iter() {
+            id_floor = id_floor.max(s.id);
+        }
+        state.next_id.fetch_max(id_floor + 1, Ordering::Relaxed);
+        state.tabs.push(tab);
+        state.tab_count.set(state.tabs.len());
+        state.selected.set(tab_id);
+        state.focus_owner.set(Some((tab_id, focused)));
+        let opacity = state.config(|c| c.background_opacity);
+        let bg = state.palette.borrow().background;
+        let window = Window::new(
+            state.window_title.clone(),
+            state.window_state.clone(),
+            {
+                let state = state.clone();
+                move || app_root(state.clone())
+            },
+        )
+        .style(if state.config(|c| c.window_decoration) {
+            WindowStyle::Titled
+        } else {
+            WindowStyle::Borderless
+        })
+        .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        Self::apply_launch_geometry(&state, &window);
         window.show(env);
     }
 
@@ -1868,6 +1997,12 @@ impl AppState {
         };
         match tab.tree.snapshot().remove(session_id) {
             Some(new_tree) => {
+                // `undo`: capture the pane's grid before killing it —
+                // the restore opens it as a one-pane tab (a mid-tree
+                // reinsert would resurrect a layout the user may have
+                // changed since). `None` = last leaf: `close_tab`
+                // captures the whole tab instead.
+                self.capture_closed(vec![session_id], ClosedNode::Leaf(0), None);
                 // Focus a remaining leaf when the closed pane had focus.
                 if tab.focused.snapshot() == session_id
                     && let Some(next) = new_tree.leaves().first()
@@ -1898,7 +2033,19 @@ impl AppState {
         else {
             return;
         };
-        let leaves = tab.tree.snapshot().leaves();
+        let tree = tab.tree.snapshot();
+        let leaves = tree.leaves();
+        // `undo` capture: the whole split shape + every pane's grid.
+        let order: HashMap<u64, usize> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        self.capture_closed(
+            leaves.clone(),
+            closed_node(&tree, &order),
+            Some(tab.title.snapshot().as_str().to_string()),
+        );
         for sid in &leaves {
             self.kill_session(*sid);
             self.session_tab.lock().unwrap().remove(sid);
@@ -1922,6 +2069,74 @@ impl AppState {
         {
             self.quit();
         }
+    }
+
+    /// `undo` capture — snapshot each pane's cwd + SGR grid dump and
+    /// push the entry (cap 8). `ids` is leaf order; `title` names the
+    /// restored tab.
+    fn capture_closed(&self, ids: Vec<u64>, tree: ClosedNode, title: Option<String>) {
+        let sessions = self.sessions.borrow();
+        let panes: Vec<ClosedPane> = ids
+            .iter()
+            .filter_map(|id| sessions.iter().find(|s| s.id == *id))
+            .map(|s| ClosedPane {
+                cwd: s.cwd.lock().unwrap().clone(),
+                dump: dump_grid_ansi(s),
+            })
+            .collect();
+        if panes.is_empty() {
+            return;
+        }
+        let title = title
+            .or_else(|| panes.first().map(|_| "Restored".to_string()))
+            .unwrap_or_default();
+        let mut stack = self.closed_stack.borrow_mut();
+        stack.push(ClosedTab {
+            title,
+            panes,
+            tree,
+        });
+        while stack.len() > 8 {
+            stack.remove(0);
+        }
+    }
+
+    /// Ghostty `undo` — reopen the most recently closed tab (or pane,
+    /// restored as a one-pane tab) with its split shape, per-pane cwd,
+    /// and scrollback replayed cell-faithfully into the new surfaces.
+    pub fn undo_close(&self) {
+        let Some(closed) = self.closed_stack.borrow_mut().pop() else {
+            return;
+        };
+        let size = self.focused_grid_estimate();
+        let mut sessions: Vec<Rc<Session>> = Vec::with_capacity(closed.panes.len());
+        for p in &closed.panes {
+            let s = self.spawn_session(p.cwd.clone(), size);
+            // Replay the old grid before the fresh shell's prompt lands
+            // — the reader can't have produced output yet (the child is
+            // still exec'ing), and the term lock serializes it anyway.
+            s.terminal.inject_output(&p.dump);
+            sessions.push(s);
+        }
+        let tree = restore_node(&closed.tree, &sessions);
+        let focused = tree.leaves().first().copied().unwrap_or(0);
+        let tab = PaneTab {
+            id: self.alloc_id(),
+            title: binding(Str::from(closed.title.clone())),
+            tree: binding(tree),
+            focused: Binding::u64(focused),
+            zoomed: Binding::default(),
+            activity: Binding::bool(false),
+            title_override: Binding::default(),
+            badge: Binding::bool(false),
+        };
+        for s in &sessions {
+            self.session_tab.lock().unwrap().insert(s.id, tab.id);
+        }
+        let tab_id = tab.id;
+        self.tabs.push(tab);
+        self.tab_count.set(self.tabs.len());
+        self.selected.set(tab_id);
     }
 
     /// Select the tab at 1-based index `n`.
@@ -2128,10 +2343,19 @@ impl View for PaneLeaf {
             .cursor(hover_cursor)
             // Drag-and-drop: a file dropped on the pane pastes its
             // shell-quoted path into the PTY (Ghostty/kitty behaviour).
-            .drop_destination(|session: PaneSession, data: DragData| {
-                let text = data.as_str();
-                if !text.starts_with(TAB_DRAG_PREFIX) {
-                    session.push_action(TermAction::DropText(text.to_string()));
+            .drop_destination({
+                let app = self.state.clone();
+                move |session: PaneSession, data: DragData| {
+                    let text = data.as_str();
+                    if let Some(id) = text.strip_prefix(TAB_DRAG_PREFIX) {
+                        // Tab tear-off: a chip dropped on a pane detaches
+                        // the tab into its own window (Ghostty's drag-out).
+                        if let Ok(tab_id) = id.parse::<u64>() {
+                            app.detach_tab_to_window(tab_id);
+                        }
+                    } else {
+                        session.push_action(TermAction::DropText(text.to_string()));
+                    }
                 }
             });
         let surface = Frame::new(surface);
@@ -2624,6 +2848,43 @@ impl View for AppRoot {
     }
 }
 
+/// Copy a `SplitNode` into a `ClosedNode`, swapping session ids for
+/// pane indexes (the `order` map is leaf order in `close_tab`).
+fn closed_node(node: &SplitNode, order: &HashMap<u64, usize>) -> ClosedNode {
+    match node {
+        SplitNode::Leaf(id) => ClosedNode::Leaf(*order.get(id).unwrap_or(&0)),
+        SplitNode::Split {
+            dir,
+            children,
+            sizes,
+        } => ClosedNode::Split {
+            dir: *dir,
+            sizes: sizes.snapshot(),
+            children: children.iter().map(|c| closed_node(c, order)).collect(),
+        },
+    }
+}
+
+/// Rebuild a `SplitNode` from a closed shape, panes becoming the new
+/// session ids in the same leaf order.
+fn restore_node(node: &ClosedNode, sessions: &[Rc<Session>]) -> SplitNode {
+    match node {
+        ClosedNode::Leaf(i) => SplitNode::Leaf(sessions[*i].id),
+        ClosedNode::Split {
+            dir,
+            sizes,
+            children,
+        } => SplitNode::Split {
+            dir: *dir,
+            sizes: binding(sizes.clone()),
+            children: children
+                .iter()
+                .map(|c| restore_node(c, sessions))
+                .collect(),
+        },
+    }
+}
+
 /// `~/.config/hydroterm/window-state` — sibling of the config file,
 /// `x y w h` in points on one line.
 fn window_state_path() -> std::path::PathBuf {
@@ -2776,9 +3037,13 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
                     .background(signal_color(hover_bg))
-                    .state(&hovered)
                     .on_hover_enter(|State(h): State<Binding<bool>>| h.set(true))
                     .on_hover_exit(|State(h): State<Binding<bool>>| h.set(false))
+                    // `.state` must wrap the handlers: it injects into
+                    // the env of the node's *children*, and a handler
+                    // attached on the same node only sees injections
+                    // applied outside it (WATERUI_FEEDBACK #61).
+                    .state(&hovered)
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.
                     .draggable(drag_drop::DragData::text(format!(
@@ -2952,6 +3217,10 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem { name: "Toggle Tab Bar", chord: "", action: TermAction::ToggleTabBar },
     PaletteItem { name: "Start Selection (keyboard select)", chord: "", action: TermAction::StartSelection },
     PaletteItem { name: "Toggle Fullscreen", chord: "f11", action: TermAction::Fullscreen },
+    PaletteItem { name: "Undo Close Tab", chord: "ctrl+shift+z", action: TermAction::Undo },
+    PaletteItem { name: "Toggle Mark", chord: "", action: TermAction::ToggleMark },
+    PaletteItem { name: "Jump to Mark: Previous", chord: "", action: TermAction::JumpToMark(-1) },
+    PaletteItem { name: "Jump to Mark: Next", chord: "", action: TermAction::JumpToMark(1) },
     PaletteItem { name: "Quit", chord: "", action: TermAction::Quit },
 ];
 

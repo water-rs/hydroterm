@@ -740,6 +740,20 @@ pub enum TermAction {
     /// Ghostty `scroll_page_fractional:f` — scroll a fraction of the
     /// page (negative = up).
     ScrollPageFractional(f64),
+    /// Ghostty `keybind = chord=sequence:a,b` — run every action in
+    /// order on one chord press.
+    Sequence(Vec<TermAction>),
+    /// Ghostty `undo` — reopen the most recently closed tab with its
+    /// scrollback restored (cell-faithful: the grid is serialized with
+    /// its SGR attributes and replayed into the new surface before the
+    /// shell's first prompt).
+    Undo,
+    /// Ghostty `toggle_mark` — mark/unmark the line the cursor sits on;
+    /// `jump_to_mark` scrolls back to it. Invisible like the reference.
+    ToggleMark,
+    /// Ghostty `jump_to_mark:previous|next` — scroll the viewport to
+    /// the nearest toggled mark (-1 / +1).
+    JumpToMark(i32),
 }
 
 /// Ghostty `adjust_selection:dir` direction set.
