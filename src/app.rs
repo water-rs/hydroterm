@@ -35,6 +35,8 @@ use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
 use waterui::shape::{FixedRoundedRectangle, ShapeExt};
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
+use waterui_core::resolve::Resolvable;
+use waterui_text::font::{Body, Font, ResolvedFont};
 
 use crate::config::{AppConfig, ConfigWatcher};
 use crate::keys::TermAction;
@@ -618,6 +620,9 @@ pub struct AppState {
     /// installs this binding as the environment's `Theme::color_scheme`, so
     /// a config reload switches the chrome scheme live (cli#188 contract).
     pub window_scheme: Binding<ColorScheme>,
+    /// `window-title-font-family` — optional family override for the tab
+    /// chips (Ghostty's titlebar font key; our chrome is the strip).
+    pub title_font_family: Binding<Option<Str>>,
     /// Config file state (parsed values + mtime watch).
     pub cfg: Rc<RefCell<ConfigWatcher>>,
     /// The active palette — swapped wholesale on theme reload.
@@ -693,6 +698,26 @@ impl std::ops::Deref for PaneSession {
     }
 }
 
+/// `window-title-font-family` as a `Resolvable<ResolvedFont>`: resolves
+/// the Body slot's font and rewrites `family` when a title family is
+/// configured (`font::Body.family(name)` is static-only; this keeps the
+/// chip labels reactive across config reloads).
+#[derive(Debug, Clone)]
+pub struct TitleFont(pub Binding<Option<Str>>);
+
+impl Resolvable for TitleFont {
+    type Resolved = ResolvedFont;
+    fn resolve(&self, env: &Environment) -> impl Signal<Output = Self::Resolved> {
+        zip(Body.resolve(env), self.0.clone())
+        .map(|(mut f, fam)| {
+            if let Some(fam) = fam {
+                f.family = Some(fam);
+            }
+            f
+        })
+    }
+}
+
 impl AppState {
     /// Create with one running session.
     // Sessions never leave the UI thread (PTY events arrive through a channel
@@ -724,7 +749,7 @@ impl AppState {
         let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
-            || matches!(watcher.config.window_theme, crate::config::WindowTheme::Auto);
+            || matches!(watcher.config.window_theme, crate::config::WindowTheme::System);
         let applied_quick_geo = (
             watcher.config.quick_terminal_position,
             watcher.config.quick_terminal_size,
@@ -755,7 +780,11 @@ impl AppState {
             window_frame: Rc::new(RefCell::new(None)),
             window_scheme: Binding::container(crate::theme::scheme_for(
                 &watcher.config.window_theme,
+                &watcher.config.resolve_theme().background,
             )),
+            title_font_family: Binding::container(
+                watcher.config.window_title_font_family.clone().map(Str::from),
+            ),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
             env: Rc::new(std::cell::OnceCell::new()),
@@ -843,9 +872,13 @@ impl AppState {
         if self.theme_dirty.swap(false, Ordering::Relaxed) {
             let config = &self.cfg.borrow().config;
             *self.palette.borrow_mut() = Palette::for_config(config);
-            if matches!(config.window_theme, crate::config::WindowTheme::Auto) {
-                self.window_scheme
-                    .set(crate::theme::scheme_for(&config.window_theme));
+            // Desktop flips matter only to `window-theme = system`; `auto`
+            // follows the terminal background (recomputed on config reload).
+            if matches!(config.window_theme, crate::config::WindowTheme::System) {
+                self.window_scheme.set(crate::theme::scheme_for(
+                    &config.window_theme,
+                    &config.resolve_theme().background,
+                ));
             }
         }
         let (config, errors) = {
@@ -982,8 +1015,16 @@ impl AppState {
         // `toggle_tab_bar` manual override was documented to hold only
         // until the next reload.
         self.tab_bar_forced.set(None);
-        self.window_scheme
-            .set(crate::theme::scheme_for(&config.window_theme));
+        self.window_scheme.set(crate::theme::scheme_for(
+            &config.window_theme,
+            &config.resolve_theme().background,
+        ));
+        self.title_font_family.set(
+            config
+                .window_title_font_family
+                .clone()
+                .map(Str::from),
+        );
         // `title` — a configured window title re-applies on reload
         // (Ghostty updates every window's title).
         if let Some(t) = &config.title {
@@ -3052,7 +3093,11 @@ pub fn tabs_view(state: AppState) -> impl View {
                                 }),
                                 // `bell-features` `attention` indicator.
                                 when(tab.badge.clone(), || text("🔔")),
-                                text(tab.title.clone()).foreground(label_color),
+                                text(tab.title.clone())
+                                    .font(Font::new(TitleFont(
+                                        app.title_font_family.clone(),
+                                    )))
+                                    .foreground(label_color),
                             ))
                             .on_tap(move |app: AppState| app.selected.set(tab_id))
                             .a11y_role(AccessibilityRole::Tab)

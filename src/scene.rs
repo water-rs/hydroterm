@@ -125,9 +125,9 @@ pub struct DrawContext<'a> {
     /// `bell-features` `border` — ring around the alerted pane until it
     /// is re-focused or receives input (Ghostty).
     pub bell_border: bool,
-    /// `font-thicken` — every glyph run is emboldened (Ghostty
-    /// `font-thicken`).
-    pub font_thicken: bool,
+    /// `font-thicken` × `font-thicken-strength` — overdraw offset in
+    /// px applied to every glyph run (0.0 = off; strength 255 ≈ 0.6px).
+    pub font_thicken: f32,
     /// `background-opacity-cells` — alpha applied to cells with an
     /// explicit background color (1.0 = opaque = default).
     pub cell_bg_opacity: f32,
@@ -697,10 +697,17 @@ fn draw_text_run(
 
             // Faux bold: redraw with a half-cell-fraction offset, like the
             // offset emboldening native text stacks apply. `font-thicken`
-            // applies the same overdraw to every run.
-            if (synthesis.embolden && ctx.font_synthetic_bold) || ctx.font_thicken {
+            // applies the same overdraw to every run, scaled by
+            // `font-thicken-strength`.
+            let synth_dx: f32 = if synthesis.embolden && ctx.font_synthetic_bold {
+                0.6
+            } else {
+                0.0
+            };
+            let dx = synth_dx.max(ctx.font_thicken);
+            if dx > 0.0 {
                 let bold_run = GlyphRun {
-                    transform: Affine::translate((0.6, baseline_y as f64)),
+                    transform: Affine::translate((f64::from(dx), baseline_y as f64)),
                     ..out
                 };
                 scene.draw_glyph_run(&bold_run);

@@ -151,12 +151,40 @@ pub fn app(env: Environment) -> App {
     App::new_with_windows([window], env)
 }
 
+/// The M3 style for `run()`/`water run`: `window-theme = ghostty` seeds
+/// Material You from the terminal's own background so the chrome wears
+/// the terminal palette (reference `ghostty` value); everything else
+/// takes the baseline dynamic style that follows `Theme::color_scheme`.
+/// Seeding happens once at launch — a reload into `ghostty` only flips
+/// the light/dark scheme until restart.
+pub fn material_style() -> hydrolysis_m3::Material3 {
+    let watcher = crate::config::ConfigWatcher::new(None);
+    let config = &watcher.config;
+    if matches!(config.window_theme, crate::config::WindowTheme::Ghostty) {
+        let bg = config.resolve_theme().background;
+        let argb = hydrolysis_m3::Argb(
+            0xff << 24 | u32::from(bg.r) << 16 | u32::from(bg.g) << 8 | u32::from(bg.b),
+        );
+        let dark = (0.2126 * f64::from(bg.r)
+            + 0.7152 * f64::from(bg.g)
+            + 0.0722 * f64::from(bg.b))
+            < 127.5;
+        hydrolysis_m3::Material3::with_seed_mode(
+            argb,
+            if dark {
+                hydrolysis_m3::MaterialColorMode::Dark
+            } else {
+                hydrolysis_m3::MaterialColorMode::Light
+            },
+        )
+    } else {
+        hydrolysis_m3::Material3::defaults()
+    }
+}
+
 /// The `hydroterm` binary's entry: identical to the generated backend's
 /// `main` — `app(env)` carries the `window-theme` scheme in the
-/// environment; the style is `Material3::defaults()` on both paths.
+/// environment; `material_style()` picks the seed on both paths.
 pub fn run() {
-    hydrolysis::run(
-        app(Environment::new()),
-        hydrolysis_m3::Material3::defaults(),
-    );
+    hydrolysis::run(app(Environment::new()), material_style());
 }

@@ -263,6 +263,13 @@ pub struct AppConfig {
     /// Named style of the primary family applied to regular text
     /// (Ghostty `font-style` — e.g. `Italic`, `Bold Italic`, `Light`).
     pub font_style: Option<String>,
+    /// `font-style-bold`/`font-style-italic`/`font-style-bold-italic` —
+    /// named styles that replace the fixed variant mapping for SGR
+    /// bold/italic runs (e.g. `font-style-bold = Light` draws bold
+    /// text in the family's Light face).
+    pub font_style_bold: Option<String>,
+    pub font_style_italic: Option<String>,
+    pub font_style_bold_italic: Option<String>,
     /// Allow fontique's synthesis for missing faces (Ghostty
     /// `font-synthetic`): `(embolden, oblique)`; `None` = both allowed
     /// (default). Each `font-synthetic = bold|italic|bold-italic` line
@@ -274,6 +281,9 @@ pub struct AppConfig {
     /// `font-thicken` — overdraw every glyph run to darken strokes
     /// (Ghostty `font-thicken`, default false).
     pub font_thicken: bool,
+    /// `font-thicken-strength` — 0-255 thicken amount (Ghostty: 0 is
+    /// the lightest thickening, not off; inert unless `font-thicken`).
+    pub font_thicken_strength: u8,
     pub scrollback: usize,
     /// Resolved at load; `Auto` consults the desktop once per (re)load.
     pub theme: ThemeRef,
@@ -552,9 +562,16 @@ pub struct AppConfig {
     /// (Ghostty `minimum-contrast`); 1.0 = off (no enforcement).
     pub minimum_contrast: f32,
     /// Color scheme of the window chrome — tab strip, dialogs, buttons
-    /// (Ghostty `window-theme`): `auto` follows the desktop, `light`/`dark`
-    /// pin the Material scheme. The terminal palette stays on `theme =`.
+    /// (Ghostty `window-theme`): `auto` picks light/dark from the
+    /// *terminal background* luminance (the reference's `auto`),
+    /// `system` follows the desktop color scheme, `light`/`dark` pin the
+    /// Material scheme, `ghostty` seeds the whole M3 chrome from the
+    /// terminal background at launch. The terminal palette stays on
+    /// `theme =`.
     pub window_theme: WindowTheme,
+    /// `window-title-font-family` — family used for the tab-strip
+    /// titles (Ghostty's titlebar font; ours drives the WaterUI chips).
+    pub window_title_font_family: Option<String>,
     /// Window decorations (Ghostty `window-decoration`): `false`/`none`
     /// maps the window borderless (title bar + frame removed).
     pub window_decoration: bool,
@@ -625,10 +642,16 @@ pub struct AppConfig {
 /// `window-theme` values.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowTheme {
-    /// Follow the desktop color-scheme (default).
+    /// Pick light/dark from the terminal background luminance — the
+    /// reference's `auto` ("based on terminal background").
     Auto,
     Light,
     Dark,
+    /// Follow the OS/desktop color-scheme preference.
+    System,
+    /// Chrome takes the terminal palette — the M3 style is seeded
+    /// from the terminal background at launch (reference `ghostty`).
+    Ghostty,
 }
 
 /// `background-image-fit` values.
@@ -653,9 +676,13 @@ impl Default for AppConfig {
             font_family_italic: None,
             font_family_bold_italic: None,
             font_style: None,
+            font_style_bold: None,
+            font_style_italic: None,
+            font_style_bold_italic: None,
             font_synthetic: None,
             font_codepoint_map: Vec::new(),
             font_thicken: false,
+            font_thicken_strength: 255,
             scrollback: 10_000,
             osc_color_report_format: OscColorReportFormat::Bits16,
             initial_command: None,
@@ -750,6 +777,7 @@ impl Default for AppConfig {
             font_features: Vec::new(),
             minimum_contrast: 1.0,
             window_theme: WindowTheme::Auto,
+            window_title_font_family: None,
             window_decoration: true,
             background_image: None,
             background_image_opacity: 1.0,
@@ -804,6 +832,7 @@ window-padding-balance = false  # center the grid when it doesn't fill the frame
 middle-click-action = primary-paste  # middle click pastes the PRIMARY selection
 right-click-action = context-menu  # context-menu | copy | paste | ignore
 font-thicken = false       # overdraw glyph runs to darken strokes
+# window-title-font-family = DejaVu Sans   # tab-chip label font (the reference's titlebar font key)
 # font-family-bold = DejaVu Sans Mono   # per-style family overrides
 # font-family-italic = DejaVu Sans Mono
 # font-family-bold-italic = DejaVu Sans Mono
@@ -872,6 +901,10 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # adjust-cursor-height = 120%  # underline thickness / beam height (0 = default)
 # font-feature = -calt         # OpenType toggle: -tag off, +tag/tag/tag=N on
 # font-style = Italic        # named style of font-family for regular text
+# font-style-bold = Demi Bold      # named styles for the bold/italic/bold-italic variants
+# font-style-italic = Light Italic
+# font-style-bold-italic = Bold Italic
+# font-thicken-strength = 255      # 0-255 thicken amount when font-thicken = true
 # font-synthetic-style = bold      # allow embolden synthesis; repeat for italic (or no-bold,no-italic,true,false)
 # font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono  # per-codepoint family
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
@@ -978,7 +1011,19 @@ impl AppConfig {
                     cfg.font_family_bold_italic = Some(value.to_string());
                 }
                 "font-thicken" => cfg.font_thicken = bool_value(value, n, &mut errors),
+                "font-thicken-strength" => match value.parse::<u8>() {
+                    Ok(s) => cfg.font_thicken_strength = s,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad font-thicken-strength {value:?} (want 0-255)",
+                        n + 1
+                    )),
+                },
                 "font-style" => cfg.font_style = Some(value.to_string()),
+                "font-style-bold" => cfg.font_style_bold = Some(value.to_string()),
+                "font-style-italic" => cfg.font_style_italic = Some(value.to_string()),
+                "font-style-bold-italic" => {
+                    cfg.font_style_bold_italic = Some(value.to_string());
+                }
                 "font-synthetic-style" => {
                     // Ghostty's form is `no-bold`,`no-italic`,`no-bold-italic`
                     // disables and `true`/`false` covers both; bare
@@ -1504,10 +1549,22 @@ impl AppConfig {
                 }
                 "window-theme" => match value {
                     "auto" => cfg.window_theme = WindowTheme::Auto,
+                    "system" => cfg.window_theme = WindowTheme::System,
                     "light" => cfg.window_theme = WindowTheme::Light,
                     "dark" => cfg.window_theme = WindowTheme::Dark,
-                    _ => errors.push(format!("line {}: bad window-theme {value:?}", n + 1)),
+                    "ghostty" => cfg.window_theme = WindowTheme::Ghostty,
+                    _ => errors.push(format!(
+                        "line {}: bad window-theme {value:?} (want auto|system|light|dark|ghostty)",
+                        n + 1
+                    )),
                 },
+                "window-title-font-family" => {
+                    cfg.window_title_font_family = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "window-decoration" => {
                     cfg.window_decoration = match value {
                         "false" => false,
@@ -3862,5 +3919,38 @@ mod tests {
         }
         let (_, errs) = AppConfig::parse("scrollback-limit-bytes = 1048576");
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn parses_r50_keys() {
+        let (cfg, errs) = AppConfig::parse(
+            "window-theme = ghostty\nfont-style-bold = Demi Bold\n\
+                    font-style-italic = Light Italic\nfont-style-bold-italic = Bold Italic\n\
+                    font-thicken = true\nfont-thicken-strength = 128\n\
+                    window-title-font-family = DejaVu Serif\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.window_theme, WindowTheme::Ghostty);
+        assert_eq!(cfg.font_style_bold.as_deref(), Some("Demi Bold"));
+        assert_eq!(cfg.font_style_italic.as_deref(), Some("Light Italic"));
+        assert_eq!(cfg.font_style_bold_italic.as_deref(), Some("Bold Italic"));
+        assert_eq!(cfg.font_thicken_strength, 128);
+        assert_eq!(
+            cfg.window_title_font_family.as_deref(),
+            Some("DejaVu Serif")
+        );
+
+        // `system` parses; a bogus value and an out-of-range strength error.
+        let (cfg2, errs) = AppConfig::parse("window-theme = system\n");
+        assert!(errs.is_empty());
+        assert_eq!(cfg2.window_theme, WindowTheme::System);
+        let (_, errs) = AppConfig::parse("window-theme = purple\n");
+        assert_eq!(errs.len(), 1);
+        let (_, errs) = AppConfig::parse("font-thicken-strength = 300\n");
+        assert_eq!(errs.len(), 1);
+        // Empty title-font clears the override.
+        let (cfg3, errs) = AppConfig::parse("window-title-font-family = \n");
+        assert!(errs.is_empty());
+        assert!(cfg3.window_title_font_family.is_none());
     }
 }

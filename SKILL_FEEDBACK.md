@@ -236,3 +236,26 @@ patched in-repo.
   compat check fails on transitive-version mismatches. `water build
   --platform linux` targets gtk4; the hydrolysis path is `water run`
   with no `--platform` flag.
+
+### Reactive font family on text (`window-title-font-family`, r50)
+- **Tried:** apply a per-config font family to tab-chip labels so a
+  config reload changes them live.
+- **Skill said:** `.font(...)` and `font::Body.family(name)` are
+  documented — but `family(impl Into<Str> + Clone + 'static)` bakes the
+  name in at construction; nothing in the skill covers a *reactive*
+  family.
+- **Actually true:** `Font::new` takes any `impl Resolvable<Resolved =
+  ResolvedFont>` (`waterui components/foundation/text/src/font.rs:187`).
+  Font slots resolve via `Resolvable::resolve(env)` → `Signal`; combine
+  with `nami::zip` + `.map` to rewrite `ResolvedFont.family` from a
+  `Binding<Option<Str>>` — hydroterm's `TitleFont` in `src/app.rs` is
+  the working shape (a `Binding` is already a `Signal`; `zip` accepts
+  mixed signal types and `.computed()` is needless — `needless_computed`
+  flags it).
+- **Concrete edit:** a `references/` section "Reactive fonts" — show
+  `Font::new(custom Resolvable)` + the zip-with-binding pattern; state
+  plainly that `Font::family`/slot `.family()` are static-only.
+
+## Lint candidates
+
+(no new entries this round)

@@ -199,15 +199,31 @@ pub fn system_prefers_dark() -> bool {
 }
 
 /// `window-theme` → the WaterUI color scheme installed into the environment
-/// as `Theme::color_scheme` (water-rs/cli#188). `auto` resolves the desktop
-/// preference at call time, so a config reload re-reads it.
+/// as `Theme::color_scheme` (water-rs/cli#188).
+///
+/// Reference semantics (`window-theme = auto|system|light|dark|ghostty`):
+/// `auto` picks light/dark from the *terminal background* luminance, not
+/// the desktop — a light `theme =` palette gets light chrome on a schema-
+/// less desktop (the r44 fix was exactly this, on the wrong trigger);
+/// `system` probes the desktop preference at call time so a config reload
+/// re-reads it; `ghostty` additionally seeds the M3 style from the
+/// terminal background at launch (`lib.rs::material_style`) — the scheme
+/// here keeps the env signal consistent for anything not token-driven.
 pub fn scheme_for(
     window_theme: &crate::config::WindowTheme,
+    background: &Rgb,
 ) -> ColorScheme {
     match window_theme {
         crate::config::WindowTheme::Light => ColorScheme::Light,
         crate::config::WindowTheme::Dark => ColorScheme::Dark,
-        crate::config::WindowTheme::Auto => {
+        crate::config::WindowTheme::Auto | crate::config::WindowTheme::Ghostty => {
+            if rgb_is_dark(background) {
+                ColorScheme::Dark
+            } else {
+                ColorScheme::Light
+            }
+        }
+        crate::config::WindowTheme::System => {
             if system_prefers_dark() {
                 ColorScheme::Dark
             } else {
@@ -215,6 +231,11 @@ pub fn scheme_for(
             }
         }
     }
+}
+
+/// Rec.709-ish luminance of the terminal background → dark scheme?
+fn rgb_is_dark(rgb: &Rgb) -> bool {
+    (0.2126 * f64::from(rgb.r) + 0.7152 * f64::from(rgb.g) + 0.0722 * f64::from(rgb.b)) < 127.5
 }
 
 

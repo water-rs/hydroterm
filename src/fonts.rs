@@ -92,6 +92,12 @@ pub struct TermFonts {
     codepoint_map: Vec<(std::ops::RangeInclusive<u32>, FontFamily<'static>)>,
     /// `font-style` — the plain run's default weight and style.
     font_style: (FontWeight, FontStyle),
+    /// `font-style-bold`/`font-style-italic`/`font-style-bold-italic` —
+    /// named styles that replace the fixed variant mapping (bold→700,
+    /// italic→Italic) when set; `None` keeps the fixed mapping.
+    style_bold: Option<(FontWeight, FontStyle)>,
+    style_italic: Option<(FontWeight, FontStyle)>,
+    style_bold_italic: Option<(FontWeight, FontStyle)>,
     pub metrics: CellMetrics,
 }
 
@@ -170,6 +176,9 @@ impl TermFonts {
             features: Vec::new(),
             codepoint_map: Vec::new(),
             font_style: (FontWeight::new(400.0), FontStyle::Normal),
+            style_bold: None,
+            style_italic: None,
+            style_bold_italic: None,
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
@@ -203,28 +212,29 @@ impl TermFonts {
     /// `Bold Italic`, `Light`, `Medium`, `SemiBold`) into the plain
     /// run's default weight and style.
     pub fn set_font_style(&mut self, style: &Option<String>) {
-        let lower = style.as_deref().map(str::to_ascii_lowercase);
-        let s = lower.as_deref().unwrap_or("");
-        let weight = if s.contains("bold") {
-            700.0
-        } else if s.contains("light") {
-            300.0
-        } else if s.contains("semibold") || s.contains("semi-bold") {
-            600.0
-        } else if s.contains("medium") {
-            500.0
-        } else {
-            400.0
+        self.font_style = style
+            .as_deref()
+            .map_or((FontWeight::new(400.0), FontStyle::Normal), named_style);
+        self.metrics = self.probe_metrics();
+    }
+
+    /// Set `font-style-bold`/`font-style-italic`/`font-style-bold-italic`
+    /// — named styles replacing the fixed (700/Italic) variant mapping.
+    /// `None` (or an empty value) restores the fixed mapping.
+    pub fn set_variant_styles(
+        &mut self,
+        bold: &Option<String>,
+        italic: &Option<String>,
+        bold_italic: &Option<String>,
+    ) {
+        let parse = |p: &Option<String>| {
+            p.as_deref()
+                .filter(|s| !s.is_empty())
+                .map(named_style)
         };
-        let italic = s.contains("italic") || s.contains("oblique");
-        self.font_style = (
-            FontWeight::new(weight),
-            if italic {
-                FontStyle::Italic
-            } else {
-                FontStyle::Normal
-            },
-        );
+        self.style_bold = parse(bold);
+        self.style_italic = parse(italic);
+        self.style_bold_italic = parse(bold_italic);
         self.metrics = self.probe_metrics();
     }
 
@@ -330,17 +340,17 @@ impl TermFonts {
             builder.push_default(StyleProperty::FontFamily(family));
             // `font-style` supplies the regular run's own weight/style;
             // SGR bold/italic keeps its fixed mapping.
-            let (weight, style) = if bold || italic {
-                (
-                    FontWeight::new(if bold { 700.0 } else { 400.0 }),
-                    if italic {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                )
-            } else {
-                self.font_style
+            let (weight, style) = match (bold, italic) {
+                (true, true) => self
+                    .style_bold_italic
+                    .unwrap_or((FontWeight::new(700.0), FontStyle::Italic)),
+                (true, false) => self
+                    .style_bold
+                    .unwrap_or((FontWeight::new(700.0), FontStyle::Normal)),
+                (false, true) => self
+                    .style_italic
+                    .unwrap_or((FontWeight::new(400.0), FontStyle::Italic)),
+                (false, false) => self.font_style,
             };
             builder.push_default(StyleProperty::FontWeight(weight));
             builder.push_default(StyleProperty::FontStyle(style));
@@ -418,6 +428,34 @@ impl TermFonts {
         metrics.finish();
         metrics
     }
+}
+
+/// Parse a Ghostty named style (`Italic`, `Bold`, `Bold Italic`,
+/// `Light`, `Medium`, `SemiBold`, `Oblique`, …) into a weight/style
+/// pair — the same vocabulary `font-style` and the `font-style-*`
+/// variant keys share.
+fn named_style(s: &str) -> (FontWeight, FontStyle) {
+    let s = s.to_ascii_lowercase();
+    let weight = if s.contains("bold") {
+        700.0
+    } else if s.contains("light") {
+        300.0
+    } else if s.contains("semibold") || s.contains("semi-bold") {
+        600.0
+    } else if s.contains("medium") {
+        500.0
+    } else {
+        400.0
+    };
+    let italic = s.contains("italic") || s.contains("oblique");
+    (
+        FontWeight::new(weight),
+        if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        },
+    )
 }
 
 /// Resolve one family name — generic aliases map to their generic

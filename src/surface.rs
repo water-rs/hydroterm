@@ -446,6 +446,7 @@ pub struct TermSurface {
     /// re-resolved inside `sync_fonts` only when one changes.
     style_prefs: (Option<String>, Option<String>, Option<String>),
     font_style_pref: Option<String>,
+    variant_style_prefs: (Option<String>, Option<String>, Option<String>),
     codepoint_map_pref: Vec<(u32, u32, String)>,
 
     // geometry (grid size in cells, logical units at draw time)
@@ -556,10 +557,22 @@ impl TermSurface {
             )
         });
         let font_style_pref = app.config(|c| c.font_style.clone());
+        let variant_style_prefs = app.config(|c| {
+            (
+                c.font_style_bold.clone(),
+                c.font_style_italic.clone(),
+                c.font_style_bold_italic.clone(),
+            )
+        });
         let codepoint_map_pref = app.config(|c| c.font_codepoint_map.clone());
         let mut fonts = TermFonts::load(fonts, font_size, &family_pref);
         fonts.set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
         fonts.set_font_style(&font_style_pref);
+        fonts.set_variant_styles(
+            &variant_style_prefs.0,
+            &variant_style_prefs.1,
+            &variant_style_prefs.2,
+        );
         fonts.set_codepoint_map(&codepoint_map_pref);
         Self {
             session,
@@ -567,6 +580,7 @@ impl TermSurface {
             fonts,
             style_prefs,
             font_style_pref,
+            variant_style_prefs,
             codepoint_map_pref,
             palette,
             font_size_pt: font_size,
@@ -1825,6 +1839,21 @@ impl TermSurface {
         if font_style_pref != self.font_style_pref {
             self.fonts.set_font_style(&font_style_pref);
             self.font_style_pref = font_style_pref;
+        }
+        let variant_style_prefs = self.app.config(|c| {
+            (
+                c.font_style_bold.clone(),
+                c.font_style_italic.clone(),
+                c.font_style_bold_italic.clone(),
+            )
+        });
+        if variant_style_prefs != self.variant_style_prefs {
+            self.fonts.set_variant_styles(
+                &variant_style_prefs.0,
+                &variant_style_prefs.1,
+                &variant_style_prefs.2,
+            );
+            self.variant_style_prefs = variant_style_prefs;
         }
         let codepoint_map_pref = self.app.config(|c| c.font_codepoint_map.clone());
         if codepoint_map_pref != self.codepoint_map_pref {
@@ -3279,7 +3308,15 @@ impl TermSurface {
                 .app
                 .config(|c| c.font_synthetic.unwrap_or((true, true)).1),
             bell_color: self.app.config(|c| c.visual_bell_color),
-            font_thicken: self.app.config(|c| c.font_thicken),
+            // `font-thicken` × `font-thicken-strength` (0-255, 0 =
+            // lightest): overdraw offset in px, 0.0 disables.
+            font_thicken: self.app.config(|c| {
+                if c.font_thicken {
+                    0.15 + 0.45 * f32::from(c.font_thicken_strength) / 255.0
+                } else {
+                    0.0
+                }
+            }),
             bold_color: self.app.config(|c| c.bold_color),
             faint_opacity: self.app.config(|c| c.faint_opacity),
             min_contrast: self.app.config(|c| c.minimum_contrast),
