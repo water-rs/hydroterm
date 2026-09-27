@@ -25,6 +25,7 @@ use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, Processor};
 use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
+use waterui::snackbar::Snackbar;
 use waterui::task::spawn_local;
 use waterui::window::WindowState;
 use waterui_core::Str;
@@ -824,6 +825,18 @@ impl TermSurface {
             let text = self.trimmed_copy(text);
             if let Some(clip) = self.clipboard.as_mut() {
                 let _ = clip.set_text(&text);
+            }
+            // `app-notifications = clipboard-copy` — the copy toast.
+            if self.app.config(|c| c.app_notify_clipboard_copy)
+                && let Some(manager) = self.session.snackbar.borrow().as_ref()
+            {
+                manager.show(Snackbar::new("Copied to clipboard"));
+            }
+            // `selection-clear-on-copy` — explicit copies clear the
+            // selection; `copy-on-select` goes through `copy_on_select`
+            // and never lands here.
+            if self.app.config(|c| c.selection_clear_on_copy) {
+                self.session.terminal.term.lock().selection = None;
             }
         }
     }
@@ -3288,6 +3301,12 @@ impl TermSurface {
             scroll,
             search_matches: &matches_view,
             search_active: &active,
+            search_colors: self.app.config(|c| crate::scene::SearchColors {
+                foreground: c.search_foreground,
+                background: c.search_background,
+                selected_foreground: c.search_selected_foreground,
+                selected_background: c.search_selected_background,
+            }),
             bell_flash: bell_alpha,
             bell_border: self.bell_border,
             bg_opacity,

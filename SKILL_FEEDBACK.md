@@ -237,7 +237,7 @@ patched in-repo.
   --platform linux` targets gtk4; the hydrolysis path is `water run`
   with no `--platform` flag.
 
-### Reactive font family on text (`window-title-font-family`, r50)
+### Reactive font family on text (`window-title-font-family`, r50) → water-rs/waterui#1303
 - **Tried:** apply a per-config font family to tab-chip labels so a
   config reload changes them live.
 - **Skill said:** `.font(...)` and `font::Body.family(name)` are
@@ -256,6 +256,30 @@ patched in-repo.
   `Font::new(custom Resolvable)` + the zip-with-binding pattern; state
   plainly that `Font::family`/slot `.family()` are static-only.
 
+### Showing a snackbar from non-handler code (`app-notifications`, r51)
+- **Tried:** `SnackbarManager::show()` from a copy handler that lives in
+  non-view code (`surface.rs` — not a `.action` closure).
+- **Skill said:** `references/components.md` documents "Every `Window`
+  installs a `SnackbarManager` through `.state()`" and shows
+  `.action(|m: SnackbarManager| …)` injection — but only inside view
+  action callbacks. Nothing covers reaching the manager from code that
+  is not a view handler.
+- **Actually true:** the manager is env-scoped to the whole window
+  (`runtime/window.rs:225` installs it via `.state(&snackbar_manager)`),
+  so any mounted view can capture it once through `.on_appear(|m:
+  SnackbarManager, …|)` and stash it — hydroterm keeps it in
+  `Session.snackbar: RefCell<Option<SnackbarManager>>` behind an
+  always-mounted `Spacer::new(0.0)` (`app.rs:2678`). Only mounting it
+  inside a conditional prompt overlay means the capture silently never
+  ran when no prompt was up — toasts were a no-op.
+- **Concrete edit:** components.md snackbar section — add a
+  "outside `.action` handlers" snippet: `Spacer::new(0).on_appear(|m:
+  SnackbarManager| stash(m))`, and warn that conditional overlays only
+  capture while mounted.
+
 ## Lint candidates
 
-(no new entries this round)
+- `qualified_waterui_path` (new at lints `a9058391`): real positive —
+  flagged my `waterui::snackbar::Snackbar::new(..)` written inline;
+  fixed with `use waterui::snackbar::Snackbar;`. Not a false positive.
+- Existing entries unchanged.

@@ -41,6 +41,28 @@ pub struct HintSpan {
 }
 
 /// Runtime state the scene pass needs beyond the term's renderable content.
+/// `search-*` color config — `None` keeps the built-in match tint.
+#[derive(Clone, Copy, Default)]
+pub struct SearchColors {
+    /// `search-foreground` — candidate-match glyph color.
+    pub foreground: Option<Rgb>,
+    /// `search-background` — candidate-match fill.
+    pub background: Option<Rgb>,
+    /// `search-selected-foreground` — focused-match glyph color.
+    pub selected_foreground: Option<Rgb>,
+    /// `search-selected-background` — focused-match fill.
+    pub selected_background: Option<Rgb>,
+}
+
+impl SearchColors {
+    fn any(&self) -> bool {
+        self.foreground.is_some()
+            || self.background.is_some()
+            || self.selected_foreground.is_some()
+            || self.selected_background.is_some()
+    }
+}
+
 pub struct DrawContext<'a> {
     pub palette: &'a Palette,
     pub fonts: &'a mut TermFonts,
@@ -68,6 +90,8 @@ pub struct DrawContext<'a> {
     /// Segments of the currently active search match (a wrap-crossing
     /// match highlights its rows on both sides).
     pub search_active: &'a [(usize, usize, usize)],
+    /// `search-*` color config.
+    pub search_colors: SearchColors,
     /// Alpha for the bell flash overlay.
     pub bell_flash: f32,
     /// Alpha of the default background fill (window transparency; 1.0 =
@@ -302,6 +326,28 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         if cell.flags.contains(Flags::HIDDEN) {
             fg = bg;
         }
+        // `search-foreground`/`search-selected-foreground` recolor the
+        // matched glyph; the translucent band covers the bg and
+        // selection/cursor overrides still win below.
+        if ctx.search_colors.any() {
+            let col = p.column.0;
+            if ctx
+                .search_active
+                .iter()
+                .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1)
+            {
+                if let Some(c) = ctx.search_colors.selected_foreground {
+                    fg = c;
+                }
+            } else if ctx
+                .search_matches
+                .iter()
+                .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1)
+                && let Some(c) = ctx.search_colors.foreground
+            {
+                fg = c;
+            }
+        }
         if is_sel {
             // Reference semantics: `selection-invert-fg-bg` always swaps;
             // otherwise each channel takes its configured color or inverts
@@ -469,15 +515,35 @@ pub fn draw_term(
     // -- Search highlights --------------------------------------------------
     for &(c0, c1, r) in ctx.search_matches {
         let active = ctx.search_active.contains(&(c0, c1, r));
-        let color = if active {
-            Rgb { r: 0xff, g: 0xa5, b: 0x00 }
+        // `search-(selected-)background` configures the match fill;
+        // the built-in palette stays a translucent tint.
+        let (color, alpha) = if active {
+            (
+                ctx.search_colors
+                    .selected_background
+                    .unwrap_or(Rgb { r: 0xff, g: 0xa5, b: 0x00 }),
+                if ctx.search_colors.selected_background.is_some() {
+                    1.0
+                } else {
+                    0.55
+                },
+            )
         } else {
-            Rgb { r: 0x8a, g: 0x6d, b: 0x3b }
+            (
+                ctx.search_colors
+                    .background
+                    .unwrap_or(Rgb { r: 0x8a, g: 0x6d, b: 0x3b }),
+                if ctx.search_colors.background.is_some() {
+                    1.0
+                } else {
+                    0.30
+                },
+            )
         };
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(color, if active { 0.55 } else { 0.30 })),
+            &Brush::Solid(peniko_alpha(color, alpha)),
             None,
             &rect(col_x(padx, cw, c0), row_y(pady, ch, r), (c1 - c0) as f32 * cw, ch),
         );

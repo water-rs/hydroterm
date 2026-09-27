@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -130,6 +130,11 @@ struct ProxyInner {
     /// `enquiry-response` — replaces the default `\x1b[?6c` reply to a
     /// primary DA (`CSI c`); `None` keeps alacritty's answer.
     enquiry: Mutex<Option<String>>,
+    /// `title-report` — gate for `CSI 21 t` title queries (default off).
+    title_report: AtomicBool,
+    /// Latest title seen through `Event::Title`/`ResetTitle` — the
+    /// `CSI 21 t` reply needs it where `Term.title` isn't public.
+    title: Mutex<String>,
 }
 
 impl EventProxy {
@@ -140,6 +145,8 @@ impl EventProxy {
             events,
             wake: Mutex::new((0, Box::new(|| {}))),
             enquiry: Mutex::new(None),
+            title_report: AtomicBool::new(false),
+            title: Mutex::new(String::new()),
         });
         (Self { inner }, rx)
     }
@@ -147,6 +154,26 @@ impl EventProxy {
     /// Set the `enquiry-response` override (None → default `\x1b[?6c`).
     pub fn set_enquiry_response(&self, response: Option<String>) {
         *self.inner.enquiry.lock().unwrap() = response;
+    }
+
+    /// `title-report` — allow/deny `CSI 21 t` title queries.
+    pub fn set_title_report(&self, on: bool) {
+        self.inner.title_report.store(on, Ordering::Relaxed);
+    }
+
+    fn title_report_enabled(&self) -> bool {
+        self.inner.title_report.load(Ordering::Relaxed)
+    }
+
+    /// Answer a `CSI 21 t` (`\x1b[21t`) query observed on the output
+    /// stream — gated by `title-report` (Ghostty default off: a title
+    /// can carry secrets). Replies `OSC l <title> ST`, the xterm form.
+    pub fn maybe_report_title(&self) {
+        if !self.inner.title_report.load(Ordering::Relaxed) {
+            return;
+        }
+        let title = self.inner.title.lock().unwrap().clone();
+        self.send_event(Event::PtyWrite(format!("\x1b]l{title}\x1b\\")));
     }
 
     /// Install the wake callback (called by `TermSurface::set_invalidator` —
@@ -211,10 +238,12 @@ impl EventListener for EventProxy {
                 self.wake();
             }
             Event::Title(title) => {
+                *self.inner.title.lock().unwrap() = title.clone();
                 let _ = self.inner.events.send(TermEvent::Title(title));
                 self.wake();
             }
             Event::ResetTitle => {
+                self.inner.title.lock().unwrap().clear();
                 let _ = self.inner.events.send(TermEvent::Title(String::new()));
                 self.wake();
             }
@@ -1402,6 +1431,10 @@ struct IoLoop {
     proxy: EventProxy,
     drain_on_exit: bool,
     marks: Marks,
+    /// Rolling 5-byte window over PTY output — `CSI 21 t` (`title-report`)
+    /// is swallowed by vte's own `('t', [])` dispatch, so it's matched on
+    /// the raw byte stream before the parser sees it.
+    csi21t_tail: u64,
 }
 
 impl IoLoop {
@@ -1424,6 +1457,7 @@ impl IoLoop {
                 proxy: event_proxy,
                 drain_on_exit,
                 marks,
+                csi21t_tail: 0,
             },
             io,
         ))
@@ -1474,6 +1508,18 @@ impl IoLoop {
                 stat_add(&STAT_TAKE_NS, t.elapsed().as_nanos() as u64);
                 if n == 0 && events.is_empty() {
                     break;
+                }
+                // `title-report`: `\x1b[21t` never reaches the Handler
+                // (vte's `('t', [])` arm only dispatches 14/18/22/23), so
+                // it is matched on the raw output bytes here.
+                if self.proxy.title_report_enabled() {
+                    for &b in &seg[..n] {
+                        self.csi21t_tail = (self.csi21t_tail << 8) | u64::from(b);
+                        // `ESC [ 2 1 t`
+                        if self.csi21t_tail & 0xff_ffff_ffff == 0x1b_5b_32_31_74 {
+                            self.proxy.maybe_report_title();
+                        }
+                    }
                 }
                 advance_tagged(parser, &mut self.marks, &mut *term, &seg[..n]);
                 for ev in &events {

@@ -637,6 +637,27 @@ pub struct AppConfig {
     /// `config-file` — include paths recorded while expanding the config
     /// (repeat key; cycles and missing files warn instead of failing).
     pub config_files: Vec<PathBuf>,
+    /// `app-notifications` — in-app toast toggles; the reference gates
+    /// `clipboard-copy` and `config-reload` notifications this way
+    /// (`no-<name>` disables; repeat key).
+    pub app_notify_clipboard_copy: bool,
+    pub app_notify_config_reload: bool,
+    /// `selection-clear-on-copy` — clear the selection after an explicit
+    /// `copy_to_clipboard`; `copy-on-select` never clears it.
+    pub selection_clear_on_copy: bool,
+    /// `undo-timeout` — ms a closed-surface undo entry stays restorable
+    /// (Ghostty default 5s; `0` disables undo entirely).
+    pub undo_timeout_ms: u64,
+    /// `title-report` — answer `CSI 21 t` with `OSC l <title> ST`;
+    /// default off (the reference treats it as an information leak).
+    pub title_report: bool,
+    /// `search-foreground` / `search-background` (candidate matches).
+    pub search_foreground: Option<Rgb>,
+    pub search_background: Option<Rgb>,
+    /// `search-selected-foreground` / `search-selected-background`
+    /// (the focused match).
+    pub search_selected_foreground: Option<Rgb>,
+    pub search_selected_background: Option<Rgb>,
 }
 
 /// `window-theme` values.
@@ -795,6 +816,15 @@ impl Default for AppConfig {
             open_link_with: None,
             link_patterns: Vec::new(),
             enquiry_response: None,
+            app_notify_clipboard_copy: true,
+            app_notify_config_reload: true,
+            selection_clear_on_copy: false,
+            undo_timeout_ms: 5000,
+            title_report: false,
+            search_foreground: None,
+            search_background: None,
+            search_selected_foreground: None,
+            search_selected_background: None,
             paste_bracketed_safe: true,
             image_storage_limit: 320 * 1024 * 1024,
             config_files: Vec::new(),
@@ -908,6 +938,14 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # font-synthetic-style = bold      # allow embolden synthesis; repeat for italic (or no-bold,no-italic,true,false)
 # font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono  # per-codepoint family
 # minimum-contrast = 4.5   # 1.0-21.0 WCAG ratio floor on cell fg vs bg
+# app-notifications = no-clipboard-copy   # gate in-app toasts: clipboard-copy | config-reload (no- disables)
+# selection-clear-on-copy = true         # drop the selection after copy_to_clipboard
+# undo-timeout = 5s                       # how long `undo` can reopen a closed surface (0 = undo off)
+# title-report = false                    # let apps query the window title via CSI 21 t (OSC l <title> ST)
+# search-foreground = #101418             # search match colors (selected-* = the focused match)
+# search-background = #ffd75f
+# search-selected-foreground = #101418
+# search-selected-background = #ffaf00
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
@@ -1849,6 +1887,60 @@ impl AppConfig {
                     Ok(v) => cfg.image_storage_limit = v,
                     _ => errors.push(format!("line {}: bad image-storage-limit {value:?}", n + 1)),
                 },
+                "app-notifications" => match value {
+                    "clipboard-copy" => cfg.app_notify_clipboard_copy = true,
+                    "no-clipboard-copy" => cfg.app_notify_clipboard_copy = false,
+                    "config-reload" => cfg.app_notify_config_reload = true,
+                    "no-config-reload" => cfg.app_notify_config_reload = false,
+                    _ => errors.push(format!(
+                        "line {}: bad app-notifications {value:?} (want clipboard-copy|config-reload, no- prefix disables)",
+                        n + 1
+                    )),
+                },
+                "selection-clear-on-copy" => match value {
+                    "true" | "yes" => cfg.selection_clear_on_copy = true,
+                    "false" | "no" => cfg.selection_clear_on_copy = false,
+                    _ => errors.push(format!(
+                        "line {}: bad selection-clear-on-copy {value:?}",
+                        n + 1
+                    )),
+                },
+                "undo-timeout" => match parse_duration_ms(value) {
+                    Some(ms) => cfg.undo_timeout_ms = ms,
+                    None => errors.push(format!(
+                        "line {}: bad undo-timeout {value:?} (want e.g. 5s)",
+                        n + 1
+                    )),
+                },
+                "title-report" => match value {
+                    "true" | "yes" => cfg.title_report = true,
+                    "false" | "no" => cfg.title_report = false,
+                    _ => errors.push(format!("line {}: bad title-report {value:?}", n + 1)),
+                },
+                "search-foreground" => match parse_rgb(value) {
+                    Some(c) => cfg.search_foreground = Some(c),
+                    None => errors
+                        .push(format!("line {}: bad search-foreground {value:?}", n + 1)),
+                },
+                "search-background" => match parse_rgb(value) {
+                    Some(c) => cfg.search_background = Some(c),
+                    None => errors
+                        .push(format!("line {}: bad search-background {value:?}", n + 1)),
+                },
+                "search-selected-foreground" => match parse_rgb(value) {
+                    Some(c) => cfg.search_selected_foreground = Some(c),
+                    None => errors.push(format!(
+                        "line {}: bad search-selected-foreground {value:?}",
+                        n + 1
+                    )),
+                },
+                "search-selected-background" => match parse_rgb(value) {
+                    Some(c) => cfg.search_selected_background = Some(c),
+                    None => errors.push(format!(
+                        "line {}: bad search-selected-background {value:?}",
+                        n + 1
+                    )),
+                },
                 // Expansion happens in `load` (the directive's file text is
                 // spliced in before `parse` runs); the surviving line only
                 // records the path for diagnostics.
@@ -2170,6 +2262,10 @@ fn parse_command(value: &str) -> Option<Vec<String>> {
 /// — every number+unit pair adds in; sub-ms units round to 0).
 fn parse_duration_ms(value: &str) -> Option<u64> {
     let mut rest = value.trim();
+    // Bare `0` reads naturally for "disabled" (`undo-timeout = 0`).
+    if rest == "0" {
+        return Some(0);
+    }
     let mut total: u64 = 0;
     let mut seen = false;
     while !rest.is_empty() {
@@ -3952,5 +4048,38 @@ mod tests {
         let (cfg3, errs) = AppConfig::parse("window-title-font-family = \n");
         assert!(errs.is_empty());
         assert!(cfg3.window_title_font_family.is_none());
+    }
+
+    #[test]
+    fn parses_r51_keys() {
+        let (cfg, errs) = AppConfig::parse(
+            "app-notifications = no-clipboard-copy\n                    selection-clear-on-copy = true\n                    undo-timeout = 30s\n                    title-report = true\n                    search-foreground = #101418\n                    search-background = #ffd75f\n                    search-selected-foreground = #101418\n                    search-selected-background = #ffaf00\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.app_notify_clipboard_copy);
+        assert!(cfg.app_notify_config_reload);
+        assert!(cfg.selection_clear_on_copy);
+        assert_eq!(cfg.undo_timeout_ms, 30_000);
+        assert!(cfg.title_report);
+        assert_eq!(cfg.search_background, Some(Rgb { r: 0xff, g: 0xd7, b: 0x5f }));
+        assert_eq!(
+            cfg.search_selected_background,
+            Some(Rgb { r: 0xff, g: 0xaf, b: 0x00 })
+        );
+
+        // `no-` disables one without touching the other; re-adding the
+        // bare name turns it back on (repeat key).
+        let (cfg2, errs) =
+            AppConfig::parse("app-notifications = no-config-reload\napp-notifications = clipboard-copy\n");
+        assert!(errs.is_empty());
+        assert!(cfg2.app_notify_clipboard_copy);
+        assert!(!cfg2.app_notify_config_reload);
+        let (_, errs) = AppConfig::parse("app-notifications = no-bell\n");
+        assert_eq!(errs.len(), 1);
+        let (cfg3, errs) = AppConfig::parse("undo-timeout = 0\n");
+        assert!(errs.is_empty());
+        assert_eq!(cfg3.undo_timeout_ms, 0);
+        let (_, errs) = AppConfig::parse("search-foreground = nope\n");
+        assert_eq!(errs.len(), 1);
     }
 }

@@ -54,7 +54,7 @@ opt-level = 2
 
 [workspace.metadata.dylint]
 libraries = [
-  { git = "https://github.com/water-rs/lints", rev = "8f74a56ad1261eded70dfdb5d6a3542c079dc1b6" },
+  { git = "https://github.com/water-rs/lints", rev = "a9058391ed6a876bea4a53c9499623eaaff82f78" },
 ]
 
 # Framework pins — copied from the hydrolysis repository's own `[patch.crates-io]`

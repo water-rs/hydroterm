@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -248,6 +248,8 @@ impl Session {
         terminal
             .proxy
             .set_enquiry_response(cfg.enquiry_response.clone());
+        // `title-report` — allow `CSI 21 t` only when configured on.
+        terminal.proxy.set_title_report(cfg.title_report);
         Self {
             id,
             terminal: Arc::new(terminal),
@@ -305,6 +307,8 @@ pub struct ClosedTab {
     title: String,
     panes: Vec<ClosedPane>,
     tree: ClosedNode,
+    /// `undo-timeout` expiry — entries older than this can't be undone.
+    closed_at: Instant,
 }
 
 #[derive(Clone)]
@@ -892,6 +896,7 @@ impl AppState {
             eprintln!("hydroterm config: {e}");
         }
         self.apply_config(&config);
+        self.reload_toast(&config);
     }
 
     /// Grab one `global:chord` on the X11 root window and register it
@@ -983,6 +988,20 @@ impl AppState {
             eprintln!("hydroterm config: {e}");
         }
         self.apply_config(&config);
+        self.reload_toast(&config);
+    }
+
+    /// `app-notifications = config-reload` — a toast on the focused pane
+    /// after a reload (mtime watcher or the `reload_config` action).
+    fn reload_toast(&self, config: &AppConfig) {
+        if !config.app_notify_config_reload {
+            return;
+        }
+        if let Some(s) = self.focused_session()
+            && let Some(manager) = s.snackbar.borrow().as_ref()
+        {
+            manager.show(Snackbar::new("Configuration reloaded"));
+        }
     }
 
     /// Ghostty `goto_split`: focus the nth leaf of the selected tab.
@@ -1044,6 +1063,7 @@ impl AppState {
         // ones (Ghostty re-grabs global binds on config reload).
         self.regrab_globals(config);
         for s in self.sessions.borrow().iter() {
+            s.terminal.proxy.set_title_report(config.title_report);
             // `font-size` applies on reload — but only to terminals
             // that never took a zoom override (`increase_font_size`, …).
             if !s.font_size_override.get() {
@@ -2155,6 +2175,7 @@ impl AppState {
             title,
             panes,
             tree,
+            closed_at: Instant::now(),
         });
         while stack.len() > 8 {
             stack.remove(0);
@@ -2165,7 +2186,22 @@ impl AppState {
     /// restored as a one-pane tab) with its split shape, per-pane cwd,
     /// and scrollback replayed cell-faithfully into the new surfaces.
     pub fn undo_close(&self) {
-        let Some(closed) = self.closed_stack.borrow_mut().pop() else {
+        // `undo-timeout` — an entry expires on its own clock; new pushes
+        // don't revive older ones. `0` disables undo outright.
+        let timeout = Duration::from_millis(self.config(|c| c.undo_timeout_ms));
+        let now = Instant::now();
+        let closed = {
+            let mut stack = self.closed_stack.borrow_mut();
+            let mut entry = None;
+            while let Some(top) = stack.pop() {
+                if now.duration_since(top.closed_at) <= timeout {
+                    entry = Some(top);
+                    break;
+                }
+            }
+            entry
+        };
+        let Some(closed) = closed else {
             return;
         };
         let size = self.focused_grid_estimate();
@@ -2635,6 +2671,15 @@ impl View for PaneLeaf {
             .padding_with(16.0),
         ))
         .anyview();
+        // The SnackbarManager is captured unconditionally here — the
+        // prompt overlays only mount while a prompt is pending, so
+        // toasts (`app-notifications` copy / config-reload) would have
+        // no manager otherwise.
+        let toast_slot = Spacer::new(0.0)
+            .on_appear(|manager: SnackbarManager, s: PaneSession| {
+                *s.0.snackbar.borrow_mut() = Some(manager);
+            })
+            .anyview();
         let stack = zstack((
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
@@ -2644,6 +2689,7 @@ impl View for PaneLeaf {
             title_prompt,
             inspector_badge,
             abnormal_overlay,
+            toast_slot,
         ));
         stack.state(&session).anyview()
         });
