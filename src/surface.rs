@@ -1167,6 +1167,9 @@ impl TermSurface {
                     let _ = clip.set_text(&uri);
                 }
             }
+            TermAction::OpenUrl(uri) => {
+                self.open_uri(&uri);
+            }
             TermAction::CopyTitleToClipboard => {
                 if let Some(clip) = self.clipboard.as_mut() {
                     let _ = clip.set_text(self.session.title.snapshot().as_ref());
@@ -2220,12 +2223,33 @@ impl TermSurface {
         }
     }
 
+    /// Refresh the context menu's pointer-time snapshot — the link
+    /// under the pointer and selection liveness. The framework claims
+    /// the secondary button for the menu itself (`hit_test.rs` delivers
+    /// `pointer_move` but not `pointer_button` when a `.context_menu`
+    /// encloses the surface), so this runs on every pointer move — the
+    /// press's move arrives before the claim — and on grid scrolls,
+    /// which re-map the cell under a still pointer.
+    fn refresh_menu_ctx(&mut self) {
+        let (x, y) = self.pointer_at;
+        let ctx = crate::app::MenuCtx {
+            url: self.link_at(self.grid_point(x, y)).map(Str::from),
+            sel: self.session.terminal.term.lock().selection.is_some(),
+        };
+        self.session.menu_ctx.set(ctx);
+    }
+
     /// Link-hover affordance: while the `open-link-modifier` is held,
     /// underline the link under the pointer and switch the cursor to a
     /// pointing hand. Re-runs on pointer moves and on modifier-chord
     /// changes.
     fn update_hover(&mut self, x: f64, y: f64) {
         self.pointer_at = (x, y);
+        if self.app.config(|c| {
+            c.right_click_action == crate::config::RightClickAction::ContextMenu
+        }) {
+            self.refresh_menu_ctx();
+        }
         let segs = if self.modifiers.contains(self.link_modifier()) {
             self.link_span_at(self.grid_point(x, y))
         } else {
@@ -2420,17 +2444,13 @@ impl TermSurface {
                             self.paste_clipboard();
                         }
                         crate::config::RightClickAction::ContextMenu => {
-                            // `context-menu` (Ghostty default): the
-                            // framework `.context_menu` modifier mounts the
-                            // popup; the scene press still extends a live
-                            // selection, xterm-style.
-                            if self.session.terminal.term.lock().selection.is_some() {
-                                let point = self.grid_point(x, y);
-                                let mut term = self.session.terminal.term.lock();
-                                if let Some(sel) = &mut term.selection {
-                                    sel.update(point, self.cell_side(x));
-                                }
-                            }
+                            // The framework's `.context_menu` claims the
+                            // secondary button before it reaches the
+                            // surface (the menu acts on the focused
+                            // surface), so no press-side work is possible
+                            // here — the menu's `menu_ctx` snapshot is
+                            // refreshed on pointer moves instead
+                            // (`refresh_menu_ctx`).
                         }
                     }
                 }
@@ -2827,6 +2847,13 @@ impl TermSurface {
         self.hints = None; // viewport moved — stale chips would mislead
         let mut term = self.session.terminal.term.lock();
         term.scroll_display(Scroll::Delta(lines_delta as i32));
+        drop(term);
+        // The cell under a still pointer changed with the viewport.
+        if self.app.config(|c| {
+            c.right_click_action == crate::config::RightClickAction::ContextMenu
+        }) {
+            self.refresh_menu_ctx();
+        }
     }
 
     // -- scene plumbing -------------------------------------------------------
@@ -3528,19 +3555,21 @@ fn open_url(uri: &str) {
         .spawn();
 }
 
-/// OSC 9/777 → a freedesktop desktop notification via `notify-send` when
-/// the desktop provides it; a missing binary or session bus just leaves
-/// the in-app bell/badge path to carry the notification.
+/// OSC 9/777 → a freedesktop desktop notification through
+/// `waterkit-notification` (D-Bus `org.freedesktop.Notifications`). A
+/// session bus or daemon being absent just leaves the in-app bell/badge
+/// path to carry the notification.
 #[cfg(target_os = "linux")]
 fn notify_desktop(title: &str, body: &str) {
-    let _ = std::process::Command::new("notify-send")
-        .arg("--app-name=hydroterm")
-        .arg(if title.is_empty() { "hydroterm" } else { title })
-        .arg(body)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let title = if title.is_empty() { "hydroterm" } else { title }.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        let _ = waterkit_notification::Notification::new()
+            .title(title)
+            .body(body)
+            .app_name("hydroterm")
+            .show();
+    });
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -27,7 +27,7 @@ use waterui::task::{sleep, spawn_local};
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
-use waterui::accessibility::{AccessibilityChildren, AccessibilityRole, AccessibilityState};
+use waterui::accessibility::{AccessibilityRole, AccessibilityState};
 use waterui::drag_drop::DragData;
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
@@ -113,6 +113,11 @@ pub struct Session {
     /// items exist only for the menu action; copy/paste/ignore deliver
     /// the secondary click to the scene instead.
     pub context_menu_enabled: Binding<bool>,
+    /// Snapshot taken when a secondary press opens the context menu —
+    /// the link under the click, whether a selection is live, whether
+    /// the clipboard has text. Drives the menu's conditional rows and
+    /// item enablement.
+    pub menu_ctx: Binding<MenuCtx>,
     /// cols×rows text while resizing (Ghostty `resize-overlay`);
     /// `None` when no recent size change.
     pub resize_label: Binding<Option<Str>>,
@@ -153,6 +158,18 @@ pub struct Session {
     /// The open rename prompt writes the owning tab's title rather than
     /// the surface's (`prompt_tab_title` vs `prompt_surface_title`).
     pub title_prompt_writes_tab: std::cell::Cell<bool>,
+}
+
+/// Pointer-time snapshot for the pane context menu — the URL under the
+/// pointer and selection liveness — so the menu's Computed can pick
+/// conditional rows and `disabled` states. The framework claims the
+/// secondary button for the menu itself, so the surface refreshes this
+/// on pointer moves (delivered before the claim) and grid scrolls; the
+/// menu reads clipboard non-emptiness itself at snapshot time.
+#[derive(Debug, Clone, Default)]
+pub struct MenuCtx {
+    pub url: Option<Str>,
+    pub sel: bool,
 }
 
 impl Session {
@@ -236,6 +253,7 @@ impl Session {
             context_menu_enabled: Binding::bool(
                 cfg.right_click_action == crate::config::RightClickAction::ContextMenu,
             ),
+            menu_ctx: Binding::default(),
             resize_label: Binding::default(),
             cell_px: std::cell::Cell::new((0.0, 0.0)),
             cursor_style: std::sync::Mutex::new(config.default_cursor_style),
@@ -2006,18 +2024,79 @@ impl View for PaneLeaf {
         // can attach the modifier on the menu branch — the zstack isn't
         // Clone, so the attach wraps the branch's returned AnyView.
         let reporting = self.session.mouse_reporting.clone();
-        let menu = zip(reporting, menu_enabled.clone())
-            .map(|(reporting, menu_enabled)| -> Vec<MenuItem> {
+        let menu_ctx = self.session.menu_ctx.clone();
+        let menu_state = self.state.clone();
+        // Clipboard liveness for the Paste row is checked when the menu
+        // items evaluate (menu open), not on pointer moves.
+        let menu_clip = waterkit_clipboard::Clipboard::new().ok();
+        let menu = zip(zip(reporting, menu_enabled.clone()), menu_ctx)
+            .map(move |((reporting, menu_enabled), ctx)| -> Vec<MenuItem> {
                 if reporting || !menu_enabled {
                     Vec::new()
                 } else {
-                    vec![
-                        "Copy".action(|s: PaneSession| s.push_action(TermAction::Copy)).into(),
-                        "Paste".action(|s: PaneSession| s.push_action(TermAction::Paste)).into(),
-                        "Select All".action(|s: PaneSession| s.push_action(TermAction::SelectAll)).into(),
-                        "Clear".action(|s: PaneSession| s.push_action(TermAction::ClearScrollback)).into(),
-                        "Search".action(|s: PaneSession| s.push_action(TermAction::Search)).into(),
+                    let mut items: Vec<MenuItem> = Vec::new();
+                    // Link rows appear only when the secondary click landed
+                    // on a link — the pane stashes the URL at press time.
+                    if let Some(url) = ctx.url.as_ref().map(Str::to_string).filter(|s| !s.is_empty()) {
+                        items.push({
+                            let open = url.clone();
+                            "Open Link"
+                                .action(move |s: PaneSession| {
+                                    s.push_action(TermAction::OpenUrl(open.clone()))
+                                })
+                                .subtitle(url.clone())
+                                .into()
+                        });
+                        items.push(
+                            "Copy Link"
+                                .action(|s: PaneSession| s.push_action(TermAction::CopyUrlToClipboard))
+                                .into(),
+                        );
+                        items.push(MenuItem::Divider);
+                    }
+                    items.extend([
+                        "Copy"
+                            .action(|s: PaneSession| s.push_action(TermAction::Copy))
+                            .disabled(!ctx.sel)
+                            .into(),
+                        "Paste"
+                            .action(|s: PaneSession| s.push_action(TermAction::Paste))
+                            // Clipboard liveness is read fresh at
+                            // snapshot time — the surface can't see the
+                            // secondary press (the framework claims it).
+                            .disabled(!menu_clip.as_ref().is_some_and(|c| c.has_text()))
+                            .into(),
+                        "Select All"
+                            .action(|s: PaneSession| s.push_action(TermAction::SelectAll))
+                            .into(),
+                        "Clear"
+                            .action(|s: PaneSession| s.push_action(TermAction::ClearScrollback))
+                            .into(),
+                        "Search"
+                            .action(|s: PaneSession| s.push_action(TermAction::Search))
+                            .into(),
+                    ]);
+                    // The user's configured chords ride along as menu
+                    // shortcut metadata (labels only — dispatch is the
+                    // keybind path, so unbound rows show no hint).
+                    let base = items.len() - 5;
+                    for (i, action) in [
+                        TermAction::Copy,
+                        TermAction::Paste,
+                        TermAction::SelectAll,
+                        TermAction::ClearScrollback,
+                        TermAction::Search,
                     ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if let Some(sc) = menu_shortcut(&menu_state, &action)
+                            && let MenuItem::Command(cmd) = &mut items[base + i]
+                        {
+                            cmd.shortcut = Some(sc);
+                        }
+                    }
+                    items
                 }
             })
             .computed();
@@ -2648,14 +2727,20 @@ pub fn tabs_view(state: AppState) -> impl View {
                     let indicator_color = signal_color(
                         active.select(Color::new(Accent), Color::new(Background)),
                     );
+                    // Hover state layer (M3 tabs tint at ~8% on-surface);
+                    // suppressed while active — the accent bar owns it.
+                    let hovered = Binding::bool(false);
+                    let hover_bg = zip(active.clone(), hovered.clone()).map(|(a, h)| {
+                        Color::new(Foreground).with_opacity(0.08 * f32::from(h && !a))
+                    });
                     vstack((
                         hstack((
                             // The tab control is the title cluster
                             // alone: it carries the role, an explicit
-                            // name, and suppresses its descendant text
-                            // nodes so screen readers announce the chip
-                            // once (composed controls double-expose
-                            // computed names — WATERUI_FEEDBACK #53).
+                            // name, and its descendant text nodes are
+                            // consumed into that name by the role claim
+                            // (hydrolysis#229 landed in this pin), so
+                            // screen readers announce the chip once.
                             hstack((
                                 // `tab-activity` dot: parser output landed
                                 // while the tab was not selected (kitty
@@ -2670,7 +2755,6 @@ pub fn tabs_view(state: AppState) -> impl View {
                             .on_tap(move |app: AppState| app.selected.set(tab_id))
                             .a11y_role(AccessibilityRole::Tab)
                             .a11y_label(tab.title.clone())
-                            .a11y_children(AccessibilityChildren::ExcludeDescendants)
                             .a11y_state_signal(
                                 active.map(|a| AccessibilityState::new().selected(a)),
                             ),
@@ -2691,6 +2775,10 @@ pub fn tabs_view(state: AppState) -> impl View {
                     ))
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
+                    .background(signal_color(hover_bg))
+                    .state(&hovered)
+                    .on_hover_enter(|State(h): State<Binding<bool>>| h.set(true))
+                    .on_hover_exit(|State(h): State<Binding<bool>>| h.set(false))
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.
                     .draggable(drag_drop::DragData::text(format!(
@@ -3028,9 +3116,9 @@ impl AppState {
 const PALETTE_CARD_WIDTH: f32 = 560.0;
 const PALETTE_CARD_RADIUS: f32 = 28.0;
 /// Field + padding share of the card's fixed chrome height.
-const PALETTE_CHROME_H: f32 = 72.0;
+const PALETTE_CHROME_H: f32 = 88.0;
 /// Height budget per visible result row (measured list-row pitch).
-const PALETTE_ROW_H: f32 = 64.0;
+const PALETTE_ROW_H: f32 = 60.0;
 const PALETTE_CARD_MAX_H: f32 = 440.0;
 /// Distance between the window's top edge and the card's.
 const PALETTE_TOP_OFFSET: f32 = 72.0;
@@ -3097,6 +3185,9 @@ fn palette_view(state: AppState) -> impl View {
     .max_width(PALETTE_CARD_WIDTH)
     .max_height(card_max_h)
     .background(FixedRoundedRectangle::new(PALETTE_CARD_RADIUS).fill(SurfaceContainerHigh))
+    // M3 cards clip content to the container shape — without this the
+    // List's square bottom corners poke past the rounded card.
+    .clip(FixedRoundedRectangle::new(PALETTE_CARD_RADIUS))
     // A click on the card returns embedded focus to the live pane —
     // without it the dead region would clear focus and trap the keys.
     .on_tap(|app: AppState| app.refocus_selected());
@@ -3145,6 +3236,34 @@ fn settings_view(state: AppState) -> impl View {
     .padding()
     .background(Surface);
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
+}
+
+/// First configured keybind for `action` as `Shortcut` menu metadata:
+/// the normalized `ctrl+alt+shift+super+key` string maps ctrl→control,
+/// alt→option, shift→shift, super→command; the last part is the key.
+fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
+    let binds = state.config(|c| c.keybinds.clone());
+    let chord = &binds
+        .iter()
+        .find(|(_, a)| a.as_ref() == Some(action))?
+        .0
+        .chord;
+    let (mods, key) = chord.rsplit_once('+').map_or(("", chord.as_str()), |(m, k)| (m, k));
+    let mut sc = Shortcut::new(key.to_string());
+    let mods = format!("{mods}+");
+    if mods.contains("ctrl+") {
+        sc = sc.control();
+    }
+    if mods.contains("alt+") {
+        sc = sc.option();
+    }
+    if mods.contains("shift+") {
+        sc = sc.shift();
+    }
+    if mods.contains("super+") {
+        sc = sc.command();
+    }
+    Some(sc)
 }
 
 #[cfg(test)]

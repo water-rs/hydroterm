@@ -613,6 +613,10 @@ pub enum TermAction {
     /// Copy the output of the last finished (or running) command — the
     /// rows between its OSC 133 `C` and `D` marks.
     CopyLastOutput,
+    /// Context-menu \"Open Link\" — the URL the secondary press landed on
+    /// travels with the action so the opener need not re-resolve the
+    /// pointer cell.
+    OpenUrl(String),
     /// Dump the scrollback + screen to a temp file and open it in
     /// `$VISUAL`/`$EDITOR` inside a new tab (kitty/WezTerm style).
     OpenScrollbackEditor,

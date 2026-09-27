@@ -57,17 +57,25 @@ the trip. Skill installed at `~/.claude/skills/waterui/` from pin
    `rich_tooltip`, `.for_target`, `persistent`, and the known edge-clip
    limitation.
 
-6. **Centering/positioning a content-sized child inside a `zstack` is
-   undocumented subtlety.** `references/components.md:146-162` does cover
-   `absolute` + `position_in`/`position_in_offset`/`UnitPoint` (accurate),
-   but nothing says `vstack().alignment(HorizontalAlignment::*)` is inert
-   when the vstack wraps a fixed-size child inside a zstack — the vstack
-   sizes to content, so the zstack re-centers it and the alignment is a
-   no-op (verified: a "trailing" chip stayed centered). I learned it from
-   behavior + `src/` layout code. Fix: one sentence in components.md —
-   "to pin a content-sized child inside a `zstack`, use
-   `absolute(...)`/`position_in(UnitPoint)`; `vstack`/`hstack` alignment
-   only arranges siblings that share the same axis".
+6. **Pinning a content-sized child inside a `zstack` — skill gap, not a
+   framework defect (root-caused r46).** `references/components.md:146-162`
+   covers `absolute` + `position_in`/`position_in_offset`/`UnitPoint`
+   accurately, and nothing in the skill explains *why* a
+   `vstack().alignment(HorizontalAlignment::*)` child inside a `zstack`
+   has no effect. Verified against source: it is **documented, intended
+   behaviour** — `ZStackLayout::place` (waterui
+   `src/layout/zstack.rs`, `place`/`size_that_fits` docstring: "Each
+   child is sized independently, and the container's final width/height
+   are the maxima of the children's reported sizes") sizes each child
+   independently and positions it on the stack's shared alignment line;
+   a content-sized `vstack` shrinks to its content, so its own
+   `.alignment` has no slack to distribute — identical to SwiftUI. The
+   correct primitive for pinning inside a `zstack` is `absolute(...)`
+   + `position_in(UnitPoint)`/`position_in_offset`. Fix: one sentence in
+   components.md's `zstack` entry — "children are sized independently;
+   to pin a content-sized child inside a `zstack`, use
+   `absolute(...)`/`position_in(UnitPoint)` — stack `.alignment` only
+   distributes slack a child actually takes".
 
 ## Seeded from WATERUI_FEEDBACK — things an app author needs that the
 ## skill never mentions
@@ -107,6 +115,41 @@ the trip. Skill installed at `~/.claude/skills/waterui/` from pin
     after `xrdb -merge Xft.dpi` is hitting dead code in winit, not its
     own handler. Fix: one line in troubleshooting.md.
 
+12. **`.context_menu` claims the secondary press itself** — a surface
+    wrapped in `.context_menu` receives `set_keyboard_focus` +
+    `pointer_move` on secondary-down, but NOT `pointer_button`
+    (hydrolysis `hit_test.rs:851-858`: "the menu's actions act on the
+    focused surface, so the button itself is not delivered"). An app that
+    wants per-click menu rows (e.g. enable Copy only when the pointer is
+    over a link) cannot snapshot at press time — it must keep menu state
+    refreshed on pointer move and gate item construction on it. The
+    skill's menus/context section documents `.context_menu` but not this
+    claim order. Fix: one line in the menus reference + the interaction
+    page noting Secondary never reaches the view under a context menu.
+
+13. **Menu `Command` options discovered only in source** —
+    `.subtitle()`, `.disabled(impl IntoComputed<bool>)`,
+    `.shortcut(Shortcut)` exist on `MenuItem::Command`
+    (waterui `menu.rs:200-270`) but no reference page lists them;
+    `references/components.md` has no context-menu/menu section at all.
+    Also framework-side: `.shortcut` is dropped by the hydrolysis popup
+    renderer and `.disabled` has no visual treatment (WATERUI_FEEDBACK
+    #58/#59). Fix: add a "Menus and context menus" section covering
+    `MenuItem::{Command,Divider,Menu}`, per-item modifiers, and the
+    Computed-list pattern.
+
+14. **`water run` framework compat check is opaque about which manifest
+    is stale** — after repinning git revs in the app's Cargo.toml, `water
+    run` failed with "the project does not resolve its selected framework
+    revision". The actual fix: update `revision` AND every
+    `framework.packages.*` `rev` in Water.toml AND the duplicated `rev`s
+    in the generated `hydrolysis/Cargo.toml` scaffold — three places,
+    error names none. The skill's build/run docs don't mention that the
+    scaffold manifest embeds a second copy of the pins. Fix: document in
+    the `water run`/framework-upgrade reference that a git-rev bump must
+    be mirrored into Water.toml and `<backend>/Cargo.toml`, or make the
+    CLI name the mismatched package.
+
 ## Verified accurate (no change needed)
 
 - `absolute` / `position_in` / `position_in_offset` / `UnitPoint`
@@ -134,3 +177,15 @@ patched in-repo.
   judge. No mechanical rule proposed.
 - *(r45)* No new `#[expect]` needed; `cargo dylint --all` at lints dev
   head `8f74a56ad126` is zero-warning on this code.
+- *(r46)* `if_else_view` misfired again on a non-View if/else — this time
+  arms producing `Color` inside `zip(a,h).map(...)` for a hover-state
+  layer (`app.rs:2734`). Same class as the earlier `Str`-producing
+  false positive: the lint should check that both arms resolve to
+  `impl View` before firing. Worked around by arithmetic
+  (`with_opacity(0.08 * f32::from(h && !a))`) rather than `#[expect]` —
+  the rewrite is arguably cleaner, so: false positive recorded, no
+  expect needed.
+- *(r46)* `handler_captures_binding` ×2 and `needless_computed` ×1 were
+  real positives on the tab-chip hover handlers — fixed per suggestion:
+  `.state(&hovered)` + `State(h): State<Binding<bool>>` params, and
+  `signal_color(hover_bg)` without `.computed()`.
