@@ -572,6 +572,24 @@ pub struct AppConfig {
     /// is replaced by the URL; otherwise the URL is appended as the
     /// last argument. Unset → `xdg-open`.
     pub open_link_with: Option<String>,
+    /// `link` — extra clickable patterns (Ghostty's proposed
+    /// `link = <regex>`); a matched span underlines on the
+    /// `open-link-modifier` hover and opens through `open-link-with`.
+    pub link_patterns: Vec<regex::Regex>,
+    /// `enquiry-response` — reply bytes for a primary DA query
+    /// (`CSI c`), C escapes decoded (`\e`, `\xNN`, `\n`). Empty/unset
+    /// keeps the built-in `\x1b[?6c` (alacritty's VT102 answer).
+    pub enquiry_response: Option<String>,
+    /// `clipboard-paste-bracketed-safe` — when false, pasted text keeps
+    /// its escape bytes verbatim (Ghostty's paranoia-off mode; default
+    /// true strips them so a paste cannot escape the bracket).
+    pub paste_bracketed_safe: bool,
+    /// `image-storage-limit` — byte cap on the kitty graphics payload
+    /// store (Ghostty, default 320 MB).
+    pub image_storage_limit: usize,
+    /// `config-file` — include paths recorded while expanding the config
+    /// (repeat key; cycles and missing files warn instead of failing).
+    pub config_files: Vec<PathBuf>,
 }
 
 /// `window-theme` values.
@@ -712,6 +730,11 @@ impl Default for AppConfig {
             visual_bell: true,
             visual_bell_color: None,
             open_link_with: None,
+            link_patterns: Vec::new(),
+            enquiry_response: None,
+            paste_bracketed_safe: true,
+            image_storage_limit: 320 * 1024 * 1024,
+            config_files: Vec::new(),
         }
     }
 }
@@ -1679,6 +1702,35 @@ impl AppConfig {
                 "open-link-with" => {
                     cfg.open_link_with = (!value.is_empty()).then(|| value.to_string());
                 }
+                "link" => match regex::Regex::new(value) {
+                    Ok(re) => cfg.link_patterns.push(re),
+                    Err(e) => errors.push(format!("line {}: bad link regex {value:?}: {e}", n + 1)),
+                },
+                "enquiry-response" => {
+                    cfg.enquiry_response = match c_escapes(value) {
+                        Ok(s) if s.is_empty() => None,
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            errors.push(format!("line {}: {e}", n + 1));
+                            None
+                        }
+                    };
+                }
+                "clipboard-paste-bracketed-safe" => {
+                    cfg.paste_bracketed_safe = bool_value(value, n, &mut errors);
+                }
+                "image-storage-limit" => match value.parse::<usize>() {
+                    Ok(v) => cfg.image_storage_limit = v,
+                    _ => errors.push(format!("line {}: bad image-storage-limit {value:?}", n + 1)),
+                },
+                // Expansion happens in `load` (the directive's file text is
+                // spliced in before `parse` runs); the surviving line only
+                // records the path for diagnostics.
+                "config-file" => {
+                    if !value.is_empty() {
+                        cfg.config_files.push(expand_home(value));
+                    }
+                }
                 "keybind" => match parse_keybind(value) {
                     // Ghostty: triggers ignore prefixes — a later
                     // `keybind` on the same chord replaces the earlier
@@ -1699,7 +1751,17 @@ impl AppConfig {
     /// is written so the user can discover the format.
     pub fn load(path: &Path) -> (Self, Vec<String>) {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text),
+            Ok(text) => {
+                let mut visited = std::collections::HashSet::new();
+                if let Ok(canon) = path.canonicalize() {
+                    visited.insert(canon);
+                }
+                let mut warnings = Vec::new();
+                let expanded = expand_includes(&text, path, &mut visited, &mut warnings);
+                let (cfg, mut errors) = Self::parse(&expanded);
+                errors.splice(0..0, warnings);
+                (cfg, errors)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
@@ -1710,6 +1772,52 @@ impl AppConfig {
             Err(e) => (Self::default(), vec![format!("reading {}: {e}", path.display())]),
         }
     }
+}
+
+/// `config-file = <path>` include expansion: each directive's file text is
+/// spliced in after the line (the directive itself stays so `parse` records
+/// it in `config_files`). Paths are relative to the including file's
+/// directory; `~` expands. Cycles and unreadable files warn, not fail —
+/// matching Ghostty's include semantics.
+fn expand_includes(
+    text: &str,
+    containing: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let dir = containing.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(line);
+        out.push('\n');
+        let t = line.trim();
+        let Some((key, value)) = t.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("config-file") {
+            let value = value.trim().trim_matches('"');
+            let raw = expand_home(value);
+            let path = if raw.is_absolute() {
+                raw
+            } else {
+                dir.join(&raw)
+            };
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !visited.insert(canon) {
+                warnings.push(format!("config-file cycle: {}", path.display()));
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(body) => {
+                    out.push_str(&expand_includes(&body, &path, visited, warnings));
+                }
+                Err(e) => {
+                    warnings.push(format!("config-file {}: {e}", path.display()));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Per-cell spacing adjustment: `N%` of the measured cell or `Npx`
@@ -2094,6 +2202,11 @@ fn parse_payload(raw: &str) -> Result<String, String> {
         // decoded to is meaningful and must not be trimmed away.
         return Ok(raw.to_string());
     };
+    c_escapes(inner)
+}
+
+/// Decode C escapes (`\n \r \t \e \\ \" \xNN`) in `inner`.
+fn c_escapes(inner: &str) -> Result<String, String> {
     let mut out = String::with_capacity(inner.len());
     let mut it = inner.chars().peekable();
     while let Some(c) = it.next() {
@@ -2113,7 +2226,7 @@ fn parse_payload(raw: &str) -> Result<String, String> {
                 let lo = it.next().and_then(|c| c.to_digit(16));
                 match (hi, lo) {
                     (Some(hi), Some(lo)) => out.push(char::from_u32(hi * 16 + lo).unwrap_or('\u{fffd}')),
-                    _ => return Err("bad \\xNN escape in keybind payload".into()),
+                    _ => return Err("bad \\xNN escape".into()),
                 }
             }
             other => {
@@ -3517,6 +3630,43 @@ mod tests {
         );
         let (_, errs) = AppConfig::parse("command-palette-entry = title:NoAction");
         assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn r48_keys_parse() {
+        let (cfg, errs) = AppConfig::parse(
+            "link = GH-[0-9]+\nlink = [0-9a-f]{40}\nenquiry-response = \\x1b[?6;7;8c\nclipboard-paste-bracketed-safe = false\nimage-storage-limit = 1024",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.link_patterns.len(), 2);
+        assert_eq!(cfg.enquiry_response.as_deref(), Some("\x1b[?6;7;8c"));
+        assert!(!cfg.paste_bracketed_safe);
+        assert_eq!(cfg.image_storage_limit, 1024);
+        let (_, errs) = AppConfig::parse("link = ([invalid\nenquiry-response = \\xzz");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    #[test]
+    fn config_file_include_expands() {
+        let dir = std::env::temp_dir().join(format!("hydroterm-inc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extra.conf"), "font-size = 22\n").unwrap();
+        std::fs::write(dir.join("loop.conf"), "config-file = loop.conf\n").unwrap();
+        std::fs::write(
+            dir.join("main"),
+            "config-file = extra.conf\nconfig-file = loop.conf\nfullscreen = true\n",
+        )
+        .unwrap();
+        let (cfg, errs) = AppConfig::load(&dir.join("main"));
+        // Included value applied, the cycle warned (not fatal), and the
+        // directive lines were recorded.
+        assert_eq!(cfg.font_size, 22.0);
+        assert!(cfg.window_fullscreen);
+        assert!(errs.iter().any(|e| e.contains("cycle")), "{errs:?}");
+        // 2 top-level directives + the `config-file` line spliced in
+        // from loop.conf's own body (its expansion hit the cycle guard).
+        assert_eq!(cfg.config_files.len(), 3, "{:?}", cfg.config_files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -27,6 +27,8 @@ x11rb = "0.13"
 pollster = "1.0"
 libc = "0.2"
 png = "0.17"
+# `link = <regex>` config patterns — already in the framework lock at 1.13.
+regex = "1.11"
 tracing = "0.1"
 polling = "3.8.0"
 

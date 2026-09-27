@@ -129,6 +129,8 @@ pub struct KittyStore {
     pub images: Vec<KittyImage>,
     /// Transmitted payloads by image id (`a=t`/`a=T` populate it).
     data: BTreeMap<u32, StoredImage>,
+    /// Bytes currently held in `data` — `image-storage-limit` accounting.
+    data_bytes: usize,
     pending: Option<(BTreeMap<char, String>, String)>,
 }
 
@@ -137,7 +139,9 @@ pub type Handled = (u32, String);
 
 impl KittyStore {
     /// Feed one parsed command; returns the `(id, status)` reply payload.
-    pub fn handle(&mut self, cmd: KittyCmd, line: i64, col: usize) -> Handled {
+    /// `limit` is `image-storage-limit` — bytes the payload store may hold
+    /// before an insert is refused with `ETOOBIG` (Ghostty default 320MB).
+    pub fn handle(&mut self, cmd: KittyCmd, line: i64, col: usize, limit: usize) -> Handled {
         // Chunk assembly: `m=1` stashes keys + payload until `m=0`.
         if cmd.more() {
             match &mut self.pending {
@@ -170,14 +174,11 @@ impl KittyStore {
             "q" => (cmd.id(), "OK".to_string()),
             // `a=t` transmits only — kitty keeps the payload under `i=`
             // and displays nothing until a later `a=p`.
-            "t" => match self.decode(&cmd) {
-                Ok(stored) => {
-                    self.data.insert(cmd.id(), stored);
-                    (cmd.id(), "OK".to_string())
-                }
+            "t" => match self.decode(&cmd).and_then(|s| self.store_checked(cmd.id(), s, limit)) {
+                Ok(()) => (cmd.id(), "OK".to_string()),
                 Err(e) => (cmd.id(), e),
             },
-            "T" | "" => self.place(&cmd, line, col),
+            "T" | "" => self.place(&cmd, line, col, limit),
             // `a=p` puts a previously transmitted image at the cursor —
             // the payload is empty; `i=` selects the stored image.
             "p" => self.put(&cmd, line, col),
@@ -216,7 +217,9 @@ impl KittyStore {
             "i" => {
                 if let Some(id) = cmd.num('i') {
                     self.images.retain(|img| img.id != id);
-                    self.data.remove(&id);
+                    if let Some(s) = self.data.remove(&id) {
+                        self.data_bytes -= s.rgba.len();
+                    }
                 }
             }
             "p" => {
@@ -240,27 +243,46 @@ impl KittyStore {
             _ => match cmd.num('i') {
                 Some(id) => {
                     self.images.retain(|img| img.id != id);
-                    self.data.remove(&id);
+                    if let Some(s) = self.data.remove(&id) {
+                        self.data_bytes -= s.rgba.len();
+                    }
                 }
                 None => {
                     self.images.clear();
                     self.data.clear();
+                    self.data_bytes = 0;
                 }
             },
         }
     }
 
     /// `a=T` (and bare transmits) — decode, store under `i=`, and place.
-    fn place(&mut self, cmd: &KittyCmd, line: i64, col: usize) -> Handled {
-        match self.decode(cmd) {
-            Ok(stored) => {
+    fn place(&mut self, cmd: &KittyCmd, line: i64, col: usize, limit: usize) -> Handled {
+        match self
+            .decode(cmd)
+            .and_then(|stored| self.store_checked(cmd.id(), stored, limit))
+        {
+            Ok(()) => {
+                let stored = &self.data[&cmd.id()];
                 let (px, w, h) = (stored.rgba.clone(), stored.w, stored.h);
-                self.data.insert(cmd.id(), stored);
                 self.push_image(cmd, line, col, px, w, h);
                 (cmd.id(), "OK".to_string())
             }
             Err(e) => (cmd.id(), e),
         }
+    }
+
+    /// Insert a decoded payload honoring `image-storage-limit`: a
+    /// rejected store frees nothing and reports `ETOOBIG` like kitty.
+    fn store_checked(&mut self, id: u32, stored: StoredImage, limit: usize) -> Result<(), String> {
+        let replacing = self.data.get(&id).map(|s| s.rgba.len()).unwrap_or(0);
+        if self.data_bytes - replacing + stored.rgba.len() > limit {
+            return Err("ETOOBIG:image-storage-limit".to_string());
+        }
+        self.data_bytes -= replacing;
+        self.data_bytes += stored.rgba.len();
+        self.data.insert(id, stored);
+        Ok(())
     }
 
     /// Payload → RGBA + source dims, honoring `t=` medium, `f=` format
@@ -494,7 +516,7 @@ mod tests {
         let mut store = KittyStore::default();
         // f=24 RGB, 1x1 red pixel.
         let cmd = parse(b"Ga=T,f=24,s=1,v=1;/wAA").unwrap();
-        let (id, status) = store.handle(cmd, 5, 3);
+        let (id, status) = store.handle(cmd, 5, 3, usize::MAX);
         assert_eq!((id, status.as_str()), (0, "OK"));
         assert_eq!(store.images.len(), 1);
         assert_eq!(store.images[0].line, 5);
@@ -505,11 +527,11 @@ mod tests {
     fn chunked_assembly() {
         let mut store = KittyStore::default();
         let first = parse(b"Ga=T,f=24,s=1,v=1,m=1;/w").unwrap();
-        let (id, s1) = store.handle(first, 0, 0);
+        let (id, s1) = store.handle(first, 0, 0, usize::MAX);
         assert_eq!((id, s1.as_str()), (0, "OK"));
         assert!(store.images.is_empty());
         let second = parse(b"Gm=0;AA").unwrap();
-        let (_, s2) = store.handle(second, 0, 0);
+        let (_, s2) = store.handle(second, 0, 0, usize::MAX);
         assert_eq!(s2, "OK");
         assert_eq!(store.images.len(), 1);
     }
@@ -529,7 +551,7 @@ mod tests {
     fn z_index_parses_signed() {
         let mut store = KittyStore::default();
         let cmd = parse(b"Ga=T,f=24,s=1,v=1,z=-1;/wAA").unwrap();
-        let (_, s) = store.handle(cmd, 0, 0);
+        let (_, s) = store.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(s.as_str(), "OK");
         assert_eq!(store.images[0].z, -1);
     }
@@ -539,15 +561,31 @@ mod tests {
         let mut store = KittyStore::default();
         // f=32 RGBA 2x2, crop to the left column (x=0,y=0,w=1,h=2).
         let cmd = parse(b"Ga=T,f=32,s=2,v=2,x=0,y=0,w=1,h=2;AAAAAAAAAAAAAAAAAAAAAA==").unwrap();
-        let (_, s) = store.handle(cmd, 0, 0);
+        let (_, s) = store.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(s.as_str(), "OK");
         assert_eq!((store.images[0].px_w, store.images[0].px_h), (1, 2));
+    }
+
+    #[test]
+    fn storage_limit_refuses_oversize() {
+        let mut s = KittyStore::default();
+        // 2x2 RGBA = 16 bytes; limit 8 → first store refused ETOOBIG.
+        let cmd = parse(b"Ga=t,f=32,s=2,v=2,i=9;AAAAAAAAAAAAAAAAAAAAAA==").unwrap();
+        let (_, st) = s.handle(cmd, 0, 0, 8);
+        assert!(st.starts_with("ETOOBIG"), "{st}");
+        // Limit raised → same payload stores; a=d frees the budget back.
+        let cmd = parse(b"Ga=t,f=32,s=2,v=2,i=9;AAAAAAAAAAAAAAAAAAAAAA==").unwrap();
+        let (_, st) = s.handle(cmd, 0, 0, 64);
+        assert_eq!(st, "OK");
+        let cmd = parse(b"Ga=d,d=i,i=9").unwrap();
+        s.handle(cmd, 0, 0, 64);
+        assert_eq!(s.data_bytes, 0);
     }
 
     fn place_rgba(store: &mut KittyStore, keys: &str, line: i64, col: usize) {
         let raw = "Ga=T,f=32,s=2,v=2".to_string() + "," + keys + ";AAAAAAAAAAAAAAAAAAAAAA==";
         let cmd = parse(raw.as_bytes()).unwrap();
-        assert_eq!(store.handle(cmd, line, col).1.as_str(), "OK");
+        assert_eq!(store.handle(cmd, line, col, usize::MAX).1.as_str(), "OK");
     }
 
     #[test]
@@ -558,16 +596,16 @@ mod tests {
         place_rgba(&mut s, "i=9", 30, 7);
         // d=z removes only the z=-1 image.
         let cmd = parse(b"Ga=d,d=z,z=-1").unwrap();
-        s.handle(cmd, 0, 0);
+        s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(s.images.len(), 2);
         // d=c removes placements intersecting the cursor cell.
         let cmd = parse(b"Ga=d,d=c").unwrap();
-        s.handle(cmd, 20, 5);
+        s.handle(cmd, 20, 5, usize::MAX);
         assert_eq!(s.images.len(), 1);
         assert_eq!(s.images[0].id, 9);
         // d=i removes by id.
         let cmd = parse(b"Ga=d,d=i,i=9").unwrap();
-        s.handle(cmd, 0, 0);
+        s.handle(cmd, 0, 0, usize::MAX);
         assert!(s.images.is_empty());
     }
 
@@ -578,7 +616,7 @@ mod tests {
         place_rgba(&mut s, "i=7,p=5", 0, 0);
         assert_eq!(s.images.len(), 2);
         let cmd = parse(b"Ga=d,d=p,i=7,p=3").unwrap();
-        s.handle(cmd, 0, 0);
+        s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(s.images.len(), 1);
         assert_eq!(s.images[0].placement, 5);
     }
@@ -596,7 +634,7 @@ mod tests {
             .chain(b"L2h5ZHJvdGVybS10ZXN0LXNobQ==".iter().copied())
             .collect::<Vec<_>>();
         let cmd = parse(&raw).unwrap();
-        let (_, status) = s.handle(cmd, 0, 0);
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "OK"); // "pixels" is ≥4 bytes → f=32 1x1
         std::fs::remove_file("/dev/shm/hydroterm-test-shm").unwrap();
     }

@@ -233,6 +233,10 @@ impl Session {
             },
         )
             .expect("failed to spawn PTY — is a shell available?");
+        // `enquiry-response` — configured DA answer, live-updated on reload.
+        terminal
+            .proxy
+            .set_enquiry_response(cfg.enquiry_response.clone());
         Self {
             id,
             terminal: Arc::new(terminal),
@@ -996,6 +1000,9 @@ impl AppState {
             s.unfocused_opacity.set(config.unfocused_split_opacity);
             s.context_menu_enabled
                 .set(config.right_click_action == crate::config::RightClickAction::ContextMenu);
+            s.terminal
+                .proxy
+                .set_enquiry_response(config.enquiry_response.clone());
             // Live scrollback-limit / cursor-style change — `set_options`
             // is alacritty's own live-reconfigure path. Rebuild the Config
             // exactly as spawn does so kitty-keyboard survives intact.
@@ -3042,7 +3049,8 @@ pub fn tabs_view(state: AppState) -> impl View {
                     // `.state` must wrap the handlers: it injects into
                     // the env of the node's *children*, and a handler
                     // attached on the same node only sees injections
-                    // applied outside it (WATERUI_FEEDBACK #61).
+                    // applied outside it (WATERUI_FEEDBACK #61 /
+                    // water-rs/waterui#1292 — ordering workaround).
                     .state(&hovered)
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.

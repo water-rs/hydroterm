@@ -126,6 +126,9 @@ struct ProxyInner {
     /// dropped after its replacement installed the next wake cannot
     /// clobber the live callback.
     wake: Mutex<(u64, Box<dyn Fn() + Send + Sync>)>,
+    /// `enquiry-response` — replaces the default `\x1b[?6c` reply to a
+    /// primary DA (`CSI c`); `None` keeps alacritty's answer.
+    enquiry: Mutex<Option<String>>,
 }
 
 impl EventProxy {
@@ -135,8 +138,14 @@ impl EventProxy {
             notifier: OnceLock::new(),
             events,
             wake: Mutex::new((0, Box::new(|| {}))),
+            enquiry: Mutex::new(None),
         });
         (Self { inner }, rx)
+    }
+
+    /// Set the `enquiry-response` override (None → default `\x1b[?6c`).
+    pub fn set_enquiry_response(&self, response: Option<String>) {
+        *self.inner.enquiry.lock().unwrap() = response;
     }
 
     /// Install the wake callback (called by `TermSurface::set_invalidator` —
@@ -184,6 +193,14 @@ impl EventListener for EventProxy {
         match event {
             Event::PtyWrite(text) => {
                 if let Some(notifier) = self.inner.notifier.get() {
+                    // `enquiry-response` — Ghostty replaces the primary-DA
+                    // answer when configured (alacritty always emits
+                    // `\x1b[?6c` for `CSI c`).
+                    let text = if text == "\x1b[?6c" {
+                        self.inner.enquiry.lock().unwrap().clone().unwrap_or(text)
+                    } else {
+                        text
+                    };
                     notifier.notify(text.into_bytes());
                 }
             }

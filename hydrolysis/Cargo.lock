@@ -2284,6 +2284,7 @@ dependencies = [
  "png 0.17.16",
  "polling",
  "pollster 1.0.1",
+ "regex",
  "tracing",
  "waterkit-clipboard",
  "waterkit-notification",

@@ -761,8 +761,14 @@ impl TermSurface {
         if bracketed {
             out.push_str("\x1b[200~");
         }
-        // A literal ESC would let the pasted text escape the bracket.
-        out.push_str(&text.replace('\x1b', ""));
+        // `clipboard-paste-bracketed-safe` — true (default) strips
+        // literal ESC so the pasted text cannot escape the bracket;
+        // false passes bytes verbatim (Ghostty's paranoia-off mode).
+        if self.app.config(|c| c.paste_bracketed_safe) {
+            out.push_str(&text.replace('\x1b', ""));
+        } else {
+            out.push_str(text);
+        }
         if bracketed {
             out.push_str("\x1b[201~");
         }
@@ -842,24 +848,22 @@ impl TermSurface {
 
     /// The URI under `point`: an OSC8 hyperlink first, then a
     /// plain-text URL scanned off the row. `link-url = false` gates
-    /// only the detected-URL scan.
+    /// only the detected-URL scan — `link = <regex>` patterns still
+    /// apply (they are a separate feature in the reference).
     fn link_at(&self, point: Point) -> Option<String> {
         let term = self.session.terminal.term.lock();
         let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
         uri.or_else(|| {
-            if !self.app.config(|c| c.link_url) {
-                return None;
-            }
-            // Scan the logical line (soft wraps joined) so a link that
-            // wraps across rows still resolves; the click's char index
-            // is the mark of the cell under it.
             let lm = logical_line_at(term.grid(), point.line.0);
             let idx = lm
                 .marks
                 .iter()
                 .rfind(|m| m.1 == point.line.0 && m.2 <= point.column.0)
                 .map(|m| m.0)?;
-            url_at(&lm.chars, idx)
+            let (url_on, patterns) = self
+                .app
+                .config(|c| (c.link_url, c.link_patterns.clone()));
+            url_at(&lm.chars, idx, &patterns, url_on)
         })
     }
 
@@ -1754,11 +1758,12 @@ impl TermSurface {
     fn handle_apc(&mut self, payload: &[u8], line: i64, col: usize) {
         let Some(cmd) = crate::kitty::parse(payload) else { return };
         let quiet = cmd.quiet();
+        let limit = self.app.config(|c| c.image_storage_limit);
         let (id, status) = self
             .session
             .kitty
             .borrow_mut()
-            .handle(cmd, line, col);
+            .handle(cmd, line, col, limit);
         if !quiet {
             self.write(format!("\x1b_Gi={id};{status}\x1b\\").into_bytes());
         }
@@ -2513,8 +2518,12 @@ impl TermSurface {
             };
         }
         // `link-url = false` disables detected URLs; OSC8 hyperlinks
-        // (explicit markup) still resolve above, like Ghostty.
-        if !self.app.config(|c| c.link_url) {
+        // (explicit markup) still resolve above, like Ghostty — and
+        // `link = <regex>` patterns still apply.
+        let (url_on, patterns) = self
+            .app
+            .config(|c| (c.link_url, c.link_patterns.clone()));
+        if !url_on && patterns.is_empty() {
             return Vec::new();
         }
         let lm = logical_line_at(grid, point.line.0);
@@ -2529,7 +2538,7 @@ impl TermSurface {
         else {
             return Vec::new();
         };
-        for (s, e) in url_spans(&lm.chars) {
+        for (s, e) in url_spans(&lm.chars, &patterns, url_on) {
             if idx >= s && idx < e {
                 return span_segments(&lm, s, e, cols)
                     .into_iter()
@@ -2724,11 +2733,12 @@ impl TermSurface {
         let screen = lines as i32;
         let mut spans: Vec<HintSpan> = Vec::new();
         let mut urls: Vec<String> = Vec::new();
+        let patterns = self.app.config(|c| c.link_patterns.clone());
         // URLs are detected on logical lines (soft wraps joined) so a
         // link spanning a wrap is one span, then mapped back to cells —
         // the badge anchors on its first visible row part.
         'outer: for lm in logical_lines(grid, -(history as i32), lines as i32 - 1) {
-            for (s, e) in url_spans(&lm.chars) {
+            for (s, e) in url_spans(&lm.chars, &patterns, true) {
                 let segments: Vec<(usize, usize, usize)> = span_segments(&lm, s, e, cols)
                     .into_iter()
                     .filter_map(|(c0, c1, l)| {
@@ -3616,29 +3626,38 @@ const URL_SCHEMES: [&str; 7] = [
     "gemini://",
 ];
 
-/// Scan `chars` (one grid row) for a scheme:// run covering `col`.
-/// Returns the URL; wraps at row boundaries are not followed.
-fn url_at(chars: &[char], col: usize) -> Option<String> {
-    for scheme in URL_SCHEMES {
-        let sc: Vec<char> = scheme.chars().collect();
-        let mut off = 0;
-        while off + sc.len() <= chars.len() {
-            if chars[off..off + sc.len()] == sc[..] {
-                let mut end = off + sc.len();
-                while end < chars.len() && is_url_char(chars[end]) {
-                    end += 1;
+/// Scan `chars` (one grid row) for a scheme:// run or `link` regex
+/// match covering `col`; `url_on=false` skips the scheme scan (the
+/// `link-url` gate — custom patterns are independent). Returns the
+/// matched text; wraps at row boundaries are not followed.
+fn url_at(chars: &[char], col: usize, patterns: &[regex::Regex], url_on: bool) -> Option<String> {
+    if url_on {
+        for scheme in URL_SCHEMES {
+            let sc: Vec<char> = scheme.chars().collect();
+            let mut off = 0;
+            while off + sc.len() <= chars.len() {
+                if chars[off..off + sc.len()] == sc[..] {
+                    let mut end = off + sc.len();
+                    while end < chars.len() && is_url_char(chars[end]) {
+                        end += 1;
+                    }
+                    // Trailing sentence punctuation is almost never part of the URL.
+                    while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                        end -= 1;
+                    }
+                    if col >= off && col < end {
+                        return Some(chars[off..end].iter().collect());
+                    }
+                    off = end;
+                } else {
+                    off += 1;
                 }
-                // Trailing sentence punctuation is almost never part of the URL.
-                while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
-                    end -= 1;
-                }
-                if col >= off && col < end {
-                    return Some(chars[off..end].iter().collect());
-                }
-                off = end;
-            } else {
-                off += 1;
             }
+        }
+    }
+    for (s, e) in regex_spans(chars, patterns) {
+        if col >= s && col < e {
+            return Some(chars[s..e].iter().collect());
         }
     }
     None
@@ -3654,31 +3673,60 @@ fn is_url_char(c: char) -> bool {
         )
 }
 
-/// Every scheme:// run in `chars` as `(start, end-exclusive)` column pairs.
-/// Same scan as `url_at` without the column filter — powers URL hint mode.
-fn url_spans(chars: &[char]) -> Vec<(usize, usize)> {
+/// Every scheme:// run and `link` regex match in `chars` as
+/// `(start, end-exclusive)` column pairs; `url_on` gates the scheme
+/// scan like `url_at`. Powers hover underline and URL hint mode.
+fn url_spans(chars: &[char], patterns: &[regex::Regex], url_on: bool) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
-    for scheme in URL_SCHEMES {
-        let sc: Vec<char> = scheme.chars().collect();
-        let mut off = 0;
-        while off + sc.len() <= chars.len() {
-            if chars[off..off + sc.len()] == sc[..] {
-                let mut end = off + sc.len();
-                while end < chars.len() && is_url_char(chars[end]) {
-                    end += 1;
+    if url_on {
+        for scheme in URL_SCHEMES {
+            let sc: Vec<char> = scheme.chars().collect();
+            let mut off = 0;
+            while off + sc.len() <= chars.len() {
+                if chars[off..off + sc.len()] == sc[..] {
+                    let mut end = off + sc.len();
+                    while end < chars.len() && is_url_char(chars[end]) {
+                        end += 1;
+                    }
+                    while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                        end -= 1;
+                    }
+                    spans.push((off, end));
+                    off = end;
+                } else {
+                    off += 1;
                 }
-                while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
-                    end -= 1;
-                }
-                spans.push((off, end));
-                off = end;
-            } else {
-                off += 1;
             }
         }
     }
+    spans.extend(regex_spans(chars, patterns));
     spans.sort_unstable();
+    spans.dedup();
     spans
+}
+
+/// `link = <regex>` matches on the row as `(start, end)` char-column
+/// pairs — regex byte ranges map back through the char offsets so
+/// multi-byte cells land correctly.
+fn regex_spans(chars: &[char], patterns: &[regex::Regex]) -> Vec<(usize, usize)> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    let text: String = chars.iter().collect();
+    // Byte offset of each char; append one past the end for match ends.
+    let mut offs: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    offs.push(text.len());
+    let to_char = |b: usize| offs.partition_point(|&o| o < b);
+    let mut out = Vec::new();
+    for re in patterns {
+        for m in re.find_iter(&text) {
+            let (s, e) = (to_char(m.start()), to_char(m.end()));
+            if s < e {
+                out.push((s, e));
+            }
+        }
+    }
+    out
 }
 
 /// Detached `xdg-open` — never wait on the launcher.
@@ -3829,28 +3877,28 @@ mod tests {
     #[test]
     fn url_at_finds_url_under_col() {
         let row = chars("see https://example.com/x for docs");
-        assert_eq!(url_at(&row, 10), Some("https://example.com/x".to_string()));
-        assert_eq!(url_at(&row, 0), None);
-        assert_eq!(url_at(&row, 30), None);
+        assert_eq!(url_at(&row, 10, &[], true), Some("https://example.com/x".to_string()));
+        assert_eq!(url_at(&row, 0, &[], true), None);
+        assert_eq!(url_at(&row, 30, &[], true), None);
     }
 
     #[test]
     fn url_at_trims_trailing_punct() {
         let row = chars("open https://a.b/c, then");
-        assert_eq!(url_at(&row, 6), Some("https://a.b/c".to_string()));
+        assert_eq!(url_at(&row, 6, &[], true), Some("https://a.b/c".to_string()));
     }
 
     #[test]
     fn url_at_trims_brackets() {
         let row = chars("[x](https://a.b/?q=(r)) ");
         // Click inside the link: parens stop the scan.
-        assert_eq!(url_at(&row, 8), Some("https://a.b/?q=".to_string()));
+        assert_eq!(url_at(&row, 8, &[], true), Some("https://a.b/?q=".to_string()));
     }
 
     #[test]
     fn url_spans_finds_both_links() {
         let s = chars("open https://a.io/x then https://b.dev/y.");
-        let spans = url_spans(&s);
+        let spans = url_spans(&s, &[], true);
         assert_eq!(spans.len(), 2);
         assert_eq!(s[spans[0].0..spans[0].1].iter().collect::<String>(), "https://a.io/x");
         assert_eq!(s[spans[1].0..spans[1].1].iter().collect::<String>(), "https://b.dev/y");
@@ -3859,7 +3907,22 @@ mod tests {
     #[test]
     fn url_at_second_of_two() {
         let row = chars("https://a.b/ and http://c.d/e");
-        assert_eq!(url_at(&row, 22), Some("http://c.d/e".to_string()));
+        assert_eq!(url_at(&row, 22, &[], true), Some("http://c.d/e".to_string()));
+    }
+
+    #[test]
+    fn link_regex_span() {
+        // `link = GH-[0-9]+` matches a plain-text pattern with no
+        // scheme; multi-byte chars before it keep byte→char mapping.
+        let re = regex::Regex::new(r"GH-\d+").unwrap();
+        let row = chars("fix GH-42 中GH-7 done");
+        assert_eq!(url_at(&row, 6, std::slice::from_ref(&re), true), Some("GH-42".to_string()));
+        // Inside the post-CJK match.
+        assert_eq!(url_at(&row, 12, std::slice::from_ref(&re), true), Some("GH-7".to_string()));
+        // `link-url = false` drops scheme matches but keeps patterns.
+        let row = chars("see https://a.b/ GH-9");
+        assert_eq!(url_at(&row, 5, std::slice::from_ref(&re), false), None);
+        assert_eq!(url_at(&row, 18, std::slice::from_ref(&re), false), Some("GH-9".to_string()));
     }
 
     #[test]
@@ -3933,7 +3996,7 @@ mod tests {
         feed(&mut term, "see https://example.com/alpha here");
         let grid = term.grid();
         let lm = logical_line_at(grid, 0);
-        let spans = url_spans(&lm.chars);
+        let spans = url_spans(&lm.chars, &[], true);
         assert_eq!(spans.len(), 1, "{spans:?}");
         let (s, e) = spans[0];
         let url: String = lm.chars[s..e].iter().collect();
