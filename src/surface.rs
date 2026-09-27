@@ -1656,7 +1656,9 @@ impl TermSurface {
                         self.app.bell_title(self.session.id);
                     }
                 }
-                TermEvent::ChildExit(_status) => {
+                TermEvent::ChildExit(code) => {
+                    *self.session.child_exit.lock().unwrap() =
+                        Some((code, self.session.spawned_at.elapsed()));
                     self.session.exited.set(true);
                 }
                 TermEvent::Exit => {
@@ -1666,10 +1668,36 @@ impl TermSurface {
                     // the exit closes just this pane — `close_tab` takes a
                     // tab id, not a session id, so route via close_pane
                     // (which removes one split leaf or the whole tab).
+                    // `abnormal-command-exit-runtime`: a child that dies
+                    // with a non-zero code within N ms of spawn is
+                    // abnormal — hold the surface and show the notice
+                    // card instead of closing silently (Ghostty).
                     let hold = self.session.ran_command
                         && self.app.config(|c| c.wait_after_command);
-                    if hold {
+                    let abnormal_ms = self.app.config(|c| c.abnormal_command_exit_runtime);
+                    let abnormal = abnormal_ms > 0
+                        && self
+                            .session
+                            .child_exit
+                            .lock()
+                            .unwrap()
+                            .is_some_and(|(code, elapsed)| {
+                                code.is_some_and(|c| c != 0)
+                                    && elapsed.as_millis() <= abnormal_ms as u128
+                            });
+                    if hold || abnormal {
                         self.session.exited.set(true);
+                        if abnormal {
+                            let info = *self.session.child_exit.lock().unwrap();
+                            let msg = match info {
+                                Some((Some(code), elapsed)) => format!(
+                                    "process exited abnormally (code {code}) after {:.1}s",
+                                    elapsed.as_secs_f64()
+                                ),
+                                _ => "process exited abnormally".to_string(),
+                            };
+                            self.session.abnormal_notice.set(Some(Str::from(msg)));
+                        }
                     } else {
                         self.app.close_pane(self.session.id);
                     }
@@ -1734,7 +1762,12 @@ impl TermSurface {
                         if self.app.config(|c| c.visual_bell) {
                             self.bell_at = Some(Instant::now());
                         }
-                        notify_desktop(&title, &body);
+                        // `desktop-notifications` gates only the
+                        // freedesktop notify-send hop (Ghostty); the
+                        // in-app badges below still apply.
+                        if self.app.config(|c| c.desktop_notifications) {
+                            notify_desktop(&title, &body);
+                        }
                         if self.app.config(|c| c.bell_attention) {
                             *self.session.notify_badge.lock().unwrap() = true;
                             self.app.tab_badge(self.session.id, true);
@@ -2020,8 +2053,11 @@ impl TermSurface {
                 Some((_, None)) => unbound = true, // explicitly disabled
                 None => {}
             }
+            // `keybind = clear` suppresses the built-in chord table —
+            // only configured binds fire (Ghostty).
             if !unbound
                 && !fired_unconsumed
+                && !self.app.config(|c| c.keybinds_cleared)
                 && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
             {
                 self.do_action(action);
@@ -3254,6 +3290,9 @@ impl TermSurface {
             cursor_thickness: self
                 .app
                 .config(|c| if c.adjust_cursor_thickness == 0 { 1.0 } else { c.adjust_cursor_thickness as f32 / 100.0 }),
+            cursor_height: self
+                .app
+                .config(|c| if c.adjust_cursor_height == 0 { 1.0 } else { c.adjust_cursor_height as f32 / 100.0 }),
             underline_adjust: self.app.config(|c| {
                 (
                     c.adjust_underline_position as f32,
@@ -3353,7 +3392,16 @@ impl SceneContent for TermSurface {
         self.app.poll_config();
         self.drain_events();
         // Rejoin ZWJ-split scalars before the frame is measured or drawn.
-        crate::terminal::fixup_graphemes(&mut self.session.terminal.term.lock());
+        // `grapheme-width-method = legacy` leaves each scalar in its own
+        // cells (Ghostty's legacy grid semantics).
+        if self.app.config(|c| {
+            matches!(
+                c.grapheme_width_method,
+                crate::config::GraphemeWidthMethod::Unicode
+            )
+        }) {
+            crate::terminal::fixup_graphemes(&mut self.session.terminal.term.lock());
+        }
         self.sync_search();
         self.sync_fonts();
         self.sync_size(width, height);

@@ -101,6 +101,11 @@ pub struct DrawContext<'a> {
     /// Cursor thickness multiplier (Ghostty `adjust-cursor-thickness`);
     /// 1.0 = the default beam/underline size.
     pub cursor_thickness: f32,
+    /// Cursor height multiplier (Ghostty `adjust-cursor-height`);
+    /// 1.0 = the default. Scales the underline bar and the beam's
+    /// vertical extent; the block cursor is the cell background and
+    /// stays cell-sized.
+    pub cursor_height: f32,
     /// Points added to the font's underline offset and a stroke
     /// multiplier (Ghostty `adjust-underline-position` / `-thickness`).
     pub underline_adjust: (f32, f32),
@@ -828,7 +833,8 @@ fn draw_cursor(
         }
         CursorShape::Underline => {
             if ctx.blink_on || !cursor.blinking {
-                let t = (3.0 * ctx.cursor_thickness).max(1.0);
+                let t = (3.0 * ctx.cursor_thickness * ctx.cursor_height)
+                    .clamp(1.0, ch);
                 scene.fill(
                     Fill::NonZero,
                     Affine::IDENTITY,
@@ -841,7 +847,11 @@ fn draw_cursor(
         CursorShape::Beam => {
             if ctx.blink_on || !cursor.blinking {
                 let t = (2.0 * ctx.cursor_thickness).max(1.0);
-                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect(x, y, t, ch));
+                // `adjust-cursor-height` shrinks the beam from the cell
+                // height upward (bottom-anchored); it can only shrink,
+                // not exceed the cell.
+                let h = (ch * ctx.cursor_height).min(ch);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect(x, y + ch - h, t, h));
             }
         }
         CursorShape::HollowBlock => {

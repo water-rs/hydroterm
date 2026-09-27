@@ -107,6 +107,15 @@ pub enum BoldColor {
     Color(Rgb),
 }
 
+/// `grapheme-width-method` — whether a grapheme cluster occupies the
+/// width of its cluster (unicode) or each scalar gets its own cells
+/// (legacy). Ghostty `grapheme-width-method`, default `unicode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphemeWidthMethod {
+    Unicode,
+    Legacy,
+}
+
 /// `right-click-action` — what a secondary click does on a pane
 /// (Ghostty `right-click-action`, default `context-menu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +327,10 @@ pub struct AppConfig {
     pub osc_color_report_format: OscColorReportFormat,
     /// `keybind = <chord>=<action>` entries; `None` action = disabled.
     pub keybinds: Vec<(KeybindTrigger, Option<TermAction>)>,
+    /// Set by `keybind = clear`: the built-in chord table
+    /// (`action_chord`/`tab_chord`) no longer applies — only binds
+    /// listed in the file (Ghostty `keybind = clear` semantics).
+    pub keybinds_cleared: bool,
     /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
     pub audible_bell: bool,
     /// `bell-features` `attention` arm — the tab's 🔔 notification badge on
@@ -460,6 +473,15 @@ pub struct AppConfig {
     /// (Ghostty `wait-after-command`, default false). Interactive
     /// shells always close their tab on exit.
     pub wait_after_command: bool,
+    /// Child runtime in milliseconds below which a non-zero exit is
+    /// abnormal — the surface then holds open with an error notice
+    /// instead of closing silently (Ghostty
+    /// `abnormal-command-exit-runtime`, default 250).
+    pub abnormal_command_exit_runtime: u64,
+    /// Whether programs may surface desktop notifications via OSC 9/777
+    /// (Ghostty `desktop-notifications`, default true). Gates only the
+    /// freedesktop notify-send hop; in-app badges still apply.
+    pub desktop_notifications: bool,
     /// Quit the app when the last tab/surface closes (Ghostty
     /// `quit-after-last-window-closed`, default true on Linux).
     pub quit_after_last_window_closed: bool,
@@ -497,6 +519,10 @@ pub struct AppConfig {
     /// Cursor thickness multiplier for beam/underline shapes, percent
     /// (Ghostty `adjust-cursor-thickness`); 0 = the framework default.
     pub adjust_cursor_thickness: u16,
+    /// Cursor height multiplier for beam/underline shapes, percent
+    /// (Ghostty `adjust-cursor-height`); 0 = the framework default
+    /// (underline 3pt at 100%, beam fills the cell).
+    pub adjust_cursor_height: u16,
     /// Underline offset in points from the font's own position and a
     /// thickness multiplier percent (Ghostty `adjust-underline-position`
     /// / `adjust-underline-thickness`); 0 keeps the font values.
@@ -510,6 +536,10 @@ pub struct AppConfig {
     /// a separator; the OSC-driven part still leads (Ghostty
     /// `window-subtitle`).
     pub window_subtitle: Option<String>,
+    /// `grapheme-width-method` — `legacy` skips the ZWJ-cluster join so
+    /// each scalar keeps its own cells; `unicode` (default) folds the
+    /// cluster into its head scalar's cells.
+    pub grapheme_width_method: GraphemeWidthMethod,
     /// `adjust-font-baseline`: shifts the text baseline, measured as the
     /// distance from the cell bottom (`Npx` or `N%` of that distance).
     /// Positive values move the baseline up (Ghostty semantics).
@@ -639,11 +669,13 @@ impl Default for AppConfig {
             quick_terminal_size: None,
             clipboard_trim: true,
             bell_title: true,
+            grapheme_width_method: GraphemeWidthMethod::Unicode,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             shell: None,
             command: None,
             keybinds: Vec::new(),
+            keybinds_cleared: false,
             // `bell-features` defaults (Ghostty): `attention` and `title`
             // on, `system`/`audio`/`border` off.
             audible_bell: false,
@@ -693,6 +725,8 @@ impl Default for AppConfig {
             window_save_state: false,
             window_fullscreen: false,
             wait_after_command: false,
+            abnormal_command_exit_runtime: 250,
+            desktop_notifications: true,
             quit_after_last_window_closed: true,
             split_divider_color: None,
             selection_background: None,
@@ -706,6 +740,7 @@ impl Default for AppConfig {
             cell_width_adjust: CellAdjust::None,
             cell_height_adjust: CellAdjust::None,
             adjust_cursor_thickness: 0,
+            adjust_cursor_height: 0,
             adjust_underline_position: 0,
             adjust_underline_thickness: 0,
             adjust_strikethrough_position: 0,
@@ -807,6 +842,9 @@ shell-integration = detect  # detect | none | bash | zsh | fish
 bell-features = system,audio,attention,title  # bell channels (no-X disables; `visual` = pane flash extension)
 notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
 notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
+desktop-notifications = true    # OSC 9/777 may emit freedesktop notifications
+abnormal-command-exit-runtime = 250  # ms — a command dying faster stays held open with a notice
+grapheme-width-method = unicode # unicode | legacy — ZWJ clusters share cells vs per-scalar cells
 # shell = /bin/bash
 
 # Colors: overrides on top of the resolved theme
@@ -831,6 +869,7 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # adjust-cell-width = 10%  # widen cells: N% or Npx
 # adjust-cell-height = 2px
 # adjust-font-baseline = 0px   # +Npx raises the text baseline; N% or Npx
+# adjust-cursor-height = 120%  # underline thickness / beam height (0 = default)
 # font-feature = -calt         # OpenType toggle: -tag off, +tag/tag/tag=N on
 # font-style = Italic        # named style of font-family for regular text
 # font-synthetic-style = bold      # allow embolden synthesis; repeat for italic (or no-bold,no-italic,true,false)
@@ -839,6 +878,7 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # env = EDITOR=vim         # repeat to inject into spawned shells
 
 # Keybinds: keybind = <chord>=<action>; empty action disables.
+# keybind = clear                          # drop all binds incl. defaults; rebuild below
 # chords: ctrl+shift+c, alt+enter, ...  actions: copy, paste,
 # new_tab, close_tab, close_surface, new_window, next_tab, previous_tab,
 # goto_tab:N, increase_font_size:N, decrease_font_size:N, reset_font_size,
@@ -1616,6 +1656,35 @@ impl AppConfig {
                         )),
                     }
                 }
+                "adjust-cursor-height" => match value
+                    .strip_suffix('%')
+                    .unwrap_or(value)
+                    .parse::<u16>()
+                {
+                    Ok(p) => cfg.adjust_cursor_height = p,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad adjust-cursor-height {value:?} (want percent)",
+                        n + 1
+                    )),
+                },
+                "desktop-notifications" => {
+                    cfg.desktop_notifications = bool_value(value, n, &mut errors);
+                }
+                "abnormal-command-exit-runtime" => match value.parse::<u64>() {
+                    Ok(ms) => cfg.abnormal_command_exit_runtime = ms,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad abnormal-command-exit-runtime {value:?} (want ms)",
+                        n + 1
+                    )),
+                },
+                "grapheme-width-method" => match value {
+                    "unicode" => cfg.grapheme_width_method = GraphemeWidthMethod::Unicode,
+                    "legacy" => cfg.grapheme_width_method = GraphemeWidthMethod::Legacy,
+                    _ => errors.push(format!(
+                        "line {}: bad grapheme-width-method {value:?} (want unicode|legacy)",
+                        n + 1
+                    )),
+                },
                 "adjust-underline-position" => match value.parse::<i16>() {
                     Ok(p) => cfg.adjust_underline_position = p,
                     Err(_) => errors.push(format!(
@@ -1730,6 +1799,13 @@ impl AppConfig {
                     if !value.is_empty() {
                         cfg.config_files.push(expand_home(value));
                     }
+                }
+                "keybind" if value.trim().eq_ignore_ascii_case("clear") => {
+                    // Ghostty `keybind = clear` — wipe every bind parsed so
+                    // far AND suppress the built-in chord table; `keybind`
+                    // lines after this rebuild from zero.
+                    cfg.keybinds.clear();
+                    cfg.keybinds_cleared = true;
                 }
                 "keybind" => match parse_keybind(value) {
                     // Ghostty: triggers ignore prefixes — a later
@@ -3261,6 +3337,52 @@ mod tests {
     }
 
     #[test]
+    fn r49_keys_parse() {
+        // `keybind = clear` empties the user list AND suppresses builtin
+        // defaults; a bind declared after it still registers.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+shift+t=new_tab\nkeybind = clear\nkeybind = ctrl+shift+z=new_tab",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.keybinds_cleared);
+        assert_eq!(cfg.keybinds.len(), 1);
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::NewTab));
+
+        let (cfg, errs) = AppConfig::parse(
+            "desktop-notifications = false\nabnormal-command-exit-runtime = 120\nadjust-cursor-height = 60%",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.desktop_notifications);
+        assert_eq!(cfg.abnormal_command_exit_runtime, 120);
+        assert_eq!(cfg.adjust_cursor_height, 60);
+
+        // `bold-is-bright` is a legacy key name — rejected, not aliased.
+        let (_, errs) = AppConfig::parse("bold-is-bright = true");
+        assert_eq!(errs.len(), 1);
+        // 0 selects the framework default again; garbage errors.
+        let (cfg, errs) = AppConfig::parse("adjust-cursor-height = 0");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.adjust_cursor_height, 0);
+        let (_, errs) = AppConfig::parse("adjust-cursor-height = x");
+        assert_eq!(errs.len(), 1);
+
+        let (cfg, errs) = AppConfig::parse("grapheme-width-method = legacy");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(
+            cfg.grapheme_width_method,
+            GraphemeWidthMethod::Legacy
+        ));
+        let (cfg, errs) = AppConfig::parse("grapheme-width-method = unicode");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(
+            cfg.grapheme_width_method,
+            GraphemeWidthMethod::Unicode
+        ));
+        let (_, errs) = AppConfig::parse("grapheme-width-method = mixed");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
     fn quick_terminal_size_parses() {
         let (cfg, errs) = AppConfig::parse("quick-terminal-size = 30%");
         assert!(errs.is_empty(), "{errs:?}");
@@ -3597,7 +3719,6 @@ mod tests {
             "keybind = ctrl+alt+a=paste_selection",
             "word-select-chars = abc",
             "clipboard-trim = true",
-            "desktop-notifications = true",
             "audible-bell = true",
             "visual-bell = true",
             "font-synthetic = bold",

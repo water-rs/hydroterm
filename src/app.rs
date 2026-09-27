@@ -70,6 +70,15 @@ pub struct Session {
     pub font_size: Binding<f32>,
     /// Child process exited.
     pub exited: Binding<bool>,
+    /// When the PTY child was spawned — `abnormal-command-exit-runtime`
+    /// compares a death's elapsed time against this.
+    pub spawned_at: std::time::Instant,
+    /// `(exit_code, time_since_spawn)` recorded on `ChildExit`;
+    /// `None` code = killed by a signal.
+    pub child_exit: std::sync::Mutex<Option<(Option<i32>, std::time::Duration)>>,
+    /// `abnormal-command-exit-runtime` notice text held over the dead
+    /// pane — `Some` while the notice card is mounted.
+    pub abnormal_notice: Binding<Option<Str>>,
     /// Latest working directory reported via OSC 7.
     pub cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Search bar visible above the pane (Ctrl+Shift+F toggles).
@@ -247,6 +256,9 @@ impl Session {
             notify_badge: std::sync::Mutex::new(false),
             font_size: Binding::f32(cfg.font_size),
             exited: Binding::bool(false),
+            spawned_at: std::time::Instant::now(),
+            child_exit: std::sync::Mutex::new(None),
+            abnormal_notice: Binding::default(),
             cwd: std::sync::Mutex::new(None),
             search_open: Binding::bool(false),
             search_query: binding(Str::from("")),
@@ -2561,6 +2573,27 @@ impl View for PaneLeaf {
             })
             .padding_vertical(8.0),
         ));
+        // `abnormal-command-exit-runtime` — the dead pane is held open
+        // and a card at its bottom reports the exit; Close dismisses the
+        // pane (Ghostty surfaces the same message on the held surface).
+        let abnormal_notice = session.0.abnormal_notice.clone();
+        let abnormal_overlay = vstack((
+            Spacer::flexible(),
+            when(abnormal_notice.is_some(), move || {
+                Card::new(
+                    hstack((
+                        text(abnormal_notice.unwrap_or_default().computed()),
+                        button("Close").bordered_prominent().action(
+                            |s: PaneSession| s.push_action(TermAction::CloseSurface),
+                        ),
+                    ))
+                    .spacing(12.0),
+                )
+                .style(CardStyle::Elevated)
+            })
+            .padding_with(16.0),
+        ))
+        .anyview();
         let stack = zstack((
             vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
             paste_overlay,
@@ -2569,6 +2602,7 @@ impl View for PaneLeaf {
             resize_badge,
             title_prompt,
             inspector_badge,
+            abnormal_overlay,
         ));
         stack.state(&session).anyview()
         });

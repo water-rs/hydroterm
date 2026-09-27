@@ -80,8 +80,9 @@ pub enum TermEvent {
     TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Send + Sync>),
     /// BEL.
     Bell,
-    /// The shell child died.
-    ChildExit(String),
+    /// The shell child died; payload is its exit code (`None` =
+    /// killed by a signal or unknown).
+    ChildExit(Option<i32>),
     /// Event loop itself shut down.
     Exit,
     /// Byte-stream tap (OSC 133/7/9/777, APC) that vte drops before `Term`.
@@ -233,7 +234,7 @@ impl EventListener for EventProxy {
                 let _ = self
                     .inner
                     .events
-                    .send(TermEvent::ChildExit(format!("{status:?}")));
+                    .send(TermEvent::ChildExit(status.code()));
                 self.wake();
             }
             Event::Exit => {
