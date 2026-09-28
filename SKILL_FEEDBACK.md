@@ -391,3 +391,21 @@ patched in-repo.
   resolved-graph Water.lock**; byte-copy only works when every pin
   matches the framework's gitlinks AND the resolved graph adds
   nothing the canonical lock doesn't already name.
+
+- **r55 repin note (waterui `bfb742d9` / hydrolysis `4f532e83` / m3
+  `f4fbd90c` / nami `ebe55e7`):** the resolved-graph Water.lock recipe
+  re-validated end-to-end — `water build --platform linux --backend
+  hydrolysis` on the committed git-pinned tree clears `prepare_build` +
+  `validate_dependencies` and fails ONLY at the 4 `.instance_name()`
+  call sites (the waterui `32616d58e` API is still unmerged upstream —
+  the expected compile-order caveat). nami `ebe55e7`'s per-watcher
+  `Distinct` fix changes shared-signal semantics silently (watchers now
+  each see every transition instead of the first consumer marking it
+  seen for the rest) — no API change, but behavior under multiple
+  watchers of one `.distinct()` signal is now correct. waterui#1311's
+  `ScrollView::report_offset` / `ScrollHandle` scroll-offset API landed
+  but hydroterm's scrollback is grid-native (no `ScrollView`) — nothing
+  to adopt. hydrolysis `4f532e8` additionally fixes #272 (off-screen
+  `frame` writes no longer clamped → WATERUI_FEEDBACK #69 resolved,
+  `quick-terminal-animation-duration` verified sliding both ways) and
+  #269 (over-sibling occlusion).
