@@ -3505,7 +3505,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis?rev=926424bc7f501863c51c9028c8d735bfcb0cdc7d#926424bc7f501863c51c9028c8d735bfcb0cdc7d"
+source = "git+https://github.com/water-rs/hydrolysis?rev=a97f58fe68507174bbce6ad181b0def242ef149d#a97f58fe68507174bbce6ad181b0def242ef149d"
 dependencies = [
  "accesskit",
  "async-task",
@@ -3525,6 +3525,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shaderloom",
+ "skrifa",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
@@ -10215,6 +10216,8 @@ name = "waterui-core"
 version = "0.5.1"
 dependencies = [
  "anyhow",
+ "bitflags 2.13.2",
+ "keyboard-types",
  "nami",
  "num-traits",
  "serde",

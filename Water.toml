@@ -8,8 +8,8 @@ bundle_identifier = "dev.lexoliu.hydroterm"
 [framework]
 channel = "dev"
 repository = "https://github.com/water-rs/waterui"
-revision = "9971190d7305bff27db2efef17c664bafc365b6c"
-lock_sha256 = "6435d69bb6d97df1eb209a3614a30dfdd35fd7d65f13474aeb573dc8358482d9"
+revision = "697f5a297be95a596cf93265ae7a20d01ec78d6a"
+lock_sha256 = "f6396039ff9fc93259760d222aaff74898085de382170ab69316314facda352b"
 minimum-cli-version = "0.4.0"
 rust-version = "1.95.0"
 
@@ -66,7 +66,7 @@ version = "=0.3.1"
 
 [framework.packages.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "926424bc7f501863c51c9028c8d735bfcb0cdc7d"
+rev = "a97f58fe68507174bbce6ad181b0def242ef149d"
 
 [framework.packages.hydrolysis-m3]
 git = "https://github.com/water-rs/hydrolysis-m3"

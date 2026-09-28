@@ -21,6 +21,7 @@ use waterui_core::id::SelfId;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::widget::condition::when;
+use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
 use waterui::window::WindowPresentation;
 use waterui::task::{sleep, spawn_local};
@@ -87,6 +88,9 @@ pub struct Session {
     pub search_open: Binding<bool>,
     /// Live search query — bound to the WaterUI `TextField`.
     pub search_query: Binding<Str>,
+    /// Focus target of the bar's `TextField` (water-rs/waterui#1265):
+    /// `Some(())` while the field owns keyboard focus.
+    pub search_field_focus: Binding<Option<()>>,
     /// Match summary shown next to the field ("3 matches" / "").
     pub search_status: Binding<Str>,
     /// kitty graphics placements transmitted on this session.
@@ -151,6 +155,8 @@ pub struct Session {
     /// Live rename text — bound to the prompt's `TextField`; seeded
     /// with the current title when the prompt opens.
     pub title_query: Binding<Str>,
+    /// Focus target of the prompt's `TextField` (same #1265 contract).
+    pub title_field_focus: Binding<Option<()>>,
     /// Ghostty `inspector` — a chip reports the attributes of the cell
     /// under the terminal cursor, refreshed every rendered frame.
     pub inspector_open: Binding<bool>,
@@ -169,6 +175,10 @@ pub struct Session {
     /// The open rename prompt writes the owning tab's title rather than
     /// the surface's (`prompt_tab_title` vs `prompt_surface_title`).
     pub title_prompt_writes_tab: std::cell::Cell<bool>,
+    /// `link-hover` — target URL of the hovered link, shown in a
+    /// bottom-left chip while the open-link modifier is held and the
+    /// pointer is over a link; empty when hidden.
+    pub link_hover_text: Binding<Str>,
     /// `toggle_mark` rows — absolute grid rows (`history_size + screen
     /// line`, the same convention `prompt_marks` uses; rows drift when
     /// scrollback overflows and drops its oldest lines). Invisible —
@@ -266,7 +276,9 @@ impl Session {
             cwd: std::sync::Mutex::new(None),
             search_open: Binding::bool(false),
             search_query: binding(Str::from("")),
+            search_field_focus: Binding::default(),
             search_status: binding(Str::from("")),
+            link_hover_text: binding(Str::from("")),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
             mouse_reporting: Binding::bool(false),
@@ -291,6 +303,7 @@ impl Session {
             pending_clipboard_fmt: Rc::new(RefCell::new(None)),
             title_prompt_open: Binding::bool(false),
             title_query: binding(Str::from("")),
+            title_field_focus: Binding::default(),
             inspector_open: Binding::bool(false),
             inspector_label: binding(Str::from("")),
             font_size_override: std::cell::Cell::new(false),
@@ -638,6 +651,8 @@ pub struct AppState {
     pub palette_open: Binding<bool>,
     /// Live palette query — bound to the WaterUI `TextField`.
     pub palette_query: Binding<Str>,
+    /// Focus target of the palette's `TextField` (#1265).
+    pub palette_field_focus: Binding<Option<()>>,
     /// Index of the highlighted palette row (Up/Down navigation).
     pub palette_sel: Binding<Option<usize>>,
     /// List scroll controller — `scroll_to(sel)` keeps the highlighted
@@ -656,6 +671,11 @@ pub struct AppState {
     /// Quick-terminal window state — the X11 global hotkey flips it
     /// Closed ↔ Normal; `conditional_window` mounts/unmounts the window.
     pub quick_state: Binding<WindowState>,
+    /// The drop-down window's `frame` binding while it exists — captured
+    /// at `quick_window` build so `quick-terminal-animation-duration`
+    /// can slide it in/out on open/close (`None` when never opened or
+    /// already unmounted).
+    quick_frame: Rc<RefCell<Option<Binding<Rect>>>>,
     /// Presentation helper for the quick window (retained `presented` flag).
     quick_presentation: WindowPresentation,
     /// Lazily-created session set for the quick window — kept alive across
@@ -797,6 +817,7 @@ impl AppState {
             env: Rc::new(std::cell::OnceCell::new()),
             palette_open: Binding::bool(false),
             palette_query: binding(Str::from("")),
+            palette_field_focus: Binding::default(),
             palette_sel: Binding::container(Some(0)),
             palette_scroll: ScrollController::new(0),
             settings_open: Binding::bool(false),
@@ -805,6 +826,7 @@ impl AppState {
             set_blink: Binding::bool(true),
             theme_dirty: Arc::new(AtomicBool::new(false)),
             quick_state: quick_binding.clone(),
+            quick_frame: Rc::new(RefCell::new(None)),
             quick_presentation: WindowPresentation::new(&quick_binding),
             quick_app: RefCell::new(None),
             global_grabs: RefCell::new(Vec::new()),
@@ -1149,6 +1171,9 @@ impl AppState {
         // drop-down surface writes it and the `conditional_window` reads
         // it — a private binding would leave the window visible.
         app.quick_state = self.quick_state.clone();
+        // The frame binding too: `animate_quick_close` on a drop-down
+        // surface slides the host-owned window out.
+        app.quick_frame = self.quick_frame.clone();
         let app = Rc::new(app);
         *self.quick_app.borrow_mut() = Some(app.clone());
         app
@@ -1166,11 +1191,12 @@ impl AppState {
             // The drop-down's own view should not host another quick window.
             return;
         }
-        let next = match self.quick_state.snapshot() {
-            WindowState::Closed => WindowState::Normal,
-            _ => WindowState::Closed,
-        };
-        self.quick_state.set(next);
+        match self.quick_state.snapshot() {
+            WindowState::Closed => self.quick_state.set(WindowState::Normal),
+            // Closing runs the `quick-terminal-animation-duration`
+            // slide-out before unmapping.
+            _ => self.close_quick(),
+        }
     }
 
     /// Start the X11 global-hotkey listener (idempotent, main window only).
@@ -1225,6 +1251,13 @@ impl AppState {
         })
         .style(WindowStyle::Borderless)
         .resizable(false);
+        // `class =` — the quick-terminal window shares the app's
+        // desktop identity too (water-rs/waterui#1291).
+        let w = if let Some(cls) = self.config(|c| c.app_class.clone()) {
+            w.app_id(Str::from(cls))
+        } else {
+            w
+        };
         // `quick-terminal-position` — dock geometry on the primary
         // screen (top/bottom: full width × 45% height; left/right:
         // 40% width × full height; center: 70%×70% centered). The initial
@@ -1246,7 +1279,8 @@ impl AppState {
                 Some(S::Px(px)) => px,
                 None => full,
             };
-            let (x, y, w_px, h_px) = match self.config(|c| c.quick_terminal_position) {
+            let pos = self.config(|c| c.quick_terminal_position);
+            let (x, y, w_px, h_px) = match pos {
                 P::Top => {
                     let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
                     let w = size
@@ -1290,12 +1324,50 @@ impl AppState {
                     ((sw - w) / 2.0, (sh - h) / 2.0, w, h)
                 }
             };
-            w.frame.set(Rect::new(
+            let dock = Rect::new(
                 Point::new(x as f32, y as f32),
                 Size::new(w_px as f32, h_px as f32),
-            ));
+            );
+            w.frame.set(dock);
+            *self.quick_frame.borrow_mut() = Some(w.frame.clone());
+            // `quick-terminal-animation-duration`: edge-docked positions
+            // slide in from their dock edge; `center` mounts instantly
+            // (there is no edge to slide from — Ghostty animates center
+            // with a fade, which has no frame equivalent).
+            let secs = self.config(|c| c.quick_terminal_animation_duration);
+            if secs > 0.0
+                && let Some(off) = dock_offscreen(pos, dock, sw as f32, sh as f32)
+            {
+                w.frame.set(off);
+                animate_frame(&w.frame, off, dock, secs, None);
+            }
         }
         w
+    }
+
+    /// `quick-terminal-animation-duration` close path: slide the
+    /// drop-down back off its dock edge, then unmap (`quick_state`
+    /// Closed). Falls back to an instant close when the frame binding
+    /// is unknown or the duration is 0. Called by `toggle_quick` and
+    /// `quick-terminal-autohide`.
+    pub fn close_quick(&self) {
+        let Some(frame) = self.quick_frame.borrow().clone() else {
+            self.quick_state.set(WindowState::Closed);
+            return;
+        };
+        let secs = self.config(|c| c.quick_terminal_animation_duration);
+        let cur = frame.snapshot();
+        let pos = self.config(|c| c.quick_terminal_position);
+        let off = crate::quickterm::screen_size().and_then(|(sw, sh)| {
+            dock_offscreen(pos, cur, sw as f32, sh as f32)
+        });
+        match off.filter(|_| secs > 0.0) {
+            Some(off) => {
+                let state = self.quick_state.clone();
+                animate_frame(&frame, cur, off, secs, Some(state));
+            }
+            None => self.quick_state.set(WindowState::Closed),
+        }
     }
 
     /// `window-width`/`window-height`, `window-position-x`/`y` and
@@ -1359,6 +1431,12 @@ impl AppState {
             WindowStyle::Borderless
         })
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        // `class =` — WM_CLASS/app_id on spawned windows too.
+        let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
+            window.app_id(Str::from(cls))
+        } else {
+            window
+        };
         Self::apply_launch_geometry(&state, &window);
         if state.config(|c| c.window_fullscreen) {
             state
@@ -1442,6 +1520,11 @@ impl AppState {
             WindowStyle::Borderless
         })
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
+            window.app_id(Str::from(cls))
+        } else {
+            window
+        };
         Self::apply_launch_geometry(&state, &window);
         window.show(env);
     }
@@ -2595,13 +2678,35 @@ impl View for PaneLeaf {
             },
         )
         .anyview();
+        let search_focus = session.0.search_field_focus.clone();
         let bar = when(open, move || {
             hstack((
-                // Hit-transparent: a clicked-in field would take real key
-                // focus and swallow Escape/Enter/arrows before the surface
-                // sees them (no bubbling — WATERUI_FEEDBACK #50). The
-                // surface owns all editing through `search_query`.
-                field("find in buffer", &query).hittable(false),
+                // water-rs/waterui#1265: the field is a real focused text
+                // input — chars land in `search_query` natively and
+                // unconsumed keys bubble to `on_key_press`. Enter stays a
+                // key handler (not `on_submit`) so Shift is inspectable:
+                // Ghostty Enter=next, Shift+Enter=prev.
+                field("find in buffer", &query)
+                    .focused(&search_focus, ())
+                    .on_key_press(|Use(press): Use<KeyPress>, s: PaneSession| {
+                        match &press.key {
+                            Key::Named(NamedKey::Enter) => {
+                                s.push_action(TermAction::NavigateSearch(
+                                    if press.modifiers.contains(Modifiers::SHIFT) {
+                                        -1
+                                    } else {
+                                        1
+                                    },
+                                ));
+                                KeyHandling::Handled
+                            }
+                            Key::Named(NamedKey::Escape) => {
+                                s.push_action(TermAction::EndSearch);
+                                KeyHandling::Handled
+                            }
+                            _ => KeyHandling::Ignored,
+                        }
+                    }),
                 text(status.clone()).muted(),
                 text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(-1))),
                 text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(1))),
@@ -2609,9 +2714,8 @@ impl View for PaneLeaf {
             .spacing(6.0)
             .padding_horizontal(8.0)
             .padding_vertical(4.0)
-            // The bar is part of the pane's keyboard world: a click
-            // anywhere on it returns embedded focus to the surface (the
-            // field itself is hit-transparent, WATERUI_FEEDBACK #50).
+            // A click on the bar background moves focus back to the pane's
+            // embedded surface.
             .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id))
         })
         .anyview();
@@ -2653,19 +2757,55 @@ impl View for PaneLeaf {
             .padding_with(8.0)
             .position_in(chip_anchor),
         ));
-        // `prompt_title` — a rename prompt over the pane. The TextField
-        // can't take keyboard focus (hydrolysis#90), so the surface
-        // routes keys + text into `title_query` and the field mirrors it.
+        // `link-hover`: while the open-link modifier is held over a link,
+        // its URL shows in a bottom-left chip (Ghostty).
+        let link_hover = session.0.link_hover_text.clone();
+        let show_link_hover = link_hover.condition(|u| !u.is_empty());
+        let link_chip = absolute((
+            when(show_link_hover, move || {
+                text(link_hover.computed())
+                    .foreground(Foreground)
+                    .padding_horizontal(10.0)
+                    .padding_vertical(4.0)
+                    .background(Surface)
+            })
+            .padding_with(8.0)
+            .position_in(UnitPoint::BOTTOM_LEADING),
+        ));
+        // `prompt_title` — a rename prompt over the pane. water-rs/waterui#1265:
+        // the field is focused while open, `on_submit` fires on Return,
+        // and Escape bubbles to `on_key_press`.
         let title_prompt_open = session.0.title_prompt_open.clone();
         let title_query = session.0.title_query.clone();
+        let title_focus = session.0.title_field_focus.clone();
         let title_prompt = vstack((
             Spacer::flexible(),
             when(title_prompt_open, move || {
                 Card::new(vstack((
                     text("Rename tab title").muted(),
-                    // Same hit-transparent rule as the search field
-                    // (WATERUI_FEEDBACK #50).
-                    field("tab title", &title_query).hittable(false),
+                    field("tab title", &title_query)
+                        .on_submit(|app: AppState, s: PaneSession| {
+                            let q = s.0.title_query.snapshot();
+                            if s.0.title_prompt_writes_tab.get() {
+                                app.set_tab_title(s.0.id, Some(q.to_string()));
+                            } else {
+                                app.set_session_title(s.0.id, q);
+                            }
+                            s.0.title_prompt_open.set(false);
+                            s.0.title_field_focus.set(None);
+                            app.refocus(s.0.id);
+                        })
+                        .focused(&title_focus, ())
+                        .on_key_press(|Use(press): Use<KeyPress>, app: AppState, s: PaneSession| {
+                            if matches!(press.key, Key::Named(NamedKey::Escape)) {
+                                s.0.title_prompt_open.set(false);
+                                s.0.title_field_focus.set(None);
+                                app.refocus(s.0.id);
+                                KeyHandling::Handled
+                            } else {
+                                KeyHandling::Ignored
+                            }
+                        }),
                     text("Enter: rename · Esc: cancel").muted(),
                 ))
                 .spacing(8.0))
@@ -2674,8 +2814,7 @@ impl View for PaneLeaf {
             }),
             Spacer::flexible(),
         ))
-        // Click on the prompt overlay returns keys to the pane (the field
-        // is hit-transparent — WATERUI_FEEDBACK #50).
+        // Click on the prompt overlay returns keys to the pane.
         .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id));
         // `inspector` — a bottom-edge chip reporting the attributes of
         // the cell under the terminal cursor; `inspector_label` is
@@ -2729,6 +2868,7 @@ impl View for PaneLeaf {
             close_overlay,
             clip_overlay,
             resize_badge,
+            link_chip,
             title_prompt,
             inspector_badge,
             abnormal_overlay,
@@ -3056,6 +3196,66 @@ fn restore_node(node: &ClosedNode, sessions: &[Rc<Session>]) -> SplitNode {
     }
 }
 
+/// The rect `dock` slides out of on a drop-down close: fully off-screen
+/// along the docked edge (`quick-terminal-position`). `None` for
+/// `Center` — it mounts/unmounts instantly (no edge to slide along).
+fn dock_offscreen(
+    pos: crate::config::QuickTermPosition,
+    dock: Rect,
+    sw: f32,
+    sh: f32,
+) -> Option<Rect> {
+    use crate::config::QuickTermPosition as P;
+    let o = dock.origin();
+    let s = dock.size();
+    let off = match pos {
+        P::Top => Point::new(o.x, -s.height),
+        P::Bottom => Point::new(o.x, sh),
+        P::Left => Point::new(-s.width, o.y),
+        P::Right => Point::new(sw, o.y),
+        P::Center => return None,
+    };
+    Some(Rect::new(off, *s))
+}
+
+/// Ease-out lerp of a `Window.frame` binding over `secs` at ~60fps, then
+/// (close path) flip `end_state` to Closed. Runs on the UI executor —
+/// `sleep` ticks the animation, no frame clock is needed.
+fn animate_frame(
+    frame: &Binding<Rect>,
+    from: Rect,
+    to: Rect,
+    secs: f32,
+    end_state: Option<Binding<WindowState>>,
+) {
+    let frame = frame.clone();
+    spawn_local(async move {
+        let steps = (secs * 60.0).ceil().max(1.0) as i32;
+        let (fo, fe) = (from.origin(), to.origin());
+        let (fs, ts) = (*from.size(), *to.size());
+        for i in 1..=steps {
+            sleep(std::time::Duration::from_secs_f32(secs / steps as f32)).await;
+            let t = i as f32 / steps as f32;
+            let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+            frame.set(Rect::new(
+                Point::new(fo.x + (fe.x - fo.x) * e, fo.y + (fe.y - fo.y) * e),
+                Size::new(
+                    fs.width + (ts.width - fs.width) * e,
+                    fs.height + (ts.height - fs.height) * e,
+                ),
+            ));
+        }
+        frame.set(to);
+        if let Some(state) = end_state {
+            state.set(WindowState::Closed);
+        }
+    })
+    // The returned handle cancels the task on drop; `detach` lets the
+    // animation run to completion (fire-and-forget, like the global-hotkey
+    // drains).
+    .detach();
+}
+
 /// `~/.config/hydroterm/window-state` — sibling of the config file,
 /// `x y w h` in points on one line.
 fn window_state_path() -> std::path::PathBuf {
@@ -3188,7 +3388,25 @@ pub fn tabs_view(state: AppState) -> impl View {
                                     )))
                                     .foreground(label_color),
                             ))
-                            .on_tap(move |app: AppState| app.selected.set(tab_id))
+                            // water-rs/waterui#1290: one recognizer accepts
+                            // both buttons and the event's `button` picks the
+                            // action — a MIDDLE-only `.gesture` on a sibling
+                            // node loses the engine's per-point top-group pick
+                            // to this node's group and never fires.
+                            .gesture(
+                                gesture::TapGesture::new().buttons(
+                                    gesture::PointerButtons::PRIMARY
+                                        | gesture::PointerButtons::MIDDLE,
+                                ),
+                                move |event: Use<gesture::TapEvent>,
+                                      app: AppState| {
+                                    if event.0.button == gesture::PointerButton::Middle {
+                                        app.try_close_tab(tab_id);
+                                    } else {
+                                        app.selected.set(tab_id);
+                                    }
+                                },
+                            )
                             .a11y_role(AccessibilityRole::Tab)
                             .a11y_label(tab.title.clone())
                             .a11y_state_signal(
@@ -3203,7 +3421,13 @@ pub fn tabs_view(state: AppState) -> impl View {
                                     .padding_with([3.0, 0.0, 4.0, 4.0])
                                     .a11y_label("Close tab")
                                     .a11y_role(AccessibilityRole::Button)
-                                    .on_tap(move |app: AppState| app.try_close_tab(tab_id)),
+                                    .gesture(
+                                        gesture::TapGesture::new().buttons(
+                                            gesture::PointerButtons::PRIMARY
+                                                | gesture::PointerButtons::MIDDLE,
+                                        ),
+                                        move |app: AppState| app.try_close_tab(tab_id),
+                                    ),
                             ),
                         ))
                         .padding_with([4.0, 0.0, 8.0, 4.0]),
@@ -3212,14 +3436,12 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .spacing(0.0)
                     .height(TAB_STRIP_HEIGHT)
                     .background(signal_color(hover_bg))
+                    // Natural order again — hydrolysis#256 made `.state`
+                    // order-independent within a modifier chain
+                    // (was WATERUI_FEEDBACK #61 / water-rs/waterui#1292).
+                    .state(&hovered)
                     .on_hover_enter(|State(h): State<Binding<bool>>| h.set(true))
                     .on_hover_exit(|State(h): State<Binding<bool>>| h.set(false))
-                    // `.state` must wrap the handlers: it injects into
-                    // the env of the node's *children*, and a handler
-                    // attached on the same node only sees injections
-                    // applied outside it (WATERUI_FEEDBACK #61 /
-                    // water-rs/waterui#1292 — ordering workaround).
-                    .state(&hovered)
                     // Drag-to-reorder: the chip carries its tab id as
                     // text payload; every sibling chip is a drop slot.
                     .draggable(drag_drop::DragData::text(format!(
@@ -3234,6 +3456,15 @@ pub fn tabs_view(state: AppState) -> impl View {
                             app.move_tab_before(id, tab_id);
                         }
                     })
+                    // Middle-click closes the tab (Ghostty/tab-browser
+                    // convention) — water-rs/waterui#1290 routed non-primary
+                    // buttons to gestures. The label cluster above carries the
+                    // same close on its own group; this region covers the
+                    // chip padding its bounds don't reach.
+                    .gesture(
+                        gesture::TapGesture::new().buttons(gesture::PointerButtons::MIDDLE),
+                        move |app: AppState| app.try_close_tab(tab_id),
+                    )
                 })
             };
             hstack((
@@ -3467,8 +3698,9 @@ pub fn palette_matches(state: &AppState, query: &str) -> Vec<PaletteRow> {
 }
 
 impl AppState {
-    /// Open/close the palette (Ctrl+Shift+P). Opening clears the query
-    /// and resets row selection to the first match.
+    /// Open/close the palette (Ctrl+Shift+P). Opening clears the query,
+    /// resets row selection to the first match, and hands key focus to
+    /// the field (water-rs/waterui#1265).
     pub fn toggle_palette(&self) {
         let next = !self.palette_open.snapshot();
         if next {
@@ -3477,6 +3709,28 @@ impl AppState {
             self.palette_scroll.scroll_to(0);
         }
         self.palette_open.set(next);
+        self.palette_field_focus.set(next.then_some(()));
+    }
+
+    /// Move the palette's highlighted row by `dir` (+1/-1), keeping the
+    /// row visible through the scroll controller. Shared by the field's
+    /// `on_key_press` and the surface fallback path.
+    pub fn palette_next(&self, dir: i32) {
+        let q = self.palette_query.snapshot().to_string();
+        let n = palette_matches(self, &q).len();
+        if n == 0 {
+            return;
+        }
+        self.palette_sel.with_mut(|s| {
+            let cur = s.unwrap_or(0);
+            *s = Some(if dir > 0 {
+                (cur + 1).min(n - 1)
+            } else {
+                cur.saturating_sub(1)
+            });
+        });
+        self.palette_scroll
+            .scroll_to(self.palette_sel.snapshot().unwrap_or(0));
     }
 
     /// Run the `i`-th match of the current query (Up/Down selection or
@@ -3486,6 +3740,7 @@ impl AppState {
         let matches = palette_matches(self, &q);
         let Some(item) = matches.as_slice().get(i) else {
             self.palette_open.set(false);
+            self.palette_field_focus.set(None);
             return;
         };
         self.run_palette_action(item.action.clone());
@@ -3528,6 +3783,7 @@ impl AppState {
     /// is focused (e.g. the last one exited).
     pub fn run_palette_action(&self, action: TermAction) {
         self.palette_open.set(false);
+        self.palette_field_focus.set(None);
         if let Some(session) = self.focused_session() {
             session.pending_actions.borrow_mut().push(action);
             session.terminal.proxy.request_frame();
@@ -3620,9 +3876,33 @@ fn palette_view(state: AppState) -> impl View {
             (PALETTE_CHROME_H + rows * PALETTE_ROW_H).min(PALETTE_CARD_MAX_H)
         }
     });
-    // Hit-transparent field like the search/title fields (WATERUI_FEEDBACK #50).
+    // water-rs/waterui#1265: the field owns keyboard focus while the
+    // palette is open — Return runs the highlighted row (`on_submit`)
+    // and Up/Down/Escape bubble to `on_key_press`.
     let card = vstack((
-        field("type a command", &state.palette_query).hittable(false),
+        field("type a command", &state.palette_query)
+            .on_submit(|app: AppState| {
+                app.run_palette_at(app.palette_sel.snapshot().unwrap_or(0));
+                app.refocus_selected();
+            })
+            .focused(&state.palette_field_focus, ())
+            .on_key_press(|Use(press): Use<KeyPress>, app: AppState| match &press.key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    app.palette_next(1);
+                    KeyHandling::Handled
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    app.palette_next(-1);
+                    KeyHandling::Handled
+                }
+                Key::Named(NamedKey::Escape) => {
+                    app.palette_open.set(false);
+                    app.palette_field_focus.set(None);
+                    app.refocus_selected();
+                    KeyHandling::Handled
+                }
+                _ => KeyHandling::Ignored,
+            }),
         list,
     ))
     .spacing(4.0)
@@ -3679,7 +3959,25 @@ fn settings_view(state: AppState) -> impl View {
     ))
     .spacing(8.0)
     .padding()
-    .background(Surface);
+    .background(Surface)
+    // Enter applies, Escape closes — bubbles up from any focused
+    // settings control (water-rs/waterui#1265); the surface's
+    // `settings_key` gate is the fallback for a focused pane.
+    .on_key_press(|Use(press): Use<KeyPress>, app: AppState| {
+        match &press.key {
+            Key::Named(NamedKey::Enter) => {
+                app.apply_settings();
+                app.refocus_selected();
+                KeyHandling::Handled
+            }
+            Key::Named(NamedKey::Escape) => {
+                app.settings_open.set(false);
+                app.refocus_selected();
+                KeyHandling::Handled
+            }
+            _ => KeyHandling::Ignored,
+        }
+    });
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }
 

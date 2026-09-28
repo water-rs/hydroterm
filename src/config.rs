@@ -257,7 +257,14 @@ pub struct KeybindTrigger {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub font_size: f32,
+    /// Comma-joined fallback chain: the first `font-family` line is the
+    /// primary, each repeat appends (Ghostty repeatable key).
+    /// `TermFonts::load` resolves the list in order.
     pub font_family: String,
+    /// Whether any `font-family` line has been seen this parse — drives
+    /// repeat-append (parse-time only; not serialized).
+    #[doc(hidden)]
+    pub font_family_set: bool,
     /// `font-family-bold` / `font-family-italic` /
     /// `font-family-bold-italic` — style-specific family overrides
     /// (Ghostty); unset falls back to `font-family`.
@@ -313,6 +320,11 @@ pub struct AppConfig {
     /// center); secondary axis is maximized for edge-docked positions
     /// unless a second value is given.
     pub quick_terminal_size: Option<(QuickTermSize, Option<QuickTermSize>)>,
+    /// `quick-terminal-animation-duration` — seconds the drop-down's
+    /// slide-in/out animation runs (Ghostty default 0.2; `= 0` disables).
+    /// Edge-docked positions slide in from the dock edge; `center` mounts
+    /// instantly (there is no edge to slide from).
+    pub quick_terminal_animation_duration: f32,
     /// `clipboard-trim` — trim whitespace at the ends of copied text.
     pub clipboard_trim: bool,
     /// `notify-on-command-finish` — raise the 🔔 notification when a
@@ -469,6 +481,12 @@ pub struct AppConfig {
     /// underline + click-to-open + URL hints (Ghostty `link-url`,
     /// default true). `= false` disables all three paths.
     pub link_url: bool,
+    /// `link-hover` — while the link modifier is held and the pointer
+    /// is over a link, show the target URL in a status chip at the
+    /// bottom-left of the pane (Ghostty `link-hover`, default true).
+    /// `= false` hides the preview; the underline/click affordance
+    /// still follows `link-url`.
+    pub link_hover: bool,
     /// Modifier that must be held for click-to-open-link (Ghostty
     /// `open-link-modifier`-style); default Control.
     pub open_link_modifier: LinkMod,
@@ -576,6 +594,11 @@ pub struct AppConfig {
     /// `window-title-font-family` — family used for the tab-strip
     /// titles (Ghostty's titlebar font; ours drives the WaterUI chips).
     pub window_title_font_family: Option<String>,
+    /// `class` — the desktop identity (X11 `WM_CLASS`, Wayland `app_id`)
+    /// every window groups under (Ghostty `class`; default =
+    /// `com.mitchellh.ghostty`). Empty `class=` resets to the compiled
+    /// `WATERUI_APP_ID`/executable name.
+    pub app_class: Option<String>,
     /// Window decorations (Ghostty `window-decoration`): `false`/`none`
     /// maps the window borderless (title bar + frame removed).
     pub window_decoration: bool,
@@ -706,6 +729,7 @@ impl Default for AppConfig {
         Self {
             font_size: 13.0,
             font_family: "monospace".to_string(),
+            font_family_set: false,
             font_family_bold: None,
             font_family_italic: None,
             font_family_bold_italic: None,
@@ -728,6 +752,7 @@ impl Default for AppConfig {
             shell_features: ShellFeatures { cursor: true, sudo: true, title: true },
             quick_terminal_position: QuickTermPosition::Top,
             quick_terminal_size: None,
+            quick_terminal_animation_duration: 0.2,
             clipboard_trim: true,
             bell_title: true,
             grapheme_width_method: GraphemeWidthMethod::Unicode,
@@ -812,6 +837,7 @@ impl Default for AppConfig {
             minimum_contrast: 1.0,
             window_theme: WindowTheme::Auto,
             window_title_font_family: None,
+            app_class: None,
             window_decoration: true,
             background_image: None,
             background_image_opacity: 1.0,
@@ -823,6 +849,7 @@ impl Default for AppConfig {
             scroll_to_cursor: true,
             tab_bar_min_tabs: 1,
             link_url: true,
+            link_hover: true,
             word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
             visual_bell: true,
             visual_bell_color: None,
@@ -1069,7 +1096,19 @@ impl AppConfig {
                     Ok(v) if (4.0..=96.0).contains(&v) => cfg.font_size = v,
                     _ => errors.push(format!("line {}: bad font-size {value:?}", n + 1)),
                 },
-                "font-family" => cfg.font_family = value.to_string(),
+                "font-family" => {
+                    // Repeatable (Ghostty): each additional `font-family`
+                    // line appends to the primary family's ordered
+                    // fallback chain. `font_family` carries the chain
+                    // comma-joined — `TermFonts::load` splits on ','.
+                    if cfg.font_family_set {
+                        cfg.font_family.push(',');
+                        cfg.font_family.push_str(value);
+                    } else {
+                        cfg.font_family = value.to_string();
+                        cfg.font_family_set = true;
+                    }
+                }
                 "font-family-bold" => cfg.font_family_bold = Some(value.to_string()),
                 "font-family-italic" => cfg.font_family_italic = Some(value.to_string()),
                 "font-family-bold-italic" => {
@@ -1425,6 +1464,15 @@ impl AppConfig {
                     Ok(s) => cfg.quick_terminal_size = s,
                     Err(msg) => errors.push(format!("line {}: {msg}", n + 1)),
                 },
+                "quick-terminal-animation-duration" => match value.parse::<f32>() {
+                    Ok(v) if (0.0..=5.0).contains(&v) => {
+                        cfg.quick_terminal_animation_duration = v;
+                    }
+                    _ => errors.push(format!(
+                        "line {}: bad quick-terminal-animation-duration {value:?}",
+                        n + 1
+                    )),
+                },
                 "quick-terminal-position" => match value {
                     "top" => cfg.quick_terminal_position = QuickTermPosition::Top,
                     "bottom" => cfg.quick_terminal_position = QuickTermPosition::Bottom,
@@ -1587,6 +1635,9 @@ impl AppConfig {
                 "link-url" => {
                     cfg.link_url = bool_value(value, n, &mut errors);
                 }
+                "link-hover" => {
+                    cfg.link_hover = bool_value(value, n, &mut errors);
+                }
                 "open-link-modifier" => {
                     match value.parse::<LinkMod>() {
                         Ok(m) => cfg.open_link_modifier = m,
@@ -1625,6 +1676,15 @@ impl AppConfig {
                 },
                 "window-title-font-family" => {
                     cfg.window_title_font_family = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                // `class` — WM_CLASS / app_id for every window
+                // (water-rs/waterui#1291 → `Window::app_id`).
+                "class" => {
+                    cfg.app_class = if value.is_empty() {
                         None
                     } else {
                         Some(value.to_string())

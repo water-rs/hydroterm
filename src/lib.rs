@@ -137,6 +137,12 @@ pub fn app(env: Environment) -> App {
         Borderless
     })
     .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+    // `class =` — X11 WM_CLASS / Wayland app_id (water-rs/waterui#1291).
+    let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
+        window.app_id(Str::from(cls))
+    } else {
+        window
+    };
     // Window geometry: `window-save-state` restores the persisted frame;
     // otherwise `window-width`/`window-height` adjust the seeded 800x600
     // and `window-position-x`/`y` the origin (shared with `new_window`;

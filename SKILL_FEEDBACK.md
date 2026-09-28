@@ -282,6 +282,33 @@ patched in-repo.
 - `qualified_waterui_path` (new at lints `a9058391`): real positive —
   flagged my `waterui::snackbar::Snackbar::new(..)` written inline;
   fixed with `use waterui::snackbar::Snackbar;`. Not a false positive.
+- `unused_spawn_handle` (r53): `spawn_local(...)` / `spawn(...)`
+  discarded (statement position or `let _ =`) → warn. async-task's
+  `Task` cancels on drop, so the spawned future never executes —
+  silent dead code. Correct: `.detach()` for fire-and-forget, or keep
+  the handle for cancellation. Real positive found in-tree:
+  hydroterm's `animate_frame` animation task (see entry above).
 - Existing entries unchanged.
 
 - **Physical-key (`physical:`) keybinds need winit `Code`, and it is already plumbed.** Tried: binding `physical:` triggers. Skill said nothing about physical vs logical keys; `keyboard-types` `Key` is the layout-translated character only, and on a non-QWERTY layout a char-based bind silently binds the wrong position. Actually true: hydrolysis forwards winit `physical_key` as `physical_code` on every key event (`src/platform.rs` `from_winit_code`/`logical:`-`code:` pair), and `keyboard_types::Code` has `FromStr` for the CamelCase names (`KeyA`, `Digit0`, `ArrowUp`, `F1`) — so position-based matching is a `Code` compare, no keymap work needed. Skill edit: one line in the input/keys reference — "key events carry both `key` (logical) and `physical_code` (position); use the latter for layout-independent binds."
+
+### `spawn_local` returns a cancel-on-drop handle — fire-and-forget needs `.detach()` (r53)
+- **Tried:** `spawn_local(async move { …animation loop… })` as a bare
+  statement for the quick-terminal slide.
+- **Skill said:** the task reference shows `spawn_local` for background
+  work but does not state the handle's drop semantics.
+- **Actually true:** `waterui::task::spawn_local` returns
+  `executor_core`'s `AsyncTask` (async-task 4.x semantics) — **dropping
+  the handle cancels the task**: the runnable is scheduled once, then
+  run() sees the cancelled flag and drops the future WITHOUT polling it
+  — no code inside the async block ever runs, and no error is logged.
+  Hydroterm's animation task was silently dead for rounds; the only
+  symptom was "the animation never moved and the end-state write never
+  fired". `sleep`/`spawn_local` themselves work fine — long-running
+  loops must `.detach()` (or store the handle), as the codebase already
+  does for the hotkey drains.
+- **Concrete edit:** task reference — one line: "`spawn_local`'s return
+  is cancel-on-drop; a bare-statement spawn never polls. Call
+  `.detach()` or store the handle."
+- **Lint candidate:** `unused_spawn_handle` — recorded under "Lint
+  candidates" above.

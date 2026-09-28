@@ -27,7 +27,6 @@ use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::snackbar::Snackbar;
 use waterui::task::spawn_local;
-use waterui::window::WindowState;
 use waterui_core::Str;
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::scene2d::Scene2D;
@@ -1072,13 +1071,19 @@ impl TermSurface {
             }
             TermAction::Search => {
                 self.session.search_open.toggle();
-                if !self.session.search_open.snapshot() {
+                let open = self.session.search_open.snapshot();
+                self.session.search_field_focus.set(open.then_some(()));
+                if !open {
                     self.app.refocus(self.session.id);
                 }
             }
-            TermAction::StartSearch => self.session.search_open.set(true),
+            TermAction::StartSearch => {
+                self.session.search_open.set(true);
+                self.session.search_field_focus.set(Some(()));
+            }
             TermAction::EndSearch => {
                 self.session.search_open.set(false);
+                self.session.search_field_focus.set(None);
                 self.session.search_query.set_from("");
                 self.app.refocus(self.session.id);
             }
@@ -1092,6 +1097,7 @@ impl TermSurface {
                 if let Some(text) = text.filter(|t| !t.is_empty()) {
                     self.session.search_query.set_from(text);
                     self.session.search_open.set(true);
+                    self.session.search_field_focus.set(Some(()));
                 }
             }
             // `search:text` — set the query (the bar only needs to open
@@ -1103,6 +1109,7 @@ impl TermSurface {
                 } else {
                     self.session.search_query.set_from(text);
                     self.session.search_open.set(true);
+                    self.session.search_field_focus.set(Some(()));
                 }
             }
             TermAction::JumpToPrompt(n) => {
@@ -1342,6 +1349,7 @@ impl TermSurface {
                     .title_query
                     .set(self.session.title.snapshot());
                 self.session.title_prompt_open.set(true);
+                self.session.title_field_focus.set(Some(()));
             }
             TermAction::PromptTabTitle => {
                 self.session.title_prompt_writes_tab.set(true);
@@ -1351,6 +1359,7 @@ impl TermSurface {
                     .unwrap_or_else(|| self.session.title.snapshot());
                 self.session.title_query.set(seed);
                 self.session.title_prompt_open.set(true);
+                self.session.title_field_focus.set(Some(()));
             }
             TermAction::SetSurfaceTitle(title) => {
                 self.app.set_session_title(self.session.id, Str::from(title));
@@ -1529,7 +1538,7 @@ impl TermSurface {
         let q = self.session.search_query.snapshot().to_string();
         if s.query != q {
             self.search.as_mut().unwrap().query = q;
-            self.run_search();
+            self.run_search(true);
         }
     }
 
@@ -1537,15 +1546,15 @@ impl TermSurface {
     /// Matches are found on logical lines (soft wraps joined) and mapped
     /// back to grid cells of the grid as it is laid out NOW — the stamp
     /// makes a reflow or new output re-run the search.
-    fn run_search(&mut self) {
+    fn run_search(&mut self, reset_active: bool) {
         let generation = self.content_gen.get();
         let Some(search) = &mut self.search else { return };
+        let keep_active = search.active;
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
         let (cols, history, lines) = (grid.columns(), grid.history_size(), grid.screen_lines());
         search.stamp = (cols, history, lines, generation);
         search.matches.clear();
-        search.active = 0;
         if !search.query.is_empty() {
             let query: Vec<char> = search
                 .query
@@ -1558,6 +1567,14 @@ impl TermSurface {
         }
         drop(term);
         let n = search.matches.len();
+        // A stamp-triggered re-run (reflow / new output) keeps the match
+        // cursor — `push_action`'s request_frame bumps `content_gen`, so
+        // resetting here would undo `search_step` in the same frame.
+        search.active = if reset_active {
+            0
+        } else {
+            keep_active.min(n.saturating_sub(1))
+        };
         self.session.search_status.set_from(if search.query.is_empty() {
             String::new()
         } else if n == 0 {
@@ -1964,7 +1981,7 @@ impl TermSurface {
             // window focus closes the window (Ghostty). This runs at
             // Focus(false), so the closed state takes effect only when
             // focus actually leaves — not while the window is fading out.
-            self.app.quick_state.set(WindowState::Closed);
+            self.app.close_quick();
         }
         let mode = *self.session.terminal.term.lock().mode();
         if mode.contains(TermMode::FOCUS_IN_OUT) {
@@ -2161,6 +2178,7 @@ impl TermSurface {
             }
             Key::Named(NamedKey::Escape) => {
                 self.app.palette_open.set(false);
+                self.app.palette_field_focus.set(None);
                 self.app.refocus(self.session.id);
                 true
             }
@@ -2199,11 +2217,13 @@ impl TermSurface {
                     self.app.set_session_title(self.session.id, q);
                 }
                 self.session.title_prompt_open.set(false);
+                self.session.title_field_focus.set(None);
                 self.app.refocus(self.session.id);
                 true
             }
             Key::Named(NamedKey::Escape) => {
                 self.session.title_prompt_open.set(false);
+                self.session.title_field_focus.set(None);
                 self.app.refocus(self.session.id);
                 true
             }
@@ -2234,6 +2254,7 @@ impl TermSurface {
             }
             Key::Named(NamedKey::Escape) => {
                 self.session.search_open.set(false);
+                self.session.search_field_focus.set(None);
                 self.app.refocus(self.session.id);
                 true
             }
@@ -2557,6 +2578,18 @@ impl TermSurface {
         };
         if segs != self.hover_link {
             self.hover_link = segs;
+        }
+        // `link-hover` — publish the hovered link's target for the
+        // pane's status chip (Ghostty shows the URL on modifier hover).
+        let hover_text = if self.hover_link.is_empty()
+            || !self.app.config(|c| c.link_hover)
+        {
+            String::new()
+        } else {
+            self.link_at(self.grid_point(x, y)).unwrap_or_default()
+        };
+        if self.session.link_hover_text.snapshot().as_str() != hover_text.as_str() {
+            self.session.link_hover_text.set_from(hover_text);
         }
         let cursor = if self.hover_link.is_empty() {
             CursorStyle::IBeam
@@ -3233,7 +3266,7 @@ impl TermSurface {
                 self.session.mouse_reporting.set(reporting);
             }
             if self.search.as_ref().is_some_and(|s| s.stamp != stamp) {
-                self.run_search();
+                self.run_search(false);
             }
         }
         let matches_view: Vec<(usize, usize, usize)> = self

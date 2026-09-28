@@ -103,62 +103,72 @@ pub struct TermFonts {
 
 impl TermFonts {
     /// Resolve the primary family in `collection` and measure the cell.
-    /// `pref` is the configured `font-family`: when it names an installed
-    /// family it wins over the built-in preference list (a comma list of
-    /// names works — the first installed one is taken). Generic aliases
-    /// like `monospace`/`serif` map to their generic family.
+    /// `pref` is the configured `font-family` chain: a comma-joined list
+    /// where each entry names an installed family, a generic alias, or is
+    /// skipped if unresolvable — every resolvable entry joins the ordered
+    /// fallback list (Ghostty repeated `font-family` semantics: glyph
+    /// lookup tries family 1, then 2, ...). Generic aliases like
+    /// `monospace`/`serif` map to their generic family.
     pub fn load(collection: FontCollection, size_pt: f32, pref: &str) -> Self {
         let (family, family_name) = collection.use_fonts(|fonts| {
-            let prefer = pref
-                .split(',')
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
-                .find_map(|name| {
-                    let generic = match name.to_ascii_lowercase().as_str() {
-                        "monospace" => Some(GenericFamily::Monospace),
-                        "sans-serif" | "sans" => Some(GenericFamily::SansSerif),
-                        "serif" => Some(GenericFamily::Serif),
-                        "cursive" => Some(GenericFamily::Cursive),
-                        "fantasy" => Some(GenericFamily::Fantasy),
-                        "system-ui" | "ui" => Some(GenericFamily::SystemUi),
-                        "emoji" => Some(GenericFamily::Emoji),
-                        "math" => Some(GenericFamily::Math),
-                        _ => None,
-                    };
-                    if let generic @ Some(_) = generic {
-                        return generic.map(|g| {
-                            (FontFamilyName::Generic(g), name.to_string())
-                        });
+            let mut list: Vec<FontFamilyName> = Vec::new();
+            let mut primary_name: Option<String> = None;
+            for name in pref.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                let resolved = match name.to_ascii_lowercase().as_str() {
+                    "monospace" => Some(FontFamilyName::Generic(GenericFamily::Monospace)),
+                    "sans-serif" | "sans" => {
+                        Some(FontFamilyName::Generic(GenericFamily::SansSerif))
                     }
-                    fonts
+                    "serif" => Some(FontFamilyName::Generic(GenericFamily::Serif)),
+                    "cursive" => Some(FontFamilyName::Generic(GenericFamily::Cursive)),
+                    "fantasy" => Some(FontFamilyName::Generic(GenericFamily::Fantasy)),
+                    "system-ui" | "ui" => {
+                        Some(FontFamilyName::Generic(GenericFamily::SystemUi))
+                    }
+                    "emoji" => Some(FontFamilyName::Generic(GenericFamily::Emoji)),
+                    "math" => Some(FontFamilyName::Generic(GenericFamily::Math)),
+                    _ => fonts
                         .collection
                         .family_by_name(name)
-                        .map(|_| (FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())), name.to_string()))
-                });
-            let (primary, family_name) = prefer.unwrap_or_else(|| {
-                // Ordered stack: the preferred monospace first, then the
-                // generic emoji family so clustered emoji (ZWJ sequences,
-                // keycaps, flags) resolve to the color emoji font instead
-                // of a monochrome symbols fallback.
+                        .map(|_| FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string()))),
+                };
+                if let Some(f) = resolved {
+                    if primary_name.is_none() {
+                        primary_name = Some(name.to_string());
+                    }
+                    list.push(f);
+                }
+            }
+            if list.is_empty() {
+                // No configured name resolved: fall back to the built-in
+                // preference order, then generic monospace.
                 let name = PRIMARY_FAMILIES.iter().copied().find(|name| {
                     *name != "monospace" && fonts.collection.family_by_name(name).is_some()
                 });
                 match name {
-                    Some(name) => (
-                        FontFamilyName::Named(std::borrow::Cow::Owned(name.to_string())),
-                        name.to_string(),
-                    ),
-                    None => (
-                        FontFamilyName::Generic(GenericFamily::Monospace),
-                        "monospace".to_string(),
-                    ),
+                    Some(name) => {
+                        primary_name = Some(name.to_string());
+                        list.push(FontFamilyName::Named(std::borrow::Cow::Owned(
+                            name.to_string(),
+                        )));
+                    }
+                    None => {
+                        primary_name = Some("monospace".to_string());
+                        list.push(FontFamilyName::Generic(GenericFamily::Monospace));
+                    }
                 }
-            });
-            let list: Vec<FontFamilyName> =
-                vec![primary, FontFamilyName::Generic(GenericFamily::Emoji)];
+            }
+            // The generic emoji family is always last so clustered emoji
+            // (ZWJ sequences, keycaps, flags) resolve to the color emoji
+            // font instead of a monochrome symbols fallback — unless the
+            // user already chained it themselves.
+            let emoji = FontFamilyName::Generic(GenericFamily::Emoji);
+            if !list.contains(&emoji) {
+                list.push(emoji);
+            }
             (
                 FontFamily::List(std::borrow::Cow::Owned(list)),
-                family_name,
+                primary_name.unwrap_or_default(),
             )
         });
         tracing::info!(family = %family_name, "terminal primary font");
