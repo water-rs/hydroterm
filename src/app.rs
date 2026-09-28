@@ -1,7 +1,7 @@
 //! Application state: sessions, tabs, split-pane trees, focus tracking,
 //! and the actions surfaces trigger (new/close/cycle, splits, clipboard).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::rc::Rc;
@@ -98,6 +98,15 @@ pub struct Session {
     /// Actions queued by the command palette — drained by the surface on
     /// the next frame (keeps one dispatch path for every action).
     pub pending_actions: Rc<RefCell<Vec<TermAction>>>,
+    /// Active Ghostty key tables, outermost→innermost; the flag marks
+    /// `activate_key_table_once` one-shot layers. Lives on the session,
+    /// not the `TermSurface`, because a layout write (`sizes`, `zoomed`,
+    /// `tree`) rebuilds the pane view — the stack must survive that.
+    pub key_tables: RefCell<Vec<(String, bool)>>,
+    /// `toggle_mouse_reporting` — while set, pointer input is captured
+    /// locally instead of producing DEC mouse reports. Session-owned for
+    /// the same rebuild-survival reason as `key_tables`.
+    pub mouse_reporting_off: Cell<bool>,
     /// The program currently holds mouse reporting (DECSET 1000/1002/
     /// 1006) — while on, secondary clicks belong to it and the context
     /// menu is suppressed (signal-driven `.context_menu` items).
@@ -172,9 +181,12 @@ pub struct Session {
     /// not clobber it (Ghostty: `font-size` applies to terminals that
     /// never changed it; `reset_font_size` clears the flag).
     pub font_size_override: std::cell::Cell<bool>,
-    /// The open rename prompt writes the owning tab's title rather than
-    /// the surface's (`prompt_tab_title` vs `prompt_surface_title`).
-    pub title_prompt_writes_tab: std::cell::Cell<bool>,
+    /// Which title the open rename prompt writes (`prompt_surface_title`
+    /// / `prompt_tab_title` / `prompt_window_title`).
+    pub title_prompt_target: std::cell::Cell<TitleTarget>,
+    /// The rename prompt's label line ("surface" / "tab" / "window"),
+    /// set when the prompt is armed.
+    pub title_prompt_label: Binding<Str>,
     /// `link-hover` — target URL of the hovered link, shown in a
     /// bottom-left chip while the open-link modifier is held and the
     /// pointer is over a link; empty when hidden.
@@ -196,6 +208,20 @@ pub struct Session {
 pub struct MenuCtx {
     pub url: Option<Str>,
     pub sel: bool,
+}
+
+/// Which title the rename prompt edits (`prompt_surface_title` /
+/// `prompt_tab_title` / `prompt_window_title` — Ghostty's three title
+/// targets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleTarget {
+    /// The session's own title (OSC 0/1/2 target).
+    #[default]
+    Surface,
+    /// The owning tab's chip label.
+    Tab,
+    /// The OS window title.
+    Window,
 }
 
 impl Session {
@@ -282,6 +308,8 @@ impl Session {
             search_status: binding(Str::from("")),
             link_hover_text: binding(Str::from("")),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
+            key_tables: RefCell::new(Vec::new()),
+            mouse_reporting_off: Cell::new(false),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
             mouse_reporting: Binding::bool(false),
             font_family: binding(Str::from(cfg.font_family.clone())),
@@ -309,7 +337,8 @@ impl Session {
             inspector_open: Binding::bool(false),
             inspector_label: binding(Str::from("")),
             font_size_override: std::cell::Cell::new(false),
-            title_prompt_writes_tab: std::cell::Cell::new(false),
+            title_prompt_target: std::cell::Cell::new(TitleTarget::Surface),
+            title_prompt_label: binding(Str::from("")),
             marks: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1004,10 +1033,14 @@ impl AppState {
     fn regrab_globals(&self, config: &AppConfig) {
         let mut grabs = self.global_grabs.borrow_mut();
         grabs.retain(|(chord, action, stop)| {
-            let keep = config
-                .keybinds
-                .iter()
-                .any(|(t, a)| t.global && t.chord == *chord && a.as_ref() == Some(action));
+            // Only default-table binds grab globally — a `global:`
+            // inside a key table is inert until its table is active.
+            let keep = config.keybinds.iter().any(|(t, a)| {
+                t.global
+                    && t.table.is_none()
+                    && t.chord == *chord
+                    && a.as_ref() == Some(action)
+            });
             if !keep {
                 stop.store(true, Ordering::SeqCst);
             }
@@ -1016,7 +1049,7 @@ impl AppState {
         let want: Vec<(String, TermAction)> = config
             .keybinds
             .iter()
-            .filter(|(t, _)| t.global)
+            .filter(|(t, _)| t.global && t.table.is_none())
             .filter_map(|(t, a)| a.clone().map(|a| (t.chord.clone(), a)))
             .collect();
         for (chord, action) in want {
@@ -1284,6 +1317,13 @@ impl AppState {
         } else {
             w
         };
+        // `x11-instance-name` — the WM_CLASS instance half, separate
+        // from `class` (`Window::instance_name`).
+        let w = if let Some(inst) = self.config(|c| c.x11_instance_name.clone()) {
+            w.instance_name(Str::from(inst))
+        } else {
+            w
+        };
         // `quick-terminal-position` — dock geometry on the primary
         // screen (top/bottom: full width × 45% height; left/right:
         // 40% width × full height; center: 70%×70% centered). The initial
@@ -1463,6 +1503,11 @@ impl AppState {
         } else {
             window
         };
+        let window = if let Some(inst) = state.config(|c| c.x11_instance_name.clone()) {
+            window.instance_name(Str::from(inst))
+        } else {
+            window
+        };
         Self::apply_launch_geometry(&state, &window);
         if state.config(|c| c.window_fullscreen) {
             state
@@ -1470,6 +1515,15 @@ impl AppState {
                 .set(WindowState::Fullscreen);
         }
         window.show(env);
+    }
+
+    /// `move_tab_to_new_window` — detach the tab owning `session_id`
+    /// into a new OS window (keybind spelling of drag tear-off).
+    pub fn detach_session_tab(&self, session_id: u64) {
+        let tab = self.session_tab.lock().unwrap().get(&session_id).copied();
+        if let Some(tab_id) = tab {
+            self.detach_tab_to_window(tab_id);
+        }
     }
 
     /// Tab tear-off (Ghostty drag-out): move a live tab — its sessions
@@ -1530,6 +1584,8 @@ impl AppState {
         state.tab_count.set(state.tabs.len());
         state.selected.set(tab_id);
         state.focus_owner.set(Some((tab_id, focused)));
+        // The new window opens on the moved surface's title.
+        state.bell_title(focused);
         let opacity = state.config(|c| c.background_opacity);
         let bg = state.palette.borrow().background;
         let window = Window::new(
@@ -1548,6 +1604,11 @@ impl AppState {
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
         let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
             window.app_id(Str::from(cls))
+        } else {
+            window
+        };
+        let window = if let Some(inst) = state.config(|c| c.x11_instance_name.clone()) {
+            window.instance_name(Str::from(inst))
         } else {
             window
         };
@@ -1589,6 +1650,37 @@ impl AppState {
             .tabs.iter().find(|t| t.id == tab_id)
             .map(|t| t.focused.snapshot())?;
         self.session(focused)
+    }
+
+    /// A key press that bubbled out of a focused modal control (palette
+    /// input, settings field, title prompt, search bar, a snackbar's
+    /// button): the surface's `input` never sees keys a focused widget
+    /// owns, so the bind table is checked here — Ghostty fires binds
+    /// over overlays (`cancel` depends on it). A hit queues on the
+    /// focused session's `pending_actions`, which its surface drains
+    /// into `do_action` on the next frame — one dispatch path. Misses
+    /// (and `unconsumed:`/`unbind` entries) bubble on to the window.
+    pub fn dispatch_bind_press(&self, press: &KeyPress) -> KeyHandling {
+        let Some(session) = self.focused_session() else {
+            return KeyHandling::Ignored;
+        };
+        let tables: Vec<String> = session
+            .key_tables
+            .borrow()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let hit = self.config(|c| {
+            c.lookup_keybind_tabled(&press.key, press.code, press.modifiers, &tables)
+        });
+        match hit {
+            Some((trig, Some(action), _)) if !trig.unconsumed => {
+                session.pending_actions.borrow_mut().push(action);
+                session.terminal.proxy.request_frame();
+                KeyHandling::Handled
+            }
+            _ => KeyHandling::Ignored,
+        }
     }
 
     /// Re-grant embedded key focus to `session_id`'s pane after an
@@ -2004,8 +2096,12 @@ impl AppState {
         };
         let delta = if forward { px as f32 } else { -px as f32 };
         let tree = tab.tree.snapshot();
-        if tree.resize_focus(tab.focused.snapshot(), horizontal, delta) {
-            tab.tree.set(tree);
+        // `sizes` inside the tree is a shared `Binding` — `resize_focus`
+        // already publishes the move; re-setting the tree would rebuild
+        // every pane surface in the tab (wiping modal state).
+        if tree.resize_focus(tab.focused.snapshot(), horizontal, delta)
+            && tab.zoomed.snapshot().is_some()
+        {
             // Layout change — unzoom (Ghostty: any layout op unzooms).
             tab.zoomed.set(None);
         }
@@ -2019,11 +2115,14 @@ impl AppState {
             return;
         };
         let tree = tab.tree.snapshot();
+        // `equalize` writes the shared `sizes` bindings — no `tree.set`
+        // (the unchanged tree re-publish would rebuild every pane).
         tree.equalize();
-        tab.tree.set(tree);
         // Layout change — unzoom (`split-preserve-zoom` covers
         // navigation only).
-        tab.zoomed.set(None);
+        if tab.zoomed.snapshot().is_some() {
+            tab.zoomed.set(None);
+        }
     }
 
     /// Move the selected tab `dir` slots (wraps at both ends).
@@ -2804,18 +2903,24 @@ impl View for PaneLeaf {
         let title_prompt_open = session.0.title_prompt_open.clone();
         let title_query = session.0.title_query.clone();
         let title_focus = session.0.title_field_focus.clone();
+        let title_label = session.0.title_prompt_label.clone();
         let title_prompt = vstack((
             Spacer::flexible(),
             when(title_prompt_open, move || {
                 Card::new(vstack((
-                    text("Rename tab title").muted(),
-                    field("tab title", &title_query)
+                    field(title_label.computed(), &title_query)
                         .on_submit(|app: AppState, s: PaneSession| {
                             let q = s.0.title_query.snapshot();
-                            if s.0.title_prompt_writes_tab.get() {
-                                app.set_tab_title(s.0.id, Some(q.to_string()));
-                            } else {
-                                app.set_session_title(s.0.id, q);
+                            match s.0.title_prompt_target.get() {
+                                TitleTarget::Tab => {
+                                    app.set_tab_title(s.0.id, Some(q.to_string()));
+                                }
+                                TitleTarget::Window => {
+                                    app.window_title.set(app.title_with_subtitle(&q));
+                                }
+                                TitleTarget::Surface => {
+                                    app.set_session_title(s.0.id, q);
+                                }
                             }
                             s.0.title_prompt_open.set(false);
                             s.0.title_field_focus.set(None);
@@ -3538,6 +3643,11 @@ pub fn tabs_view(state: AppState) -> impl View {
         settings_overlay,
         quick,
     ))
+    // Keys a focused modal control did not consume bubble here — bind
+    // them (Ghostty fires keybinds over overlays; `cancel` relies on it).
+    .on_key_press(|Use(press): Use<KeyPress>, app: AppState| {
+        app.dispatch_bind_press(&press)
+    })
     // Tab switch → grant embedded focus to that tab's remembered pane;
     // also track the previously-selected tab for `last_tab`.
     .on_change(&state.selected, {
@@ -3561,6 +3671,9 @@ pub fn tabs_view(state: AppState) -> impl View {
     // never be recorded as focused.
     .on_change(&state.focus_owner, {
         let app = state.clone();
+        let prev_focus = Rc::new(std::cell::Cell::new(
+            state.focus_owner.snapshot().unwrap_or((0, 0)),
+        ));
         move |o: Option<(u64, u64)>| {
             let Some((tab_id, session_id)) = o else { return };
             let Some(t) = app.tabs.iter().find(|t| t.id == tab_id) else {
@@ -3573,6 +3686,13 @@ pub fn tabs_view(state: AppState) -> impl View {
                 {
                     t.title.set(s.title.snapshot());
                 }
+            }
+            // The window title follows the newly focused surface (tab
+            // switch, pane switch, tab detach) — but not on a re-assert
+            // of the same owner, which would clobber an explicitly set
+            // window title (`set_window_title` / prompt).
+            if prev_focus.replace((tab_id, session_id)) != (tab_id, session_id) {
+                app.bell_title(session_id);
             }
         }
     })

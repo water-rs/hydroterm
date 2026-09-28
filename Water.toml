@@ -9,7 +9,7 @@ bundle_identifier = "dev.lexoliu.hydroterm"
 channel = "dev"
 repository = "https://github.com/water-rs/waterui"
 revision = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
-lock_sha256 = "1de91ba7c6adb95461d0fcb7a620987047f906df8bd6a601393ee7b467c597d5"
+lock_sha256 = "f81b5080d89a5779aaba110ea8056864bd2d9a264b60b89744682334c64bee87"
 minimum-cli-version = "0.4.0"
 rust-version = "1.95.0"
 
@@ -50,7 +50,7 @@ waterui-version = "0.5.2"
 waterui-winui-version = "0.1.0"
 
 [framework.packages.block2]
-version = "=0.5.1"
+version = ">=0.5.1"
 
 [framework.packages.core-graphics]
 version = "=0.23.2"
@@ -73,37 +73,37 @@ git = "https://github.com/water-rs/hydrolysis-m3"
 rev = "303b21a9645e85c31e7cc8fcbcb8d329e7c1d36b"
 
 [framework.packages.objc2]
-version = "=0.5.2"
+version = ">=0.5.2"
 
 [framework.packages.objc2-app-kit]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-cloud-kit]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-core-data]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-core-image]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-core-location]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-foundation]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-metal]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-quartz-core]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-ui-kit]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.objc2-user-notifications]
-version = "=0.2.2"
+version = ">=0.2.2"
 
 [framework.packages.phf]
 version = "=0.14.0"
@@ -115,16 +115,16 @@ version = "=0.14.0"
 version = "=0.14.0"
 
 [framework.packages.phf_shared]
-version = "=0.14.0"
+version = ">=0.11.3"
 
 [framework.packages.png]
-version = "=0.17.16"
+version = ">=0.17.16"
 
 [framework.packages.redox_syscall]
 version = "*"
 
 [framework.packages.tiny-skia-path]
-version = "=0.11.4"
+version = ">=0.11.4"
 
 [framework.packages.vte]
 version = "=0.15.0"
@@ -266,11 +266,12 @@ rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 [framework.packages.waterui-winui]
 version = "=0.1.0"
 
-# r54 explicit channel selection: the pinned dev heads (hydrolysis
-# 72ae6266, hydrolysis-m3 303b21a9, nami 78d8fd4f) resolve ahead of the
-# framework lock Water.lock records — each divergent package the
-# framework graph reaches is declared here so the compat check
-# (`sanctioned_source`) certifies it.
+# r55: the pinned dev heads (hydrolysis 72ae6266, hydrolysis-m3 303b21a9,
+# nami 78d8fd4f) resolve ahead of the framework lock. Water.lock carries the
+# channel lock merged with each pinned repository's own Cargo.lock
+# (merge_foreign_lock's recipe); the git+rev declarations below keep the
+# extracted crates sanctioned, and shipped version pins are widened to
+# `>=` where the pinned backend's own graph moved them.
 [framework.packages.nami]
 git = "https://github.com/water-rs/nami"
 rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
@@ -282,51 +283,6 @@ rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
 [framework.packages.nami-derive]
 git = "https://github.com/water-rs/nami"
 rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
-
-[framework.packages.accesskit]
-version = "=0.25.1"
-
-[framework.packages.cc]
-version = "=1.5.1"
-
-[framework.packages.find-msvc-tools]
-version = "=0.1.14"
-
-[framework.packages.js-sys]
-version = "=0.3.106"
-
-[framework.packages.siphasher]
-version = "=1.0.4"
-
-[framework.packages.smallvec]
-version = "=1.16.2"
-
-[framework.packages.wasm-bindgen]
-version = "=0.2.129"
-
-[framework.packages.wasm-bindgen-futures]
-version = "=0.4.79"
-
-[framework.packages.wasm-bindgen-macro]
-version = "=0.2.129"
-
-[framework.packages.wasm-bindgen-macro-support]
-version = "=0.2.129"
-
-[framework.packages.wasm-bindgen-shared]
-version = "=0.2.129"
-
-[framework.packages.web-sys]
-version = "=0.3.106"
-
-[framework.packages.wl-clipboard-rs]
-version = "=0.9.4"
-
-[framework.packages.zerocopy]
-version = "=0.8.59"
-
-[framework.packages.zerocopy-derive]
-version = "=0.8.59"
 
 [framework.patches.crates-io.block]
 git = "https://github.com/Dicklesworthstone/rust-block"

@@ -514,6 +514,16 @@ pub struct TermSurface {
     /// `toggle_mouse_visibility` manual hide state — survives pointer
     /// motion until toggled off (Ghostty).
     pointer_hidden: bool,
+    /// Text staged by the `TextInput` event hydrolysis delivers BEFORE
+    /// the `Key` press it pairs with (platform.rs queues text first).
+    /// The key's verdict decides it: an action-consumed press drops the
+    /// text, anything else flushes it through `on_text`.
+    pending_text: Option<String>,
+    /// Set inside `on_key` when the press was claimed by an action
+    /// (keybind, built-in chord, keysel, modal prompt) — drops
+    /// `pending_text` so a bound key never echoes into the PTY. Text
+    /// prompts leave it unset: their `on_text` arm still wants the char.
+    suppress_pending_text: bool,
     /// `content_gen` seen by the last `build()` — `scroll-to-bottom
     /// output` snaps when the term publishes new cells while scrolled.
     last_output_gen: Cell<u64>,
@@ -627,6 +637,8 @@ impl TermSurface {
             cursor_hider: None,
             cursor_hider_tried: false,
             pointer_hidden: false,
+            pending_text: None,
+            suppress_pending_text: false,
             last_output_gen: Cell::new(0),
             primary: waterkit_clipboard::PrimarySelection::new().ok(),
             pointer_at: (0.0, 0.0),
@@ -1358,7 +1370,12 @@ impl TermSurface {
                 }
             }
             TermAction::PromptTitle => {
-                self.session.title_prompt_writes_tab.set(false);
+                self.session
+                    .title_prompt_target
+                    .set(crate::app::TitleTarget::Surface);
+                self.session
+                    .title_prompt_label
+                    .set_from("Rename surface title");
                 self.session
                     .title_query
                     .set(self.session.title.snapshot());
@@ -1366,7 +1383,12 @@ impl TermSurface {
                 self.session.title_field_focus.set(Some(()));
             }
             TermAction::PromptTabTitle => {
-                self.session.title_prompt_writes_tab.set(true);
+                self.session
+                    .title_prompt_target
+                    .set(crate::app::TitleTarget::Tab);
+                self.session
+                    .title_prompt_label
+                    .set_from("Rename tab title");
                 let seed = self
                     .app
                     .tab_title_of(self.session.id)
@@ -1374,6 +1396,93 @@ impl TermSurface {
                 self.session.title_query.set(seed);
                 self.session.title_prompt_open.set(true);
                 self.session.title_field_focus.set(Some(()));
+            }
+            TermAction::PromptWindowTitle => {
+                self.session
+                    .title_prompt_target
+                    .set(crate::app::TitleTarget::Window);
+                self.session
+                    .title_prompt_label
+                    .set_from("Rename window title");
+                self.session
+                    .title_query
+                    .set(self.app.window_title.snapshot());
+                self.session.title_prompt_open.set(true);
+                self.session.title_field_focus.set(Some(()));
+            }
+            TermAction::SetWindowTitle(title) => {
+                self.app
+                    .window_title
+                    .set(self.app.title_with_subtitle(&title));
+            }
+            TermAction::MoveTabToNewWindow => {
+                self.app.detach_session_tab(self.session.id);
+            }
+            TermAction::ToggleMouseReporting => {
+                self.session
+                    .mouse_reporting_off
+                    .set(!self.session.mouse_reporting_off.get());
+            }
+            TermAction::Cancel => {
+                // Dismiss the innermost open transient (Ghostty
+                // `cancel`): URL hints → keyboard selection → rename
+                // prompt → paste confirm → search → palette. The
+                // dismissed overlay may own keyboard focus, so the
+                // field's focus binding is cleared and the pane
+                // re-grabbed — without it the next keys go orphaned.
+                let dismissed = if self.hints.is_some() {
+                    self.hints = None;
+                    true
+                } else if self.keysel.is_some() {
+                    self.keysel = None;
+                    self.session.terminal.term.lock().selection = None;
+                    true
+                } else if self.session.title_prompt_open.snapshot() {
+                    self.session.title_prompt_open.set(false);
+                    self.session.title_field_focus.set(None);
+                    true
+                } else if self.session.pending_paste.snapshot().is_some() {
+                    self.session.pending_paste.set(None);
+                    true
+                } else if self.search.is_some() {
+                    self.search = None;
+                    self.session.search_open.set(false);
+                    self.session.search_field_focus.set(None);
+                    true
+                } else if self.app.palette_open.snapshot() {
+                    self.app.palette_open.set(false);
+                    self.app.palette_field_focus.set(None);
+                    true
+                } else {
+                    false
+                };
+                if dismissed {
+                    self.app.refocus(self.session.id);
+                }
+            }
+            TermAction::OpenUrlUnderCursor => {
+                let (x, y) = self.pointer_at;
+                self.open_link_at(self.grid_point(x, y));
+            }
+            TermAction::ActivateKeyTable(name) => {
+                // Ghostty: re-activating the innermost table is ignored;
+                // otherwise push (a table may repeat higher in the stack).
+                let mut kt = self.session.key_tables.borrow_mut();
+                if kt.last().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
+                    kt.push((name, false));
+                }
+            }
+            TermAction::ActivateKeyTableOnce(name) => {
+                let mut kt = self.session.key_tables.borrow_mut();
+                if kt.last().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
+                    kt.push((name, true));
+                }
+            }
+            TermAction::DeactivateKeyTable => {
+                self.session.key_tables.borrow_mut().pop();
+            }
+            TermAction::DeactivateAllKeyTables => {
+                self.session.key_tables.borrow_mut().clear();
             }
             TermAction::SetSurfaceTitle(title) => {
                 self.app.set_session_title(self.session.id, Str::from(title));
@@ -2097,13 +2206,15 @@ impl TermSurface {
                 _ => {}
             }
         }
-        // `clipboard-read = ask` prompt: Enter allows, Escape denies.
+        // `clipboard-read = ask` prompt: Enter allows, Escape denies —
+        // and the paired text of any printable key is swallowed with it.
         if pressed && self.session.pending_clipboard_read.snapshot() {
             match key {
                 Key::Named(NamedKey::Enter) => self.clipboard_read_confirm(true),
                 Key::Named(NamedKey::Escape) => self.clipboard_read_confirm(false),
                 _ => {}
             }
+            self.suppress_pending_text = true;
             return true;
         }
         // `confirm-close` snackbar: Enter closes, Escape cancels —
@@ -2127,12 +2238,14 @@ impl TermSurface {
         // Enter opens, Escape cancels — everything else cancels and falls
         // through to normal handling.
         if pressed && self.hints.is_some() && self.hint_key(key) {
+            self.suppress_pending_text = true;
             return true;
         }
         // Keyboard selection mode (`start_selection`): navigation keys
         // extend the mark, Enter copies, Escape cancels; any other key
         // exits and falls through to normal handling.
         if pressed && self.keysel.is_some() && self.keysel_key(key) {
+            self.suppress_pending_text = true;
             return true;
         }
         let mode = *self.session.terminal.term.lock().mode();
@@ -2147,8 +2260,21 @@ impl TermSurface {
             // user's bind occupies this slot). `global:`/`all:` always
             // consume (Ghostty).
             let mut fired_unconsumed = false;
-            match self.app.config(|c| c.lookup_keybind(key, code, mods)) {
-                Some((trig, Some(action))) => {
+            // Key tables (Ghostty 1.3): the active stack is searched
+            // innermost-first; an `unbind` in an active table shadows
+            // the default map too.
+            let table_names: Vec<String> = self
+                .session
+                .key_tables
+                .borrow()
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+            match self
+                .app
+                .config(|c| c.lookup_keybind_tabled(key, code, mods, &table_names))
+            {
+                Some((trig, Some(action), hit_table)) => {
                     // `performable:` — an unperformable bind does not
                     // consume the press; it falls through to the default
                     // chord table and literal bytes (Ghostty).
@@ -2160,14 +2286,30 @@ impl TermSurface {
                         } else {
                             self.do_action(action);
                         }
+                        // One-shot tables retire once any of their
+                        // bindings is invoked. `pos` is bound outside the
+                        // `if let` so the shared borrow drops before the
+                        // mutable one.
+                        if let Some(name) = hit_table {
+                            let pos = self
+                                .session
+                                .key_tables
+                                .borrow()
+                                .iter()
+                                .rposition(|(n, once)| *once && *n == name);
+                            if let Some(pos) = pos {
+                                self.session.key_tables.borrow_mut().remove(pos);
+                            }
+                        }
                         if trig.unconsumed && !trig.all && !trig.global {
                             fired_unconsumed = true;
                         } else {
+                            self.suppress_pending_text = true;
                             return true;
                         }
                     }
                 }
-                Some((_, None)) => unbound = true, // explicitly disabled
+                Some((_, None, _)) => unbound = true, // explicitly disabled
                 None => {}
             }
             // `keybind = clear` suppresses the built-in chord table —
@@ -2178,6 +2320,7 @@ impl TermSurface {
                 && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
             {
                 self.do_action(action);
+                self.suppress_pending_text = true;
                 return true;
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
@@ -2275,11 +2418,19 @@ impl TermSurface {
         match key {
             Key::Named(NamedKey::Enter) => {
                 let q = self.session.title_query.snapshot();
-                if self.session.title_prompt_writes_tab.get() {
-                    self.app
-                        .set_tab_title(self.session.id, Some(q.to_string()));
-                } else {
-                    self.app.set_session_title(self.session.id, q);
+                match self.session.title_prompt_target.get() {
+                    crate::app::TitleTarget::Tab => {
+                        self.app
+                            .set_tab_title(self.session.id, Some(q.to_string()));
+                    }
+                    crate::app::TitleTarget::Window => {
+                        self.app
+                            .window_title
+                            .set(self.app.title_with_subtitle(&q));
+                    }
+                    crate::app::TitleTarget::Surface => {
+                        self.app.set_session_title(self.session.id, q);
+                    }
                 }
                 self.session.title_prompt_open.set(false);
                 self.session.title_field_focus.set(None);
@@ -2564,7 +2715,7 @@ impl TermSurface {
             self.app.focus_pane(self.session.id);
         }
         let (col, row) = self.viewport_cell(x, y);
-        let mode = *self.session.terminal.term.lock().mode();
+        let mode = self.mouse_mode();
 
         // `mouse-shift-capture`: under mouse reporting a shifted press/
         // drag bypasses the program and selects locally — unless
@@ -2602,6 +2753,18 @@ impl TermSurface {
             if let Some(sel) = &mut term.selection {
                 sel.update(point, side);
             }
+        }
+    }
+
+    /// The term's mode as the mouse path sees it — `toggle_mouse_reporting`
+    /// masks the program's DEC mouse bits (1000/1002/1003 + encodings) so
+    /// pointer events stay local while toggled off.
+    fn mouse_mode(&self) -> TermMode {
+        let mode = *self.session.terminal.term.lock().mode();
+        if self.session.mouse_reporting_off.get() {
+            mode & !TermMode::MOUSE_MODE
+        } else {
+            mode
         }
     }
 
@@ -2755,7 +2918,7 @@ impl TermSurface {
 
     fn on_pointer_button(&mut self, pressed: bool, button: SurfacePointerButton, x: f64, y: f64) {
         let (col, row) = self.viewport_cell(x, y);
-        let mode = *self.session.terminal.term.lock().mode();
+        let mode = self.mouse_mode();
 
         // `mouse-shift-capture`: same gate as motion — shift bypasses
         // reporting unless `always`.
@@ -3208,7 +3371,7 @@ impl TermSurface {
 
     fn on_scroll(&mut self, x: f64, y: f64, _dx: f64, dy: f64, unit: ScrollUnit) {
         let (col, row) = self.viewport_cell(x, y);
-        let mode = *self.session.terminal.term.lock().mode();
+        let mode = self.mouse_mode();
 
         let lines_delta = match unit {
             ScrollUnit::Line => dy,
@@ -3294,7 +3457,11 @@ impl TermSurface {
                 grid.screen_lines(),
                 self.content_gen.get(),
             );
-            let reporting = term.mode().intersects(TermMode::MOUSE_MODE);
+            // `toggle_mouse_reporting`: while suppressed, the context
+            // menu and local pointer behavior come back (the program
+            // still holds its modes; we simply stop forwarding).
+            let reporting = term.mode().intersects(TermMode::MOUSE_MODE)
+                && !self.session.mouse_reporting_off.get();
             // `inspector`: re-report the cursor cell's attributes on
             // every rendered frame — the chip follows edits and cursor
             // moves with no separate refresh path.
@@ -3702,6 +3869,17 @@ impl SceneContent for TermSurface {
                 }
             }
         }
+        // `pending_text` pairs a TextInput with the Key press that
+        // follows it. Anything else arriving first means the pair broke
+        // (a dropped event) — flush rather than strand the text.
+        let pairs_with_key = matches!(
+            event,
+            SurfaceInputEvent::TextInput(_) | SurfaceInputEvent::Key { pressed: true, .. }
+        );
+        let mut flushed = false;
+        if !pairs_with_key && let Some(t) = self.pending_text.take() {
+            flushed = self.on_text(&t);
+        }
         // A frame is only requested when the handler changed what the
         // scene draws. Keystrokes that just write bytes to the PTY need
         // no invalidation — the echoed output repaints through the wake
@@ -3746,13 +3924,28 @@ impl SceneContent for TermSurface {
                         "[key] pressed={pressed} key={key:?} code={code:?} mods={modifiers:?}"
                     );
                 }
-                self.on_key(*pressed, key, *code, *modifiers)
+                // The press pairs with the staged TextInput: when an
+                // action consumes it, the text is dropped instead of
+                // reaching the PTY.
+                let paired = if *pressed { self.pending_text.take() } else { None };
+                self.suppress_pending_text = false;
+                let mut r = self.on_key(*pressed, key, *code, *modifiers);
+                if let Some(t) = paired
+                    && !self.suppress_pending_text
+                {
+                    r = self.on_text(&t) || r;
+                }
+                r
             }
             SurfaceInputEvent::TextInput(text) => {
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                     eprintln!("[text] {text:?}");
                 }
-                self.on_text(text.as_str())
+                // hydrolysis emits TextInput BEFORE the Key press it
+                // belongs to — stage it; the Key's verdict decides
+                // whether it lands (consumed actions drop it).
+                self.pending_text = Some(text.to_string());
+                false
             }
             SurfaceInputEvent::CompositionStart => {
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
@@ -3785,7 +3978,7 @@ impl SceneContent for TermSurface {
                 true
             }
         };
-        if needs_frame
+        if (needs_frame || flushed)
             && let Some(invalidator) = &self.invalidator
         {
             invalidator();

@@ -251,6 +251,10 @@ pub struct KeybindTrigger {
     /// not the layout-translated character. `chord` then stores only
     /// the modifier prefix (`ctrl+shift+`) for compare.
     pub physical_code: Option<Code>,
+    /// Ghostty key table (`<table>/<trigger>`): the bind lives in the
+    /// named table and only matches while that table is active.
+    /// `None` is the default table.
+    pub table: Option<String>,
 }
 
 /// Fully-resolved settings — defaults plus file overrides.
@@ -607,6 +611,11 @@ pub struct AppConfig {
     /// `com.mitchellh.ghostty`). Empty `class=` resets to the compiled
     /// `WATERUI_APP_ID`/executable name.
     pub app_class: Option<String>,
+    /// `x11-instance-name` — the X11 `WM_CLASS` *instance* part (`res_name`),
+    /// set independently of `class` (`res_class`) so WM rules written
+    /// `instance = …` match (Ghostty `x11-instance-name`). `None` = the
+    /// class name fills the slot.
+    pub x11_instance_name: Option<String>,
     /// Window decorations (Ghostty `window-decoration`): `false`/`none`
     /// maps the window borderless (title bar + frame removed).
     pub window_decoration: bool,
@@ -854,6 +863,7 @@ impl Default for AppConfig {
             window_theme: WindowTheme::Auto,
             window_title_font_family: None,
             app_class: None,
+            x11_instance_name: None,
             window_decoration: true,
             background_image: None,
             background_image_opacity: 1.0,
@@ -1077,13 +1087,53 @@ impl AppConfig {
         self.keybinds
             .iter()
             .rev() // last wins
-            .find(|(t, _)| match t.physical_code {
-                // Physical binds fire on key position regardless of the
-                // layout-translated character (unnamed keys included).
-                Some(pc) => pc == code && chord_mods(&t.chord) == mods_part,
-                None => chord.as_deref() == Some(t.chord.as_str()),
+            .find(|(t, _)| {
+                t.table.is_none()
+                    && match t.physical_code {
+                        // Physical binds fire on key position regardless of the
+                        // layout-translated character (unnamed keys included).
+                        Some(pc) => pc == code && chord_mods(&t.chord) == mods_part,
+                        None => chord.as_deref() == Some(t.chord.as_str()),
+                    }
             })
             .map(|(t, a)| (t.clone(), a.clone()))
+    }
+
+    /// Lookup with active key tables (Ghostty `key_table`). The stack is
+    /// searched innermost-last → outermost; the first table with an
+    /// entry for the key wins (an `unbind` there also shadows the outer
+    /// tables and the default map — the key then falls through to
+    /// literal bytes). Returns the matched table's name alongside the
+    /// entry so the caller can retire one-shot tables.
+    pub fn lookup_keybind_tabled(
+        &self,
+        key: &Key,
+        code: Code,
+        mods: Modifiers,
+        tables: &[String],
+    ) -> Option<(KeybindTrigger, Option<TermAction>, Option<String>)> {
+        let chord = chord_of(key, mods);
+        let mods_part = mods_prefix(mods);
+        let hit = |table: Option<&str>| {
+            self.keybinds
+                .iter()
+                .rev()
+                .find(|(t, _)| {
+                    t.table.as_deref() == table
+                        && match t.physical_code {
+                            Some(pc) => pc == code && chord_mods(&t.chord) == mods_part,
+                            None => chord.as_deref() == Some(t.chord.as_str()),
+                        }
+                })
+                .map(|(t, a)| (t.clone(), a.clone()))
+        };
+        for name in tables.iter().rev() {
+            if let Some(found) = hit(Some(name.as_str())) {
+                return Some((found.0, found.1, Some(name.clone())));
+            }
+        }
+        self.lookup_keybind(key, code, mods)
+            .map(|(t, a)| (t, a, None))
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -1717,6 +1767,15 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                // `x11-instance-name` — the WM_CLASS instance part
+                // (`Window::instance_name`, water-rs/hydrolysis#70 fix).
+                "x11-instance-name" => {
+                    cfg.x11_instance_name = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "window-decoration" => {
                     cfg.window_decoration = match value {
                         "false" => false,
@@ -2091,16 +2150,32 @@ impl AppConfig {
                     cfg.keybinds.clear();
                     cfg.keybinds_cleared = true;
                 }
-                "keybind" => match parse_keybind(value) {
-                    // Ghostty: triggers ignore prefixes — a later
-                    // `keybind` on the same chord replaces the earlier
-                    // entry wholesale, flags included.
-                    Ok((trig, action)) => {
-                        cfg.keybinds.retain(|(t, _)| t.chord != trig.chord);
-                        cfg.keybinds.push((trig, action));
+                "keybind" => {
+                    // `keybind = <table>/` (a table name and nothing
+                    // else) defines and clears that key table —
+                    // drops every earlier bind in it (Ghostty).
+                    let trig_text = value.split('=').next().unwrap_or("").trim();
+                    if !value.contains('=')
+                        && let Some(name) = trig_text.strip_suffix('/')
+                        && is_key_table_name(name)
+                    {
+                        cfg.keybinds
+                            .retain(|(t, _)| t.table.as_deref() != Some(name));
+                        continue;
                     }
-                    Err(e) => errors.push(format!("line {}: {e}", n + 1)),
-                },
+                    match parse_keybind(value) {
+                        // Ghostty: triggers ignore prefixes — a later
+                        // `keybind` on the same chord replaces the earlier
+                        // entry wholesale, flags included.
+                        Ok((trig, action)) => {
+                            cfg.keybinds.retain(|(t, _)| {
+                                t.chord != trig.chord || t.table != trig.table
+                            });
+                            cfg.keybinds.push((trig, action));
+                        }
+                        Err(e) => errors.push(format!("line {}: {e}", n + 1)),
+                    }
+                }
                 _ => errors.push(format!("line {}: unknown key {key:?}", n + 1)),
             }
         }
@@ -2454,6 +2529,13 @@ pub const ACTION_NAMES: &[&str] = &[
     "undo", "redo", "toggle_mark", "jump_to_mark:<previous|next>",
     "cursor_key:<up|down|left|right|home|end|page_up|page_down>",
     "hide_all_windows",
+    "move_tab_to_new_window",
+    "prompt_window_title", "set_window_title:<text>",
+    "toggle_mouse_reporting", "cancel", "open_url",
+    "next_split", "previous_split",
+    "<table>/<trigger>=<action>  (key table binds)",
+    "activate_key_table:<name>", "activate_key_table_once:<name>",
+    "deactivate_key_table", "deactivate_all_key_tables",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
@@ -2522,6 +2604,12 @@ fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
     }
 }
 
+/// A key-table name is non-empty and excludes `/`, `=`, `+`, `>`
+/// (Ghostty: `+`/`>` are keybind syntax).
+fn is_key_table_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '=', '+', '>'])
+}
+
 /// `ctrl+shift+c=copy` → (trigger, Some(Copy)); an empty action or
 /// `none`/`unbind` disables the chord.
 fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), String> {
@@ -2529,6 +2617,19 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
         .split_once('=')
         .ok_or_else(|| format!("keybind needs `<chord>=<action>`: {value:?}"))?;
     let raw = chord.trim();
+    // Ghostty key tables: `<table>/<trigger>` — the table name comes
+    // first and may contain anything except `/`, `=`, `+`, `>`
+    // (`+`/`>` are binding syntax). A leading segment with a `+` is a
+    // modifier, not a table (`ctrl+/` is a chord, not a table prefix).
+    let (table, raw) = match raw.split_once('/') {
+        Some((name, rest))
+            if is_key_table_name(name) =>
+        {
+            (Some(name.to_ascii_lowercase()), rest)
+        }
+        _ => (None, raw),
+    };
+    let raw = raw.trim();
     let lower = raw.to_ascii_lowercase();
     // Ghostty trigger prefixes — any order, each at most once:
     // `global:` (X11 root grab), `all:` (every surface), `unconsumed:`
@@ -2568,11 +2669,12 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
         unconsumed,
         performable,
         physical_code,
+        table,
     };
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
     let action = match lower.as_str() {
-        "" | "none" => None,
+        "" | "none" | "unbind" => None,
         _ => Some(
             action_from_str(&lower, action_raw)
                 .ok_or_else(|| format!("unknown action {action_raw:?}"))?,
@@ -2950,14 +3052,45 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "paste_from_selection" => TermAction::PasteFromSelection,
         "prompt_surface_title" => TermAction::PromptTitle,
         "prompt_tab_title" => TermAction::PromptTabTitle,
-        // Ghostty `set_surface_title:text` / `set_tab_title:text` — the
-        // raw payload keeps its case and spaces.
+        "prompt_window_title" => TermAction::PromptWindowTitle,
+        // Ghostty `set_surface_title:text` / `set_tab_title:text` /
+        // `set_window_title:text` — the raw payload keeps its case and
+        // spaces.
         _ if name.starts_with("set_surface_title:") => {
             TermAction::SetSurfaceTitle(raw["set_surface_title:".len()..].to_string())
         }
         _ if name.starts_with("set_tab_title:") => {
             TermAction::SetTabTitle(raw["set_tab_title:".len()..].to_string())
         }
+        _ if name.starts_with("set_window_title:") => {
+            TermAction::SetWindowTitle(raw["set_window_title:".len()..].to_string())
+        }
+        // Ghostty `move_tab_to_new_window` — detach the focused tab into
+        // a new OS window (drag tear-off's keybind spelling).
+        "move_tab_to_new_window" => TermAction::MoveTabToNewWindow,
+        // Ghostty `toggle_mouse_reporting` — stop forwarding pointer
+        // events to the program; the app recaptures them (selection,
+        // scroll, context menu) until toggled again.
+        "toggle_mouse_reporting" => TermAction::ToggleMouseReporting,
+        // Ghostty `cancel` — dismiss the open transient (search, hints,
+        // keyboard selection, prompts, palette).
+        "cancel" => TermAction::Cancel,
+        // Ghostty split focus shorthand for `goto_split:next|previous`.
+        "next_split" => TermAction::FocusNextPane,
+        "previous_split" => TermAction::FocusPrevPane,
+        // Ghostty `open_url` — open the link under the pointer.
+        "open_url" => TermAction::OpenUrlUnderCursor,
+        // Ghostty key tables (1.3): `activate_key_table:name` pushes a
+        // modal layer; `deactivate_key_table` pops the innermost;
+        // `deactivate_all_key_tables` clears the stack.
+        _ if name.starts_with("activate_key_table_once:") => {
+            TermAction::ActivateKeyTableOnce(raw["activate_key_table_once:".len()..].to_string())
+        }
+        _ if name.starts_with("activate_key_table:") => {
+            TermAction::ActivateKeyTable(raw["activate_key_table:".len()..].to_string())
+        }
+        "deactivate_key_table" => TermAction::DeactivateKeyTable,
+        "deactivate_all_key_tables" => TermAction::DeactivateAllKeyTables,
         "undo" => TermAction::Undo,
         "redo" => TermAction::Redo,
         "toggle_mark" => TermAction::ToggleMark,
@@ -4589,4 +4722,109 @@ mod tests {
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::Redo));
     }
 
+}
+
+#[cfg(test)]
+mod instance_name_parse_test {
+    use super::*;
+
+    #[test]
+    fn x11_instance_name_parses() {
+        let (cfg, errs) = AppConfig::parse("class = wmclass55\nx11-instance-name = wminst55\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.app_class.as_deref(), Some("wmclass55"));
+        assert_eq!(cfg.x11_instance_name.as_deref(), Some("wminst55"));
+    }
+}
+
+#[cfg(test)]
+mod key_table_tests {
+    use super::*;
+
+    #[test]
+    fn key_tables_parse_lookup_and_clear() {
+        // `keybind = <table>/<trigger>=<action>` + activation actions.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+shift+k=activate_key_table:resize\n\
+             keybind = resize/h=resize_split:left,10\n\
+             keybind = resize/l=resize_split:right,10\n\
+             keybind = resize/escape=deactivate_key_table\n\
+             keybind = ctrl+shift+j=activate_key_table_once:resize\n\
+             keybind = ctrl+shift+x=deactivate_all_key_tables\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds.len(), 6);
+        assert_eq!(
+            cfg.keybinds[1].0.table.as_deref(),
+            Some("resize"),
+            "table-tagged bind must carry its table"
+        );
+        assert_eq!(cfg.keybinds[0].0.table, None);
+
+        // Inactive table → the tabled bind must not fire.
+        assert!(
+            cfg.lookup_keybind_tabled(
+                &Key::Character("h".into()),
+                Code::Unidentified,
+                Modifiers::empty(),
+                &[],
+            )
+            .is_none()
+        );
+        // Active table: `h` hits the table, a key the table lacks falls
+        // through to the default map.
+        let active = vec!["resize".to_string()];
+        let hit = cfg.lookup_keybind_tabled(
+            &Key::Character("h".into()),
+            Code::Unidentified,
+            Modifiers::empty(),
+            &active,
+        );
+        assert_eq!(
+            hit.map(|(_, a, t)| (a.unwrap(), t)),
+            Some((
+                TermAction::ResizePane {
+                    horizontal: true,
+                    forward: false,
+                    px: 10
+                },
+                Some("resize".into())
+            ))
+        );
+        let miss = cfg.lookup_keybind_tabled(
+            &Key::Character("x".into()),
+            Code::Unidentified,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            &active,
+        );
+        assert_eq!(
+            miss.map(|(_, a, t)| (a.unwrap(), t)),
+            Some((TermAction::DeactivateAllKeyTables, None)),
+            "keys the table lacks fall through to the default map"
+        );
+        // An `unbind` inside the active table shadows the default map.
+        let (cfg2, errs) = AppConfig::parse(
+            "keybind = ctrl+shift+c=copy_to_clipboard\n\
+             keybind = sel/ctrl+shift+c=unbind\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        let hit = cfg2.lookup_keybind_tabled(
+            &Key::Character("c".into()),
+            Code::Unidentified,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            &["sel".to_string()],
+        );
+        assert_eq!(hit.map(|(_, a, t)| (a, t)), Some((None, Some("sel".into()))));
+        // `<table>/` clears the table's earlier binds.
+        let (cfg3, errs) = AppConfig::parse(
+            "keybind = vim/h=new_tab\nkeybind = vim/\nkeybind = vim/l=new_window\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg3.keybinds.len(), 1);
+        assert_eq!(cfg3.keybinds[0].0.chord, "l");
+        // `ctrl+/` is a chord, not a table prefix.
+        let (cfg4, errs) = AppConfig::parse("keybind = ctrl+/=cancel\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg4.keybinds[0].0.table, None);
+    }
 }

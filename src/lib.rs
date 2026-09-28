@@ -143,6 +143,13 @@ pub fn app(env: Environment) -> App {
     } else {
         window
     };
+    // `x11-instance-name` — the WM_CLASS instance half
+    // (`Window::instance_name`, water-rs/hydrolysis#70 fix).
+    let window = if let Some(inst) = state.config(|c| c.x11_instance_name.clone()) {
+        window.instance_name(Str::from(inst))
+    } else {
+        window
+    };
     // Window geometry: `window-save-state` restores the persisted frame;
     // otherwise `window-width`/`window-height` adjust the seeded 800x600
     // and `window-position-x`/`y` the origin (shared with `new_window`;

@@ -288,6 +288,15 @@ patched in-repo.
   silent dead code. Correct: `.detach()` for fire-and-forget, or keep
   the handle for cancellation. Real positive found in-tree:
   hydroterm's `animate_frame` animation task (see entry above).
+- `refcell_borrow_in_if_let_scrutinee` (r55): `if let X = cell.borrow()
+  { ... cell.borrow_mut() ... }` — the temporary borrow lives for the
+  whole `if let` block (it's part of the scrutinee expression), so the
+  borrow_mut inside panics at runtime. Real positive hit live:
+  surface.rs one-shot key-table retire crashed with `RefCell already
+  borrowed` on first invoke. Fix shape: bind the value in a `let`
+  before the `if let` so the borrow drops at the semicolon. Worth a
+  lints-crate rule: borrow_mut/borrow in the body of an `if let` whose
+  scrutinee borrows the same cell.
 - Existing entries unchanged.
 
 - **Physical-key (`physical:`) keybinds need winit `Code`, and it is already plumbed.** Tried: binding `physical:` triggers. Skill said nothing about physical vs logical keys; `keyboard-types` `Key` is the layout-translated character only, and on a non-QWERTY layout a char-based bind silently binds the wrong position. Actually true: hydrolysis forwards winit `physical_key` as `physical_code` on every key event (`src/platform.rs` `from_winit_code`/`logical:`-`code:` pair), and `keyboard_types::Code` has `FromStr` for the CamelCase names (`KeyA`, `Digit0`, `ArrowUp`, `F1`) — so position-based matching is a `Code` compare, no keymap work needed. Skill edit: one line in the input/keys reference — "key events carry both `key` (logical) and `physical_code` (position); use the latter for layout-independent binds."
@@ -355,3 +364,30 @@ patched in-repo.
   merge and that Water.lock is the certified resolution of the WHOLE
   managed build (app + scaffold extras like waterui-mcp), not a copy of
   upstream's lock.
+
+- **r55 cli behavior:** `water build`/`water run` regenerates
+  `hydrolysis/src/main.rs` from the scaffold template on every run —
+  local edits to that file (e.g. the `material_style()` call the
+  template drops) are overwritten silently. Keep the restored version
+  on disk and re-check it after any `water` invocation; do not rely on
+  it persisting.
+
+- **r55 update — byte-copy stays retired even after the upstream fix.**
+  Lexo asked whether water-rs/cli dev (`073a457` "seed from one
+  resolution" + `b93cd92`, plus our regression test at `34aa4fb`) lets
+  Water.lock return to the r47 byte-copy recipe. Verified empirically
+  (pristine clone at `2c141d5`, byte-copied waterui@ee85dc4 lock,
+  `water build --platform linux` with a `cargo install`ed fixed cli):
+  the seed now resolves — canonical lock owns every name it records —
+  but `validate_dependencies` still fails the build: any resolved
+  package that *replaces* a canonical identity within a compatible
+  range (`replaces_locked_package`: same name+source, resolved version
+  satisfies `^locked`) is a conflict. accesskit 0.25.1 vs canonical
+  0.25.0 is exactly that, plus ~30 more (objc2 family, wasm-bindgen
+  set, zerocopy ×2…). Plain byte-copy would need a
+  `[framework.packages.<name>] = "=<our version>"` sanction per
+  divergent package — strictly worse than the resolved-graph recipe,
+  which IS the sanctioned resolution. Verdict: **keep
+  resolved-graph Water.lock**; byte-copy only works when every pin
+  matches the framework's gitlinks AND the resolved graph adds
+  nothing the canonical lock doesn't already name.

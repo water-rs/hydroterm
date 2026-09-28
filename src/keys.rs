@@ -765,6 +765,33 @@ pub enum TermAction {
     /// Ghostty `hide_all_windows` — minimize every window of this
     /// instance (main, spawned, torn-off).
     HideAllWindows,
+    /// Ghostty `move_tab_to_new_window` — detach the focused tab (with
+    /// its live sessions) into a new OS window.
+    MoveTabToNewWindow,
+    /// Ghostty `prompt_window_title` — interactive rename of the window
+    /// title (until the next title change).
+    PromptWindowTitle,
+    /// Ghostty `set_window_title:text` — set the window title directly.
+    SetWindowTitle(String),
+    /// Ghostty `toggle_mouse_reporting` — stop forwarding pointer events
+    /// to the program; the app recaptures them (selection, scroll,
+    /// context menu) until toggled again. Per-surface.
+    ToggleMouseReporting,
+    /// Ghostty `cancel` — dismiss the open transient (hints, keyboard
+    /// selection, prompts, paste-confirm, search, palette).
+    Cancel,
+    /// Ghostty `open_url` — open the link under the pointer.
+    OpenUrlUnderCursor,
+    /// Ghostty `activate_key_table:name` — push a modal keybind layer;
+    /// stays until `deactivate_key_table` (or all-clear).
+    ActivateKeyTable(String),
+    /// Ghostty `activate_key_table_once:name` — like
+    /// `activate_key_table` but auto-pops when any binding fires.
+    ActivateKeyTableOnce(String),
+    /// Ghostty `deactivate_key_table` — pop the innermost key table.
+    DeactivateKeyTable,
+    /// Ghostty `deactivate_all_key_tables` — clear the whole stack.
+    DeactivateAllKeyTables,
 }
 
 /// Ghostty `cursor_key:<key>` key set.
