@@ -158,6 +158,9 @@ pub struct DrawContext<'a> {
     /// Points added to the font's underline offset and a stroke
     /// multiplier (Ghostty `adjust-underline-position` / `-thickness`).
     pub underline_adjust: (f32, f32),
+    /// `font-shaping-break = cursor` (Ghostty 1.2, default on): split
+    /// the shaping run at the cursor cell so a ligature never spans it.
+    pub shaping_break_cursor: bool,
     /// Same pair for strikethrough (Ghostty
     /// `adjust-strikethrough-position` / `-thickness`).
     pub strikethrough_adjust: (f32, f32),
@@ -460,12 +463,15 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> BezPath {
     .to_path(0.0)
 }
 
-/// Segment a row into same-style runs.
-fn style_runs(row: &[CellData]) -> Vec<(usize, usize, StyleKey)> {
+/// Split a row into same-style runs; `break_cell` additionally splits
+/// at that column and the one after (the `font-shaping-break = cursor`
+/// cut — a ligature can never span the cursor cell).
+fn style_runs(row: &[CellData], break_cell: Option<usize>) -> Vec<(usize, usize, StyleKey)> {
     let mut runs = Vec::new();
     let mut start = 0usize;
     for (i, cell) in row.iter().enumerate().skip(1) {
-        if cell.style != row[start].style {
+        let cut = break_cell.is_some_and(|c| i == c || i == c + 1);
+        if cell.style != row[start].style || cut {
             runs.push((start, i, row[start].style));
             start = i;
         }
@@ -529,7 +535,7 @@ pub fn draw_term(
             continue;
         }
         let y = row_y(pady, ch, row_i);
-        for (start, end, style) in style_runs(row) {
+        for (start, end, style) in style_runs(row, None) {
             // Cells on the default bg are covered by the base fill — skipping
             // them keeps explicit backgrounds opaque over a translucent base.
             if style.bg == theme_bg {
@@ -604,7 +610,11 @@ pub fn draw_term(
             continue;
         }
         let baseline_y = row_y(pady, ch, row_i) + m.baseline;
-        for (start, end, style) in style_runs(row) {
+        // `font-shaping-break = cursor`: break the run under the
+        // cursor so no ligature spans its cell (Ghostty default on).
+        let break_cell =
+            (ctx.shaping_break_cursor && row_i as i32 == cursor.row).then_some(cursor.col);
+        for (start, end, style) in style_runs(row, break_cell) {
             draw_text_run(
                 scene, row, start, end, style, row_i, padx, pady, baseline_y, ctx,
             );
@@ -1306,13 +1316,15 @@ fn paint_pad_extend(
             continue;
         }
         let line = row_i as i32 - display_offset;
-        let has_default = style_runs(row).iter().any(|(_, _, s)| s.bg == theme_bg);
+        let has_default = style_runs(row, None)
+            .iter()
+            .any(|(_, _, s)| s.bg == theme_bg);
         let is_prompt = crate::terminal::row_has_mark(term.grid(), cols, line);
         let powerline = has_powerline(term.grid(), cols, line);
         if !pad_vertical_ok(ctx.pad_mode, alt, has_default, is_prompt, powerline) {
             continue;
         }
-        for (start, end, style) in style_runs(row) {
+        for (start, end, style) in style_runs(row, None) {
             if style.bg == theme_bg {
                 continue;
             }

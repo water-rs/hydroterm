@@ -3980,6 +3980,7 @@ impl TermSurface {
                 }
             }),
             bold_color: self.app.config(|c| c.bold_color),
+            shaping_break_cursor: self.app.config(|c| c.font_shaping_break),
             cursor_blink: self.app.config(|c| c.cursor_blink),
             faint_opacity: self.app.config(|c| c.faint_opacity),
             min_contrast: self.app.config(|c| c.minimum_contrast),

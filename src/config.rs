@@ -502,6 +502,11 @@ pub struct AppConfig {
     /// (Ghostty default 0.5): blends the resolved fg toward the
     /// background.
     pub faint_opacity: f32,
+    /// `font-shaping-break` — Ghostty 1.2 `FontShapingBreak` packed
+    /// struct; the only member today is `cursor`: break shaping runs
+    /// under the cursor so a ligature can never span the cursor cell.
+    /// Default on (Ghostty's `cursor: bool = true`).
+    pub font_shaping_break: bool,
     /// Initial working directory when no OSC 7 cwd was reported
     /// (Ghostty `working-directory`); `~` expands at load.
     pub working_directory: Option<PathBuf>,
@@ -982,6 +987,7 @@ impl Default for AppConfig {
             vt_window_resize_allowed: false,
             bold_color: BoldColor::Bright,
             faint_opacity: 0.5,
+            font_shaping_break: true,
             working_directory: None,
             unfocused_split_opacity: 1.0,
             resize_overlay: ResizeOverlay::AfterFirst,
@@ -1120,6 +1126,7 @@ mouse-shift-capture = false # false | true | always | never — whether Shift re
 cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
 bold-color = bright        # bright | #rrggbb — bold-text color (unset = no override)
 faint-opacity = 0.5        # faint (SGR 2) text opacity, 0.0-1.0
+# font-shaping-break = cursor  # cursor|no-cursor — break ligatures under the cursor (default on)
 selection-clear-on-typing = true  # typing drops the selection highlight
 unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
 resize-overlay = after-first   # never | always | after-first — cols x rows chip while resizing
@@ -2384,6 +2391,26 @@ impl AppConfig {
                                 "line {}: bad font-feature {spec:?} (want -tag, +tag, tag or tag=N)",
                                 n + 1
                             ));
+                        }
+                    }
+                }
+                "font-shaping-break" => {
+                    // Ghostty `FontShapingBreak` packed struct (1.2+):
+                    // only member `cursor`. Named items set, `no-`
+                    // clears, empty clears all — assignment applies the
+                    // comma list in order.
+                    if value.trim().is_empty() {
+                        cfg.font_shaping_break = false;
+                    } else {
+                        for tok in value.split(',').map(str::trim) {
+                            match tok {
+                                "cursor" => cfg.font_shaping_break = true,
+                                "no-cursor" => cfg.font_shaping_break = false,
+                                _ => errors.push(format!(
+                                    "line {}: bad font-shaping-break {value:?} (cursor|no-cursor)",
+                                    n + 1
+                                )),
+                            }
                         }
                     }
                 }
@@ -5683,6 +5710,30 @@ mod key_table_tests {
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("zero windows"));
         let (_, errs) = AppConfig::parse("initial-window = maybe\n");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn parses_r64_keys() {
+        // `font-shaping-break` — Ghostty 1.2 `FontShapingBreak` packed
+        // struct: only member `cursor` (default on); `no-cursor` clears,
+        // empty clears all, comma list applies in order.
+        let (cfg, errs) = AppConfig::parse("");
+        assert!(errs.is_empty());
+        assert!(cfg.font_shaping_break);
+        let (cfg, errs) = AppConfig::parse("font-shaping-break = no-cursor\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.font_shaping_break);
+        let (cfg, errs) = AppConfig::parse("font-shaping-break = cursor\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.font_shaping_break);
+        let (cfg, errs) = AppConfig::parse("font-shaping-break = cursor,no-cursor\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.font_shaping_break);
+        let (cfg, errs) = AppConfig::parse("font-shaping-break = \n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.font_shaping_break);
+        let (_, errs) = AppConfig::parse("font-shaping-break = true\n");
         assert_eq!(errs.len(), 1);
     }
 }
