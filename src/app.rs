@@ -753,6 +753,13 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// `quit-after-last-window-closed-delay` armed flag — the timer thread
+/// exits the process at the deadline unless a new surface sets it first.
+/// Process-global (not per-`AppState`): the quit applies to the whole
+/// process, so a surface spawned in any window — including a drop-down —
+/// cancels it.
+static QUIT_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
 
 /// Extractor key for a pane's session — a local newtype because the
 /// orphan rule won't let `Extractor` (foreign) be implemented for
@@ -886,13 +893,7 @@ impl AppState {
             next_id: Arc::new(AtomicU64::new(0)),
         };
         if spawn_initial {
-            let first_tab = state.new_tab();
-            // Seed the embedded-focus owner so `.focused` grants key
-            // focus to the first pane at mount — the launch dead-keys
-            // fix (#29).
-            if let Some(t) = state.tabs.iter().find(|t| t.id == first_tab) {
-                state.focus_owner.set(Some((first_tab, t.focused.snapshot())));
-            }
+            state.open_first_tab();
         }
         // `initial-command` is consumed by the first session (like
         // xterm/kitty `-e`); `command` stays — it applies to every
@@ -1481,7 +1482,19 @@ impl AppState {
     /// `WindowManager` — `Window::show` mounts a real winit window.
     pub fn new_window(&self) {
         let Some(env) = self.env.get() else { return };
-        let state = AppState::new(Some(self.cfg.borrow().path.clone()), None);
+        // `spawn_initial = false`: the first tab is opened below, after
+        // `window-inherit-working-directory` seeds `working-directory` —
+        // inheriting post-construction is too late, the session already
+        // spawned.
+        let state = AppState::new_inner(Some(self.cfg.borrow().path.clone()), None, false);
+        if self.config(|c| c.inherit_working_directory)
+            && let Some(cwd) = self
+                .focused_session()
+                .and_then(|s| s.cwd.lock().unwrap().clone())
+        {
+            state.cfg.borrow_mut().config.working_directory = Some(cwd);
+        }
+        state.open_first_tab();
         // Same launch-time transparency as the main window.
         let opacity = state.config(|c| c.background_opacity);
         // `background =` overrides the theme's fill (same as the grid).
@@ -1742,6 +1755,11 @@ impl AppState {
         cwd: Option<std::path::PathBuf>,
         initial_size: Option<(usize, usize, (u16, u16))>,
     ) -> Rc<Session> {
+        // A surface arriving inside `quit-after-last-window-closed-delay`
+        // cancels the pending quit (covers tabs, splits, undo restores).
+        if let Some(cancel) = QUIT_CANCEL.lock().unwrap().take() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let id = self.alloc_id();
         let mut cfg = self.cfg.borrow().config.clone();
         // First surface: `initial-command` (`-e`) wins over `command`.
@@ -1771,12 +1789,24 @@ impl AppState {
         session
     }
 
+    /// Spawn the launch tab and seed the embedded-focus owner so
+    /// `.focused` grants key focus to the first pane at mount — the
+    /// launch dead-keys fix (#29). Called from `new_inner` and by
+    /// `new_window` after `window-inherit-working-directory` seeds
+    /// `working-directory`.
+    fn open_first_tab(&self) {
+        let first_tab = self.new_tab();
+        if let Some(t) = self.tabs.iter().find(|t| t.id == first_tab) {
+            self.focus_owner.set(Some((first_tab, t.focused.snapshot())));
+        }
+    }
+
     /// Spawn a session, wrap it in a new tab, select it. Inherits the OSC 7
     /// cwd of the currently focused session when the shell reported one
-    /// (`window-inherit-working-directory`).
+    /// (`tab-inherit-working-directory`).
     pub fn new_tab(&self) -> u64 {
         let cwd = self
-            .config(|c| c.inherit_working_directory)
+            .config(|c| c.tab_inherit_working_directory)
             .then(|| {
                 self.focused_session()
                     .and_then(|s| s.cwd.lock().unwrap().clone())
@@ -1834,15 +1864,16 @@ impl AppState {
     }
 
     /// Split the pane `target` of the selected tab in `dir`; the new pane
-    /// inherits the target's cwd.
+    /// inherits the target's cwd under `split-inherit-working-directory`.
     /// `before` puts the new pane ahead of the target (left/up split).
     pub fn split_pane(&self, dir: SplitDir, target: u64, before: bool) -> Option<u64> {
         let tab_id = self.selected.snapshot();
         let tab = self
             .tabs.iter().find(|t| t.id == tab_id)?;
         let cwd = self
-            .session(target)
-            .and_then(|s| s.cwd.lock().unwrap().clone());
+            .config(|c| c.split_inherit_working_directory)
+            .then(|| self.session(target).and_then(|s| s.cwd.lock().unwrap().clone()))
+            .flatten();
         // The new pane's slot: half the target's main-axis extent minus
         // the divider, full extent on the other axis — exact, from the
         // same math `SplitNode::split` seeds the shares with.
@@ -2380,11 +2411,34 @@ impl AppState {
             }
         }
         // `quit-after-last-window-closed` (default on, Ghostty/Linux):
-        // the last tab is gone, so is every session — exit.
+        // the last tab is gone, so is every session — exit. With
+        // `quit-after-last-window-closed-delay` the exit waits out the
+        // delay on a timer thread; a new surface anywhere in the process
+        // (new tab, undo restore, a quick-terminal window spawning)
+        // cancels it (checked on the flag at spawn_session).
         if self.tabs.is_empty()
+            && !self.is_quick
             && self.config(|c| c.quit_after_last_window_closed)
         {
-            self.quit();
+            match self.config(|c| c.quit_after_last_window_closed_delay) {
+                Some(delay) => {
+                    let mut armed = QUIT_CANCEL.lock().unwrap();
+                    if armed.is_none() {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        *armed = Some(cancel.clone());
+                        std::thread::Builder::new()
+                            .name("quit-delay".into())
+                            .spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+                                if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                                    std::process::exit(0);
+                                }
+                            })
+                            .ok();
+                    }
+                }
+                None => self.quit(),
+            }
         }
     }
 

@@ -339,6 +339,12 @@ pub struct AppConfig {
     pub quick_terminal_animation_duration: f32,
     /// `clipboard-trim` — trim whitespace at the ends of copied text.
     pub clipboard_trim: bool,
+    /// `notify-on-command-finish-action` — how a command-finish event
+    /// reports: `bell` = the bell features (default on), `notify` =
+    /// the freedesktop notify-send hop (default off). Comma list,
+    /// `no-` prefixes negate.
+    pub notify_on_command_finish_bell: bool,
+    pub notify_on_command_finish_notify: bool,
     /// `notify-on-command-finish` — raise the 🔔 notification when a
     /// command completes (Ghostty; requires OSC 133 marks).
     pub notify_on_command_finish: NotifyWhen,
@@ -402,6 +408,15 @@ pub struct AppConfig {
     /// bypasses reporting so click/drag selects terminal text
     /// (Ghostty `mouse-shift-capture`, default `false` = bypass).
     pub mouse_shift_capture: MouseShiftCapture,
+    /// `mouse-reporting` — false means pointer events are never
+    /// reported to the program even if it asks (Ghostty
+    /// `mouse-reporting`, default true; `toggle_mouse_reporting`
+    /// is the runtime form).
+    pub mouse_reporting: bool,
+    /// `clipboard-codepoint-map` — per-copy codepoint rewrites,
+    /// `U+AAAA[-U+BBBB]=U+XXXX` or `=literal text` (repeatable,
+    /// first matching range wins).
+    pub clipboard_codepoint_map: Vec<(u32, u32, String)>,
     /// `clipboard-read` — policy for program clipboard reads via
     /// OSC 52 `?` requests (Ghostty `clipboard-read`, default ask).
     pub clipboard_read: ClipboardRead,
@@ -529,6 +544,11 @@ pub struct AppConfig {
     /// Quit the app when the last tab/surface closes (Ghostty
     /// `quit-after-last-window-closed`, default true on Linux).
     pub quit_after_last_window_closed: bool,
+    /// Seconds the process stays up after the last surface closes
+    /// before quitting (Ghostty `quit-after-last-window-closed-delay`;
+    /// a surface spawned inside the delay cancels it). `None` = exit
+    /// immediately.
+    pub quit_after_last_window_closed_delay: Option<f64>,
     /// Glyph color under the block cursor (Ghostty `cursor-text`);
     /// `None` = the inverted cell color.
     pub cursor_text: Option<Rgb>,
@@ -633,9 +653,19 @@ pub struct AppConfig {
     /// `window-new-tab-position = end|current` — where a new tab is
     /// inserted in the strip (Ghostty `window-new-tab-position`).
     pub new_tab_position: NewTabPosition,
-    /// New tab inherits the focused surface's OSC 7 working directory
-    /// (Ghostty `window-inherit-working-directory`, default true).
+    /// New window inherits the focused surface's OSC 7 working
+    /// directory (Ghostty `window-inherit-working-directory`,
+    /// default true). A new window is a fresh `AppState`, so the
+    /// inherit lands as an override on its `working-directory`.
     pub inherit_working_directory: bool,
+    /// New tab inherits the focused surface's OSC 7 working
+    /// directory (Ghostty `tab-inherit-working-directory`,
+    /// default true).
+    pub tab_inherit_working_directory: bool,
+    /// New split inherits the split-off pane's OSC 7 working
+    /// directory (Ghostty `split-inherit-working-directory`,
+    /// default true).
+    pub split_inherit_working_directory: bool,
     /// New tab/window/pane inherits the focused surface's live font
     /// size instead of the config value (Ghostty
     /// `window-inherit-font-size`, default true).
@@ -797,8 +827,12 @@ impl Default for AppConfig {
             paste_protection: true,
             mouse_hide_typing: true,
             mouse_shift_capture: MouseShiftCapture::False,
+            mouse_reporting: true,
+            clipboard_codepoint_map: Vec::new(),
             notify_on_command_finish: NotifyWhen::No,
             notify_on_command_finish_after: 5.0,
+            notify_on_command_finish_bell: true,
+            notify_on_command_finish_notify: false,
             clipboard_read: ClipboardRead::Ask,
             cursor_invert_fg_bg: true,
             cursor_click_to_move: false,
@@ -839,6 +873,7 @@ impl Default for AppConfig {
             abnormal_command_exit_runtime: 250,
             desktop_notifications: true,
             quit_after_last_window_closed: true,
+            quit_after_last_window_closed_delay: None,
             split_divider_color: None,
             selection_background: None,
             unfocused_split_fill: None,
@@ -871,6 +906,8 @@ impl Default for AppConfig {
             background_image_repeat: false,
             new_tab_position: NewTabPosition::End,
             inherit_working_directory: true,
+            tab_inherit_working_directory: true,
+            split_inherit_working_directory: true,
             inherit_font_size: true,
             scroll_to_cursor: true,
             tab_bar_min_tabs: 1,
@@ -954,7 +991,9 @@ focus-follows-mouse = false
 # osc-color-report-format = 16-bit  # 8-bit | 16-bit | none — OSC 4/10/11/12 reply width
 # working-directory = ~/projects   # initial cwd when no OSC 7 report
 # window-new-tab-position = end    # end | current — where new tabs insert
-# window-inherit-working-directory = true  # new tab takes focused pane's OSC 7 cwd
+# window-inherit-working-directory = true  # new window takes focused pane's OSC 7 cwd
+# tab-inherit-working-directory = true     # new tab ditto
+# split-inherit-working-directory = true   # new split ditto
 # window-inherit-font-size = true  # new tab takes focused pane's live zoom
 
 # Theme: auto | hydroterm-dark | hydroterm-light |
@@ -970,6 +1009,7 @@ shell-integration = detect  # detect | none | bash | zsh | fish
 bell-features = system,audio,attention,title  # bell channels (no-X disables; `visual` = pane flash extension)
 notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
 notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
+# notify-on-command-finish-action = bell  # bell | notify, comma list, no- negates (bell on, notify off)
 desktop-notifications = true    # OSC 9/777 may emit freedesktop notifications
 abnormal-command-exit-runtime = 250  # ms — a command dying faster stays held open with a notice
 grapheme-width-method = unicode # unicode | legacy — ZWJ clusters share cells vs per-scalar cells
@@ -1033,6 +1073,9 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # keybind = performable:ctrl+c=copy_to_clipboard      # fires only while copyable;
 #                                                      # falls through to ^C otherwise
 # keybind = unconsumed:alt+z=set_tab_title:hi          # fires AND ^[z reaches shell
+# keybind = ctrl+alt+n=new_tab
+# keybind = chain=prompt_surface_title                  # chain= runs right after the
+#                                                        # most recent keybind's action
 # scroll-to-bottom = keystroke,output   # keystroke on by default; output off
 # tab-bar-min-tabs = 2    # hide the tab strip until N tabs exist
 # selection-word-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
@@ -1043,6 +1086,9 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 #                                  # left/right; edge docks maximize the rest
 # shell-integration-features = cursor,sudo,title   # prefix a feature with no- to disable
 # clipboard-trim-trailing-spaces = true   # trim whitespace at the ends of copied text
+# clipboard-codepoint-map = U+2500=U+002D  # rewrite copied codepoints: U+X[-U+Y]=U+Z or =text
+# mouse-reporting = false   # never report pointer events to apps that ask (default true)
+# quit-after-last-window-closed-delay = 10s  # hold the last-close quit; a new surface cancels
 # keybind = ctrl+shift+q=unbind   # unbind a chord (falls through to literal keys)
 
 # Alpha of the terminal background fill (0..1); set below 1.0 at launch
@@ -1422,6 +1468,24 @@ impl AppConfig {
                     "deny" | "never" => cfg.clipboard_read = ClipboardRead::Deny,
                     _ => errors.push(format!("line {}: bad clipboard-read {value:?}", n + 1)),
                 },
+                // Ghostty `notify-on-command-finish-action` — a comma
+                // list of `bell`/`notify` with `no-` negation, applied
+                // over the built-in set (bell on, notify off).
+                "notify-on-command-finish-action" => {
+                    for tok in value.split(',') {
+                        let tok = tok.trim();
+                        match tok {
+                            "bell" => cfg.notify_on_command_finish_bell = true,
+                            "no-bell" => cfg.notify_on_command_finish_bell = false,
+                            "notify" => cfg.notify_on_command_finish_notify = true,
+                            "no-notify" => cfg.notify_on_command_finish_notify = false,
+                            _ => errors.push(format!(
+                                "line {}: bad notify-on-command-finish-action token {tok:?}",
+                                n + 1
+                            )),
+                        }
+                    }
+                }
                 "notify-on-command-finish" => {
                     cfg.notify_on_command_finish = match value {
                         "no" => NotifyWhen::No,
@@ -1486,6 +1550,9 @@ impl AppConfig {
                     "false" | "0" => cfg.mouse_hide_typing = false,
                     _ => errors.push(format!("line {}: bad mouse-hide-while-typing {value:?}", n + 1)),
                 },
+                "mouse-reporting" => {
+                    cfg.mouse_reporting = bool_value(value, n, &mut errors);
+                }
                 "theme" => {
                     if value.eq_ignore_ascii_case("auto") {
                         cfg.theme = ThemeRef::Auto;
@@ -1569,6 +1636,15 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "clipboard-codepoint-map" => {
+                    match parse_clipboard_codepoint_map(value) {
+                        Some(entry) => cfg.clipboard_codepoint_map.push(entry),
+                        None => errors.push(format!(
+                            "line {}: bad clipboard-codepoint-map {value:?} (want U+AAAA[-U+BBBB]=U+XXXX or =text)",
+                            n + 1
+                        )),
+                    }
+                }
                 // Ghostty `bell-features` — a comma list naming the enabled
                 // bell channels; `no-<name>` disables and an empty value
                 // turns every channel off (the reference's packed-set
@@ -1740,6 +1816,20 @@ impl AppConfig {
                 "quit-after-last-window-closed" => {
                     cfg.quit_after_last_window_closed = bool_value(value, n, &mut errors);
                 }
+                "quit-after-last-window-closed-delay" => {
+                    match parse_duration_ms(value) {
+                        // Ghostty clamps below 1s up to 1s; `0` disables
+                        // (we keep None = immediate as the unset form).
+                        Some(ms) => {
+                            cfg.quit_after_last_window_closed_delay =
+                                Some((ms as f64 / 1000.0).max(1.0));
+                        }
+                        None => errors.push(format!(
+                            "line {}: bad quit-after-last-window-closed-delay {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
                 "window-theme" => match value {
                     "auto" => cfg.window_theme = WindowTheme::Auto,
                     "system" => cfg.window_theme = WindowTheme::System,
@@ -1834,6 +1924,12 @@ impl AppConfig {
                 }
                 "window-inherit-working-directory" => {
                     cfg.inherit_working_directory = bool_value(value, n, &mut errors);
+                }
+                "tab-inherit-working-directory" => {
+                    cfg.tab_inherit_working_directory = bool_value(value, n, &mut errors);
+                }
+                "split-inherit-working-directory" => {
+                    cfg.split_inherit_working_directory = bool_value(value, n, &mut errors);
                 }
                 "window-inherit-font-size" => {
                     cfg.inherit_font_size = bool_value(value, n, &mut errors);
@@ -2151,6 +2247,34 @@ impl AppConfig {
                     cfg.keybinds_cleared = true;
                 }
                 "keybind" => {
+                    // `keybind = chain=<action>` (Ghostty chained
+                    // actions): appends to the most recently defined
+                    // keybind, so the chord runs its action list in
+                    // order. The chained entry has no trigger of its
+                    // own — prefixes do not exist on it.
+                    if let Some(rest) = value.strip_prefix("chain=") {
+                        let act = rest.trim();
+                        let Some(action) = action_from_str(&act.to_lowercase(), act) else {
+                            errors.push(format!("line {}: bad chain= action {act:?}", n + 1));
+                            continue;
+                        };
+                        match cfg.keybinds.last_mut().map(|(_, a)| a) {
+                            Some(Some(TermAction::Sequence(seq))) => seq.push(action),
+                            Some(Some(prev)) => {
+                                let first = std::mem::replace(prev, TermAction::Ignore);
+                                *prev = TermAction::Sequence(vec![first, action]);
+                            }
+                            Some(None) => errors.push(format!(
+                                "line {}: chain= follows an unbind on line {}",
+                                n + 1, n
+                            )),
+                            None => errors.push(format!(
+                                "line {}: chain= with no preceding keybind",
+                                n + 1
+                            )),
+                        }
+                        continue;
+                    }
                     // `keybind = <table>/` (a table name and nothing
                     // else) defines and clears that key table —
                     // drops every earlier bind in it (Ghostty).
@@ -2451,25 +2575,6 @@ fn expand_home(value: &str) -> PathBuf {
 
 /// `#rgb` / `#rrggbb` / `0xrrggbb` → a terminal RGB. No names,
 /// no alpha — those live in the theme, not the override keys.
-/// Parse `U+AAAA[-U+BBBB]=Family Name` (Ghostty `font-codepoint-map`).
-fn parse_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
-    let (range, family) = value.split_once('=')?;
-    let family = family.trim();
-    if family.is_empty() {
-        return None;
-    }
-    let hex = |s: &str| -> Option<u32> {
-        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
-    };
-    let mut parts = range.splitn(2, '-');
-    let lo = hex(parts.next()?)?;
-    let hi = match parts.next() {
-        Some(h) => hex(h)?,
-        None => lo,
-    };
-    (hi >= lo).then(|| (lo, hi, family.to_string()))
-}
-
 fn parse_rgb(value: &str) -> Option<Rgb> {
     let hex = value
         .strip_prefix('#')
@@ -2490,6 +2595,50 @@ fn parse_rgb(value: &str) -> Option<Rgb> {
         }),
         _ => None,
     }
+}
+
+/// Parse `U+AAAA[-U+BBBB]=Family Name` (Ghostty `font-codepoint-map`).
+fn parse_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
+    let (range, family) = value.split_once('=')?;
+    let family = family.trim();
+    if family.is_empty() {
+        return None;
+    }
+    let hex = |s: &str| -> Option<u32> {
+        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
+    };
+    let mut parts = range.splitn(2, '-');
+    let lo = hex(parts.next()?)?;
+    let hi = match parts.next() {
+        Some(h) => hex(h)?,
+        None => lo,
+    };
+    (hi >= lo).then(|| (lo, hi, family.to_string()))
+}
+
+/// Parse `U+AAAA[-U+BBBB]=U+XXXX` or `=literal` (Ghostty
+/// `clipboard-codepoint-map`): the replacement is a single
+/// codepoint when written `U+XXXX`, else verbatim text.
+fn parse_clipboard_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
+    let (range, to) = value.split_once('=')?;
+    let hex = |s: &str| -> Option<u32> {
+        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
+    };
+    let mut parts = range.splitn(2, '-');
+    let lo = hex(parts.next()?)?;
+    let hi = match parts.next() {
+        Some(h) => hex(h)?,
+        None => lo,
+    };
+    let to = to.trim();
+    if to.is_empty() || hi < lo {
+        return None;
+    }
+    let repl = match to.strip_prefix("U+") {
+        Some(h) => char::from_u32(u32::from_str_radix(h, 16).ok()?)?.to_string(),
+        None => to.to_string(),
+    };
+    Some((lo, hi, repl))
 }
 
 /// Every action name the `keybind` parser accepts — printed by
@@ -4826,5 +4975,88 @@ mod key_table_tests {
         let (cfg4, errs) = AppConfig::parse("keybind = ctrl+/=cancel\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg4.keybinds[0].0.table, None);
+    }
+
+    #[test]
+    fn parses_r58_keys() {
+        // `keybind = chain=<action>` appends to the previous bind; a
+        // second chain appends again, producing a flat Sequence.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+n=new_tab\n\
+             keybind = chain=prompt_surface_title\n\
+             keybind = chain=goto_split:left\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::Sequence(vec![
+                TermAction::NewTab,
+                TermAction::PromptTitle,
+                TermAction::FocusPaneDir { horizontal: true, forward: false },
+            ]))
+        );
+        // `chain=` with no preceding keybind, or after an unbind, errors.
+        let (_, errs) = AppConfig::parse("keybind = chain=new_tab\n");
+        assert_eq!(errs.len(), 1);
+        let (_, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+z=unbind\nkeybind = chain=new_tab\n",
+        );
+        assert_eq!(errs.len(), 1, "unbind+chain errs: {errs:?}");
+        let (_, errs) = AppConfig::parse(
+            "keybind = ctrl+shift+x=ignore\nkeybind = chain=bogus_action\n",
+        );
+        assert_eq!(errs.len(), 1, "ignore+chain-bogus errs: {errs:?}");
+
+        // `mouse-reporting` bool.
+        let (cfg, errs) = AppConfig::parse("mouse-reporting = false\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.mouse_reporting);
+
+        // `clipboard-codepoint-map` — codepoint and text replacements.
+        let (cfg, errs) = AppConfig::parse(
+            "clipboard-codepoint-map = U+2500=U+002D\n\
+             clipboard-codepoint-map = U+2502=|\n\
+             clipboard-codepoint-map = U+2580-U+259F=>block<\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.clipboard_codepoint_map,
+            vec![
+                (0x2500, 0x2500, "-".to_string()),
+                (0x2502, 0x2502, "|".to_string()),
+                (0x2580, 0x259F, ">block<".to_string()),
+            ]
+        );
+        let (_, errs) = AppConfig::parse("clipboard-codepoint-map = U+2500=\n");
+        assert_eq!(errs.len(), 1);
+        let (_, errs) = AppConfig::parse("clipboard-codepoint-map = 2500=U+002D\n");
+        assert_eq!(errs.len(), 1);
+
+        // `*-inherit-working-directory` trio defaults true, each parses.
+        let (cfg, errs) = AppConfig::parse(
+            "window-inherit-working-directory = false\n\
+             tab-inherit-working-directory = false\n\
+             split-inherit-working-directory = false\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.inherit_working_directory);
+        assert!(!cfg.tab_inherit_working_directory);
+        assert!(!cfg.split_inherit_working_directory);
+
+        // `quit-after-last-window-closed-delay` — seconds, clamped ≥1.
+        let (cfg, errs) = AppConfig::parse("quit-after-last-window-closed-delay = 5s\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.quit_after_last_window_closed_delay, Some(5.0));
+        let (cfg, errs) = AppConfig::parse("quit-after-last-window-closed-delay = 200ms\n");
+        assert!(errs.is_empty());
+        assert_eq!(cfg.quit_after_last_window_closed_delay, Some(1.0));
+
+        // `notify-on-command-finish-action` — comma set + no- negation.
+        let (cfg, errs) = AppConfig::parse("notify-on-command-finish-action = no-bell,notify\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.notify_on_command_finish_bell);
+        assert!(cfg.notify_on_command_finish_notify);
+        let (_, errs) = AppConfig::parse("notify-on-command-finish-action = sparkle\n");
+        assert_eq!(errs.len(), 1);
     }
 }

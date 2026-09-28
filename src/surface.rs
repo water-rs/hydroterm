@@ -826,13 +826,28 @@ impl TermSurface {
     }
 
     /// `clipboard-trim` — strip whitespace at the ends of copied text
-    /// (the per-line trailing pads are already gone).
+    /// (the per-line trailing pads are already gone); then
+    /// `clipboard-codepoint-map` rewrites mapped codepoints (first
+    /// matching range wins).
     fn trimmed_copy(&self, text: String) -> String {
-        if self.app.config(|c| c.clipboard_trim) {
+        let text = if self.app.config(|c| c.clipboard_trim) {
             text.trim().to_owned()
         } else {
             text
+        };
+        let map = self.app.config(|c| c.clipboard_codepoint_map.clone());
+        if map.is_empty() {
+            return text;
         }
+        let mut out = String::with_capacity(text.len());
+        for ch in text.chars() {
+            let cp = ch as u32;
+            match map.iter().find(|(lo, hi, _)| cp >= *lo && cp <= *hi) {
+                Some((_, _, repl)) => out.push_str(repl),
+                None => out.push(ch),
+            }
+        }
+        out
     }
 
     /// The explicit Copy action writes CLIPBOARD only — PRIMARY
@@ -1934,22 +1949,32 @@ impl TermSurface {
                                 crate::config::NotifyWhen::No => false,
                             };
                         if fire {
-                            if self.app.config(|c| c.visual_bell) {
-                                self.bell_at = Some(Instant::now());
+                            // `notify-on-command-finish-action`:
+                            // `bell` (default) = the bell features,
+                            // `notify` = the freedesktop hop.
+                            let (do_bell, do_notify) = self.app.config(|c| {
+                                (c.notify_on_command_finish_bell, c.notify_on_command_finish_notify)
+                            });
+                            if do_bell {
+                                if self.app.config(|c| c.visual_bell) {
+                                    self.bell_at = Some(Instant::now());
+                                }
+                                if self.app.config(|c| c.bell_attention) {
+                                    *self.session.notify_badge.lock().unwrap() = true;
+                                    self.app.tab_badge(self.session.id, true);
+                                }
+                                if self.app.config(|c| c.bell_border) {
+                                    self.bell_border = true;
+                                }
+                                if self.app.config(|c| c.bell_title) {
+                                    self.app.set_session_title(
+                                        self.session.id,
+                                        Str::from("\u{1f514} Command finished"),
+                                    );
+                                }
                             }
-                            notify_desktop("hydroterm", "Command finished");
-                            if self.app.config(|c| c.bell_attention) {
-                                *self.session.notify_badge.lock().unwrap() = true;
-                            self.app.tab_badge(self.session.id, true);
-                            }
-                            if self.app.config(|c| c.bell_border) {
-                                self.bell_border = true;
-                            }
-                            if self.app.config(|c| c.bell_title) {
-                                self.app.set_session_title(
-                                    self.session.id,
-                                    Str::from("\u{1f514} Command finished"),
-                                );
+                            if do_notify {
+                                notify_desktop("hydroterm", "Command finished");
                             }
                         }
                     }
@@ -2755,11 +2780,13 @@ impl TermSurface {
     }
 
     /// The term's mode as the mouse path sees it — `toggle_mouse_reporting`
-    /// masks the program's DEC mouse bits (1000/1002/1003 + encodings) so
-    /// pointer events stay local while toggled off.
+    /// and `mouse-reporting = false` both mask the program's DEC mouse
+    /// bits (1000/1002/1003 + encodings) so pointer events stay local.
     fn mouse_mode(&self) -> TermMode {
         let mode = *self.session.terminal.term.lock().mode();
-        if self.session.mouse_reporting_off.get() {
+        if self.session.mouse_reporting_off.get()
+            || !self.app.config(|c| c.mouse_reporting)
+        {
             mode & !TermMode::MOUSE_MODE
         } else {
             mode
