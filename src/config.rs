@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
-use keyboard_types::{Key, Modifiers, NamedKey};
+use keyboard_types::{Code, Key, Modifiers, NamedKey};
 
 use crate::keys::{AdjustSel, FileSink, TermAction};
 use crate::theme::Theme;
@@ -247,6 +247,10 @@ pub struct KeybindTrigger {
     pub unconsumed: bool,
     /// `performable:` — only fire while the action is performable.
     pub performable: bool,
+    /// `physical:` — match the physical key position (winit `Code`),
+    /// not the layout-translated character. `chord` then stores only
+    /// the modifier prefix (`ctrl+shift+`) for compare.
+    pub physical_code: Option<Code>,
 }
 
 /// Fully-resolved settings — defaults plus file overrides.
@@ -658,6 +662,15 @@ pub struct AppConfig {
     /// (the focused match).
     pub search_selected_foreground: Option<Rgb>,
     pub search_selected_background: Option<Rgb>,
+    /// `split-preserve-zoom` — `navigation` moves the zoom to the
+    /// split `goto_split` focuses instead of unzooming; every layout
+    /// change (split/close/resize/equalize) still unzooms (Ghostty
+    /// 1.3 `navigation`; `no-navigation` disables, default).
+    pub split_preserve_zoom_navigation: bool,
+    /// `config-default-files` — when false, stop loading the remaining
+    /// default locations (`$XDG_CONFIG_DIRS` then `$XDG_CONFIG_HOME`;
+    /// a `--config` path already stands alone).
+    pub config_default_files: bool,
 }
 
 /// `window-theme` values.
@@ -825,6 +838,8 @@ impl Default for AppConfig {
             search_background: None,
             search_selected_foreground: None,
             search_selected_background: None,
+            split_preserve_zoom_navigation: false,
+            config_default_files: true,
             paste_bracketed_safe: true,
             image_storage_limit: 320 * 1024 * 1024,
             config_files: Vec::new(),
@@ -941,6 +956,8 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # app-notifications = no-clipboard-copy   # gate in-app toasts: clipboard-copy | config-reload (no- disables)
 # selection-clear-on-copy = true         # drop the selection after copy_to_clipboard
 # undo-timeout = 5s                       # how long `undo` can reopen a closed surface (0 = undo off)
+# split-preserve-zoom = navigation         # zoom follows goto_split instead of unzooming (default unzooms)
+# config-default-files = true              # load $XDG_CONFIG_DIRS + $XDG_CONFIG_HOME configs (false stops the chain)
 # title-report = false                    # let apps query the window title via CSI 21 t (OSC l <title> ST)
 # search-foreground = #101418             # search match colors (selected-* = the focused match)
 # search-background = #ffd75f
@@ -1000,16 +1017,26 @@ impl AppConfig {
     /// action is an explicit `unbind`, `None` overall = no entry.
     /// `global:` binds match here too — while the root grab is live the
     /// grabbed key never reaches the window, so there is no double-fire.
+    /// `physical:` triggers compare `code` (the key POSITION), not the
+    /// layout-translated character — their `chord` field carries only
+    /// the modifier prefix for compare (`<mods>physical:<name>`).
     pub fn lookup_keybind(
         &self,
         key: &Key,
+        code: Code,
         mods: Modifiers,
     ) -> Option<(KeybindTrigger, Option<TermAction>)> {
-        let chord = chord_of(key, mods)?;
+        let chord = chord_of(key, mods);
+        let mods_part = mods_prefix(mods);
         self.keybinds
             .iter()
             .rev() // last wins
-            .find(|(t, _)| t.chord == chord)
+            .find(|(t, _)| match t.physical_code {
+                // Physical binds fire on key position regardless of the
+                // layout-translated character (unnamed keys included).
+                Some(pc) => pc == code && chord_mods(&t.chord) == mods_part,
+                None => chord.as_deref() == Some(t.chord.as_str()),
+            })
             .map(|(t, a)| (t.clone(), a.clone()))
     }
 
@@ -1941,6 +1968,22 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "split-preserve-zoom" => match value {
+                    "navigation" => cfg.split_preserve_zoom_navigation = true,
+                    "no-navigation" => cfg.split_preserve_zoom_navigation = false,
+                    _ => errors.push(format!(
+                        "line {}: bad split-preserve-zoom {value:?} (want navigation|no-navigation)",
+                        n + 1
+                    )),
+                },
+                "config-default-files" => match value {
+                    "true" | "yes" => cfg.config_default_files = true,
+                    "false" | "no" => cfg.config_default_files = false,
+                    _ => errors.push(format!(
+                        "line {}: bad config-default-files {value:?}",
+                        n + 1
+                    )),
+                },
                 // Expansion happens in `load` (the directive's file text is
                 // spliced in before `parse` runs); the surviving line only
                 // records the path for diagnostics.
@@ -1974,6 +2017,84 @@ impl AppConfig {
 
     /// Load a config file; a missing file yields defaults and a template
     /// is written so the user can discover the format.
+    /// Every default config location in load order (later wins):
+    /// each `$XDG_CONFIG_DIRS` entry's `hydroterm/config`, then
+    /// `$XDG_CONFIG_HOME/hydroterm/config` (highest precedence).
+    /// `XDG_CONFIG_DIRS` unset falls back to `/etc/xdg` (freedesktop).
+    pub fn default_paths() -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        match std::env::var_os("XDG_CONFIG_DIRS") {
+            Some(dirs) => {
+                for d in std::env::split_paths(&dirs) {
+                    out.push(d.join("hydroterm/config"));
+                }
+            }
+            None => out.push(PathBuf::from("/etc/xdg/hydroterm/config")),
+        }
+        out.push(default_path());
+        out
+    }
+
+    /// Load the default locations in precedence order — the reference
+    /// reads every default file, lowest precedence first. A file that
+    /// sets `config-default-files = false` ends the chain early (the
+    /// flag's file itself still applies). Missing files are skipped,
+    /// except the XDG_CONFIG_HOME path, which gets the template like
+    /// `load` does.
+    pub fn load_defaults() -> (Self, Vec<String>) {
+        let mut texts = String::new();
+        let mut errors: Vec<String> = Vec::new();
+        let home = default_path();
+        let paths = Self::default_paths();
+        let mut applied: Vec<PathBuf> = Vec::new();
+        for path in &paths {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => Some(t),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if path == &home {
+                        // Last path = the home file: seed the template
+                        // and take its contents so reload tests see it.
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(path, TEMPLATE);
+                        Some(TEMPLATE.to_string())
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("reading {}: {e}", path.display()));
+                    None
+                }
+            };
+            let Some(text) = text else { continue };
+            applied.push(path.clone());
+            // Includes splice per file so a `config-file =` path resolves
+            // against its own directory, not the chain's.
+            let mut visited = std::collections::HashSet::new();
+            if let Ok(canon) = path.canonicalize() {
+                visited.insert(canon);
+            }
+            let mut warnings = Vec::new();
+            let expanded = expand_includes(&text, path, &mut visited, &mut warnings);
+            errors.extend(warnings);
+            texts.push_str(&expanded);
+            // `config-default-files = false` ends the chain after this
+            // file's own lines have applied.
+            if !Self::parse(&expanded).0.config_default_files {
+                break;
+            }
+        }
+        let (mut cfg, errs) = Self::parse(&texts);
+        errors.extend(errs);
+        // `config_files` records the default locations actually applied
+        // (the chain stops early on `config-default-files = false`).
+        applied.extend(std::mem::take(&mut cfg.config_files));
+        cfg.config_files = applied;
+        (cfg, errors)
+    }
+
     pub fn load(path: &Path) -> (Self, Vec<String>) {
         match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -2238,7 +2359,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "goto_split:<previous|next>  (pane focus cycle)",
     "toggle_split_zoom", "equalize_splits",
     "sequence:<a,b,…>  (run every action on one chord)",
-    "undo", "toggle_mark", "jump_to_mark:<previous|next>",
+    "undo", "redo", "toggle_mark", "jump_to_mark:<previous|next>",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
@@ -2319,8 +2440,8 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
     // `global:` (X11 root grab), `all:` (every surface), `unconsumed:`
     // (fire the action and still send the encoded key), `performable:`
     // (fire only while performable). e.g. `global:unconsumed:ctrl+a`.
-    let (mut global, mut all, mut unconsumed, mut performable) =
-        (false, false, false, false);
+    let (mut global, mut all, mut unconsumed, mut performable, mut physical) =
+        (false, false, false, false, false);
     let mut rest = lower.as_str();
     while let Some((prefix, tail)) = rest.split_once(':') {
         let flag = match prefix {
@@ -2328,6 +2449,7 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
             "all" => &mut all,
             "unconsumed" => &mut unconsumed,
             "performable" => &mut performable,
+            "physical" => &mut physical,
             _ => break,
         };
         if *flag {
@@ -2336,12 +2458,22 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
         *flag = true;
         rest = tail;
     }
+    // `physical:` keeps the modifier prefix for compare and resolves the
+    // key name to its physical `Code` (US-layout position) — `physical:e`
+    // fires on the E-position key whatever the layout maps there.
+    let (chord, physical_code) = if physical {
+        let (mods, name, code) = parse_physical_chord(rest)?;
+        (format!("{mods}physical:{name}"), Some(code))
+    } else {
+        (normalize_chord(rest)?, None)
+    };
     let chord = KeybindTrigger {
-        chord: normalize_chord(rest)?,
+        chord,
         global,
         all,
         unconsumed,
         performable,
+        physical_code,
     };
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
@@ -2537,6 +2669,133 @@ fn normalize_chord(chord: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// The modifier part of a normalized chord — everything before the
+/// last `+` (`"ctrl+shift+e"` → `"ctrl+shift"`, `"physical:e"` → `""`).
+fn chord_mods(chord: &str) -> &str {
+    chord.rsplit_once('+').map(|(m, _)| m).unwrap_or("")
+}
+
+/// Canonical `ctrl+alt+shift+super` prefix for a live modifier state —
+/// same segment order `chord_of` emits (no trailing `+`, empty when
+/// none are held).
+fn mods_prefix(mods: Modifiers) -> &'static str {
+    match (
+        mods.contains(Modifiers::CONTROL),
+        mods.contains(Modifiers::ALT),
+        mods.contains(Modifiers::SHIFT),
+        mods.contains(Modifiers::META),
+    ) {
+        (false, false, false, false) => "",
+        (true, false, false, false) => "ctrl",
+        (false, true, false, false) => "alt",
+        (false, false, true, false) => "shift",
+        (false, false, false, true) => "super",
+        (true, true, false, false) => "ctrl+alt",
+        (true, false, true, false) => "ctrl+shift",
+        (true, false, false, true) => "ctrl+super",
+        (false, true, true, false) => "alt+shift",
+        (false, true, false, true) => "alt+super",
+        (false, false, true, true) => "shift+super",
+        (true, true, true, false) => "ctrl+alt+shift",
+        (true, true, false, true) => "ctrl+alt+super",
+        (true, false, true, true) => "ctrl+shift+super",
+        (false, true, true, true) => "alt+shift+super",
+        (true, true, true, true) => "ctrl+alt+shift+super",
+    }
+}
+
+/// Parse a `physical:` chord tail — `<mods>+<keyname>` →
+/// (mods prefix, key name, winit `Code` for its US-layout position).
+fn parse_physical_chord(chord: &str) -> Result<(String, String, Code), String> {
+    let mut mods = [false; 4]; // ctrl, alt, shift, super
+    let mut out = (String::new(), None, None);
+    let mut parts = chord.split('+').peekable();
+    while let Some(part) = parts.next() {
+        let p = part.trim().to_ascii_lowercase();
+        match p.as_str() {
+            "ctrl" => mods[0] = true,
+            "alt" => mods[1] = true,
+            "shift" => mods[2] = true,
+            "super" => mods[3] = true,
+            _ => {
+                if !parts.peek().is_none() || out.1.is_some() {
+                    return Err(format!("bad keybind chord {chord:?}"));
+                }
+                let name = canonical_key_name(&p)?;
+                let code = physical_code_of(&name)
+                    .ok_or_else(|| format!("no physical code for key {p:?}"))?;
+                out.1 = Some(name);
+                out.2 = Some(code);
+            }
+        }
+    }
+    if mods[0] {
+        out.0.push_str("ctrl+");
+    }
+    if mods[1] {
+        out.0.push_str("alt+");
+    }
+    if mods[2] {
+        out.0.push_str("shift+");
+    }
+    if mods[3] {
+        out.0.push_str("super+");
+    }
+    match (out.1, out.2) {
+        (Some(name), Some(code)) => Ok((out.0, name, code)),
+        _ => Err(format!("keybind chord has no key: {chord:?}")),
+    }
+}
+
+/// Ghostty `physical:` key name → winit/keyboard-types `Code` (the
+/// US-QWERTY position the name refers to).
+fn physical_code_of(name: &str) -> Option<Code> {
+    let n = name.to_ascii_lowercase();
+    if n.len() == 1 {
+        let c = n.chars().next()?;
+        return match c {
+            'a'..='z' => format!("Key{}", c.to_ascii_uppercase()).parse().ok(),
+            '0'..='9' => format!("Digit{c}").parse().ok(),
+            ',' => Some(Code::Comma),
+            '.' => Some(Code::Period),
+            '/' => Some(Code::Slash),
+            '-' => Some(Code::Minus),
+            '=' => Some(Code::Equal),
+            '[' => Some(Code::BracketLeft),
+            ']' => Some(Code::BracketRight),
+            ';' => Some(Code::Semicolon),
+            '\'' => Some(Code::Quote),
+            '`' => Some(Code::Backquote),
+            '\\' => Some(Code::Backslash),
+            _ => None,
+        };
+    }
+    if let Some(digits) = n.strip_prefix('f')
+        && digits.parse::<u8>().is_ok_and(|d| (1..=24).contains(&d))
+    {
+        return format!("F{digits}").parse().ok();
+    }
+    let code = match n.as_str() {
+        "arrowup" => "ArrowUp",
+        "arrowdown" => "ArrowDown",
+        "arrowleft" => "ArrowLeft",
+        "arrowright" => "ArrowRight",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "home" => "Home",
+        "end" => "End",
+        "insert" => "Insert",
+        "delete" => "Delete",
+        "backspace" => "Backspace",
+        "tab" => "Tab",
+        "enter" => "Enter",
+        "escape" => "Escape",
+        "space" => "Space",
+        _ => return None,
+    };
+    code.parse().ok()
+}
+
 /// Canonical key names used in chords: single chars stay single,
 /// named keys use lowercase `arrowup`, `f4`, `pageup`, …
 fn canonical_key_name(name: &str) -> Result<String, String> {
@@ -2606,6 +2865,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
             TermAction::SetTabTitle(raw["set_tab_title:".len()..].to_string())
         }
         "undo" => TermAction::Undo,
+        "redo" => TermAction::Redo,
         "toggle_mark" => TermAction::ToggleMark,
         // Ghostty `jump_to_mark:previous|next`.
         _ if name.starts_with("jump_to_mark:") => {
@@ -2924,10 +3184,16 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    /// Load the file at `path` (or the default) and remember its mtime.
+    /// Load the file at `path`, or the whole default chain
+    /// (`default_paths`, honouring `config-default-files`). The watched
+    /// path stays the XDG_CONFIG_HOME file for hot-reload either way.
     pub fn new(path: Option<PathBuf>) -> Self {
         let path = path.unwrap_or_else(default_path);
-        let (config, errors) = AppConfig::load(&path);
+        let (config, errors) = if path == default_path() {
+            AppConfig::load_defaults()
+        } else {
+            AppConfig::load(&path)
+        };
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         Self {
             path,
@@ -2942,7 +3208,11 @@ impl ConfigWatcher {
     pub fn reload(&mut self) {
         let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
         self.mtime = mtime;
-        let (config, errors) = AppConfig::load(&self.path);
+        let (config, errors) = if self.path == default_path() {
+            AppConfig::load_defaults()
+        } else {
+            AppConfig::load(&self.path)
+        };
         self.config = config;
         self.errors = errors;
     }
@@ -2958,7 +3228,11 @@ impl ConfigWatcher {
             return false;
         }
         self.mtime = mtime;
-        let (config, errors) = AppConfig::load(&self.path);
+        let (config, errors) = if self.path == default_path() {
+            AppConfig::load_defaults()
+        } else {
+            AppConfig::load(&self.path)
+        };
         self.config = config;
         self.errors = errors;
         true
@@ -3058,17 +3332,17 @@ mod tests {
         assert!(errs.is_empty());
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         let hit = cfg
-            .lookup_keybind(&Key::Character("c".into()), ctrl_shift)
+            .lookup_keybind(&Key::Character("c".into()), Code::Unidentified, ctrl_shift)
             .unwrap();
         assert!(!hit.0.all && !hit.0.performable && !hit.0.unconsumed && hit.1.is_none());
         assert_eq!(
-            cfg.lookup_keybind(&Key::Named(NamedKey::F4), Modifiers::ALT)
+            cfg.lookup_keybind(&Key::Named(NamedKey::F4), Code::Unidentified, Modifiers::ALT)
                 .unwrap()
                 .1,
             Some(TermAction::Quit)
         );
         assert_eq!(
-            cfg.lookup_keybind(&Key::Character("v".into()), ctrl_shift),
+            cfg.lookup_keybind(&Key::Character("v".into()), Code::Unidentified, ctrl_shift),
             None
         );
     }
@@ -3082,7 +3356,7 @@ mod tests {
         // Ghostty: triggers ignore prefixes — the later `ctrl+alt+g`
         // replaces the `all:` entry wholesale, flags included.
         let hit = cfg
-            .lookup_keybind(&Key::Character("g".into()), ctrl_alt)
+            .lookup_keybind(&Key::Character("g".into()), Code::Unidentified, ctrl_alt)
             .unwrap();
         assert!(!hit.0.all && hit.1 == Some(TermAction::Quit));
         assert_eq!(cfg.keybinds.len(), 1);
@@ -3090,7 +3364,7 @@ mod tests {
             AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
         assert!(errs2.is_empty(), "{errs2:?}");
         let hit = cfg2
-            .lookup_keybind(&Key::Character("g".into()), ctrl_alt)
+            .lookup_keybind(&Key::Character("g".into()), Code::Unidentified, ctrl_alt)
             .unwrap();
         assert!(hit.0.all && hit.1 == Some(TermAction::IncreaseFontSize(10)));
     }
@@ -3106,12 +3380,12 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         let ctrl = Modifiers::CONTROL;
         let hit = cfg
-            .lookup_keybind(&Key::Character("c".into()), ctrl)
+            .lookup_keybind(&Key::Character("c".into()), Code::Unidentified, ctrl)
             .unwrap();
         assert!(hit.0.performable && hit.1 == Some(TermAction::Copy));
         let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
         let hit = cfg
-            .lookup_keybind(&Key::Character("h".into()), ctrl_alt)
+            .lookup_keybind(&Key::Character("h".into()), Code::Unidentified, ctrl_alt)
             .unwrap();
         assert!(
             hit.0.all && hit.0.performable && hit.1 == Some(TermAction::ClearScrollback)
@@ -3122,7 +3396,7 @@ mod tests {
         );
         assert!(errs2.is_empty(), "{errs2:?}");
         let hit = cfg2
-            .lookup_keybind(&Key::Character("c".into()), ctrl)
+            .lookup_keybind(&Key::Character("c".into()), Code::Unidentified, ctrl)
             .unwrap();
         assert!(
             !hit.0.performable && !hit.0.all && hit.1 == Some(TermAction::Quit)
@@ -3142,12 +3416,12 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         let ctrl = Modifiers::CONTROL;
         let (t, a) = cfg
-            .lookup_keybind(&Key::Character("a".into()), ctrl)
+            .lookup_keybind(&Key::Character("a".into()), Code::Unidentified, ctrl)
             .unwrap();
         assert!(t.unconsumed && !t.global && a == Some(TermAction::ReloadConfig));
         for k in ["b", "c"] {
             let (t, _) = cfg
-                .lookup_keybind(&Key::Character(k.into()), ctrl)
+                .lookup_keybind(&Key::Character(k.into()), Code::Unidentified, ctrl)
                 .unwrap();
             assert!(t.unconsumed && t.global);
         }
@@ -3161,7 +3435,7 @@ mod tests {
         assert!(errs3.is_empty());
         assert_eq!(cfg3.keybinds.len(), 1);
         let (t, a) = cfg3
-            .lookup_keybind(&Key::Character("a".into()), ctrl)
+            .lookup_keybind(&Key::Character("a".into()), Code::Unidentified, ctrl)
             .unwrap();
         assert!(!t.unconsumed && a == Some(TermAction::Quit));
     }
@@ -4082,4 +4356,57 @@ mod tests {
         let (_, errs) = AppConfig::parse("search-foreground = nope\n");
         assert_eq!(errs.len(), 1);
     }
+
+    #[test]
+    fn parses_r52_keys() {
+        // `split-preserve-zoom` — navigation flag, `no-` clears it.
+        let (cfg, errs) = AppConfig::parse("split-preserve-zoom = navigation\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.split_preserve_zoom_navigation);
+        let (cfg, errs) =
+            AppConfig::parse("split-preserve-zoom = navigation\nsplit-preserve-zoom = no-navigation\n");
+        assert!(errs.is_empty());
+        assert!(!cfg.split_preserve_zoom_navigation);
+        let (_, errs) = AppConfig::parse("split-preserve-zoom = sideways\n");
+        assert_eq!(errs.len(), 1);
+
+        // `config-default-files` is a plain bool key.
+        let (cfg, errs) = AppConfig::parse("config-default-files = false\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.config_default_files);
+
+        // `physical:` triggers carry the resolved Code; matching uses
+        // the key position, not the logical character.
+        let (cfg, errs) = AppConfig::parse("keybind = physical:ctrl+shift+e=new_tab\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds.len(), 1);
+        assert_eq!(cfg.keybinds[0].0.physical_code, Some(Code::KeyE));
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::NewTab));
+        // Matches by code + mods — the logical key is irrelevant.
+        let hit = cfg.lookup_keybind(
+            &Key::Character("q".into()),
+            Code::KeyE,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+        );
+        assert_eq!(hit.map(|(_, a)| a), Some(Some(TermAction::NewTab)));
+        // Wrong position → no match.
+        assert!(
+            cfg.lookup_keybind(
+                &Key::Character("e".into()),
+                Code::KeyQ,
+                Modifiers::CONTROL | Modifiers::SHIFT,
+            )
+            .is_none()
+        );
+        // Mods must still match.
+        assert!(
+            cfg.lookup_keybind(&Key::Character("e".into()), Code::KeyE, Modifiers::CONTROL)
+                .is_none()
+        );
+        // `redo` action parses.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+shift+r=redo\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::Redo));
+    }
+
 }

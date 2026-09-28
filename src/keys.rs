@@ -748,6 +748,10 @@ pub enum TermAction {
     /// its SGR attributes and replayed into the new surface before the
     /// shell's first prompt).
     Undo,
+    /// Ghostty `redo` — re-close the surface `undo` just restored,
+    /// pushing it back onto the undo stack so undo can restore again.
+    /// Only fires while the restored tab still exists.
+    Redo,
     /// Ghostty `toggle_mark` — mark/unmark the line the cursor sits on;
     /// `jump_to_mark` scrolls back to it. Invisible like the reference.
     ToggleMark,

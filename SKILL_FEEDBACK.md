@@ -283,3 +283,5 @@ patched in-repo.
   flagged my `waterui::snackbar::Snackbar::new(..)` written inline;
   fixed with `use waterui::snackbar::Snackbar;`. Not a false positive.
 - Existing entries unchanged.
+
+- **Physical-key (`physical:`) keybinds need winit `Code`, and it is already plumbed.** Tried: binding `physical:` triggers. Skill said nothing about physical vs logical keys; `keyboard-types` `Key` is the layout-translated character only, and on a non-QWERTY layout a char-based bind silently binds the wrong position. Actually true: hydrolysis forwards winit `physical_key` as `physical_code` on every key event (`src/platform.rs` `from_winit_code`/`logical:`-`code:` pair), and `keyboard_types::Code` has `FromStr` for the CamelCase names (`KeyA`, `Digit0`, `ArrowUp`, `F1`) — so position-based matching is a `Code` compare, no keymap work needed. Skill edit: one line in the input/keys reference — "key events carry both `key` (logical) and `physical_code` (position); use the latter for layout-independent binds."

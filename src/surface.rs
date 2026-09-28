@@ -1137,6 +1137,7 @@ impl TermSurface {
                 }
             }
             TermAction::Undo => self.app.undo_close(),
+            TermAction::Redo => self.app.redo_close(),
             TermAction::ToggleMark => self.toggle_mark(),
             TermAction::JumpToMark(dir) => self.jump_mark(dir),
             TermAction::SelectAll => {
@@ -2072,7 +2073,7 @@ impl TermSurface {
             // user's bind occupies this slot). `global:`/`all:` always
             // consume (Ghostty).
             let mut fired_unconsumed = false;
-            match self.app.config(|c| c.lookup_keybind(key, mods)) {
+            match self.app.config(|c| c.lookup_keybind(key, code, mods)) {
                 Some((trig, Some(action))) => {
                     // `performable:` — an unperformable bind does not
                     // consume the press; it falls through to the default

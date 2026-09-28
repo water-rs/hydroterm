@@ -673,6 +673,9 @@ pub struct AppState {
     /// Capped at 8 entries; each pane carries its cwd and its grid
     /// serialized with SGR attributes (replay = cell-faithful).
     closed_stack: Rc<RefCell<Vec<ClosedTab>>>,
+    /// `redo` — the tab id `undo_close` last restored; `redo_close`
+    /// re-closes it (re-pushing its entry) and clears the slot.
+    last_restored: Rc<RefCell<Option<u64>>>,
     /// True after the first `spawn_session` — `command` is consumed as
     /// initial-surface-only and never re-applied by a hot reload.
     initial_spawn: std::cell::Cell<bool>,
@@ -810,6 +813,7 @@ impl AppState {
             quick_task: Rc::new(RefCell::new(None)),
             quick_unavailable: RefCell::new(false),
             closed_stack: Rc::new(RefCell::new(Vec::new())),
+            last_restored: Rc::new(RefCell::new(None)),
             initial_spawn: std::cell::Cell::new(false),
             is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
@@ -1670,6 +1674,10 @@ impl AppState {
                 .retain(|s| s.id != session.id);
             return None;
         }
+        // A new split is a layout change — always unzooms, even under
+        // `split-preserve-zoom = navigation` (which covers navigation
+        // only, per the reference).
+        tab.zoomed.set(None);
         self.session_tab
             .lock()
             .unwrap()
@@ -1691,6 +1699,18 @@ impl AppState {
         };
         if tab.focused.snapshot() == session_id {
             return;
+        }
+        // `split-preserve-zoom`: focus moves while a pane is zoomed
+        // either move the zoom along (`navigation`) or unzoom (default
+        // — the reference unzooms on any focus change).
+        if let Some(zoomed) = tab.zoomed.snapshot()
+            && zoomed != session_id
+        {
+            if self.config(|c| c.split_preserve_zoom_navigation) {
+                tab.zoomed.set(Some(session_id));
+            } else {
+                tab.zoomed.set(None);
+            }
         }
         tab.focused.set(session_id);
         if self.selected.snapshot() == tab_id {
@@ -1877,6 +1897,8 @@ impl AppState {
         let tree = tab.tree.snapshot();
         if tree.resize_focus(tab.focused.snapshot(), horizontal, delta) {
             tab.tree.set(tree);
+            // Layout change — unzoom (Ghostty: any layout op unzooms).
+            tab.zoomed.set(None);
         }
     }
 
@@ -1890,6 +1912,9 @@ impl AppState {
         let tree = tab.tree.snapshot();
         tree.equalize();
         tab.tree.set(tree);
+        // Layout change — unzoom (`split-preserve-zoom` covers
+        // navigation only).
+        tab.zoomed.set(None);
     }
 
     /// Move the selected tab `dir` slots (wraps at both ends).
@@ -2083,6 +2108,10 @@ impl AppState {
                 // changed since). `None` = last leaf: `close_tab`
                 // captures the whole tab instead.
                 self.capture_closed(vec![session_id], ClosedNode::Leaf(0), None);
+                // A leaf left the layout — drop a zoom pointing at it
+                // (unzoom on layout change; also fixes a dead zoomed
+                // id leaving the tab blank).
+                tab.zoomed.set(None);
                 // Focus a remaining leaf when the closed pane had focus.
                 if tab.focused.snapshot() == session_id
                     && let Some(next) = new_tree.leaves().first()
@@ -2233,6 +2262,20 @@ impl AppState {
         self.tabs.push(tab);
         self.tab_count.set(self.tabs.len());
         self.selected.set(tab_id);
+        *self.last_restored.borrow_mut() = Some(tab_id);
+    }
+
+    /// Ghostty `redo` — re-close the tab `undo` just restored. The
+    /// close goes through `close_tab`, which pushes a fresh undo entry,
+    /// so undo and redo ping-pong the same surface. No-op when the
+    /// restored tab was closed or further undone since.
+    pub fn redo_close(&self) {
+        let Some(tab_id) = self.last_restored.borrow_mut().take() else {
+            return;
+        };
+        if self.tabs.iter().any(|t| t.id == tab_id) {
+            self.close_tab(tab_id);
+        }
     }
 
     /// Select the tab at 1-based index `n`.
