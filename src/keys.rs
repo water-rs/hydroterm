@@ -809,6 +809,11 @@ pub enum TermAction {
     /// to the program; the app recaptures them (selection, scroll,
     /// context menu) until toggled again. Per-surface.
     ToggleMouseReporting,
+    /// Ghostty `toggle_readonly` — the surface stops accepting input
+    /// (key bytes, committed text, pastes, `text:`/`csi:`/`esc:`
+    /// payloads) until toggled again; protocol replies and keybinds
+    /// still work. Per-surface.
+    ToggleReadonly,
     /// Ghostty `cancel` — dismiss the open transient (hints, keyboard
     /// selection, prompts, paste-confirm, search, palette).
     Cancel,

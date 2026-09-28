@@ -224,6 +224,91 @@ fn ring_bell(last: &mut Option<Instant>) {
     let _ = std::process::Command::new("xkbbell").spawn();
 }
 
+/// `bell-features` `audio` — play `bell-audio-path` through the first
+/// player on PATH (`HYDROTERM_BELL_PLAYER` overrides; order pw-play →
+/// aplay → ffplay). `bell-audio-volume` is clamped 0.0..=1.0 at play
+/// (Ghostty clamps at use — `application.zig` `std.math.clamp`) and
+/// maps onto the player's own flag where it has one (aplay has none).
+/// Relative paths resolve against the config file's directory. No
+/// path → nothing plays (`config.@"bell-audio-path" orelse break
+/// :audio` — Ghostty has no fallback sound). Failures warn, throttled
+/// per `warn_at` so a bell storm doesn't flood the log. Same throttle.
+const BELL_AUDIO_WARN_MIN: Duration = Duration::from_secs(5);
+fn play_bell_audio(
+    path: Option<&str>,
+    volume: f64,
+    last: &mut Option<Instant>,
+    warn_at: &mut Option<Instant>,
+    config_dir: &std::path::Path,
+) {
+    if last.is_some_and(|t| t.elapsed() < BELL_AUDIO_MIN) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let Some(path) = path else { return };
+    let mut warn = |args: std::fmt::Arguments<'_>| {
+        if warn_at.is_some_and(|t| t.elapsed() < BELL_AUDIO_WARN_MIN) {
+            return;
+        }
+        *warn_at = Some(Instant::now());
+        tracing::warn!("{}", args);
+    };
+    let on_path = |name: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(name).is_file()))
+    };
+    let player = std::env::var_os("HYDROTERM_BELL_PLAYER")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            ["pw-play", "aplay", "ffplay"]
+                .iter()
+                .find(|p| on_path(p))
+                .map(std::path::PathBuf::from)
+        });
+    let Some(player) = player else {
+        warn(format_args!(
+            "bell audio: no player on PATH (need one of pw-play, aplay, ffplay) for {path:?}"
+        ));
+        return;
+    };
+    let file = {
+        let p = std::path::PathBuf::from(path);
+        if p.is_absolute() {
+            p
+        } else {
+            config_dir.join(p)
+        }
+    };
+    if !file.is_file() {
+        warn(format_args!("bell audio: file not found {file:?}"));
+        return;
+    }
+    let volume = volume.clamp(0.0, 1.0);
+    let stem = player.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut cmd = std::process::Command::new(&player);
+    match stem {
+        "ffplay" => {
+            cmd.args(["-nodisp", "-autoexit", "-volume"])
+                .arg(format!("{}", (volume * 100.0).round() as i32));
+        }
+        "pw-play" => {
+            cmd.arg(format!("--volume={volume}"));
+        }
+        _ => {}
+    }
+    if let Err(e) = cmd
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        warn(format_args!(
+            "bell audio: failed to spawn {player:?} for {file:?}: {e}"
+        ));
+    }
+}
+
 /// `undo` serializer — the session's whole grid (scrollback + screen)
 /// as a byte stream cell-faithful enough to replay: characters plus
 /// SGR color/attribute runs, WRAPLINE rows joined (no newline), and
@@ -508,6 +593,10 @@ pub struct TermSurface {
     resize_count: u32,
     /// Last time the X11 bell actually rang (throttle).
     bell_ring_at: Option<Instant>,
+    /// Same throttle slot for the `bell-features` `audio` player —
+    /// separate so `system,audio` rings both channels on one BEL.
+    bell_audio_ring_at: Option<Instant>,
+    bell_audio_warn_at: Option<Instant>,
     blink_epoch: Instant,
     search: Option<Search>,
     /// URL hint mode state — chips over every visible link + digits typed.
@@ -650,6 +739,8 @@ impl TermSurface {
             resize_at: None,
             resize_count: 0,
             bell_ring_at: None,
+            bell_audio_ring_at: None,
+            bell_audio_warn_at: None,
             blink_epoch: Instant::now(),
             search: None,
             hints: None,
@@ -837,6 +928,11 @@ impl TermSurface {
 
     /// Write `text` to the PTY as a (possibly bracketed) paste.
     fn paste_text(&mut self, text: &str, bracketed: bool) {
+        // `toggle_readonly` — pastes are input too; the surface drops
+        // them whole.
+        if self.session.readonly.get() {
+            return;
+        }
         let mut out = String::with_capacity(text.len() + 12);
         if bracketed {
             out.push_str("\x1b[200~");
@@ -1378,16 +1474,26 @@ impl TermSurface {
             TermAction::Settings => self.app.toggle_settings(),
             // `text:`/`esc:`/`csi:` payloads — literal bytes on the pty,
             // same write path as typed input.
-            TermAction::TypeText(s) => self.write(s.into_bytes()),
+            TermAction::TypeText(s) => {
+                // `toggle_readonly` — `text:`/`esc:`/`csi:` payloads
+                // are input too; a read-only surface drops them.
+                if !self.session.readonly.get() {
+                    self.write(s.into_bytes());
+                }
+            }
             TermAction::EscSeq(s) => {
-                let mut b = vec![b'\x1b'];
-                b.extend_from_slice(s.as_bytes());
-                self.write(b);
+                if !self.session.readonly.get() {
+                    let mut b = vec![b'\x1b'];
+                    b.extend_from_slice(s.as_bytes());
+                    self.write(b);
+                }
             }
             TermAction::CsiSeq(s) => {
-                let mut b = vec![b'\x1b', b'['];
-                b.extend_from_slice(s.as_bytes());
-                self.write(b);
+                if !self.session.readonly.get() {
+                    let mut b = vec![b'\x1b', b'['];
+                    b.extend_from_slice(s.as_bytes());
+                    self.write(b);
+                }
             }
             TermAction::PasteFromSelection => {
                 let bracketed = self
@@ -1473,6 +1579,19 @@ impl TermSurface {
                 self.session
                     .mouse_reporting_off
                     .set(!self.session.mouse_reporting_off.get());
+            }
+            TermAction::ToggleReadonly => {
+                // Ghostty `toggle_readonly` — flip the surface's input
+                // block; the snackbar confirms the new state.
+                let on = !self.session.readonly.get();
+                self.session.readonly.set(on);
+                if let Some(manager) = self.session.snackbar.borrow().as_ref() {
+                    manager.show(Snackbar::new(if on {
+                        "Read-only: input blocked"
+                    } else {
+                        "Read-only off"
+                    }));
+                }
             }
             TermAction::Cancel => {
                 // Dismiss the innermost open transient (Ghostty
@@ -1897,6 +2016,26 @@ impl TermSurface {
                     }
                     if self.app.config(|c| c.audible_bell) {
                         ring_bell(&mut self.bell_ring_at);
+                    }
+                    if self.app.config(|c| c.bell_audio) {
+                        let (path, vol) = self
+                            .app
+                            .config(|c| (c.bell_audio_path.clone(), c.bell_audio_volume));
+                        let dir = self
+                            .app
+                            .cfg
+                            .borrow()
+                            .path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default();
+                        play_bell_audio(
+                            path.as_deref(),
+                            vol,
+                            &mut self.bell_audio_ring_at,
+                            &mut self.bell_audio_warn_at,
+                            &dir,
+                        );
                     }
                     // `bell-features` `attention`/`title` — each is an
                     // attention alert cleared by `clear_notify_badge`.
@@ -2532,7 +2671,9 @@ impl TermSurface {
                 // ANSI KAM (`CSI 2 h`, gated by `vt-kam-allowed`):
                 // the program holds the keyboard lock — key bytes are
                 // dropped, not queued. App keybinds above still fire.
-                if self.session.terminal.proxy.kam_locked() {
+                // `toggle_readonly` drops the same bytes (the surface
+                // takes no input) — both consume the key either way.
+                if self.session.terminal.proxy.kam_locked() || self.session.readonly.get() {
                     return true;
                 }
                 self.write(bytes);
@@ -2542,7 +2683,7 @@ impl TermSurface {
             }
             false
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
-            if !self.session.terminal.proxy.kam_locked() {
+            if !self.session.terminal.proxy.kam_locked() && !self.session.readonly.get() {
                 self.write(bytes);
                 self.clear_selection_on_input();
             }
@@ -2848,8 +2989,9 @@ impl TermSurface {
         }
         // ANSI KAM: committed text (the IME/composition path — xdotool
         // and IME input land here, not in `on_key`) is dropped while
-        // the program holds the keyboard lock.
-        if self.session.terminal.proxy.kam_locked() {
+        // the program holds the keyboard lock. `toggle_readonly` drops
+        // the same text.
+        if self.session.terminal.proxy.kam_locked() || self.session.readonly.get() {
             return true;
         }
         self.write(text.as_bytes().to_vec());
@@ -3230,6 +3372,19 @@ impl TermSurface {
                         }
                         crate::config::RightClickAction::Paste => {
                             self.paste_clipboard();
+                        }
+                        crate::config::RightClickAction::CopyOrPaste => {
+                            // Ghostty `copy-or-paste`: copy when a
+                            // selection is live, paste otherwise.
+                            let has_sel = {
+                                let term = self.session.terminal.term.lock();
+                                term.selection.as_ref().is_some_and(|s| !s.is_empty())
+                            };
+                            if has_sel {
+                                self.copy_selection();
+                            } else {
+                                self.paste_clipboard();
+                            }
                         }
                         crate::config::RightClickAction::ContextMenu => {
                             // The framework's `.context_menu` claims the

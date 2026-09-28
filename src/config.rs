@@ -149,6 +149,9 @@ pub enum RightClickAction {
     Copy,
     /// Paste the clipboard at the pointer.
     Paste,
+    /// Copy the live selection; paste the clipboard when nothing is
+    /// selected (Ghostty `copy-or-paste`).
+    CopyOrPaste,
     /// Do nothing on a right click.
     Ignore,
 }
@@ -399,8 +402,18 @@ pub struct AppConfig {
     /// (`action_chord`/`tab_chord`) no longer applies — only binds
     /// listed in the file (Ghostty `keybind = clear` semantics).
     pub keybinds_cleared: bool,
-    /// Ring the X11 keyboard bell on `\a` (in addition to the visual flash).
+    /// Ring the X11 keyboard bell on `\a` — the `bell-features` `system`
+    /// arm (in addition to the visual flash).
     pub audible_bell: bool,
+    /// `bell-features` `audio` arm — play `bell_audio_path` on `\a`;
+    /// with no path set nothing plays (Ghostty has no fallback sound).
+    /// Default off.
+    pub bell_audio: bool,
+    /// Ghostty `bell-audio-path` — audio file the `audio` bell feature
+    /// plays; `~/` expands to the home directory.
+    pub bell_audio_path: Option<String>,
+    /// Ghostty `bell-audio-volume` — playback volume 0..=1, default 0.5.
+    pub bell_audio_volume: f64,
     /// `bell-features` `attention` arm — the tab's 🔔 notification badge on
     /// `TermEvent::Bell`/OSC 9 (Ghostty's request-attention feature; the
     /// badge is our attention channel). Default on; `no-attention` (or an
@@ -935,6 +948,9 @@ impl Default for AppConfig {
             // `bell-features` defaults (Ghostty): `attention` and `title`
             // on, `system`/`audio`/`border` off.
             audible_bell: false,
+            bell_audio: false,
+            bell_audio_path: None,
+            bell_audio_volume: 0.5,
             bell_attention: true,
             bell_border: false,
             background_opacity: 1.0,
@@ -1131,7 +1147,9 @@ cursor-style = block        # block | beam | underline | hollow
 cursor-style-blink = true
 copy-on-select = both       # both | clipboard | primary | false
 shell-integration = detect  # detect | none | bash | zsh | fish
-bell-features = system,audio,attention,title  # bell channels (no-X disables; `visual` = pane flash extension)
+# bell-features = attention,title   # bell channels; reference default — add `system`/`audio`/`border` to enable more
+# bell-audio-path = ~/bell.wav      # sound for the `audio` bell channel (rel. to config dir)
+# bell-audio-volume = 0.5           # 0.0..1.0 — maps to the player's own flag
 notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
 notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
 # notify-on-command-finish-action = bell  # bell | notify, comma list, no- negates (bell on, notify off)
@@ -1442,6 +1460,7 @@ impl AppConfig {
                     cfg.right_click_action = match value {
                         "context-menu" => RightClickAction::ContextMenu,
                         "copy" => RightClickAction::Copy,
+                        "copy-or-paste" => RightClickAction::CopyOrPaste,
                         "paste" => RightClickAction::Paste,
                         "ignore" => RightClickAction::Ignore,
                         _ => {
@@ -1473,6 +1492,43 @@ impl AppConfig {
                             "line {}: bad scrollback-limit-bytes {value:?}",
                             n + 1
                         ));
+                    }
+                }
+                "scrollback-compression" => {
+                    // Ghostty compresses scrollback pages' resident
+                    // memory (virtual retained). Our grid history is
+                    // uncompressed and stays so — `false` is exactly our
+                    // behavior and is accepted; `true` fails loudly
+                    // rather than pretending to compress.
+                    match value.trim() {
+                        "false" => {}
+                        "true" => errors.push(format!(
+                            "line {}: scrollback-compression = true is not supported: scrollback is kept uncompressed (see PARITY)",
+                            n + 1
+                        )),
+                        _ => errors.push(format!(
+                            "line {}: bad scrollback-compression {value:?}",
+                            n + 1
+                        )),
+                    }
+                }
+                "initial-window" => {
+                    // Ghostty launches the process with no window and
+                    // stays resident — WaterUI cannot keep a process
+                    // alive with zero windows (App::new_with_windows
+                    // panics on empty; the runner exits when none
+                    // remain). `true` (the default) is accepted; `false`
+                    // fails loudly naming the gap.
+                    match value.trim() {
+                        "true" => {}
+                        "false" => errors.push(format!(
+                            "line {}: initial-window = false is not supported yet: WaterUI cannot keep a process alive with zero windows, see WATERUI_FEEDBACK #76 / water-rs/waterui#1315",
+                            n + 1
+                        )),
+                        _ => errors.push(format!(
+                            "line {}: bad initial-window {value:?}",
+                            n + 1
+                        )),
                     }
                 }
                 "background-opacity" => match value.parse::<f32>() {
@@ -1802,16 +1858,20 @@ impl AppConfig {
                 // bell channels; `no-<name>` disables and an empty value
                 // turns every channel off (the reference's packed-set
                 // semantics: each line applies its items to the set).
-                // `system`/`audio` → the X11 bell (audio's custom sound
-                // file isn't played), `attention` → the tab 🔔 badge,
-                // `title` → 🔔 in the title, `border` → a border ring.
+                // `system` → the X11 bell, `audio` → `bell_audio_path`
+                // through a spawned player (system bell fallback when no
+                // path — we bundle no default sound), `attention` → the
+                // tab 🔔 badge, `title` → 🔔 in the title, `border` → a
+                // border ring.
                 "bell-features" => {
-                    if value.trim().is_empty() {
-                        cfg.audible_bell = false;
-                        cfg.bell_attention = false;
-                        cfg.bell_title = false;
-                        cfg.bell_border = false;
-                    }
+                    // A `BellFeatures` packed struct: assigning
+                    // REPLACES the whole set — unlisted channels turn
+                    // off even when the value is non-empty.
+                    cfg.audible_bell = false;
+                    cfg.bell_audio = false;
+                    cfg.bell_attention = false;
+                    cfg.bell_title = false;
+                    cfg.bell_border = false;
                     for feature in value.split(',') {
                         let feature = feature.trim();
                         if feature.is_empty() {
@@ -1822,7 +1882,8 @@ impl AppConfig {
                             None => (true, feature),
                         };
                         match name {
-                            "system" | "audio" => cfg.audible_bell = on,
+                            "system" => cfg.audible_bell = on,
+                            "audio" => cfg.bell_audio = on,
                             "attention" => cfg.bell_attention = on,
                             "title" => cfg.bell_title = on,
                             "border" => cfg.bell_border = on,
@@ -1833,6 +1894,32 @@ impl AppConfig {
                         }
                     }
                 }
+                // Ghostty `bell-audio-path` — sound file for the `audio`
+                // bell feature; `~/` expands here; relative paths resolve
+                // against the config file's directory at play time.
+                "bell-audio-path" => {
+                    cfg.bell_audio_path = (!value.trim().is_empty()).then(|| {
+                        let v = value.trim();
+                        if let Some(rest) = v.strip_prefix("~/")
+                            && let Some(home) = std::env::var_os("HOME")
+                        {
+                            let mut p = std::path::PathBuf::from(home);
+                            p.push(rest);
+                            return p.to_string_lossy().into_owned();
+                        }
+                        v.to_string()
+                    });
+                }
+                // Ghostty clamps to 0.0..=1.0 at play time
+                // (`std.math.clamp` in `apprt/gtk/class/application.zig`)
+                // — accept any finite f64 here; it clamps at use.
+                "bell-audio-volume" => match value.parse::<f64>() {
+                    Ok(v) if v.is_finite() => cfg.bell_audio_volume = v,
+                    _ => errors.push(format!(
+                        "line {}: bad bell-audio-volume {value:?}",
+                        n + 1
+                    )),
+                },
                 "cursor-style-blink" => {
                     cfg.cursor_blink = Some(bool_value(value, n, &mut errors))
                 }
@@ -2960,6 +3047,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "prompt_window_title",
     "set_window_title:<text>",
     "toggle_mouse_reporting",
+    "toggle_readonly",
     "cancel",
     "open_url",
     "next_split",
@@ -3561,6 +3649,9 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         // events to the program; the app recaptures them (selection,
         // scroll, context menu) until toggled again.
         "toggle_mouse_reporting" => TermAction::ToggleMouseReporting,
+        // Ghostty `toggle_readonly` — the surface takes no input until
+        // toggled off (key bytes, committed text, pastes, payloads).
+        "toggle_readonly" => TermAction::ToggleReadonly,
         // Ghostty `cancel` — dismiss the open transient (search, hints,
         // keyboard selection, prompts, palette).
         "cancel" => TermAction::Cancel,
@@ -4896,13 +4987,14 @@ mod tests {
 
     #[test]
     fn bell_features_reference_mapping() {
-        // `attention` drives only the badge channel; `title` only the
-        // title prepend; `no-` forms disable one at a time; `system`
-        // and `audio` both drive the XBell channel.
+        // `BellFeatures` is a packed struct: assigning replaces the
+        // whole set, so unlisted channels turn off. `no-` forms clear
+        // one item within the same line; `system` rings the X11 bell
+        // and `audio` plays `bell-audio-path` — separate channels.
         let (cfg, errs) = AppConfig::parse("bell-features = title");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.bell_title);
-        assert!(cfg.bell_attention, "title leaves attention untouched");
+        assert!(!cfg.bell_attention, "unlisted channels turn off");
         let (cfg, errs) = AppConfig::parse("bell-features = attention,no-title");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.bell_attention);
@@ -4910,10 +5002,11 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("bell-features = no-attention");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(!cfg.bell_attention);
-        assert!(cfg.bell_title);
+        assert!(!cfg.bell_title);
         let (cfg, errs) = AppConfig::parse("bell-features = system,audio");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.audible_bell);
+        assert!(cfg.bell_audio);
         // `border` enables the pane ring; `no-border` turns it back off.
         let (cfg, errs) = AppConfig::parse("bell-features = border");
         assert!(errs.is_empty(), "{errs:?}");
@@ -5544,5 +5637,52 @@ mod key_table_tests {
         assert_eq!(cfg.copy_on_select, CopyOnSelect::Both);
         let (cfg, _) = AppConfig::parse("copy-on-select = false\n");
         assert_eq!(cfg.copy_on_select, CopyOnSelect::Disabled);
+    }
+
+    #[test]
+    fn parses_r63_keys() {
+        // `bell-audio-path`/`bell-audio-volume` + `bell-features`
+        // split: `system` rings the X11 bell, `audio` plays the file.
+        let (cfg, errs) = AppConfig::parse(
+            "bell-features = audio,attention\n\
+             bell-audio-path = ~/bell.wav\n\
+             bell-audio-volume = 0.8\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.audible_bell && cfg.bell_audio && cfg.bell_attention && !cfg.bell_title);
+        assert!(cfg.bell_audio_path.unwrap().ends_with("bell.wav"));
+        assert!((cfg.bell_audio_volume - 0.8).abs() < 1e-9);
+        let (cfg, _) = AppConfig::parse("bell-features = \n");
+        assert!(!cfg.bell_audio && !cfg.bell_attention);
+        // Ghostty clamps 0..=1 at play time — a negative parses fine.
+        let (cfg, errs) = AppConfig::parse("bell-audio-volume = -1\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.bell_audio_volume, -1.0);
+        let (_, errs) = AppConfig::parse("bell-audio-volume = nan\n");
+        assert_eq!(errs.len(), 1);
+
+        // `right-click-action = copy-or-paste` (Ghostty's fifth arm).
+        let (cfg, errs) = AppConfig::parse("right-click-action = copy-or-paste\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.right_click_action, RightClickAction::CopyOrPaste);
+
+        // `toggle_readonly` keybind action parses.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+shift+r=toggle_readonly\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds.len(), 1);
+
+        // `scrollback-compression = false` is our behavior (accepted);
+        // `true` errors loudly. `initial-window = true` accepted;
+        // `false` errors naming the zero-window residency gap.
+        let (_, errs) = AppConfig::parse("scrollback-compression = false\ninitial-window = true\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let (_, errs) = AppConfig::parse("scrollback-compression = true\n");
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("kept uncompressed"));
+        let (_, errs) = AppConfig::parse("initial-window = false\n");
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("zero windows"));
+        let (_, errs) = AppConfig::parse("initial-window = maybe\n");
+        assert_eq!(errs.len(), 1);
     }
 }

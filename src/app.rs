@@ -121,6 +121,11 @@ pub struct Session {
     /// locally instead of producing DEC mouse reports. Session-owned for
     /// the same rebuild-survival reason as `key_tables`.
     pub mouse_reporting_off: Cell<bool>,
+    /// `toggle_readonly` — while set the surface accepts no input (key
+    /// bytes, committed text, pastes, `text:`/`csi:`/`esc:` payloads);
+    /// protocol replies and keybinds still run. Session-owned so a
+    /// rebuild keeps it.
+    pub readonly: Cell<bool>,
     /// The program currently holds mouse reporting (DECSET 1000/1002/
     /// 1006) — while on, secondary clicks belong to it and the context
     /// menu is suppressed (signal-driven `.context_menu` items).
@@ -337,6 +342,7 @@ impl Session {
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             key_tables: RefCell::new(Vec::new()),
             mouse_reporting_off: Cell::new(false),
+            readonly: Cell::new(false),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
             mouse_reporting: Binding::bool(false),
             font_family: binding(Str::from(cfg.font_family.clone())),
