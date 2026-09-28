@@ -830,7 +830,11 @@ impl Default for AppConfig {
             copy_on_select: CopyOnSelect::Both,
             selection_clear_on_typing: true,
             shell_integration: ShellIntegration::Detect,
-            shell_features: ShellFeatures { cursor: true, sudo: true, title: true },
+            shell_features: ShellFeatures {
+                cursor: true,
+                sudo: true,
+                title: true,
+            },
             quick_terminal_position: QuickTermPosition::Top,
             quick_terminal_size: None,
             quick_terminal_animation_duration: 0.2,
@@ -976,7 +980,8 @@ pub fn default_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.unwrap_or_else(|| PathBuf::from("/tmp")).join("hydroterm/config")
+    base.unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("hydroterm/config")
 }
 
 /// `background-opacity-cells` mapping: the alpha applied to cells with
@@ -2476,7 +2481,10 @@ impl AppConfig {
                 let _ = std::fs::write(path, TEMPLATE);
                 (Self::default(), Vec::new())
             }
-            Err(e) => (Self::default(), vec![format!("reading {}: {e}", path.display())]),
+            Err(e) => (
+                Self::default(),
+                vec![format!("reading {}: {e}", path.display())],
+            ),
         }
     }
 }
@@ -2492,7 +2500,10 @@ fn expand_includes(
     visited: &mut std::collections::HashSet<PathBuf>,
     warnings: &mut Vec<String>,
 ) -> String {
-    let dir = containing.parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = containing
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         out.push_str(line);
@@ -2555,14 +2566,20 @@ fn parse_cell_adjust(value: &str) -> Option<CellAdjust> {
     let v = value.trim();
     if let Some(p) = v.strip_suffix('%') {
         let f: f32 = p.trim().parse().ok()?;
-        return (-50.0..=100.0).contains(&f).then_some(CellAdjust::Fraction(f / 100.0));
+        return (-50.0..=100.0)
+            .contains(&f)
+            .then_some(CellAdjust::Fraction(f / 100.0));
     }
     if let Some(p) = v.strip_suffix("px") {
         let f: f32 = p.trim().parse().ok()?;
-        return (-100.0..=200.0).contains(&f).then_some(CellAdjust::Points(f));
+        return (-100.0..=200.0)
+            .contains(&f)
+            .then_some(CellAdjust::Points(f));
     }
     let f: f32 = v.parse().ok()?;
-    (-50.0..=100.0).contains(&f).then_some(CellAdjust::Fraction(f / 100.0))
+    (-50.0..=100.0)
+        .contains(&f)
+        .then_some(CellAdjust::Fraction(f / 100.0))
 }
 
 /// `theme = light:<name>,dark:<name>` — Ghostty's per-mode theme pair.
@@ -2607,9 +2624,7 @@ fn parse_quick_term_size(
                 .map(QuickTermSize::Px)
                 .map_err(|_| format!("bad quick-terminal-size {v:?}"));
         }
-        Err(format!(
-            "quick-terminal-size {v:?} needs a % or px suffix"
-        ))
+        Err(format!("quick-terminal-size {v:?} needs a % or px suffix"))
     }
     let mut parts = value.splitn(2, ',');
     let a = one(parts.next().unwrap_or_default())?;
@@ -2627,7 +2642,12 @@ fn parse_notify_after(value: &str) -> Option<f64> {
     let v = value.trim();
     for (suffix, scale) in [("ms", 0.001), ("s", 1.0), ("m", 60.0), ("h", 3600.0)] {
         if let Some(n) = v.strip_suffix(suffix) {
-            return n.trim().parse::<f64>().ok().filter(|x| *x >= 0.0).map(|x| x * scale);
+            return n
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|x| *x >= 0.0)
+                .map(|x| x * scale);
         }
     }
     v.parse::<f64>().ok().filter(|x| *x >= 0.0)
@@ -2656,7 +2676,11 @@ fn parse_rgb(value: &str) -> Option<Rgb> {
             let r = ((v >> 8) & 0xf) as u8;
             let g = ((v >> 4) & 0xf) as u8;
             let b = (v & 0xf) as u8;
-            Rgb { r: r * 17, g: g * 17, b: b * 17 }
+            Rgb {
+                r: r * 17,
+                g: g * 17,
+                b: b * 17,
+            }
         }),
         6 => u32_from_hex(hex).map(|v| Rgb {
             r: ((v >> 16) & 0xff) as u8,
@@ -2674,9 +2698,8 @@ fn parse_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
     if family.is_empty() {
         return None;
     }
-    let hex = |s: &str| -> Option<u32> {
-        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
-    };
+    let hex =
+        |s: &str| -> Option<u32> { u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok() };
     let mut parts = range.splitn(2, '-');
     let lo = hex(parts.next()?)?;
     let hi = match parts.next() {
@@ -2691,9 +2714,8 @@ fn parse_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
 /// codepoint when written `U+XXXX`, else verbatim text.
 fn parse_clipboard_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
     let (range, to) = value.split_once('=')?;
-    let hex = |s: &str| -> Option<u32> {
-        u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok()
-    };
+    let hex =
+        |s: &str| -> Option<u32> { u32::from_str_radix(s.trim().strip_prefix("U+")?, 16).ok() };
     let mut parts = range.splitn(2, '-');
     let lo = hex(parts.next()?)?;
     let hi = match parts.next() {
@@ -2714,47 +2736,100 @@ fn parse_clipboard_codepoint_map(value: &str) -> Option<(u32, u32, String)> {
 /// Every action name the `keybind` parser accepts — printed by
 /// `+list-actions`. Parameterized forms show their argument shape.
 pub const ACTION_NAMES: &[&str] = &[
-    "ignore", "copy_to_clipboard", "copy_url_to_clipboard", "copy_title_to_clipboard",
-    "new_tab", "close_tab", "close_surface", "new_window", "next_tab", "previous_tab",
-    "goto_tab:<n>", "move_tab:<±n>",
-    "increase_font_size[:pt]", "decrease_font_size[:pt]", "set_font_size:<pt>",
+    "ignore",
+    "copy_to_clipboard",
+    "copy_url_to_clipboard",
+    "copy_title_to_clipboard",
+    "new_tab",
+    "close_tab",
+    "close_surface",
+    "new_window",
+    "next_tab",
+    "previous_tab",
+    "goto_tab:<n>",
+    "move_tab:<±n>",
+    "increase_font_size[:pt]",
+    "decrease_font_size[:pt]",
+    "set_font_size:<pt>",
     "reset_font_size",
-    "clear_scrollback", "clear_screen", "reset",
-    "start_search", "end_search", "search_selection", "search:<text>",
-    "navigate_search:<next|previous>", "search", "jump_to_prompt:<±n>",
-    "select_all", "start_selection",
-    "last_tab", "close_window", "close_all_tabs", "close_other_tabs", "toggle_tab_bar",
-    "scroll_to_top", "scroll_to_bottom", "scroll_page_up", "scroll_page_down",
-    "scroll_page_lines:<±n>", "scroll_page_fractional:<±f>",
-    "url_hints", "copy_last_output", "open_scrollback_editor", "reload_config",
-    "write_screen_file[:open|copy|paste]", "write_scrollback_file[:open|copy|paste]",
-    "write_selection_file[:open|copy|paste]", "write_last_output_file[:open|copy|paste]",
-    "open_config", "scroll_to_selection", "clear_selection",
-    "text:\"…\"", "csi:\"…\"", "esc:\"…\"",
-    "scroll_to_fraction:<0-1>", "scroll_to_row:<n>",
-    "paste_from_clipboard", "paste_from_selection",
-    "prompt_surface_title", "prompt_tab_title",
-    "set_surface_title:<text>", "set_tab_title:<text>",
+    "clear_scrollback",
+    "clear_screen",
+    "reset",
+    "start_search",
+    "end_search",
+    "search_selection",
+    "search:<text>",
+    "navigate_search:<next|previous>",
+    "search",
+    "jump_to_prompt:<±n>",
+    "select_all",
+    "start_selection",
+    "last_tab",
+    "close_window",
+    "close_all_tabs",
+    "close_other_tabs",
+    "toggle_tab_bar",
+    "scroll_to_top",
+    "scroll_to_bottom",
+    "scroll_page_up",
+    "scroll_page_down",
+    "scroll_page_lines:<±n>",
+    "scroll_page_fractional:<±f>",
+    "url_hints",
+    "copy_last_output",
+    "open_scrollback_editor",
+    "reload_config",
+    "write_screen_file[:open|copy|paste]",
+    "write_scrollback_file[:open|copy|paste]",
+    "write_selection_file[:open|copy|paste]",
+    "write_last_output_file[:open|copy|paste]",
+    "open_config",
+    "scroll_to_selection",
+    "clear_selection",
+    "text:\"…\"",
+    "csi:\"…\"",
+    "esc:\"…\"",
+    "scroll_to_fraction:<0-1>",
+    "scroll_to_row:<n>",
+    "paste_from_clipboard",
+    "paste_from_selection",
+    "prompt_surface_title",
+    "prompt_tab_title",
+    "set_surface_title:<text>",
+    "set_tab_title:<text>",
     "inspector[:toggle|show|hide]",
     "toggle_mouse_visibility",
     "adjust_selection:<left|right|up|down|home|end|page_up|page_down|escape>",
-    "quit", "toggle_fullscreen", "toggle_command_palette", "settings",
+    "quit",
+    "toggle_fullscreen",
+    "toggle_command_palette",
+    "settings",
     "new_split:<right|down|left|up|auto>",
     "goto_split:<left|right|up|down|previous|next|top|bottom>",
     "resize_split:<left|right|up|down>[,px]",
     "goto_split:<previous|next>  (pane focus cycle)",
-    "toggle_split_zoom", "equalize_splits",
+    "toggle_split_zoom",
+    "equalize_splits",
     "sequence:<a,b,…>  (run every action on one chord)",
-    "undo", "redo", "toggle_mark", "jump_to_mark:<previous|next>",
+    "undo",
+    "redo",
+    "toggle_mark",
+    "jump_to_mark:<previous|next>",
     "cursor_key:<up|down|left|right|home|end|page_up|page_down>",
     "hide_all_windows",
     "move_tab_to_new_window",
-    "prompt_window_title", "set_window_title:<text>",
-    "toggle_mouse_reporting", "cancel", "open_url",
-    "next_split", "previous_split",
+    "prompt_window_title",
+    "set_window_title:<text>",
+    "toggle_mouse_reporting",
+    "cancel",
+    "open_url",
+    "next_split",
+    "previous_split",
     "<table>/<trigger>=<action>  (key table binds)",
-    "activate_key_table:<name>", "activate_key_table_once:<name>",
-    "deactivate_key_table", "deactivate_all_key_tables",
+    "activate_key_table:<name>",
+    "activate_key_table_once:<name>",
+    "deactivate_key_table",
+    "deactivate_all_key_tables",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
@@ -2785,7 +2860,9 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut seen = false;
     while !rest.is_empty() {
-        let dlen = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let dlen = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         if dlen == 0 {
             return None;
         }
@@ -2834,9 +2911,7 @@ fn mod_name_codes(name: &str) -> Option<(Vec<Code>, Modifiers)> {
             Modifiers::CONTROL,
         ),
         "alt" | "opt" | "option" => (vec![Code::AltLeft, Code::AltRight], Modifiers::ALT),
-        "super" | "cmd" | "command" => {
-            (vec![Code::MetaLeft, Code::MetaRight], Modifiers::META)
-        }
+        "super" | "cmd" | "command" => (vec![Code::MetaLeft, Code::MetaRight], Modifiers::META),
         "left_shift" => (vec![Code::ShiftLeft], Modifiers::SHIFT),
         "right_shift" => (vec![Code::ShiftRight], Modifiers::SHIFT),
         "left_ctrl" | "left_control" => (vec![Code::ControlLeft], Modifiers::CONTROL),
@@ -2844,9 +2919,7 @@ fn mod_name_codes(name: &str) -> Option<(Vec<Code>, Modifiers)> {
         "left_alt" | "left_opt" | "left_option" => (vec![Code::AltLeft], Modifiers::ALT),
         "right_alt" | "right_opt" | "right_option" => (vec![Code::AltRight], Modifiers::ALT),
         "left_super" | "left_cmd" | "left_command" => (vec![Code::MetaLeft], Modifiers::META),
-        "right_super" | "right_cmd" | "right_command" => {
-            (vec![Code::MetaRight], Modifiers::META)
-        }
+        "right_super" | "right_cmd" | "right_command" => (vec![Code::MetaRight], Modifiers::META),
         _ => return None,
     };
     Some((codes, bit))
@@ -2859,10 +2932,10 @@ fn parse_key_remap(value: &str) -> Result<Vec<(Code, Modifiers)>, String> {
     let (from, to) = value
         .split_once('=')
         .ok_or_else(|| format!("bad key-remap {value:?} (want from=to)"))?;
-    let (from_codes, _) = mod_name_codes(from.trim())
-        .ok_or_else(|| format!("bad key-remap source {from:?}"))?;
-    let (_, to_bit) = mod_name_codes(to.trim())
-        .ok_or_else(|| format!("bad key-remap target {to:?}"))?;
+    let (from_codes, _) =
+        mod_name_codes(from.trim()).ok_or_else(|| format!("bad key-remap source {from:?}"))?;
+    let (_, to_bit) =
+        mod_name_codes(to.trim()).ok_or_else(|| format!("bad key-remap target {to:?}"))?;
     Ok(from_codes.iter().map(|c| (*c, to_bit)).collect())
 }
 
@@ -2884,11 +2957,7 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
     // (`+`/`>` are binding syntax). A leading segment with a `+` is a
     // modifier, not a table (`ctrl+/` is a chord, not a table prefix).
     let (table, raw) = match raw.split_once('/') {
-        Some((name, rest))
-            if is_key_table_name(name) =>
-        {
-            (Some(name.to_ascii_lowercase()), rest)
-        }
+        Some((name, rest)) if is_key_table_name(name) => (Some(name.to_ascii_lowercase()), rest),
         _ => (None, raw),
     };
     let raw = raw.trim();
@@ -3044,7 +3113,9 @@ fn c_escapes(inner: &str) -> Result<String, String> {
                 let hi = it.next().and_then(|c| c.to_digit(16));
                 let lo = it.next().and_then(|c| c.to_digit(16));
                 match (hi, lo) {
-                    (Some(hi), Some(lo)) => out.push(char::from_u32(hi * 16 + lo).unwrap_or('\u{fffd}')),
+                    (Some(hi), Some(lo)) => {
+                        out.push(char::from_u32(hi * 16 + lo).unwrap_or('\u{fffd}'))
+                    }
                     _ => return Err("bad \\xNN escape".into()),
                 }
             }
@@ -3083,7 +3154,11 @@ fn split_sequence(inner: &str) -> Vec<&str> {
         }
     }
     parts.push(&inner[start..]);
-    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Parse `ctrl+shift+arrowup` / `alt+f4` / `super+v` into the canonical
@@ -3258,8 +3333,21 @@ fn physical_code_of(name: &str) -> Option<Code> {
 /// named keys use lowercase `arrowup`, `f4`, `pageup`, …
 fn canonical_key_name(name: &str) -> Result<String, String> {
     const NAMES: &[&str] = &[
-        "arrowup", "arrowdown", "arrowleft", "arrowright", "pageup", "pagedown", "home", "end",
-        "insert", "delete", "backspace", "tab", "enter", "escape", "space",
+        "arrowup",
+        "arrowdown",
+        "arrowleft",
+        "arrowright",
+        "pageup",
+        "pagedown",
+        "home",
+        "end",
+        "insert",
+        "delete",
+        "backspace",
+        "tab",
+        "enter",
+        "escape",
+        "space",
     ];
     let n = name.to_ascii_lowercase();
     if n.len() == 1 || NAMES.contains(&n.as_str()) {
@@ -3281,9 +3369,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         // Ghostty payload actions — `keybind = chord=text:"hi\n"` types
         // the literal text; `esc:`/`csi:` prepend `\e`/`\e[`. Payload
         // keeps the config line's case, so these read `raw` not `name`.
-        _ if name.starts_with("text:") => {
-            TermAction::TypeText(parse_payload(&raw[5..]).ok()?)
-        }
+        _ if name.starts_with("text:") => TermAction::TypeText(parse_payload(&raw[5..]).ok()?),
         _ if name.starts_with("csi:") => TermAction::CsiSeq(parse_payload(&raw[4..]).ok()?),
         _ if name.starts_with("esc:") => TermAction::EscSeq(parse_payload(&raw[4..]).ok()?),
         // Ghostty `sequence:a,b` — every action runs in order on one
@@ -3294,8 +3380,10 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
             if parts.is_empty() {
                 return None;
             }
-            let actions: Option<Vec<TermAction>> =
-                parts.iter().map(|p| action_from_str(&p.to_lowercase(), p)).collect();
+            let actions: Option<Vec<TermAction>> = parts
+                .iter()
+                .map(|p| action_from_str(&p.to_lowercase(), p))
+                .collect();
             TermAction::Sequence(actions?)
         }
         _ if name.starts_with("scroll_to_fraction:") => {
@@ -3357,13 +3445,11 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "redo" => TermAction::Redo,
         "toggle_mark" => TermAction::ToggleMark,
         // Ghostty `jump_to_mark:previous|next`.
-        _ if name.starts_with("jump_to_mark:") => {
-            match &name["jump_to_mark:".len()..] {
-                "previous" | "prev" => TermAction::JumpToMark(-1),
-                "next" => TermAction::JumpToMark(1),
-                _ => return None,
-            }
-        }
+        _ if name.starts_with("jump_to_mark:") => match &name["jump_to_mark:".len()..] {
+            "previous" | "prev" => TermAction::JumpToMark(-1),
+            "next" => TermAction::JumpToMark(1),
+            _ => return None,
+        },
         // Ghostty `cursor_key:<up|down|left|right|home|end|page_up|
         // page_down>` — emits the escape sequence a physical cursor
         // keypress would send, honoring DECCKM application mode.
@@ -3515,43 +3601,39 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         // Ghostty `keybind = ...=new_split:right` — direction arg selects
         // which side the new pane lands on (`auto` picks by pane aspect).
-        _ if name.strip_prefix("new_split:").is_some() => {
-            match &name["new_split:".len()..] {
-                "right" => TermAction::SplitRight,
-                "auto" => TermAction::SplitAuto,
-                "down" => TermAction::SplitDown,
-                "left" => TermAction::SplitLeft,
-                "up" => TermAction::SplitUp,
-                _ => return None,
-            }
-        }
+        _ if name.strip_prefix("new_split:").is_some() => match &name["new_split:".len()..] {
+            "right" => TermAction::SplitRight,
+            "auto" => TermAction::SplitAuto,
+            "down" => TermAction::SplitDown,
+            "left" => TermAction::SplitLeft,
+            "up" => TermAction::SplitUp,
+            _ => return None,
+        },
         // Ghostty `keybind = ...=goto_split:left` — directional focus,
         // previous/next cycle, top/bottom = first/last pane.
-        _ if name.strip_prefix("goto_split:").is_some() => {
-            match &name["goto_split:".len()..] {
-                "left" => TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: false,
-                },
-                "right" => TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: true,
-                },
-                "up" => TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: false,
-                },
-                "down" => TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: true,
-                },
-                "previous" => TermAction::FocusPrevPane,
-                "next" => TermAction::FocusNextPane,
-                "top" => TermAction::GotoSplit(0),
-                "bottom" => TermAction::GotoSplit(usize::MAX),
-                _ => return None,
-            }
-        }
+        _ if name.strip_prefix("goto_split:").is_some() => match &name["goto_split:".len()..] {
+            "left" => TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: false,
+            },
+            "right" => TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: true,
+            },
+            "up" => TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: false,
+            },
+            "down" => TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: true,
+            },
+            "previous" => TermAction::FocusPrevPane,
+            "next" => TermAction::FocusNextPane,
+            "top" => TermAction::GotoSplit(0),
+            "bottom" => TermAction::GotoSplit(usize::MAX),
+            _ => return None,
+        },
         // Ghostty `keybind = ...=resize_split:up[,10]` — optional `,px`
         // amount; without one it uses the 48pt arrow-key step.
         _ if name.strip_prefix("resize_split:").is_some() => {
@@ -3714,7 +3796,9 @@ impl ConfigWatcher {
 
     /// Unconditional re-read (the `reload-config` action path).
     pub fn reload(&mut self) {
-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
         self.mtime = mtime;
         let (config, errors) = if self.path == default_path() {
             AppConfig::load_defaults()
@@ -3731,7 +3815,9 @@ impl ConfigWatcher {
             return false;
         }
         self.last_check = Instant::now();
-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
         if mtime == self.mtime {
             return false;
         }
@@ -3746,7 +3832,6 @@ impl ConfigWatcher {
         true
     }
 }
-
 
 /// Insert or replace `key = value` in the config file, preserving every
 /// other line (comments, unknown keys). Creates the file and parent dirs
@@ -3844,9 +3929,13 @@ mod tests {
             .unwrap();
         assert!(!hit.0.all && !hit.0.performable && !hit.0.unconsumed && hit.1.is_none());
         assert_eq!(
-            cfg.lookup_keybind(&Key::Named(NamedKey::F4), Code::Unidentified, Modifiers::ALT)
-                .unwrap()
-                .1,
+            cfg.lookup_keybind(
+                &Key::Named(NamedKey::F4),
+                Code::Unidentified,
+                Modifiers::ALT
+            )
+            .unwrap()
+            .1,
             Some(TermAction::Quit)
         );
         assert_eq!(
@@ -3857,8 +3946,9 @@ mod tests {
 
     #[test]
     fn keybind_all_scope_marks_the_hit() {
-        let (cfg, errs) =
-            AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10\nkeybind = ctrl+alt+g=quit");
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = all:ctrl+alt+g=increase_font_size:10\nkeybind = ctrl+alt+g=quit",
+        );
         assert!(errs.is_empty(), "{errs:?}");
         let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
         // Ghostty: triggers ignore prefixes — the later `ctrl+alt+g`
@@ -3868,8 +3958,7 @@ mod tests {
             .unwrap();
         assert!(!hit.0.all && hit.1 == Some(TermAction::Quit));
         assert_eq!(cfg.keybinds.len(), 1);
-        let (cfg2, errs2) =
-            AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
+        let (cfg2, errs2) = AppConfig::parse("keybind = all:ctrl+alt+g=increase_font_size:10");
         assert!(errs2.is_empty(), "{errs2:?}");
         let hit = cfg2
             .lookup_keybind(&Key::Character("g".into()), Code::Unidentified, ctrl_alt)
@@ -3895,9 +3984,7 @@ mod tests {
         let hit = cfg
             .lookup_keybind(&Key::Character("h".into()), Code::Unidentified, ctrl_alt)
             .unwrap();
-        assert!(
-            hit.0.all && hit.0.performable && hit.1 == Some(TermAction::ClearScrollback)
-        );
+        assert!(hit.0.all && hit.0.performable && hit.1 == Some(TermAction::ClearScrollback));
         // A plain bind on the same chord still wins by list order.
         let (cfg2, errs2) = AppConfig::parse(
             "keybind = performable:ctrl+c=copy_to_clipboard\nkeybind = ctrl+c=quit",
@@ -3906,9 +3993,7 @@ mod tests {
         let hit = cfg2
             .lookup_keybind(&Key::Character("c".into()), Code::Unidentified, ctrl)
             .unwrap();
-        assert!(
-            !hit.0.performable && !hit.0.all && hit.1 == Some(TermAction::Quit)
-        );
+        assert!(!hit.0.performable && !hit.0.all && hit.1 == Some(TermAction::Quit));
     }
 
     #[test]
@@ -3937,9 +4022,8 @@ mod tests {
         assert!(!errs2.is_empty());
         drop(cfg2);
         // Later same-chord bind replaces the earlier entry wholesale.
-        let (cfg3, errs3) = AppConfig::parse(
-            "keybind = unconsumed:ctrl+a=reload_config\nkeybind = ctrl+a=quit",
-        );
+        let (cfg3, errs3) =
+            AppConfig::parse("keybind = unconsumed:ctrl+a=reload_config\nkeybind = ctrl+a=quit");
         assert!(errs3.is_empty());
         assert_eq!(cfg3.keybinds.len(), 1);
         let (t, a) = cfg3
@@ -3973,9 +4057,8 @@ mod tests {
 
     #[test]
     fn padding_color_and_opacity_cells_parse() {
-        let (cfg, errs) = AppConfig::parse(
-            "window-padding-color = extend\nbackground-opacity-cells = true",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("window-padding-color = extend\nbackground-opacity-cells = true");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.window_padding_color, WindowPaddingColor::Extend);
         assert!(cfg.background_opacity_cells);
@@ -3998,8 +4081,7 @@ mod tests {
     fn r38_reference_names() {
         // `window-position-x`/`y` are the reference's names — `window-x`/
         // `window-y` are rejected, not aliased.
-        let (cfg, errs) =
-            AppConfig::parse("window-position-x = 120\nwindow-position-y = 90");
+        let (cfg, errs) = AppConfig::parse("window-position-x = 120\nwindow-position-y = 90");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.window_x, Some(120.0));
         assert_eq!(cfg.window_y, Some(90.0));
@@ -4103,23 +4185,13 @@ mod tests {
             "keybind = ctrl+alt+u=cursor_key:up\nkeybind = ctrl+alt+h=cursor_key:home\nkeybind = ctrl+alt+n=cursor_key:page_down\nkeybind = ctrl+alt+m=hide_all_windows\nkeybind = ctrl+alt+b=cursor_key:diagonal",
         );
         assert_eq!(errs.len(), 1, "bad dir rejected: {errs:?}");
-        assert_eq!(
-            cfg.keybinds[0].1,
-            Some(TermAction::CursorKey(D::Up))
-        );
-        assert_eq!(
-            cfg.keybinds[1].1,
-            Some(TermAction::CursorKey(D::Home))
-        );
-        assert_eq!(
-            cfg.keybinds[2].1,
-            Some(TermAction::CursorKey(D::PageDown))
-        );
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::CursorKey(D::Up)));
+        assert_eq!(cfg.keybinds[1].1, Some(TermAction::CursorKey(D::Home)));
+        assert_eq!(cfg.keybinds[2].1, Some(TermAction::CursorKey(D::PageDown)));
         assert_eq!(cfg.keybinds[3].1, Some(TermAction::HideAllWindows));
         // Works inside `sequence:` too.
-        let (cfg, errs) = AppConfig::parse(
-            "keybind = ctrl+alt+s=sequence:cursor_key:left,cursor_key:up",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("keybind = ctrl+alt+s=sequence:cursor_key:left,cursor_key:up");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(
             cfg.keybinds[0].1,
@@ -4153,9 +4225,8 @@ mod tests {
         assert!(parse_font_variation("wght=seven").is_none());
         assert!(parse_font_variation("wght=700,bad").is_none());
         assert!(parse_font_variation("wght=700,,wdth=85").is_none());
-        let (cfg, errs) = AppConfig::parse(
-            "font-variation = wght=200\nfont-variation-bold = wght=100",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("font-variation = wght=200\nfont-variation-bold = wght=100");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.font_variation.as_deref(), Some("wght=200"));
         assert_eq!(cfg.font_variation_bold.as_deref(), Some("wght=100"));
@@ -4204,9 +4275,7 @@ mod tests {
         // `no-` negates, empty clears, unknown items error.
         let (d, _) = AppConfig::parse("");
         assert!(d.scroll_bottom_keystroke && !d.scroll_bottom_output);
-        let (cfg4, errs4) = AppConfig::parse(
-            "scroll-to-bottom = keystroke,output",
-        );
+        let (cfg4, errs4) = AppConfig::parse("scroll-to-bottom = keystroke,output");
         assert!(errs4.is_empty(), "{errs4:?}");
         assert!(cfg4.scroll_bottom_keystroke && cfg4.scroll_bottom_output);
         let (cfg5, _) = AppConfig::parse("scroll-to-bottom = no-keystroke");
@@ -4245,10 +4314,7 @@ mod tests {
         );
         assert_eq!(cfg.keybinds[1].1, Some(TermAction::CsiSeq("18t".into())));
         assert_eq!(cfg.keybinds[2].1, Some(TermAction::EscSeq("[H".into())));
-        assert_eq!(
-            cfg.keybinds[3].1,
-            Some(TermAction::ScrollToFraction(0.5))
-        );
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::ScrollToFraction(0.5)));
         assert_eq!(cfg.keybinds[4].1, Some(TermAction::ScrollToRow(12)));
     }
 
@@ -4290,8 +4356,7 @@ mod tests {
 
     #[test]
     fn theme_pair_parses() {
-        let (cfg, errs) =
-            AppConfig::parse("theme = light:solarized-light,dark:solarized-dark");
+        let (cfg, errs) = AppConfig::parse("theme = light:solarized-light,dark:solarized-dark");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(
             cfg.theme,
@@ -4302,8 +4367,7 @@ mod tests {
         );
         // Reversed order works; a lone half falls back to the unknown
         // theme error path (not silently a Named theme).
-        let (cfg2, errs2) =
-            AppConfig::parse("theme = dark:solarized-dark,light:solarized-light");
+        let (cfg2, errs2) = AppConfig::parse("theme = dark:solarized-dark,light:solarized-light");
         assert!(errs2.is_empty(), "{errs2:?}");
         assert!(matches!(cfg2.theme, ThemeRef::Pair { .. }));
         let (_, errs3) = AppConfig::parse("theme = light:solarized-light");
@@ -4426,24 +4490,65 @@ mod tests {
              palette = 1=#e06c75\npalette = 0=#000\n",
         );
         assert!(errs.is_empty(), "{errs:?}");
-        assert_eq!(cfg.foreground, Some(Rgb { r: 0xdd, g: 0xee, b: 0xff }));
-        assert_eq!(cfg.background, Some(Rgb { r: 0x10, g: 0x14, b: 0x18 }));
-        assert_eq!(cfg.cursor_color, Some(Rgb { r: 0xff, g: 0xcc, b: 0x00 }));
-        assert_eq!(cfg.selection_color, Some(Rgb { r: 0xff, g: 0xff, b: 0xff }));
+        assert_eq!(
+            cfg.foreground,
+            Some(Rgb {
+                r: 0xdd,
+                g: 0xee,
+                b: 0xff
+            })
+        );
+        assert_eq!(
+            cfg.background,
+            Some(Rgb {
+                r: 0x10,
+                g: 0x14,
+                b: 0x18
+            })
+        );
+        assert_eq!(
+            cfg.cursor_color,
+            Some(Rgb {
+                r: 0xff,
+                g: 0xcc,
+                b: 0x00
+            })
+        );
+        assert_eq!(
+            cfg.selection_color,
+            Some(Rgb {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff
+            })
+        );
         assert_eq!(
             cfg.palette_overrides,
             vec![
-                (1, Rgb { r: 0xe0, g: 0x6c, b: 0x75 }),
-                (0, Rgb { r: 0x00, g: 0x00, b: 0x00 }),
+                (
+                    1,
+                    Rgb {
+                        r: 0xe0,
+                        g: 0x6c,
+                        b: 0x75
+                    }
+                ),
+                (
+                    0,
+                    Rgb {
+                        r: 0x00,
+                        g: 0x00,
+                        b: 0x00
+                    }
+                ),
             ]
         );
     }
 
     #[test]
     fn scroll_multiplier_and_confirm_close() {
-        let (cfg, errs) = AppConfig::parse(
-            "mouse-scroll-multiplier = 3.5\nconfirm-close-surface = false",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("mouse-scroll-multiplier = 3.5\nconfirm-close-surface = false");
         assert!(errs.is_empty(), "{errs:?}");
         assert!((cfg.mouse_scroll_multiplier - 3.5).abs() < f32::EPSILON);
         assert_eq!(cfg.confirm_close, ConfirmCloseSurface::False);
@@ -4516,9 +4621,7 @@ mod tests {
 
     #[test]
     fn env_lines_collect_name_value_pairs() {
-        let (cfg, errs) = AppConfig::parse(
-            "env = EDITOR=vim\nenv = A=B=C\nenv = =x\n",
-        );
+        let (cfg, errs) = AppConfig::parse("env = EDITOR=vim\nenv = A=B=C\nenv = =x\n");
         assert_eq!(errs.len(), 1, "{errs:?}"); // `=x` has an empty name
         assert_eq!(
             cfg.env,
@@ -4531,19 +4634,14 @@ mod tests {
 
     #[test]
     fn cell_adjust_parses_percent_and_px() {
-        let (cfg, errs) = AppConfig::parse(
-            "adjust-cell-width = 20%\nadjust-cell-height = 4px\n",
-        );
+        let (cfg, errs) = AppConfig::parse("adjust-cell-width = 20%\nadjust-cell-height = 4px\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.cell_width_adjust, CellAdjust::Fraction(0.2));
         assert_eq!(cfg.cell_height_adjust, CellAdjust::Points(4.0));
         // Bare number = percent; bad input reports.
         let (_, errs) = AppConfig::parse("adjust-cell-width = wide");
         assert_eq!(errs.len(), 1);
-        assert_eq!(
-            CellAdjust::Fraction(0.5).apply(10.0),
-            15.0
-        );
+        assert_eq!(CellAdjust::Fraction(0.5).apply(10.0), 15.0);
         assert_eq!(CellAdjust::Points(3.0).apply(10.0), 13.0);
         assert_eq!(CellAdjust::None.apply(10.0), 10.0);
     }
@@ -4561,9 +4659,8 @@ mod tests {
     fn font_synthetic_tokens_or_into_allow_set() {
         // Each line ORs tokens into the allow-set; an empty value
         // (or a line with no known tokens) allows nothing.
-        let (cfg, errs) = AppConfig::parse(
-            "font-synthetic-style = bold\nfont-synthetic-style = italic|bold\n",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("font-synthetic-style = bold\nfont-synthetic-style = italic|bold\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.font_synthetic, Some((true, true)));
         let (cfg, errs) = AppConfig::parse("font-synthetic-style = \n");
@@ -4587,7 +4684,10 @@ mod tests {
                 (0x1F600, 0x1F600, "Noto Color Emoji".to_string()),
             ]
         );
-        for bad in ["font-codepoint-map = U+ZZZZ=X", "font-codepoint-map = U+2-U+1=X"] {
+        for bad in [
+            "font-codepoint-map = U+ZZZZ=X",
+            "font-codepoint-map = U+2-U+1=X",
+        ] {
             let (_, errs) = AppConfig::parse(bad);
             assert_eq!(errs.len(), 1, "{bad}");
         }
@@ -4613,8 +4713,7 @@ mod tests {
 
     #[test]
     fn middle_click_action_enum() {
-        let (cfg, errs) =
-            AppConfig::parse("middle-click-action = clipboard-paste");
+        let (cfg, errs) = AppConfig::parse("middle-click-action = clipboard-paste");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.middle_click_action, MiddleClickAction::ClipboardPaste);
         let (cfg, errs) = AppConfig::parse("middle-click-action = primary-paste");
@@ -4701,7 +4800,10 @@ mod tests {
             cfg.keybinds[2].1,
             Some(TermAction::SetSurfaceTitle("myssn".into()))
         );
-        assert_eq!(cfg.keybinds[3].1, Some(TermAction::SetTabTitle(String::new())));
+        assert_eq!(
+            cfg.keybinds[3].1,
+            Some(TermAction::SetTabTitle(String::new()))
+        );
         assert_eq!(cfg.keybinds[4].1, Some(TermAction::CopyTitleToClipboard));
         assert_eq!(cfg.keybinds[5].1, Some(TermAction::CopyUrlToClipboard));
     }
@@ -4748,7 +4850,10 @@ mod tests {
             Some(TermAction::TypeText("printf q\n".to_string()))
         );
         assert_eq!(
-            action_from_str(&cfg.palette_entries[1].action, &cfg.palette_entries[1].action),
+            action_from_str(
+                &cfg.palette_entries[1].action,
+                &cfg.palette_entries[1].action
+            ),
             Some(TermAction::SelectTab(2))
         );
         let (_, errs) = AppConfig::parse("command-palette-entry = title:NoAction");
@@ -4830,8 +4935,13 @@ mod tests {
         let (_, errs) = AppConfig::parse("resize-overlay = purple\nresize-overlay-duration = soon");
         assert_eq!(errs.len(), 2, "{errs:?}");
         for pos in [
-            "center", "top-left", "top-center", "top-right",
-            "bottom-left", "bottom-center", "bottom-right",
+            "center",
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
         ] {
             let (cfg, errs) = AppConfig::parse(&format!("resize-overlay-position = {pos}"));
             assert!(errs.is_empty(), "{pos}: {errs:?}");
@@ -4910,16 +5020,28 @@ mod tests {
         assert!(cfg.selection_clear_on_copy);
         assert_eq!(cfg.undo_timeout_ms, 30_000);
         assert!(cfg.title_report);
-        assert_eq!(cfg.search_background, Some(Rgb { r: 0xff, g: 0xd7, b: 0x5f }));
+        assert_eq!(
+            cfg.search_background,
+            Some(Rgb {
+                r: 0xff,
+                g: 0xd7,
+                b: 0x5f
+            })
+        );
         assert_eq!(
             cfg.search_selected_background,
-            Some(Rgb { r: 0xff, g: 0xaf, b: 0x00 })
+            Some(Rgb {
+                r: 0xff,
+                g: 0xaf,
+                b: 0x00
+            })
         );
 
         // `no-` disables one without touching the other; re-adding the
         // bare name turns it back on (repeat key).
-        let (cfg2, errs) =
-            AppConfig::parse("app-notifications = no-config-reload\napp-notifications = clipboard-copy\n");
+        let (cfg2, errs) = AppConfig::parse(
+            "app-notifications = no-config-reload\napp-notifications = clipboard-copy\n",
+        );
         assert!(errs.is_empty());
         assert!(cfg2.app_notify_clipboard_copy);
         assert!(!cfg2.app_notify_config_reload);
@@ -4938,8 +5060,9 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("split-preserve-zoom = navigation\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert!(cfg.split_preserve_zoom_navigation);
-        let (cfg, errs) =
-            AppConfig::parse("split-preserve-zoom = navigation\nsplit-preserve-zoom = no-navigation\n");
+        let (cfg, errs) = AppConfig::parse(
+            "split-preserve-zoom = navigation\nsplit-preserve-zoom = no-navigation\n",
+        );
         assert!(errs.is_empty());
         assert!(!cfg.split_preserve_zoom_navigation);
         let (_, errs) = AppConfig::parse("split-preserve-zoom = sideways\n");
@@ -4983,7 +5106,6 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::Redo));
     }
-
 }
 
 #[cfg(test)]
@@ -5076,7 +5198,10 @@ mod key_table_tests {
             Modifiers::CONTROL | Modifiers::SHIFT,
             &["sel".to_string()],
         );
-        assert_eq!(hit.map(|(_, a, t)| (a, t)), Some((None, Some("sel".into()))));
+        assert_eq!(
+            hit.map(|(_, a, t)| (a, t)),
+            Some((None, Some("sel".into())))
+        );
         // `<table>/` clears the table's earlier binds.
         let (cfg3, errs) = AppConfig::parse(
             "keybind = vim/h=new_tab\nkeybind = vim/\nkeybind = vim/l=new_window\n",
@@ -5105,19 +5230,19 @@ mod key_table_tests {
             Some(TermAction::Sequence(vec![
                 TermAction::NewTab,
                 TermAction::PromptTitle,
-                TermAction::FocusPaneDir { horizontal: true, forward: false },
+                TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false
+                },
             ]))
         );
         // `chain=` with no preceding keybind, or after an unbind, errors.
         let (_, errs) = AppConfig::parse("keybind = chain=new_tab\n");
         assert_eq!(errs.len(), 1);
-        let (_, errs) = AppConfig::parse(
-            "keybind = ctrl+alt+z=unbind\nkeybind = chain=new_tab\n",
-        );
+        let (_, errs) = AppConfig::parse("keybind = ctrl+alt+z=unbind\nkeybind = chain=new_tab\n");
         assert_eq!(errs.len(), 1, "unbind+chain errs: {errs:?}");
-        let (_, errs) = AppConfig::parse(
-            "keybind = ctrl+shift+x=ignore\nkeybind = chain=bogus_action\n",
-        );
+        let (_, errs) =
+            AppConfig::parse("keybind = ctrl+shift+x=ignore\nkeybind = chain=bogus_action\n");
         assert_eq!(errs.len(), 1, "ignore+chain-bogus errs: {errs:?}");
 
         // `mouse-reporting` bool.
@@ -5202,13 +5327,18 @@ mod key_table_tests {
         assert_eq!(cfg.titlebar_foreground.unwrap().g, 0xff);
 
         // `key-remap` — generic expands to both sides, sided hits one.
-        let (cfg, errs) = AppConfig::parse(
-            "key-remap = ctrl=super\nkey-remap = left_alt=right_ctrl\n",
-        );
+        let (cfg, errs) =
+            AppConfig::parse("key-remap = ctrl=super\nkey-remap = left_alt=right_ctrl\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.key_remap.len(), 3);
-        assert!(cfg.key_remap.contains(&(Code::ControlLeft, Modifiers::META)));
-        assert!(cfg.key_remap.contains(&(Code::ControlRight, Modifiers::META)));
+        assert!(
+            cfg.key_remap
+                .contains(&(Code::ControlLeft, Modifiers::META))
+        );
+        assert!(
+            cfg.key_remap
+                .contains(&(Code::ControlRight, Modifiers::META))
+        );
         assert!(cfg.key_remap.contains(&(Code::AltLeft, Modifiers::CONTROL)));
         let (_, errs) = AppConfig::parse("key-remap = ctrl\nkey-remap = f1=super\n");
         assert_eq!(errs.len(), 2, "{errs:?}");

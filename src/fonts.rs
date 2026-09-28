@@ -8,10 +8,12 @@
 //! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
 
 use parley::fontique::Synthesis;
-use parley::style::{FontFeature, FontFeatures, FontVariation, FontVariations};
 use parley::setting::Tag;
-use parley::{Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle,
-             FontWeight, Layout, LayoutContext, StyleProperty, style::GenericFamily};
+use parley::style::{FontFeature, FontFeatures, FontVariation, FontVariations};
+use parley::{
+    Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle, FontWeight, Layout,
+    LayoutContext, StyleProperty, style::GenericFamily,
+};
 use waterui_text::FontCollection;
 
 /// Parse one `font-feature` entry: `-tag` disables, `+tag`/`tag`/`tag=N`
@@ -126,9 +128,7 @@ impl TermFonts {
                     "serif" => Some(FontFamilyName::Generic(GenericFamily::Serif)),
                     "cursive" => Some(FontFamilyName::Generic(GenericFamily::Cursive)),
                     "fantasy" => Some(FontFamilyName::Generic(GenericFamily::Fantasy)),
-                    "system-ui" | "ui" => {
-                        Some(FontFamilyName::Generic(GenericFamily::SystemUi))
-                    }
+                    "system-ui" | "ui" => Some(FontFamilyName::Generic(GenericFamily::SystemUi)),
                     "emoji" => Some(FontFamilyName::Generic(GenericFamily::Emoji)),
                     "math" => Some(FontFamilyName::Generic(GenericFamily::Math)),
                     _ => fonts
@@ -185,7 +185,10 @@ impl TermFonts {
             family_italic: None,
             family_bold_italic: None,
             size_px: size_pt,
-            cell_adjust: (crate::config::CellAdjust::None, crate::config::CellAdjust::None),
+            cell_adjust: (
+                crate::config::CellAdjust::None,
+                crate::config::CellAdjust::None,
+            ),
             baseline_adjust: crate::config::CellAdjust::None,
             features: Vec::new(),
             codepoint_map: Vec::new(),
@@ -242,11 +245,7 @@ impl TermFonts {
         italic: &Option<String>,
         bold_italic: &Option<String>,
     ) {
-        let parse = |p: &Option<String>| {
-            p.as_deref()
-                .filter(|s| !s.is_empty())
-                .map(named_style)
-        };
+        let parse = |p: &Option<String>| p.as_deref().filter(|s| !s.is_empty()).map(named_style);
         self.style_bold = parse(bold);
         self.style_italic = parse(italic);
         self.style_bold_italic = parse(bold_italic);
@@ -287,9 +286,8 @@ impl TermFonts {
     /// unparsable clears that face's set. Re-measure since `wght`/`wdth`
     /// move the advance.
     pub fn set_variations(&mut self, specs: &[Option<String>; 4]) {
-        let parsed: [Option<Vec<FontVariation>>; 4] = std::array::from_fn(|i| {
-            specs[i].as_deref().and_then(parse_font_variation)
-        });
+        let parsed: [Option<Vec<FontVariation>>; 4] =
+            std::array::from_fn(|i| specs[i].as_deref().and_then(parse_font_variation));
         if self.variations != parsed {
             self.variations = parsed;
             self.metrics = self.probe_metrics();
@@ -311,11 +309,7 @@ impl TermFonts {
     }
 
     /// Hot-reload `adjust-cell-width`/`adjust-cell-height` and re-measure.
-    pub fn set_cell_adjust(
-        &mut self,
-        w: crate::config::CellAdjust,
-        h: crate::config::CellAdjust,
-    ) {
+    pub fn set_cell_adjust(&mut self, w: crate::config::CellAdjust, h: crate::config::CellAdjust) {
         if self.cell_adjust != (w, h) {
             self.cell_adjust = (w, h);
             self.metrics = self.probe_metrics();
@@ -333,8 +327,7 @@ impl TermFonts {
     /// Hot-reload `font-feature` entries and re-measure (a feature can
     /// change advances — e.g. `-calt` rejoins ligatures into cells).
     pub fn set_features(&mut self, specs: &[String]) {
-        let parsed: Vec<FontFeature> =
-            specs.iter().filter_map(|s| parse_font_feature(s)).collect();
+        let parsed: Vec<FontFeature> = specs.iter().filter_map(|s| parse_font_feature(s)).collect();
         if self.features != parsed {
             self.features = parsed;
             self.metrics = self.probe_metrics();
@@ -362,9 +355,7 @@ impl TermFonts {
         }
         .clone();
         self.collection.use_fonts(|fonts| {
-            let mut builder = self
-                .layout_cx
-                .ranged_builder(fonts, text, 1.0, false);
+            let mut builder = self.layout_cx.ranged_builder(fonts, text, 1.0, false);
             builder.push_default(StyleProperty::Brush([255, 255, 255, 255]));
             builder.push_default(StyleProperty::FontSize(size));
             builder.push_default(StyleProperty::FontFamily(family));
@@ -394,14 +385,14 @@ impl TermFonts {
                 (true, true) => 3,
             };
             if let Some(v) = &self.variations[variant_idx] {
-                builder.push_default(StyleProperty::FontVariations(
-                    FontVariations::List(std::borrow::Cow::Owned(v.clone())),
-                ));
+                builder.push_default(StyleProperty::FontVariations(FontVariations::List(
+                    std::borrow::Cow::Owned(v.clone()),
+                )));
             }
             if !self.features.is_empty() {
-                builder.push_default(StyleProperty::FontFeatures(
-                    FontFeatures::List(std::borrow::Cow::Owned(self.features.clone())),
-                ));
+                builder.push_default(StyleProperty::FontFeatures(FontFeatures::List(
+                    std::borrow::Cow::Owned(self.features.clone()),
+                )));
             }
             if !self.codepoint_map.is_empty() {
                 // Group consecutive chars that resolve to the same map
@@ -416,9 +407,7 @@ impl TermFonts {
                     if idx != run_map {
                         if let Some(mi) = run_map {
                             builder.push(
-                                StyleProperty::FontFamily(
-                                    self.codepoint_map[mi].1.clone(),
-                                ),
+                                StyleProperty::FontFamily(self.codepoint_map[mi].1.clone()),
                                 run_start..bi,
                             );
                         }
@@ -609,8 +598,7 @@ mod tests {
     /// per-scalar fallbacks.
     #[test]
     fn zwj_cluster_shapes_as_one_ligature() {
-        let mut fonts =
-            TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0, "");
+        let mut fonts = TermFonts::load(FontCollection::new(parley::FontContext::new()), 13.0, "");
         let layout = fonts.shape_run(
             "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
             false,

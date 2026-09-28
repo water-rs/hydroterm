@@ -209,10 +209,7 @@ pub fn system_prefers_dark() -> bool {
 /// re-reads it; `ghostty` additionally seeds the M3 style from the
 /// terminal background at launch (`lib.rs::material_style`) — the scheme
 /// here keeps the env signal consistent for anything not token-driven.
-pub fn scheme_for(
-    window_theme: &crate::config::WindowTheme,
-    background: &Rgb,
-) -> ColorScheme {
+pub fn scheme_for(window_theme: &crate::config::WindowTheme, background: &Rgb) -> ColorScheme {
     match window_theme {
         crate::config::WindowTheme::Light => ColorScheme::Light,
         crate::config::WindowTheme::Dark => ColorScheme::Dark,
@@ -237,5 +234,3 @@ pub fn scheme_for(
 fn rgb_is_dark(rgb: &Rgb) -> bool {
     (0.2126 * f64::from(rgb.r) + 0.7152 * f64::from(rgb.g) + 0.0722 * f64::from(rgb.b)) < 127.5
 }
-
-

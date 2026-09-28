@@ -7,8 +7,8 @@
 use std::thread;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, Keycode, ModMask};
 use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, Keycode, ModMask};
 use x11rb::rust_connection::RustConnection;
 
 /// X11 keysym for F12 (X11 keysymdef `XK_F12`).
@@ -116,14 +116,7 @@ pub fn spawn_hotkey<E: Clone + Send + 'static>(
         ModMask::LOCK | ModMask::M2 | ModMask::from(mod_bits),
     ];
     for mask in variants {
-        let cookie = conn.grab_key(
-            false,
-            root,
-            mask,
-            keycode,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        );
+        let cookie = conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
         let failed = match cookie {
             Ok(c) => c.check().err().map(|e| e.to_string()),
             Err(e) => Some(e.to_string()),
@@ -134,20 +127,24 @@ pub fn spawn_hotkey<E: Clone + Send + 'static>(
         }
     }
     conn.flush().ok()?;
-    eprintln!("quickterm: grabbed {keysym:#x}+{mod_bits:#x} as keycode {keycode} on root {root:#x}");
-    Some(thread::spawn(move || loop {
-        // Poll rather than block on `wait_for_event` so `stop` can tear
-        // the grab down without a wakeup mechanism on this connection.
-        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        match conn.poll_for_event() {
-            Ok(Some(Event::KeyPress(e))) if e.detail == keycode => {
-                let _ = send.try_send(event.clone());
+    eprintln!(
+        "quickterm: grabbed {keysym:#x}+{mod_bits:#x} as keycode {keycode} on root {root:#x}"
+    );
+    Some(thread::spawn(move || {
+        loop {
+            // Poll rather than block on `wait_for_event` so `stop` can tear
+            // the grab down without a wakeup mechanism on this connection.
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
             }
-            Ok(Some(_)) => {}
-            Ok(None) => thread::sleep(std::time::Duration::from_millis(60)),
-            Err(_) => break,
+            match conn.poll_for_event() {
+                Ok(Some(Event::KeyPress(e))) if e.detail == keycode => {
+                    let _ = send.try_send(event.clone());
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => thread::sleep(std::time::Duration::from_millis(60)),
+                Err(_) => break,
+            }
         }
     }))
 }

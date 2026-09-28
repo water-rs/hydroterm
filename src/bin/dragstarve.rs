@@ -22,11 +22,11 @@ use waterui::app::App;
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
 use waterui::window::{Window, WindowState};
+use waterui_core::extract::Use;
 use waterui_graphics::color::{BorderColor, Color};
 use waterui_graphics::input::SurfaceInputEvent;
-use waterui_graphics::scene2d::Scene2D;
 use waterui_graphics::scene_view::{SceneContent, SceneView};
-use waterui_core::extract::Use;
+use waterui_graphics::scene2d::Scene2D;
 
 struct Pane([f32; 4]);
 
@@ -58,32 +58,37 @@ fn main() {
     use waterui::cursor::CursorStyle;
     use waterui::gesture::{DragEvent, DragGesture};
 
-    let window = Window::new("dragstarve", Binding::container(WindowState::Normal), move || {
-        let divider = Frame::new(Color::new(BorderColor))
-            .width(1.0)
-            .max_height(f32::INFINITY);
-        let divider = Frame::new(divider)
-            .width(20.0)
-            .max_height(f32::INFINITY)
-            .cursor(CursorStyle::ResizeLeftRight)
-            .gesture(DragGesture::new(0.0), move |event: Option<
-                Use<DragEvent>,
-            >| {
-                if let Some(e) = event {
-                    eprintln!(
-                        "[divider] phase={:?} t=({:.1},{:.1})",
-                        e.0.phase, e.0.translation.x, e.0.translation.y
-                    );
-                }
-            })
-            .anyview();
-        hstack((
-            Frame::new(SceneView::new(Pane([0.13, 0.59, 0.95, 1.0]))).width(390.0),
-            divider,
-            Frame::new(SceneView::new(Pane([0.96, 0.26, 0.21, 1.0]))).width(390.0),
-        ))
-        .spacing(0.0)
-    });
+    let window = Window::new(
+        "dragstarve",
+        Binding::container(WindowState::Normal),
+        move || {
+            let divider = Frame::new(Color::new(BorderColor))
+                .width(1.0)
+                .max_height(f32::INFINITY);
+            let divider = Frame::new(divider)
+                .width(20.0)
+                .max_height(f32::INFINITY)
+                .cursor(CursorStyle::ResizeLeftRight)
+                .gesture(
+                    DragGesture::new(0.0),
+                    move |event: Option<Use<DragEvent>>| {
+                        if let Some(e) = event {
+                            eprintln!(
+                                "[divider] phase={:?} t=({:.1},{:.1})",
+                                e.0.phase, e.0.translation.x, e.0.translation.y
+                            );
+                        }
+                    },
+                )
+                .anyview();
+            hstack((
+                Frame::new(SceneView::new(Pane([0.13, 0.59, 0.95, 1.0]))).width(390.0),
+                divider,
+                Frame::new(SceneView::new(Pane([0.96, 0.26, 0.21, 1.0]))).width(390.0),
+            ))
+            .spacing(0.0)
+        },
+    );
     let app = App::new_with_windows([window], Environment::new());
     hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }

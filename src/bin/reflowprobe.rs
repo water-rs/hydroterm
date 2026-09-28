@@ -26,8 +26,8 @@ fn dump(term: &Term<VoidListener>, cols: usize) {
     for l in 0..lines {
         let mut s = String::new();
         for c in 0..cols {
-            let cell: &Cell =
-                &grid[alacritty_terminal::index::Line(l as i32)][alacritty_terminal::index::Column(c)];
+            let cell: &Cell = &grid[alacritty_terminal::index::Line(l as i32)]
+                [alacritty_terminal::index::Column(c)];
             s.push(if cell.c == '\0' { ' ' } else { cell.c });
         }
         println!("{l:3}|{}|", s.trim_end());

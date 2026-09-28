@@ -18,9 +18,7 @@ pub struct CursorHider {
 impl CursorHider {
     /// Connect and resolve our toplevel XID, or `None` off-X11.
     pub fn new() -> Option<Self> {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
-            && std::env::var_os("DISPLAY").is_none()
-        {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
             return None;
         }
         let (conn, screen) = RustConnection::connect(None).ok()?;

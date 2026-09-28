@@ -3,42 +3,42 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
+use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
+use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
 use nami::collection::{Collection, List as NamiList};
 use nami::impl_constant;
 use nami::zip::zip;
 use nami::{Binding, Signal, binding};
-use waterui::state;
-use waterui::theme::ColorScheme;
 use waterui::Identifiable;
-use waterui_core::id::SelfId;
+use waterui::Url;
+use waterui::accessibility::{AccessibilityRole, AccessibilityState};
+use waterui::drag_drop::{Files, Transferable};
+use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
-use waterui::widget::condition::when;
-use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
-use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
-use waterui::window::WindowPresentation;
-use waterui::task::{sleep, spawn_local};
-use waterui_core::layout::{Point, Rect, Size};
-use waterui_graphics::SceneView;
-use waterui::snackbar::{Snackbar, SnackbarManager};
-use waterui::accessibility::{AccessibilityRole, AccessibilityState};
-use waterui::Url;
-use waterui::drag_drop::{Files, Transferable};
-use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
-use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
-use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
 use waterui::shape::{FixedRoundedRectangle, ShapeExt};
+use waterui::snackbar::{Snackbar, SnackbarManager};
+use waterui::state;
+use waterui::task::{sleep, spawn_local};
+use waterui::theme::ColorScheme;
+use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
+use waterui::widget::condition::when;
+use waterui::window::WindowPresentation;
+use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
+use waterui_core::id::SelfId;
+use waterui_core::layout::{Point, Rect, Size};
+use waterui_core::resolve::Resolvable;
+use waterui_graphics::SceneView;
 use waterui_graphics::color::{Color, Srgb, signal_color};
 use waterui_text::FontCollection;
-use waterui_core::resolve::Resolvable;
 use waterui_text::font::{Body, Font, ResolvedFont};
 
 use crate::config::{AppConfig, ConfigWatcher};
@@ -293,7 +293,7 @@ impl Session {
                 shell_features: cfg.shell_features,
             },
         )
-            .expect("failed to spawn PTY — is a shell available?");
+        .expect("failed to spawn PTY — is a shell available?");
         // `enquiry-response` — configured DA answer, live-updated on reload.
         terminal
             .proxy
@@ -309,7 +309,9 @@ impl Session {
         Self {
             id,
             terminal: Arc::new(terminal),
-            title: binding(Str::from(cfg.title.clone().unwrap_or_else(|| "Shell".into()))),
+            title: binding(Str::from(
+                cfg.title.clone().unwrap_or_else(|| "Shell".into()),
+            )),
             base_title: std::sync::Mutex::new(Str::from(
                 cfg.title.clone().unwrap_or_else(|| "Shell".into()),
             )),
@@ -501,9 +503,7 @@ impl SplitNode {
     fn leaves(&self) -> Vec<u64> {
         match self {
             Self::Leaf(id) => vec![*id],
-            Self::Split { children, .. } => {
-                children.iter().flat_map(Self::leaves).collect()
-            }
+            Self::Split { children, .. } => children.iter().flat_map(Self::leaves).collect(),
         }
     }
 
@@ -783,7 +783,6 @@ thread_local! {
 /// cancels it.
 static QUIT_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
-
 /// Extractor key for a pane's session — a local newtype because the
 /// orphan rule won't let `Extractor` (foreign) be implemented for
 /// `Rc<Session>` (also foreign). Per-pane `.state(&PaneSession(..))` lets
@@ -809,8 +808,7 @@ pub struct TitleFont(pub Binding<Option<Str>>);
 impl Resolvable for TitleFont {
     type Resolved = ResolvedFont;
     fn resolve(&self, env: &Environment) -> impl Signal<Output = Self::Resolved> {
-        zip(Body.resolve(env), self.0.clone())
-        .map(|(mut f, fam)| {
+        zip(Body.resolve(env), self.0.clone()).map(|(mut f, fam)| {
             if let Some(fam) = fam {
                 f.family = Some(fam);
             }
@@ -850,7 +848,10 @@ impl AppState {
         let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
-            || matches!(watcher.config.window_theme, crate::config::WindowTheme::System);
+            || matches!(
+                watcher.config.window_theme,
+                crate::config::WindowTheme::System
+            );
         let applied_quick_geo = (
             watcher.config.quick_terminal_position,
             watcher.config.quick_terminal_size,
@@ -886,7 +887,11 @@ impl AppState {
                 &watcher.config.resolve_theme().background,
             )),
             title_font_family: Binding::container(
-                watcher.config.window_title_font_family.clone().map(Str::from),
+                watcher
+                    .config
+                    .window_title_font_family
+                    .clone()
+                    .map(Str::from),
             ),
             cfg: Rc::new(RefCell::new(watcher)),
             palette: Rc::new(RefCell::new(palette)),
@@ -941,7 +946,9 @@ impl AppState {
                 else {
                     return;
                 };
-                let Some(out) = child.stdout.take() else { return };
+                let Some(out) = child.stdout.take() else {
+                    return;
+                };
                 for _ in std::io::BufReader::new(out).lines().map_while(Result::ok) {
                     dirty.store(true, Ordering::Relaxed);
                     wakes.lock().unwrap().retain(|w| match w.upgrade() {
@@ -1034,8 +1041,7 @@ impl AppState {
             tracing::warn!(chord, "global: unmapped key name");
             return;
         };
-        let mod_bits =
-            crate::quickterm::chord_mod_bits(mods[0], mods[1], mods[2], mods[3]);
+        let mod_bits = crate::quickterm::chord_mod_bits(mods[0], mods[1], mods[2], mods[3]);
         let (tx, rx) = async_channel::unbounded::<TermAction>();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         match crate::quickterm::spawn_hotkey(tx, keysym, mod_bits, action.clone(), stop.clone()) {
@@ -1066,10 +1072,7 @@ impl AppState {
             // Only default-table binds grab globally — a `global:`
             // inside a key table is inert until its table is active.
             let keep = config.keybinds.iter().any(|(t, a)| {
-                t.global
-                    && t.table.is_none()
-                    && t.chord == *chord
-                    && a.as_ref() == Some(action)
+                t.global && t.table.is_none() && t.chord == *chord && a.as_ref() == Some(action)
             });
             if !keep {
                 stop.store(true, Ordering::SeqCst);
@@ -1152,12 +1155,8 @@ impl AppState {
             &config.window_theme,
             &config.resolve_theme().background,
         ));
-        self.title_font_family.set(
-            config
-                .window_title_font_family
-                .clone()
-                .map(Str::from),
-        );
+        self.title_font_family
+            .set(config.window_title_font_family.clone().map(Str::from));
         self.titlebar_bg.set(config.titlebar_background);
         self.titlebar_fg.set(config.titlebar_foreground);
         // `title` — a configured window title re-applies on reload
@@ -1189,7 +1188,8 @@ impl AppState {
             if !s.font_size_override.get() {
                 s.font_size.set(config.font_size);
             }
-            s.font_family.set_from(Str::from(config.font_family.clone()));
+            s.font_family
+                .set_from(Str::from(config.font_family.clone()));
             s.unfocused_opacity.set(config.unfocused_split_opacity);
             s.context_menu_enabled
                 .set(config.right_click_action == crate::config::RightClickAction::ContextMenu);
@@ -1227,8 +1227,7 @@ impl AppState {
     /// tab strip dots it until the tab is selected again. Called from
     /// each surface's parser-wake (which fires on new output).
     pub fn note_activity(&self, session_id: u64) {
-        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
-        else {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id) else {
             return;
         };
         if self.selected.snapshot() == tab_id {
@@ -1340,11 +1339,9 @@ impl AppState {
     fn quick_window(&self, state: Binding<WindowState>) -> Window {
         let app = self.quick_app();
         let title = app.window_title.clone();
-        let w = Window::new(title, state, move || {
-            app_root((*app).clone())
-        })
-        .style(WindowStyle::Borderless)
-        .resizable(false);
+        let w = Window::new(title, state, move || app_root((*app).clone()))
+            .style(WindowStyle::Borderless)
+            .resizable(false);
         // `class =` — the quick-terminal window shares the app's
         // desktop identity too (water-rs/waterui#1291).
         let w = if let Some(cls) = self.config(|c| c.app_class.clone()) {
@@ -1384,30 +1381,22 @@ impl AppState {
             let (x, y, w_px, h_px) = match pos {
                 P::Top => {
                     let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
-                    let w = size
-                        .and_then(|(_, b)| b)
-                        .map_or(sw, |b| axis(Some(b), sw));
+                    let w = size.and_then(|(_, b)| b).map_or(sw, |b| axis(Some(b), sw));
                     ((sw - w) / 2.0, 0.0, w, h)
                 }
                 P::Bottom => {
                     let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
-                    let w = size
-                        .and_then(|(_, b)| b)
-                        .map_or(sw, |b| axis(Some(b), sw));
+                    let w = size.and_then(|(_, b)| b).map_or(sw, |b| axis(Some(b), sw));
                     ((sw - w) / 2.0, sh - h, w, h)
                 }
                 P::Left => {
                     let w = size.map_or(sw * 0.40, |(a, _)| axis(Some(a), sw));
-                    let h = size
-                        .and_then(|(_, b)| b)
-                        .map_or(sh, |b| axis(Some(b), sh));
+                    let h = size.and_then(|(_, b)| b).map_or(sh, |b| axis(Some(b), sh));
                     (0.0, (sh - h) / 2.0, w, h)
                 }
                 P::Right => {
                     let w = size.map_or(sw * 0.40, |(a, _)| axis(Some(a), sw));
-                    let h = size
-                        .and_then(|(_, b)| b)
-                        .map_or(sh, |b| axis(Some(b), sh));
+                    let h = size.and_then(|(_, b)| b).map_or(sh, |b| axis(Some(b), sh));
                     (sw - w, (sh - h) / 2.0, w, h)
                 }
                 P::Center => {
@@ -1459,9 +1448,8 @@ impl AppState {
         let secs = self.config(|c| c.quick_terminal_animation_duration);
         let cur = frame.snapshot();
         let pos = self.config(|c| c.quick_terminal_position);
-        let off = crate::quickterm::screen_size().and_then(|(sw, sh)| {
-            dock_offscreen(pos, cur, sw as f32, sh as f32)
-        });
+        let off = crate::quickterm::screen_size()
+            .and_then(|(sw, sh)| dock_offscreen(pos, cur, sw as f32, sh as f32));
         match off.filter(|_| secs > 0.0) {
             Some(off) => {
                 let state = self.quick_state.clone();
@@ -1529,14 +1517,10 @@ impl AppState {
         let opacity = state.config(|c| c.background_opacity);
         // `background =` overrides the theme's fill (same as the grid).
         let bg = state.palette.borrow().background;
-        let window = Window::new(
-            state.window_title.clone(),
-            state.window_state.clone(),
-            {
-                let state = state.clone();
-                move || app_root(state.clone())
-            },
-        )
+        let window = Window::new(state.window_title.clone(), state.window_state.clone(), {
+            let state = state.clone();
+            move || app_root(state.clone())
+        })
         // `window-decoration` applies to spawned windows too.
         .style(if state.config(|c| c.window_decoration) {
             WindowStyle::Titled
@@ -1557,9 +1541,7 @@ impl AppState {
         };
         Self::apply_launch_geometry(&state, &window);
         if state.config(|c| c.window_fullscreen) {
-            state
-                .window_state
-                .set(WindowState::Fullscreen);
+            state.window_state.set(WindowState::Fullscreen);
         }
         window.show(env);
     }
@@ -1635,14 +1617,10 @@ impl AppState {
         state.bell_title(focused);
         let opacity = state.config(|c| c.background_opacity);
         let bg = state.palette.borrow().background;
-        let window = Window::new(
-            state.window_title.clone(),
-            state.window_state.clone(),
-            {
-                let state = state.clone();
-                move || app_root(state.clone())
-            },
-        )
+        let window = Window::new(state.window_title.clone(), state.window_state.clone(), {
+            let state = state.clone();
+            move || app_root(state.clone())
+        })
         .style(if state.config(|c| c.window_decoration) {
             WindowStyle::Titled
         } else {
@@ -1673,11 +1651,7 @@ impl AppState {
 
     /// Look up one session.
     pub fn session(&self, id: u64) -> Option<Rc<Session>> {
-        self.sessions
-            .borrow()
-            .iter()
-            .find(|s| s.id == id)
-            .cloned()
+        self.sessions.borrow().iter().find(|s| s.id == id).cloned()
     }
 
     /// Every live session — `keybind = all:` applies a per-surface
@@ -1694,7 +1668,9 @@ impl AppState {
     pub fn focused_session(&self) -> Option<Rc<Session>> {
         let tab_id = self.selected.snapshot();
         let focused = self
-            .tabs.iter().find(|t| t.id == tab_id)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
             .map(|t| t.focused.snapshot())?;
         self.session(focused)
     }
@@ -1717,9 +1693,8 @@ impl AppState {
             .iter()
             .map(|(n, _)| n.clone())
             .collect();
-        let hit = self.config(|c| {
-            c.lookup_keybind_tabled(&press.key, press.code, press.modifiers, &tables)
-        });
+        let hit = self
+            .config(|c| c.lookup_keybind_tabled(&press.key, press.code, press.modifiers, &tables));
         match hit {
             Some((trig, Some(action), _)) if !trig.unconsumed => {
                 session.pending_actions.borrow_mut().push(action);
@@ -1762,7 +1737,12 @@ impl AppState {
     /// the PTY at spawn from the GUI's known pane size; doing the same
     /// makes the first `sync_size` a no-op, so no resize ioctl lands
     /// while the shell is still arming its SIGWINCH handler.
-    fn initial_grid_for(&self, pane_w: f32, pane_h: f32, cell: (f32, f32)) -> (usize, usize, (u16, u16)) {
+    fn initial_grid_for(
+        &self,
+        pane_w: f32,
+        pane_h: f32,
+        cell: (f32, f32),
+    ) -> (usize, usize, (u16, u16)) {
         let (wpx, wpy) = self.config(|c| (c.window_padding_x, c.window_padding_y));
         let pad_x = crate::scene::PADDING + wpx;
         let pad_y = crate::scene::PADDING + wpy;
@@ -1827,7 +1807,8 @@ impl AppState {
     fn open_first_tab(&self) {
         let first_tab = self.new_tab();
         if let Some(t) = self.tabs.iter().find(|t| t.id == first_tab) {
-            self.focus_owner.set(Some((first_tab, t.focused.snapshot())));
+            self.focus_owner
+                .set(Some((first_tab, t.focused.snapshot())));
         }
     }
 
@@ -1868,10 +1849,7 @@ impl AppState {
             title_override: Binding::default(),
             badge: Binding::bool(false),
         };
-        self.session_tab
-            .lock()
-            .unwrap()
-            .insert(session.id, tab.id);
+        self.session_tab.lock().unwrap().insert(session.id, tab.id);
         let tab_id = tab.id;
         // `window-new-tab-position = current` inserts right after the
         // selected tab instead of appending at the strip's end.
@@ -1898,11 +1876,13 @@ impl AppState {
     /// `before` puts the new pane ahead of the target (left/up split).
     pub fn split_pane(&self, dir: SplitDir, target: u64, before: bool) -> Option<u64> {
         let tab_id = self.selected.snapshot();
-        let tab = self
-            .tabs.iter().find(|t| t.id == tab_id)?;
+        let tab = self.tabs.iter().find(|t| t.id == tab_id)?;
         let cwd = self
             .config(|c| c.split_inherit_working_directory)
-            .then(|| self.session(target).and_then(|s| s.cwd.lock().unwrap().clone()))
+            .then(|| {
+                self.session(target)
+                    .and_then(|s| s.cwd.lock().unwrap().clone())
+            })
             .flatten();
         // The new pane's slot: half the target's main-axis extent minus
         // the divider, full extent on the other axis — exact, from the
@@ -1935,32 +1915,24 @@ impl AppState {
             .with_mut(|tree| tree.split(dir, target, session.id, slot_px, before));
         if !ok {
             session.terminal.shutdown();
-            self.sessions
-                .borrow_mut()
-                .retain(|s| s.id != session.id);
+            self.sessions.borrow_mut().retain(|s| s.id != session.id);
             return None;
         }
         // A new split is a layout change — always unzooms, even under
         // `split-preserve-zoom = navigation` (which covers navigation
         // only, per the reference).
         tab.zoomed.set(None);
-        self.session_tab
-            .lock()
-            .unwrap()
-            .insert(session.id, tab_id);
+        self.session_tab.lock().unwrap().insert(session.id, tab_id);
         self.focus_pane(session.id);
         Some(session.id)
     }
 
     /// A pane took focus — record it and sync the tab title.
     pub fn focus_pane(&self, session_id: u64) {
-        let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied()
-        else {
+        let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied() else {
             return;
         };
-        let Some(tab) = self
-            .tabs.iter().find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         if tab.focused.snapshot() == session_id {
@@ -2007,18 +1979,17 @@ impl AppState {
             s.title.set(title.clone());
         }
         if let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied()
-            && let Some(tab) = self
-                .tabs.iter().find(|t| t.id == tab_id)
-                && tab.focused.snapshot() == session_id
-            {
-                if tab.title_override.snapshot().is_none() {
-                    tab.title.set(title.clone());
-                }
-                if self.selected.snapshot() == tab_id {
-                    let shown = self.bell_prefixed_title(session_id, &title);
-                    self.window_title.set(shown);
-                }
+            && let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id)
+            && tab.focused.snapshot() == session_id
+        {
+            if tab.title_override.snapshot().is_none() {
+                tab.title.set(title.clone());
             }
+            if self.selected.snapshot() == tab_id {
+                let shown = self.bell_prefixed_title(session_id, &title);
+                self.window_title.set(shown);
+            }
+        }
     }
 
     /// `bell-features` `title` — the 🔔 prefix applies to the WINDOW
@@ -2027,8 +1998,7 @@ impl AppState {
     /// prefix (applied here in `set_session_title`). Call after the
     /// session's `notify_badge` flag is already in its new state.
     pub fn bell_title(&self, session_id: u64) {
-        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
-        else {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id) else {
             return;
         };
         if self.selected.snapshot() != tab_id {
@@ -2040,7 +2010,9 @@ impl AppState {
         if tab.focused.snapshot() != session_id {
             return;
         }
-        let Some(s) = self.session(session_id) else { return };
+        let Some(s) = self.session(session_id) else {
+            return;
+        };
         let base = s.base_title.lock().unwrap().clone();
         self.window_title
             .set(self.bell_prefixed_title(session_id, &base));
@@ -2075,8 +2047,7 @@ impl AppState {
     /// (Ghostty). `None` clears the override; the tab resyncs to the
     /// focused session's title.
     pub fn set_tab_title(&self, session_id: u64, title: Option<String>) {
-        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id)
-        else {
+        let Some(&tab_id) = self.session_tab.lock().unwrap().get(&session_id) else {
             return;
         };
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
@@ -2105,15 +2076,16 @@ impl AppState {
     /// `prompt_tab_title` seed).
     pub fn tab_title_of(&self, session_id: u64) -> Option<Str> {
         let tab_id = *self.session_tab.lock().unwrap().get(&session_id)?;
-        self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.title.snapshot())
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.title.snapshot())
     }
 
     /// Cycle pane focus within the selected tab.
     pub fn cycle_pane(&self, dir: isize) {
         let tab_id = self.selected.snapshot();
-        let Some(tab) = self
-            .tabs.iter().find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         let leaves = tab.tree.snapshot().leaves();
@@ -2136,10 +2108,10 @@ impl AppState {
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
-        if let Some(next) = tab
-            .tree
-            .snapshot()
-            .neighbor(tab.focused.snapshot(), horizontal, forward)
+        if let Some(next) =
+            tab.tree
+                .snapshot()
+                .neighbor(tab.focused.snapshot(), horizontal, forward)
         {
             self.focus_pane(next);
         }
@@ -2238,13 +2210,12 @@ impl AppState {
     /// the split layout.
     pub fn toggle_pane_zoom(&self) {
         let tab_id = self.selected.snapshot();
-        let Some(tab) = self
-            .tabs.iter().find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         let focused = tab.focused.snapshot();
-        tab.zoomed.with_mut(|z| *z = z.take().is_none().then_some(focused));
+        tab.zoomed
+            .with_mut(|z| *z = z.take().is_none().then_some(focused));
     }
 
     /// `confirm-close` gate on `close_pane`: when the pane's PTY has a
@@ -2259,9 +2230,7 @@ impl AppState {
         let prog = session.and_then(|s| s.terminal.foreground_program());
         let prompted = match (mode, pending) {
             (C::False, _) | (_, None) => None,
-            (C::True, Some(pending)) => {
-                prog.map(|p| (Str::from(p), pending))
-            }
+            (C::True, Some(pending)) => prog.map(|p| (Str::from(p), pending)),
             (C::Always, Some(pending)) => Some((
                 prog.map(Str::from)
                     .unwrap_or_else(|| Str::from("a shell session")),
@@ -2336,7 +2305,9 @@ impl AppState {
                 .find(|s| s.id == session_id)
                 .map(|s| s.pending_close.snapshot().map(|(_, whole)| whole))
         };
-        let Some(whole_tab) = decision.flatten() else { return };
+        let Some(whole_tab) = decision.flatten() else {
+            return;
+        };
         self.cancel_close_prompt(session_id);
         if whole_tab {
             if let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied() {
@@ -2360,13 +2331,10 @@ impl AppState {
 
     /// Close a pane; when it's the tab's last pane, close the tab.
     pub fn close_pane(&self, session_id: u64) {
-        let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied()
-        else {
+        let Some(tab_id) = self.session_tab.lock().unwrap().get(&session_id).copied() else {
             return;
         };
-        let Some(tab) = self
-            .tabs.iter().find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         match tab.tree.snapshot().remove(session_id) {
@@ -2406,19 +2374,14 @@ impl AppState {
 
     /// Kill every session in a tab and drop the tab; selects a neighbor.
     pub fn close_tab(&self, tab_id: u64) {
-        let Some(tab) = self
-            .tabs.iter().find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
         let tree = tab.tree.snapshot();
         let leaves = tree.leaves();
         // `undo` capture: the whole split shape + every pane's grid.
-        let order: HashMap<u64, usize> = leaves
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i))
-            .collect();
+        let order: HashMap<u64, usize> =
+            leaves.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         self.capture_closed(
             leaves.clone(),
             closed_node(&tree, &order),
@@ -2572,11 +2535,7 @@ impl AppState {
 
     /// Select the tab at 1-based index `n`.
     pub fn select_tab(&self, n: usize) {
-        let id = self
-            .tabs
-            .iter()
-            .nth(n.saturating_sub(1))
-            .map(|t| t.id);
+        let id = self.tabs.iter().nth(n.saturating_sub(1)).map(|t| t.id);
         if let Some(id) = id {
             self.selected.set(id);
         }
@@ -2683,7 +2642,12 @@ impl View for PaneLeaf {
                     let mut items: Vec<MenuItem> = Vec::new();
                     // Link rows appear only when the secondary click landed
                     // on a link — the pane stashes the URL at press time.
-                    if let Some(url) = ctx.url.as_ref().map(Str::to_string).filter(|s| !s.is_empty()) {
+                    if let Some(url) = ctx
+                        .url
+                        .as_ref()
+                        .map(Str::to_string)
+                        .filter(|s| !s.is_empty())
+                    {
                         items.push({
                             let open = url.clone();
                             "Open Link"
@@ -2695,7 +2659,9 @@ impl View for PaneLeaf {
                         });
                         items.push(
                             "Copy Link"
-                                .action(|s: PaneSession| s.push_action(TermAction::CopyUrlToClipboard))
+                                .action(|s: PaneSession| {
+                                    s.push_action(TermAction::CopyUrlToClipboard)
+                                })
                                 .into(),
                         );
                         items.push(MenuItem::Divider);
@@ -2747,262 +2713,264 @@ impl View for PaneLeaf {
             })
             .computed();
         let session_state = PaneSession(self.session.clone());
-        let assemble = std::rc::Rc::new(move || -> AnyView {
-        // Search bar: a real WaterUI row that appears above the surface —
-        // the field is a sibling, so toggling it never remounts the
-        // SceneView or drops its keyboard focus.
-        let query = self.session.search_query.clone();
-        let status = self.session.search_status.clone();
-        let open = self.session.search_open.clone();
-        let term_surface = TermSurface::new(
-            self.session.clone(),
-            self.state.clone(),
-            self.state.palette.clone(),
-            FontCollection::from_env(&env),
-        );
-        // Reactive IBeam/pointing-hand over Ctrl-hovered links.
-        let hover_cursor = term_surface.hover_cursor.clone();
-        // `.focused` is hydrolysis's programmatic embedded-focus grant
-        // (#132): when `focus_owner == (this tab, this pane)` the surface
-        // takes key focus without a click — at launch, after a tab switch,
-        // and across split rebuilds. Pointer focus writes back into
-        // `focus_owner`; the `on_change` watchers in `tabs_view` keep it
-        // and `tab.focused` in sync. Hidden tabs' panes never match the
-        // owner, so only the visible pane can hold embedded focus.
-        let surface = SceneView::new(term_surface)
-            .focused(&self.state.focus_owner, (self.tab_id, self.session.id))
-            .cursor(hover_cursor)
-            // Drag-and-drop: a file dropped on the pane pastes its
-            // shell-quoted path into the PTY (Ghostty/kitty behaviour), and
-            // a tab chip dropped on a pane detaches into its own window
-            // (Ghostty's drag-out). One destination per payload kind — the
-            // hit test delivers to the topmost acceptor.
-            .drop_destination(move |files: Files, session: PaneSession| {
-                let text = files
-                    .urls()
-                    .iter()
-                    .map(|url| url.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !text.is_empty() {
-                    session.push_action(TermAction::DropText(text));
-                }
-            })
-            .drop_destination(move |text: Str, session: PaneSession| {
-                session.push_action(TermAction::DropText(text.to_string()));
-            })
-            .drop_destination(move |url: Url, session: PaneSession| {
-                session.push_action(TermAction::DropText(url.to_string()));
-            })
-            .drop_destination({
-                let app = self.state.clone();
-                move |drag: TabDrag, _session: PaneSession| {
-                    app.detach_tab_to_window(drag.tab_id);
-                }
-            });
-        let surface = Frame::new(surface);
-        // Paste-protection confirm: multi-line clipboard content waits in
-        // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
-        let pending = self.session.pending_paste.clone();
-        let session = PaneSession(self.session.clone()); // `.state` stores a clone
-        // Paste-protection confirmation rides the framework's own snackbar
-        // overlay (mounted by `Window::new`), so it layers above the pane
-        // correctly. The `when` gate mounts a zero-size trigger whose
-        // `on_appear` presents the Snackbar; `pending_paste` still gates
-        // keystrokes (Enter = Paste, Escape = Cancel) on the surface side.
-        let paste_overlay = when(
-            pending.is_some(),
-            move || {
-                let preview: Str = pending
-                    .snapshot()
-                    .map(|t| {
-                        let lines = t.lines().count();
-                        let first: String = t.lines().next().unwrap_or_default().chars().take(60).collect();
-                        Str::from(format!("Paste {lines} lines? {first}…"))
-                    })
-                    .unwrap_or_else(|| Str::from("Paste?"));
-                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
-                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
-                    manager.show(
-                        Snackbar::new(preview)
-                            .action("Paste", |s: PaneSession| s.push_action(TermAction::PasteConfirm))
-                            .duration(Duration::ZERO)
-                            .state(&PaneSession(s.0.clone())),
-                    );
-                })
-            },
-        )
-        .anyview();
-        // `confirm-close`: closing a pane/tab whose PTY runs a program
-        // asks via the snackbar — “Close”/Enter confirms, Escape cancels
-        // (the snackbar's single action slot; the surface gate does Esc).
-        // `clipboard-read = ask`: an OSC 52 read waits on Allow / Deny
-        // (or Enter / Escape on the surface's key gate). Ghostty asks
-        // with both actions visible; the framework's Snackbar has a
-        // single action slot and no two-choice transient primitive at
-        // this pin (WATERUI_FEEDBACK #30), so the prompt is a composed
-        // card — Allow is the filled primary (`BorderedProminent`), Deny
-        // the lower-emphasis `Bordered` secondary (not the snackbar's
-        // close ✕, which would silently deny).
-        let pending_clip = session.0.pending_clipboard_read.clone();
-        let clip_overlay = vstack((
-            Spacer::flexible(),
-            when(pending_clip, move || {
-                Card::new(
-                    vstack((
-                        text("Program wants to read the clipboard"),
-                        hstack((
-                            button("Deny")
-                                .bordered()
-                                .action(|s: PaneSession| {
-                                    s.push_action(TermAction::ClipboardReadDeny)
-                                }),
-                            button("Allow")
-                                .bordered_prominent()
-                                .action(|s: PaneSession| {
-                                    s.push_action(TermAction::ClipboardReadConfirm)
-                                }),
-                        ))
-                        .spacing(8.0),
-                    ))
-                    .spacing(8.0),
-                )
-                .style(CardStyle::Elevated)
-            })
-            .padding_with(16.0),
-        ))
-        .anyview();
-        let pending_close = session.0.pending_close.clone();
-        let close_overlay = when(
-            pending_close.is_some(),
-            move || {
-                let label: Str = pending_close
-                    .snapshot()
-                    .map(|(prog, whole)| {
-                        let scope = match whole {
-                            true => "Close tab? ",
-                            false => "Close? ",
-                        };
-                        Str::from(format!("{scope}{prog} is still running"))
-                    })
-                    .unwrap_or_else(|| Str::from("Close?"));
-                Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
-                    *s.0.snackbar.borrow_mut() = Some(manager.clone());
-                    manager.show(
-                        Snackbar::new(label)
-                            .action("Close", |s: PaneSession| s.push_action(TermAction::CloseConfirm))
-                            .duration(Duration::ZERO)
-                            .state(&PaneSession(s.0.clone())),
-                    );
-                })
-            },
-        )
-        .anyview();
-        let search_focus = session.0.search_field_focus.clone();
-        let bar = when(open, move || {
-            hstack((
-                // water-rs/waterui#1265: the field is a real focused text
-                // input — chars land in `search_query` natively and
-                // unconsumed keys bubble to `on_key_press`. Enter stays a
-                // key handler (not `on_submit`) so Shift is inspectable:
-                // Ghostty Enter=next, Shift+Enter=prev.
-                field("find in buffer", &query)
-                    .focused(&search_focus, ())
-                    .on_key_press(|Use(press): Use<KeyPress>, s: PaneSession| {
-                        match &press.key {
-                            Key::Named(NamedKey::Enter) => {
-                                s.push_action(TermAction::NavigateSearch(
-                                    if press.modifiers.contains(Modifiers::SHIFT) {
-                                        -1
-                                    } else {
-                                        1
-                                    },
-                                ));
-                                KeyHandling::Handled
-                            }
-                            Key::Named(NamedKey::Escape) => {
-                                s.push_action(TermAction::EndSearch);
-                                KeyHandling::Handled
-                            }
-                            _ => KeyHandling::Ignored,
+        let assemble =
+            std::rc::Rc::new(move || -> AnyView {
+                // Search bar: a real WaterUI row that appears above the surface —
+                // the field is a sibling, so toggling it never remounts the
+                // SceneView or drops its keyboard focus.
+                let query = self.session.search_query.clone();
+                let status = self.session.search_status.clone();
+                let open = self.session.search_open.clone();
+                let term_surface = TermSurface::new(
+                    self.session.clone(),
+                    self.state.clone(),
+                    self.state.palette.clone(),
+                    FontCollection::from_env(&env),
+                );
+                // Reactive IBeam/pointing-hand over Ctrl-hovered links.
+                let hover_cursor = term_surface.hover_cursor.clone();
+                // `.focused` is hydrolysis's programmatic embedded-focus grant
+                // (#132): when `focus_owner == (this tab, this pane)` the surface
+                // takes key focus without a click — at launch, after a tab switch,
+                // and across split rebuilds. Pointer focus writes back into
+                // `focus_owner`; the `on_change` watchers in `tabs_view` keep it
+                // and `tab.focused` in sync. Hidden tabs' panes never match the
+                // owner, so only the visible pane can hold embedded focus.
+                let surface = SceneView::new(term_surface)
+                    .focused(&self.state.focus_owner, (self.tab_id, self.session.id))
+                    .cursor(hover_cursor)
+                    // Drag-and-drop: a file dropped on the pane pastes its
+                    // shell-quoted path into the PTY (Ghostty/kitty behaviour), and
+                    // a tab chip dropped on a pane detaches into its own window
+                    // (Ghostty's drag-out). One destination per payload kind — the
+                    // hit test delivers to the topmost acceptor.
+                    .drop_destination(move |files: Files, session: PaneSession| {
+                        let text = files
+                            .urls()
+                            .iter()
+                            .map(|url| url.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !text.is_empty() {
+                            session.push_action(TermAction::DropText(text));
                         }
-                    }),
-                text(status.clone()).muted(),
-                text("\u{2191}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(-1))),
-                text("\u{2193}").on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(1))),
-            ))
-            .spacing(6.0)
-            .padding_horizontal(8.0)
-            .padding_vertical(4.0)
-            // A click on the bar background moves focus back to the pane's
-            // embedded surface.
-            .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id))
-        })
-        .anyview();
-        // `unfocused-split-opacity`: the focused pane stays opaque, every
-        // other leaf in this tab fades to the configured alpha — a
-        // signal-driven dim like Ghostty's.
-        let session_id = session.0.id;
-        let pane_alpha = zip(
-            self.focused.equal_to(session_id),
-            session.0.unfocused_opacity.clone(),
-        )
-        .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
-        // `resize-overlay`: a cols×rows chip inside the pane while the
-        // terminal resizes; `resize_label` is Some only in the display
-        // window. `resize-overlay-position` anchors the chip — an
-        // `absolute` layer + `position_in` gives the exact anchor (a
-        // `vstack` sized to its chip would center in the `zstack` and
-        // make left/right unreachable). Position is read at pane build.
-        let resize_label = session.0.resize_label.clone();
-        let show_resize = resize_label.is_some();
-        use crate::config::ResizeOverlayPosition as ROP;
-        let chip_anchor = match self.state.config(|c| c.resize_overlay_position) {
-            ROP::Center => UnitPoint::CENTER,
-            ROP::TopLeft => UnitPoint::TOP_LEADING,
-            ROP::TopCenter => UnitPoint::TOP,
-            ROP::TopRight => UnitPoint::TOP_TRAILING,
-            ROP::BottomLeft => UnitPoint::BOTTOM_LEADING,
-            ROP::BottomCenter => UnitPoint::BOTTOM,
-            ROP::BottomRight => UnitPoint::BOTTOM_TRAILING,
-        };
-        let resize_badge = absolute((
-            when(show_resize, move || {
-                text(resize_label.unwrap_or_default().computed())
-                    .foreground(Foreground)
-                    .padding_horizontal(10.0)
+                    })
+                    .drop_destination(move |text: Str, session: PaneSession| {
+                        session.push_action(TermAction::DropText(text.to_string()));
+                    })
+                    .drop_destination(move |url: Url, session: PaneSession| {
+                        session.push_action(TermAction::DropText(url.to_string()));
+                    })
+                    .drop_destination({
+                        let app = self.state.clone();
+                        move |drag: TabDrag, _session: PaneSession| {
+                            app.detach_tab_to_window(drag.tab_id);
+                        }
+                    });
+                let surface = Frame::new(surface);
+                // Paste-protection confirm: multi-line clipboard content waits in
+                // `pending_paste` for an explicit Paste/Cancel (or Enter/Escape).
+                let pending = self.session.pending_paste.clone();
+                let session = PaneSession(self.session.clone()); // `.state` stores a clone
+                // Paste-protection confirmation rides the framework's own snackbar
+                // overlay (mounted by `Window::new`), so it layers above the pane
+                // correctly. The `when` gate mounts a zero-size trigger whose
+                // `on_appear` presents the Snackbar; `pending_paste` still gates
+                // keystrokes (Enter = Paste, Escape = Cancel) on the surface side.
+                let paste_overlay = when(pending.is_some(), move || {
+                    let preview: Str = pending
+                        .snapshot()
+                        .map(|t| {
+                            let lines = t.lines().count();
+                            let first: String = t
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(60)
+                                .collect();
+                            Str::from(format!("Paste {lines} lines? {first}…"))
+                        })
+                        .unwrap_or_else(|| Str::from("Paste?"));
+                    Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
+                        *s.0.snackbar.borrow_mut() = Some(manager.clone());
+                        manager.show(
+                            Snackbar::new(preview)
+                                .action("Paste", |s: PaneSession| {
+                                    s.push_action(TermAction::PasteConfirm)
+                                })
+                                .duration(Duration::ZERO)
+                                .state(&PaneSession(s.0.clone())),
+                        );
+                    })
+                })
+                .anyview();
+                // `confirm-close`: closing a pane/tab whose PTY runs a program
+                // asks via the snackbar — “Close”/Enter confirms, Escape cancels
+                // (the snackbar's single action slot; the surface gate does Esc).
+                // `clipboard-read = ask`: an OSC 52 read waits on Allow / Deny
+                // (or Enter / Escape on the surface's key gate). Ghostty asks
+                // with both actions visible; the framework's Snackbar has a
+                // single action slot and no two-choice transient primitive at
+                // this pin (WATERUI_FEEDBACK #30), so the prompt is a composed
+                // card — Allow is the filled primary (`BorderedProminent`), Deny
+                // the lower-emphasis `Bordered` secondary (not the snackbar's
+                // close ✕, which would silently deny).
+                let pending_clip = session.0.pending_clipboard_read.clone();
+                let clip_overlay = vstack((
+                    Spacer::flexible(),
+                    when(pending_clip, move || {
+                        Card::new(
+                            vstack((
+                                text("Program wants to read the clipboard"),
+                                hstack((
+                                    button("Deny").bordered().action(|s: PaneSession| {
+                                        s.push_action(TermAction::ClipboardReadDeny)
+                                    }),
+                                    button("Allow").bordered_prominent().action(
+                                        |s: PaneSession| {
+                                            s.push_action(TermAction::ClipboardReadConfirm)
+                                        },
+                                    ),
+                                ))
+                                .spacing(8.0),
+                            ))
+                            .spacing(8.0),
+                        )
+                        .style(CardStyle::Elevated)
+                    })
+                    .padding_with(16.0),
+                ))
+                .anyview();
+                let pending_close = session.0.pending_close.clone();
+                let close_overlay = when(pending_close.is_some(), move || {
+                    let label: Str = pending_close
+                        .snapshot()
+                        .map(|(prog, whole)| {
+                            let scope = match whole {
+                                true => "Close tab? ",
+                                false => "Close? ",
+                            };
+                            Str::from(format!("{scope}{prog} is still running"))
+                        })
+                        .unwrap_or_else(|| Str::from("Close?"));
+                    Spacer::new(0.0).on_appear(move |manager: SnackbarManager, s: PaneSession| {
+                        *s.0.snackbar.borrow_mut() = Some(manager.clone());
+                        manager.show(
+                            Snackbar::new(label)
+                                .action("Close", |s: PaneSession| {
+                                    s.push_action(TermAction::CloseConfirm)
+                                })
+                                .duration(Duration::ZERO)
+                                .state(&PaneSession(s.0.clone())),
+                        );
+                    })
+                })
+                .anyview();
+                let search_focus = session.0.search_field_focus.clone();
+                let bar = when(open, move || {
+                    hstack((
+                        // water-rs/waterui#1265: the field is a real focused text
+                        // input — chars land in `search_query` natively and
+                        // unconsumed keys bubble to `on_key_press`. Enter stays a
+                        // key handler (not `on_submit`) so Shift is inspectable:
+                        // Ghostty Enter=next, Shift+Enter=prev.
+                        field("find in buffer", &query)
+                            .focused(&search_focus, ())
+                            .on_key_press(|Use(press): Use<KeyPress>, s: PaneSession| match &press
+                                .key
+                            {
+                                Key::Named(NamedKey::Enter) => {
+                                    s.push_action(TermAction::NavigateSearch(
+                                        if press.modifiers.contains(Modifiers::SHIFT) {
+                                            -1
+                                        } else {
+                                            1
+                                        },
+                                    ));
+                                    KeyHandling::Handled
+                                }
+                                Key::Named(NamedKey::Escape) => {
+                                    s.push_action(TermAction::EndSearch);
+                                    KeyHandling::Handled
+                                }
+                                _ => KeyHandling::Ignored,
+                            }),
+                        text(status.clone()).muted(),
+                        text("\u{2191}")
+                            .on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(-1))),
+                        text("\u{2193}")
+                            .on_tap(|s: PaneSession| s.push_action(TermAction::NavigateSearch(1))),
+                    ))
+                    .spacing(6.0)
+                    .padding_horizontal(8.0)
                     .padding_vertical(4.0)
-                    .background(Surface)
-            })
-            .padding_with(8.0)
-            .position_in(chip_anchor),
-        ));
-        // `link-hover`: while the open-link modifier is held over a link,
-        // its URL shows in a bottom-left chip (Ghostty).
-        let link_hover = session.0.link_hover_text.clone();
-        let show_link_hover = link_hover.condition(|u| !u.is_empty());
-        let link_chip = absolute((
-            when(show_link_hover, move || {
-                text(link_hover.computed())
-                    .foreground(Foreground)
-                    .padding_horizontal(10.0)
-                    .padding_vertical(4.0)
-                    .background(Surface)
-            })
-            .padding_with(8.0)
-            .position_in(UnitPoint::BOTTOM_LEADING),
-        ));
-        // `prompt_title` — a rename prompt over the pane. water-rs/waterui#1265:
-        // the field is focused while open, `on_submit` fires on Return,
-        // and Escape bubbles to `on_key_press`.
-        let title_prompt_open = session.0.title_prompt_open.clone();
-        let title_query = session.0.title_query.clone();
-        let title_focus = session.0.title_field_focus.clone();
-        let title_label = session.0.title_prompt_label.clone();
-        let title_prompt = vstack((
-            Spacer::flexible(),
-            when(title_prompt_open, move || {
-                Card::new(vstack((
+                    // A click on the bar background moves focus back to the pane's
+                    // embedded surface.
+                    .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id))
+                })
+                .anyview();
+                // `unfocused-split-opacity`: the focused pane stays opaque, every
+                // other leaf in this tab fades to the configured alpha — a
+                // signal-driven dim like Ghostty's.
+                let session_id = session.0.id;
+                let pane_alpha = zip(
+                    self.focused.equal_to(session_id),
+                    session.0.unfocused_opacity.clone(),
+                )
+                .map(|(is_focused, unfocused)| if is_focused { 1.0 } else { unfocused });
+                // `resize-overlay`: a cols×rows chip inside the pane while the
+                // terminal resizes; `resize_label` is Some only in the display
+                // window. `resize-overlay-position` anchors the chip — an
+                // `absolute` layer + `position_in` gives the exact anchor (a
+                // `vstack` sized to its chip would center in the `zstack` and
+                // make left/right unreachable). Position is read at pane build.
+                let resize_label = session.0.resize_label.clone();
+                let show_resize = resize_label.is_some();
+                use crate::config::ResizeOverlayPosition as ROP;
+                let chip_anchor = match self.state.config(|c| c.resize_overlay_position) {
+                    ROP::Center => UnitPoint::CENTER,
+                    ROP::TopLeft => UnitPoint::TOP_LEADING,
+                    ROP::TopCenter => UnitPoint::TOP,
+                    ROP::TopRight => UnitPoint::TOP_TRAILING,
+                    ROP::BottomLeft => UnitPoint::BOTTOM_LEADING,
+                    ROP::BottomCenter => UnitPoint::BOTTOM,
+                    ROP::BottomRight => UnitPoint::BOTTOM_TRAILING,
+                };
+                let resize_badge = absolute((when(show_resize, move || {
+                    text(resize_label.unwrap_or_default().computed())
+                        .foreground(Foreground)
+                        .padding_horizontal(10.0)
+                        .padding_vertical(4.0)
+                        .background(Surface)
+                })
+                .padding_with(8.0)
+                .position_in(chip_anchor),));
+                // `link-hover`: while the open-link modifier is held over a link,
+                // its URL shows in a bottom-left chip (Ghostty).
+                let link_hover = session.0.link_hover_text.clone();
+                let show_link_hover = link_hover.condition(|u| !u.is_empty());
+                let link_chip = absolute((when(show_link_hover, move || {
+                    text(link_hover.computed())
+                        .foreground(Foreground)
+                        .padding_horizontal(10.0)
+                        .padding_vertical(4.0)
+                        .background(Surface)
+                })
+                .padding_with(8.0)
+                .position_in(UnitPoint::BOTTOM_LEADING),));
+                // `prompt_title` — a rename prompt over the pane. water-rs/waterui#1265:
+                // the field is focused while open, `on_submit` fires on Return,
+                // and Escape bubbles to `on_key_press`.
+                let title_prompt_open = session.0.title_prompt_open.clone();
+                let title_query = session.0.title_query.clone();
+                let title_focus = session.0.title_field_focus.clone();
+                let title_label = session.0.title_prompt_label.clone();
+                let title_prompt =
+                    vstack((
+                        Spacer::flexible(),
+                        when(title_prompt_open, move || {
+                            Card::new(vstack((
                     field(title_label.computed(), &title_query)
                         .on_submit(|app: AppState, s: PaneSession| {
                             let q = s.0.title_query.snapshot();
@@ -3037,71 +3005,72 @@ impl View for PaneLeaf {
                 .spacing(8.0))
                 .style(CardStyle::Elevated)
                 .padding_with(24.0)
-            }),
-            Spacer::flexible(),
-        ))
-        // Click on the prompt overlay returns keys to the pane.
-        .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id));
-        // `inspector` — a bottom-edge chip reporting the attributes of
-        // the cell under the terminal cursor; `inspector_label` is
-        // rewritten every rendered frame while the inspector is open.
-        let inspector_open = session.0.inspector_open.clone();
-        let inspector_label = session.0.inspector_label.clone();
-        let inspector_badge = vstack((
-            Spacer::flexible(),
-            when(inspector_open, move || {
-                text(inspector_label.computed())
-                    .foreground(Foreground)
-                    .padding_horizontal(10.0)
-                    .padding_vertical(4.0)
-                    .background(Surface)
-            })
-            .padding_vertical(8.0),
-        ));
-        // `abnormal-command-exit-runtime` — the dead pane is held open
-        // and a card at its bottom reports the exit; Close dismisses the
-        // pane (Ghostty surfaces the same message on the held surface).
-        let abnormal_notice = session.0.abnormal_notice.clone();
-        let abnormal_overlay = vstack((
-            Spacer::flexible(),
-            when(abnormal_notice.is_some(), move || {
-                Card::new(
-                    hstack((
-                        text(abnormal_notice.unwrap_or_default().computed()),
-                        button("Close").bordered_prominent().action(
-                            |s: PaneSession| s.push_action(TermAction::CloseSurface),
-                        ),
+                        }),
+                        Spacer::flexible(),
                     ))
-                    .spacing(12.0),
-                )
-                .style(CardStyle::Elevated)
-            })
-            .padding_with(16.0),
-        ))
-        .anyview();
-        // The SnackbarManager is captured unconditionally here — the
-        // prompt overlays only mount while a prompt is pending, so
-        // toasts (`app-notifications` copy / config-reload) would have
-        // no manager otherwise.
-        let toast_slot = Spacer::new(0.0)
-            .on_appear(|manager: SnackbarManager, s: PaneSession| {
-                *s.0.snackbar.borrow_mut() = Some(manager);
-            })
-            .anyview();
-        let stack = zstack((
-            vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
-            paste_overlay,
-            close_overlay,
-            clip_overlay,
-            resize_badge,
-            link_chip,
-            title_prompt,
-            inspector_badge,
-            abnormal_overlay,
-            toast_slot,
-        ));
-        stack.state(&session).anyview()
-        });
+                    // Click on the prompt overlay returns keys to the pane.
+                    .on_tap(|app: AppState, s: PaneSession| app.refocus(s.0.id));
+                // `inspector` — a bottom-edge chip reporting the attributes of
+                // the cell under the terminal cursor; `inspector_label` is
+                // rewritten every rendered frame while the inspector is open.
+                let inspector_open = session.0.inspector_open.clone();
+                let inspector_label = session.0.inspector_label.clone();
+                let inspector_badge = vstack((
+                    Spacer::flexible(),
+                    when(inspector_open, move || {
+                        text(inspector_label.computed())
+                            .foreground(Foreground)
+                            .padding_horizontal(10.0)
+                            .padding_vertical(4.0)
+                            .background(Surface)
+                    })
+                    .padding_vertical(8.0),
+                ));
+                // `abnormal-command-exit-runtime` — the dead pane is held open
+                // and a card at its bottom reports the exit; Close dismisses the
+                // pane (Ghostty surfaces the same message on the held surface).
+                let abnormal_notice = session.0.abnormal_notice.clone();
+                let abnormal_overlay =
+                    vstack((
+                        Spacer::flexible(),
+                        when(abnormal_notice.is_some(), move || {
+                            Card::new(
+                                hstack((
+                                    text(abnormal_notice.unwrap_or_default().computed()),
+                                    button("Close").bordered_prominent().action(
+                                        |s: PaneSession| s.push_action(TermAction::CloseSurface),
+                                    ),
+                                ))
+                                .spacing(12.0),
+                            )
+                            .style(CardStyle::Elevated)
+                        })
+                        .padding_with(16.0),
+                    ))
+                    .anyview();
+                // The SnackbarManager is captured unconditionally here — the
+                // prompt overlays only mount while a prompt is pending, so
+                // toasts (`app-notifications` copy / config-reload) would have
+                // no manager otherwise.
+                let toast_slot = Spacer::new(0.0)
+                    .on_appear(|manager: SnackbarManager, s: PaneSession| {
+                        *s.0.snackbar.borrow_mut() = Some(manager);
+                    })
+                    .anyview();
+                let stack = zstack((
+                    vstack((bar, surface)).spacing(0.0).opacity(pane_alpha),
+                    paste_overlay,
+                    close_overlay,
+                    clip_overlay,
+                    resize_badge,
+                    link_chip,
+                    title_prompt,
+                    inspector_badge,
+                    abnormal_overlay,
+                    toast_slot,
+                ));
+                stack.state(&session).anyview()
+            });
         // `right-click-action`: only `context-menu` attaches the framework
         // modifier — an attached modifier registers a menu target that
         // claims every secondary click (debug builds also mount the
@@ -3156,31 +3125,26 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, tab_id: u64, state: &AppS
             let mut views: Vec<AnyView> = Vec::with_capacity(2 * k - 1);
             for (j, child) in children.iter().enumerate() {
                 if j > 0 {
-                    views.push(
-                        divider_handle(*dir, j, children, sizes, state.clone()).anyview(),
-                    );
+                    views.push(divider_handle(*dir, j, children, sizes, state.clone()).anyview());
                 }
-                let framed = when(
-                    sized,
-                    {
-                        let sz = sizes.clone();
-                        let extent = sz
-                            .map(move |v: Vec<f32>| v.as_slice().get(j).copied().unwrap_or(0.0));
-                        let child = child.clone();
-                        let foc = focused.clone();
-                        let st = state.clone();
-                        let d = *dir;
-                        move || {
-                            let child_view = pane_view(&child, &foc, tab_id, &st);
-                            let ext = extent.clone();
-                            let frame = Frame::new(child_view);
-                            match d {
-                                SplitDir::Row => frame.width(ext),
-                                SplitDir::Column => frame.height(ext),
-                            }
+                let framed = when(sized, {
+                    let sz = sizes.clone();
+                    let extent =
+                        sz.map(move |v: Vec<f32>| v.as_slice().get(j).copied().unwrap_or(0.0));
+                    let child = child.clone();
+                    let foc = focused.clone();
+                    let st = state.clone();
+                    let d = *dir;
+                    move || {
+                        let child_view = pane_view(&child, &foc, tab_id, &st);
+                        let ext = extent.clone();
+                        let frame = Frame::new(child_view);
+                        match d {
+                            SplitDir::Row => frame.width(ext),
+                            SplitDir::Column => frame.height(ext),
                         }
-                    },
-                )
+                    }
+                })
                 .otherwise({
                     let child = child.clone();
                     let foc = focused.clone();
@@ -3193,8 +3157,16 @@ fn pane_view(node: &SplitNode, focused: &Binding<u64>, tab_id: u64, state: &AppS
             }
             // Vec<AnyView> collects straight into a stack — no ForEach ids.
             match dir {
-                SplitDir::Row => views.into_iter().collect::<HStack<_>>().spacing(0.0).anyview(),
-                SplitDir::Column => views.into_iter().collect::<VStack<_>>().spacing(0.0).anyview(),
+                SplitDir::Row => views
+                    .into_iter()
+                    .collect::<HStack<_>>()
+                    .spacing(0.0)
+                    .anyview(),
+                SplitDir::Column => views
+                    .into_iter()
+                    .collect::<VStack<_>>()
+                    .spacing(0.0)
+                    .anyview(),
             }
         }
     }
@@ -3414,10 +3386,7 @@ fn restore_node(node: &ClosedNode, sessions: &[Rc<Session>]) -> SplitNode {
         } => SplitNode::Split {
             dir: *dir,
             sizes: binding(sizes.clone()),
-            children: children
-                .iter()
-                .map(|c| restore_node(c, sessions))
-                .collect(),
+            children: children.iter().map(|c| restore_node(c, sessions)).collect(),
         },
     }
 }
@@ -3496,18 +3465,14 @@ pub fn load_window_state() -> Option<Rect> {
     let text = std::fs::read_to_string(window_state_path()).ok()?;
     let mut it = text.split_whitespace().map(|t| t.parse::<f32>().ok());
     let (x, y, w, h) = (it.next()??, it.next()??, it.next()??, it.next()??);
-    (w >= 100.0 && h >= 100.0)
-        .then(|| Rect::new(Point::new(x, y), Size::new(w, h)))
+    (w >= 100.0 && h >= 100.0).then(|| Rect::new(Point::new(x, y), Size::new(w, h)))
 }
 
 fn save_window_state(frame: Rect) {
     let path = window_state_path();
     let o = frame.origin();
     let s = frame.size();
-    let _ = std::fs::write(
-        path,
-        format!("{} {} {} {}\n", o.x, o.y, s.width, s.height),
-    );
+    let _ = std::fs::write(path, format!("{} {} {} {}\n", o.x, o.y, s.width, s.height));
 }
 
 /// Window content — used for both the main window and spawned ones.
@@ -3590,9 +3555,8 @@ pub fn tabs_view(state: AppState) -> impl View {
                             over.map(|c| Color::srgb(c.r, c.g, c.b)).unwrap_or(base)
                         }),
                     );
-                    let indicator_color = signal_color(
-                        active.select(Color::new(Accent), Color::new(Background)),
-                    );
+                    let indicator_color =
+                        signal_color(active.select(Color::new(Accent), Color::new(Background)));
                     // Hover state layer (M3 tabs tint at ~8% on-surface);
                     // suppressed while active — the accent bar owns it.
                     let hovered = Binding::bool(false);
@@ -3611,15 +3575,11 @@ pub fn tabs_view(state: AppState) -> impl View {
                                 // `tab-activity` dot: parser output landed
                                 // while the tab was not selected (kitty
                                 // `tab_activity_symbol`).
-                                when(tab.activity.clone(), || {
-                                    text("●").foreground(Accent)
-                                }),
+                                when(tab.activity.clone(), || text("●").foreground(Accent)),
                                 // `bell-features` `attention` indicator.
                                 when(tab.badge.clone(), || text("🔔")),
                                 text(tab.title.clone())
-                                    .font(Font::new(TitleFont(
-                                        app.title_font_family.clone(),
-                                    )))
+                                    .font(Font::new(TitleFont(app.title_font_family.clone())))
                                     .foreground(label_color),
                             ))
                             // water-rs/waterui#1290: one recognizer accepts
@@ -3632,8 +3592,7 @@ pub fn tabs_view(state: AppState) -> impl View {
                                     gesture::PointerButtons::PRIMARY
                                         | gesture::PointerButtons::MIDDLE,
                                 ),
-                                move |event: Use<gesture::TapEvent>,
-                                      app: AppState| {
+                                move |event: Use<gesture::TapEvent>, app: AppState| {
                                     if event.0.button == gesture::PointerButton::Middle {
                                         app.try_close_tab(tab_id);
                                     } else {
@@ -3747,9 +3706,7 @@ pub fn tabs_view(state: AppState) -> impl View {
     ))
     // Keys a focused modal control did not consume bubble here — bind
     // them (Ghostty fires keybinds over overlays; `cancel` relies on it).
-    .on_key_press(|Use(press): Use<KeyPress>, app: AppState| {
-        app.dispatch_bind_press(&press)
-    })
+    .on_key_press(|Use(press): Use<KeyPress>, app: AppState| app.dispatch_bind_press(&press))
     // Tab switch → grant embedded focus to that tab's remembered pane;
     // also track the previously-selected tab for `last_tab`.
     .on_change(&state.selected, {
@@ -3777,7 +3734,9 @@ pub fn tabs_view(state: AppState) -> impl View {
             state.focus_owner.snapshot().unwrap_or((0, 0)),
         ));
         move |o: Option<(u64, u64)>| {
-            let Some((tab_id, session_id)) = o else { return };
+            let Some((tab_id, session_id)) = o else {
+                return;
+            };
             let Some(t) = app.tabs.iter().find(|t| t.id == tab_id) else {
                 return;
             };
@@ -3819,64 +3778,308 @@ pub struct PaletteItem {
 
 /// Everything reachable from the palette — same actions as keybinds.
 pub const PALETTE_ITEMS: &[PaletteItem] = &[
-    PaletteItem { name: "New Tab", chord: "ctrl+shift+t", action: TermAction::NewTab },
-    PaletteItem { name: "New Window", chord: "ctrl+shift+n", action: TermAction::NewWindow },
-    PaletteItem { name: "Reload Config", chord: "ctrl+shift+,", action: TermAction::ReloadConfig },
-    PaletteItem { name: "Close Pane / Tab", chord: "ctrl+shift+w", action: TermAction::CloseTab },
-    PaletteItem { name: "Split Right", chord: "ctrl+shift+e", action: TermAction::SplitRight },
-    PaletteItem { name: "Split Down", chord: "ctrl+shift+d", action: TermAction::SplitDown },
-    PaletteItem { name: "Toggle Pane Zoom", chord: "ctrl+shift+z", action: TermAction::PaneZoom },
-    PaletteItem { name: "Equalize Splits", chord: "", action: TermAction::EqualizeSplits },
-    PaletteItem { name: "Focus Next Pane", chord: "ctrl+shift+]", action: TermAction::FocusNextPane },
-    PaletteItem { name: "Focus Previous Pane", chord: "ctrl+shift+[", action: TermAction::FocusPrevPane },
-    PaletteItem { name: "Copy", chord: "ctrl+shift+c", action: TermAction::Copy },
-    PaletteItem { name: "Paste", chord: "ctrl+shift+v", action: TermAction::Paste },
-    PaletteItem { name: "Select All", chord: "ctrl+shift+a", action: TermAction::SelectAll },
-    PaletteItem { name: "Find in Buffer", chord: "ctrl+shift+f", action: TermAction::Search },
-    PaletteItem { name: "Settings", chord: "ctrl+shift+,", action: TermAction::Settings },
-    PaletteItem { name: "Clear Scrollback", chord: "ctrl+shift+k", action: TermAction::ClearScrollback },
-    PaletteItem { name: "Clear Screen", chord: "ctrl+shift+l", action: TermAction::ClearScreen },
-    PaletteItem { name: "Reset Terminal", chord: "", action: TermAction::Reset },
-    PaletteItem { name: "Write Screen to File", chord: "", action: TermAction::WriteScreenFile(crate::keys::FileSink::Open) },
-    PaletteItem { name: "Write Scrollback to File", chord: "", action: TermAction::WriteScrollbackFile(crate::keys::FileSink::Open) },
-    PaletteItem { name: "Write Selection to File", chord: "", action: TermAction::WriteSelectionFile(crate::keys::FileSink::Open) },
-    PaletteItem { name: "Write Last Output to File", chord: "", action: TermAction::WriteLastOutputFile(crate::keys::FileSink::Open) },
-    PaletteItem { name: "Scroll to Selection", chord: "", action: TermAction::ScrollToSelection },
-    PaletteItem { name: "Clear Selection", chord: "", action: TermAction::ClearSelection },
-    PaletteItem { name: "Open Config", chord: "", action: TermAction::OpenConfig },
-    PaletteItem { name: "Increase Font Size", chord: "ctrl+shift+=", action: TermAction::IncreaseFontSize(1) },
-    PaletteItem { name: "Decrease Font Size", chord: "ctrl+shift+-", action: TermAction::DecreaseFontSize(1) },
-    PaletteItem { name: "Reset Font Size", chord: "ctrl+shift+0", action: TermAction::FontReset },
-    PaletteItem { name: "Jump to Previous Prompt", chord: "ctrl+shift+up", action: TermAction::JumpToPrompt(-1) },
-    PaletteItem { name: "Jump to Next Prompt", chord: "ctrl+shift+down", action: TermAction::JumpToPrompt(1) },
-    PaletteItem { name: "Scroll to Top", chord: "ctrl+shift+home", action: TermAction::ScrollToTop },
-    PaletteItem { name: "Scroll to Bottom", chord: "ctrl+shift+end", action: TermAction::ScrollToBottom },
-    PaletteItem { name: "Scroll Page Up", chord: "shift+pageup", action: TermAction::ScrollPageUp },
-    PaletteItem { name: "Scroll Page Down", chord: "shift+pagedown", action: TermAction::ScrollPageDown },
-    PaletteItem { name: "Scroll Line Up", chord: "shift+up", action: TermAction::ScrollPageLines(-1) },
-    PaletteItem { name: "Scroll Line Down", chord: "shift+down", action: TermAction::ScrollPageLines(1) },
-    PaletteItem { name: "Move Tab Left", chord: "ctrl+shift+pageup", action: TermAction::MoveTab(-1) },
-    PaletteItem { name: "Move Tab Right", chord: "ctrl+shift+pagedown", action: TermAction::MoveTab(1) },
-    PaletteItem { name: "Focus Pane Left", chord: "ctrl+shift+alt+left", action: TermAction::FocusPaneDir { horizontal: true, forward: false } },
-    PaletteItem { name: "Focus Pane Right", chord: "ctrl+shift+alt+right", action: TermAction::FocusPaneDir { horizontal: true, forward: true } },
-    PaletteItem { name: "Focus Pane Up", chord: "ctrl+shift+alt+up", action: TermAction::FocusPaneDir { horizontal: false, forward: false } },
-    PaletteItem { name: "Focus Pane Down", chord: "ctrl+shift+alt+down", action: TermAction::FocusPaneDir { horizontal: false, forward: true } },
-    PaletteItem { name: "URL Hints (open link by number)", chord: "ctrl+shift+u", action: TermAction::UrlHints },
-    PaletteItem { name: "Copy Last Command Output", chord: "ctrl+shift+o", action: TermAction::CopyLastOutput },
-    PaletteItem { name: "Next Tab", chord: "ctrl+tab", action: TermAction::NextTab },
-    PaletteItem { name: "Previous Tab", chord: "ctrl+shift+tab", action: TermAction::PrevTab },
-    PaletteItem { name: "Last Tab (previously selected)", chord: "", action: TermAction::LastTab },
-    PaletteItem { name: "Close Window (all tabs)", chord: "", action: TermAction::CloseWindow },
-    PaletteItem { name: "Close All Tabs", chord: "", action: TermAction::CloseAllTabs },
-    PaletteItem { name: "Close Other Tabs", chord: "", action: TermAction::CloseOtherTabs },
-    PaletteItem { name: "Toggle Tab Bar", chord: "", action: TermAction::ToggleTabBar },
-    PaletteItem { name: "Start Selection (keyboard select)", chord: "", action: TermAction::StartSelection },
-    PaletteItem { name: "Toggle Fullscreen", chord: "f11", action: TermAction::Fullscreen },
-    PaletteItem { name: "Undo Close Tab", chord: "ctrl+shift+z", action: TermAction::Undo },
-    PaletteItem { name: "Toggle Mark", chord: "", action: TermAction::ToggleMark },
-    PaletteItem { name: "Jump to Mark: Previous", chord: "", action: TermAction::JumpToMark(-1) },
-    PaletteItem { name: "Jump to Mark: Next", chord: "", action: TermAction::JumpToMark(1) },
-    PaletteItem { name: "Quit", chord: "", action: TermAction::Quit },
+    PaletteItem {
+        name: "New Tab",
+        chord: "ctrl+shift+t",
+        action: TermAction::NewTab,
+    },
+    PaletteItem {
+        name: "New Window",
+        chord: "ctrl+shift+n",
+        action: TermAction::NewWindow,
+    },
+    PaletteItem {
+        name: "Reload Config",
+        chord: "ctrl+shift+,",
+        action: TermAction::ReloadConfig,
+    },
+    PaletteItem {
+        name: "Close Pane / Tab",
+        chord: "ctrl+shift+w",
+        action: TermAction::CloseTab,
+    },
+    PaletteItem {
+        name: "Split Right",
+        chord: "ctrl+shift+e",
+        action: TermAction::SplitRight,
+    },
+    PaletteItem {
+        name: "Split Down",
+        chord: "ctrl+shift+d",
+        action: TermAction::SplitDown,
+    },
+    PaletteItem {
+        name: "Toggle Pane Zoom",
+        chord: "ctrl+shift+z",
+        action: TermAction::PaneZoom,
+    },
+    PaletteItem {
+        name: "Equalize Splits",
+        chord: "",
+        action: TermAction::EqualizeSplits,
+    },
+    PaletteItem {
+        name: "Focus Next Pane",
+        chord: "ctrl+shift+]",
+        action: TermAction::FocusNextPane,
+    },
+    PaletteItem {
+        name: "Focus Previous Pane",
+        chord: "ctrl+shift+[",
+        action: TermAction::FocusPrevPane,
+    },
+    PaletteItem {
+        name: "Copy",
+        chord: "ctrl+shift+c",
+        action: TermAction::Copy,
+    },
+    PaletteItem {
+        name: "Paste",
+        chord: "ctrl+shift+v",
+        action: TermAction::Paste,
+    },
+    PaletteItem {
+        name: "Select All",
+        chord: "ctrl+shift+a",
+        action: TermAction::SelectAll,
+    },
+    PaletteItem {
+        name: "Find in Buffer",
+        chord: "ctrl+shift+f",
+        action: TermAction::Search,
+    },
+    PaletteItem {
+        name: "Settings",
+        chord: "ctrl+shift+,",
+        action: TermAction::Settings,
+    },
+    PaletteItem {
+        name: "Clear Scrollback",
+        chord: "ctrl+shift+k",
+        action: TermAction::ClearScrollback,
+    },
+    PaletteItem {
+        name: "Clear Screen",
+        chord: "ctrl+shift+l",
+        action: TermAction::ClearScreen,
+    },
+    PaletteItem {
+        name: "Reset Terminal",
+        chord: "",
+        action: TermAction::Reset,
+    },
+    PaletteItem {
+        name: "Write Screen to File",
+        chord: "",
+        action: TermAction::WriteScreenFile(crate::keys::FileSink::Open),
+    },
+    PaletteItem {
+        name: "Write Scrollback to File",
+        chord: "",
+        action: TermAction::WriteScrollbackFile(crate::keys::FileSink::Open),
+    },
+    PaletteItem {
+        name: "Write Selection to File",
+        chord: "",
+        action: TermAction::WriteSelectionFile(crate::keys::FileSink::Open),
+    },
+    PaletteItem {
+        name: "Write Last Output to File",
+        chord: "",
+        action: TermAction::WriteLastOutputFile(crate::keys::FileSink::Open),
+    },
+    PaletteItem {
+        name: "Scroll to Selection",
+        chord: "",
+        action: TermAction::ScrollToSelection,
+    },
+    PaletteItem {
+        name: "Clear Selection",
+        chord: "",
+        action: TermAction::ClearSelection,
+    },
+    PaletteItem {
+        name: "Open Config",
+        chord: "",
+        action: TermAction::OpenConfig,
+    },
+    PaletteItem {
+        name: "Increase Font Size",
+        chord: "ctrl+shift+=",
+        action: TermAction::IncreaseFontSize(1),
+    },
+    PaletteItem {
+        name: "Decrease Font Size",
+        chord: "ctrl+shift+-",
+        action: TermAction::DecreaseFontSize(1),
+    },
+    PaletteItem {
+        name: "Reset Font Size",
+        chord: "ctrl+shift+0",
+        action: TermAction::FontReset,
+    },
+    PaletteItem {
+        name: "Jump to Previous Prompt",
+        chord: "ctrl+shift+up",
+        action: TermAction::JumpToPrompt(-1),
+    },
+    PaletteItem {
+        name: "Jump to Next Prompt",
+        chord: "ctrl+shift+down",
+        action: TermAction::JumpToPrompt(1),
+    },
+    PaletteItem {
+        name: "Scroll to Top",
+        chord: "ctrl+shift+home",
+        action: TermAction::ScrollToTop,
+    },
+    PaletteItem {
+        name: "Scroll to Bottom",
+        chord: "ctrl+shift+end",
+        action: TermAction::ScrollToBottom,
+    },
+    PaletteItem {
+        name: "Scroll Page Up",
+        chord: "shift+pageup",
+        action: TermAction::ScrollPageUp,
+    },
+    PaletteItem {
+        name: "Scroll Page Down",
+        chord: "shift+pagedown",
+        action: TermAction::ScrollPageDown,
+    },
+    PaletteItem {
+        name: "Scroll Line Up",
+        chord: "shift+up",
+        action: TermAction::ScrollPageLines(-1),
+    },
+    PaletteItem {
+        name: "Scroll Line Down",
+        chord: "shift+down",
+        action: TermAction::ScrollPageLines(1),
+    },
+    PaletteItem {
+        name: "Move Tab Left",
+        chord: "ctrl+shift+pageup",
+        action: TermAction::MoveTab(-1),
+    },
+    PaletteItem {
+        name: "Move Tab Right",
+        chord: "ctrl+shift+pagedown",
+        action: TermAction::MoveTab(1),
+    },
+    PaletteItem {
+        name: "Focus Pane Left",
+        chord: "ctrl+shift+alt+left",
+        action: TermAction::FocusPaneDir {
+            horizontal: true,
+            forward: false,
+        },
+    },
+    PaletteItem {
+        name: "Focus Pane Right",
+        chord: "ctrl+shift+alt+right",
+        action: TermAction::FocusPaneDir {
+            horizontal: true,
+            forward: true,
+        },
+    },
+    PaletteItem {
+        name: "Focus Pane Up",
+        chord: "ctrl+shift+alt+up",
+        action: TermAction::FocusPaneDir {
+            horizontal: false,
+            forward: false,
+        },
+    },
+    PaletteItem {
+        name: "Focus Pane Down",
+        chord: "ctrl+shift+alt+down",
+        action: TermAction::FocusPaneDir {
+            horizontal: false,
+            forward: true,
+        },
+    },
+    PaletteItem {
+        name: "URL Hints (open link by number)",
+        chord: "ctrl+shift+u",
+        action: TermAction::UrlHints,
+    },
+    PaletteItem {
+        name: "Copy Last Command Output",
+        chord: "ctrl+shift+o",
+        action: TermAction::CopyLastOutput,
+    },
+    PaletteItem {
+        name: "Next Tab",
+        chord: "ctrl+tab",
+        action: TermAction::NextTab,
+    },
+    PaletteItem {
+        name: "Previous Tab",
+        chord: "ctrl+shift+tab",
+        action: TermAction::PrevTab,
+    },
+    PaletteItem {
+        name: "Last Tab (previously selected)",
+        chord: "",
+        action: TermAction::LastTab,
+    },
+    PaletteItem {
+        name: "Close Window (all tabs)",
+        chord: "",
+        action: TermAction::CloseWindow,
+    },
+    PaletteItem {
+        name: "Close All Tabs",
+        chord: "",
+        action: TermAction::CloseAllTabs,
+    },
+    PaletteItem {
+        name: "Close Other Tabs",
+        chord: "",
+        action: TermAction::CloseOtherTabs,
+    },
+    PaletteItem {
+        name: "Toggle Tab Bar",
+        chord: "",
+        action: TermAction::ToggleTabBar,
+    },
+    PaletteItem {
+        name: "Start Selection (keyboard select)",
+        chord: "",
+        action: TermAction::StartSelection,
+    },
+    PaletteItem {
+        name: "Toggle Fullscreen",
+        chord: "f11",
+        action: TermAction::Fullscreen,
+    },
+    PaletteItem {
+        name: "Undo Close Tab",
+        chord: "ctrl+shift+z",
+        action: TermAction::Undo,
+    },
+    PaletteItem {
+        name: "Toggle Mark",
+        chord: "",
+        action: TermAction::ToggleMark,
+    },
+    PaletteItem {
+        name: "Jump to Mark: Previous",
+        chord: "",
+        action: TermAction::JumpToMark(-1),
+    },
+    PaletteItem {
+        name: "Jump to Mark: Next",
+        chord: "",
+        action: TermAction::JumpToMark(1),
+    },
+    PaletteItem {
+        name: "Quit",
+        chord: "",
+        action: TermAction::Quit,
+    },
 ];
 
 /// Theme names offered by the settings page — index order is the
@@ -3893,10 +4096,9 @@ pub const THEME_CHOICES: &[&str] = &[
 pub fn theme_index(theme: &crate::config::ThemeRef) -> usize {
     match theme {
         crate::config::ThemeRef::Auto => 0,
-        crate::config::ThemeRef::Named(name) => THEME_CHOICES
-            .iter()
-            .position(|t| t == name)
-            .unwrap_or(0),
+        crate::config::ThemeRef::Named(name) => {
+            THEME_CHOICES.iter().position(|t| t == name).unwrap_or(0)
+        }
         // A light/dark pair has no picker row — show `auto`, the
         // nearest semantic (it also follows the desktop scheme).
         crate::config::ThemeRef::Pair { .. } => 0,
@@ -4134,23 +4336,25 @@ fn palette_view(state: AppState) -> impl View {
                 app.refocus_selected();
             })
             .focused(&state.palette_field_focus, ())
-            .on_key_press(|Use(press): Use<KeyPress>, app: AppState| match &press.key {
-                Key::Named(NamedKey::ArrowDown) => {
-                    app.palette_next(1);
-                    KeyHandling::Handled
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    app.palette_next(-1);
-                    KeyHandling::Handled
-                }
-                Key::Named(NamedKey::Escape) => {
-                    app.palette_open.set(false);
-                    app.palette_field_focus.set(None);
-                    app.refocus_selected();
-                    KeyHandling::Handled
-                }
-                _ => KeyHandling::Ignored,
-            }),
+            .on_key_press(
+                |Use(press): Use<KeyPress>, app: AppState| match &press.key {
+                    Key::Named(NamedKey::ArrowDown) => {
+                        app.palette_next(1);
+                        KeyHandling::Handled
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        app.palette_next(-1);
+                        KeyHandling::Handled
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        app.palette_open.set(false);
+                        app.palette_field_focus.set(None);
+                        app.refocus_selected();
+                        KeyHandling::Handled
+                    }
+                    _ => KeyHandling::Ignored,
+                },
+            ),
         list,
     ))
     .spacing(4.0)
@@ -4164,9 +4368,8 @@ fn palette_view(state: AppState) -> impl View {
     // A click on the card returns embedded focus to the live pane —
     // without it the dead region would clear focus and trap the keys.
     .on_tap(|app: AppState| app.refocus_selected());
-    let card =
-        material_elevation(MaterialElevationLevel::LEVEL3, PALETTE_CARD_RADIUS, card)
-            .position_in_offset(UnitPoint::TOP, UnitPoint::TOP, 0.0, PALETTE_TOP_OFFSET);
+    let card = material_elevation(MaterialElevationLevel::LEVEL3, PALETTE_CARD_RADIUS, card)
+        .position_in_offset(UnitPoint::TOP, UnitPoint::TOP, 0.0, PALETTE_TOP_OFFSET);
     absolute((
         // M3 `scrim` role over the whole window; a click on it returns
         // keys to the pane rather than dropping focus to nothing.
@@ -4211,8 +4414,8 @@ fn settings_view(state: AppState) -> impl View {
     // Enter applies, Escape closes — bubbles up from any focused
     // settings control (water-rs/waterui#1265); the surface's
     // `settings_key` gate is the fallback for a focused pane.
-    .on_key_press(|Use(press): Use<KeyPress>, app: AppState| {
-        match &press.key {
+    .on_key_press(
+        |Use(press): Use<KeyPress>, app: AppState| match &press.key {
             Key::Named(NamedKey::Enter) => {
                 app.apply_settings();
                 app.refocus_selected();
@@ -4224,8 +4427,8 @@ fn settings_view(state: AppState) -> impl View {
                 KeyHandling::Handled
             }
             _ => KeyHandling::Ignored,
-        }
-    });
+        },
+    );
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }
 
@@ -4239,7 +4442,9 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
         .find(|(_, a)| a.as_ref() == Some(action))?
         .0
         .chord;
-    let (mods, key) = chord.rsplit_once('+').map_or(("", chord.as_str()), |(m, k)| (m, k));
+    let (mods, key) = chord
+        .rsplit_once('+')
+        .map_or(("", chord.as_str()), |(m, k)| (m, k));
     let mut sc = Shortcut::new(key.to_string());
     let mods = format!("{mods}+");
     if mods.contains("ctrl+") {
@@ -4303,7 +4508,10 @@ mod tests {
     fn split_seeds_and_remove_reseeds_sizes() {
         let mut t = SplitNode::Leaf(0);
         assert!(t.split(SplitDir::Row, 0, 1, 800.0, false));
-        let SplitNode::Split { children, sizes, .. } = &t else {
+        let SplitNode::Split {
+            children, sizes, ..
+        } = &t
+        else {
             panic!("not a split");
         };
         assert_eq!(sizes.snapshot().as_slice(), &[396.5, 396.5]);
@@ -4312,7 +4520,10 @@ mod tests {
         // minus the divider.
         assert!(t.split(SplitDir::Column, 1, 2, 400.0, false));
         let rest = t.remove(0).expect("tree survives removing leaf 0");
-        let SplitNode::Split { sizes, children, .. } = &rest else {
+        let SplitNode::Split {
+            sizes, children, ..
+        } = &rest
+        else {
             panic!("expected the nested column split to remain");
         };
         assert_eq!(children.len(), 2);

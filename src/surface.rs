@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, Processor};
 use nami::{Binding, Signal, binding};
@@ -31,8 +31,8 @@ use waterui::window::WindowState;
 use waterui_core::Str;
 use waterui_core::layout::{Rect as UiRect, Size as UiSize};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
-use waterui_graphics::scene2d::Scene2D;
 use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
+use waterui_graphics::scene2d::Scene2D;
 use waterui_graphics::{Code, Key, Modifiers, NamedKey};
 use waterui_text::FontCollection;
 
@@ -92,7 +92,10 @@ fn line_cell(lm: &LineMap, i: usize) -> (i32, usize, usize) {
 }
 
 /// A grid `line`'s row carries the soft-wrap flag on its last cell.
-fn row_wraps(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>, line: i32) -> bool {
+fn row_wraps(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    line: i32,
+) -> bool {
     grid[Line(line)]
         .last()
         .is_some_and(|c| c.flags.contains(Flags::WRAPLINE))
@@ -106,7 +109,10 @@ fn logical_lines(
     bottom: i32,
 ) -> Vec<LineMap> {
     let mut out = Vec::new();
-    let mut lm = LineMap { chars: Vec::new(), marks: Vec::new() };
+    let mut lm = LineMap {
+        chars: Vec::new(),
+        marks: Vec::new(),
+    };
     for line in top..=bottom {
         let row = &grid[Line(line)];
         let mut col = 0;
@@ -125,7 +131,10 @@ fn logical_lines(
         }
         if !row_wraps(grid, line) {
             out.push(lm);
-            lm = LineMap { chars: Vec::new(), marks: Vec::new() };
+            lm = LineMap {
+                chars: Vec::new(),
+                marks: Vec::new(),
+            };
         }
     }
     if !lm.marks.is_empty() {
@@ -174,11 +183,7 @@ fn span_segments(lm: &LineMap, s: usize, e: usize, cols: usize) -> Vec<(usize, u
 /// Every `query` hit in one logical line — each match is a list of
 /// `(start col, end col exclusive, grid line)` segments (more than one
 /// when the match crosses a soft wrap). `query` is lowercase chars.
-fn line_map_matches(
-    lm: &LineMap,
-    query: &[char],
-    cols: usize,
-) -> Vec<Vec<(usize, usize, i32)>> {
+fn line_map_matches(lm: &LineMap, query: &[char], cols: usize) -> Vec<Vec<(usize, usize, i32)>> {
     if lm.marks.is_empty() || query.is_empty() {
         return Vec::new();
     }
@@ -251,8 +256,8 @@ pub(crate) fn dump_grid_ansi(session: &Session) -> Vec<u8> {
         let mut last = cols;
         for c in (0..cols).rev() {
             let cell = &row[Column(c)];
-            let styled = cell.bg != AnsiColor::Named(NamedColor::Background)
-                || !cell.flags.is_empty();
+            let styled =
+                cell.bg != AnsiColor::Named(NamedColor::Background) || !cell.flags.is_empty();
             if cell.c != ' ' || styled {
                 break;
             }
@@ -326,9 +331,7 @@ fn push_color(codes: &mut String, color: AnsiColor, bg: bool) {
     };
     match color {
         AnsiColor::Named(n) => match n {
-            NamedColor::Foreground
-            | NamedColor::BrightForeground
-            | NamedColor::DimForeground => {
+            NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
                 codes.push_str(if bg { "49" } else { "39" });
                 codes.push(';');
             }
@@ -549,7 +552,10 @@ pub struct TermSurface {
 }
 
 /// `background-image` decode cache: (config path, decoded brush + pixel dims).
-type BgImageCache = (Option<std::path::PathBuf>, Option<(peniko::ImageBrush, u32, u32)>);
+type BgImageCache = (
+    Option<std::path::PathBuf>,
+    Option<(peniko::ImageBrush, u32, u32)>,
+);
 
 /// The semantic `Modifiers` bit a physical modifier `Code` contributes
 /// when unmapped (the `key-remap` fallback).
@@ -727,10 +733,8 @@ impl TermSurface {
         let m = self.fonts.metrics;
         let (pad_x, pad_y) = (self.pad_x as f64, self.pad_y as f64);
         let (cw, ch) = (m.cell_w as f64, m.cell_h as f64);
-        let col = ((x - pad_x) / cw)
-            .clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
-        let row = ((y - pad_y) / ch)
-            .clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
+        let col = ((x - pad_x) / cw).clamp(0.0, self.cols.saturating_sub(1) as f64) as usize;
+        let row = ((y - pad_y) / ch).clamp(0.0, self.lines.saturating_sub(1) as f64) as usize;
         (col, row)
     }
 
@@ -747,14 +751,22 @@ impl TermSurface {
         let pad = self.pad_x as f64;
         let cw = m.cell_w as f64;
         let within = (x - pad).rem_euclid(cw);
-        if within < cw * 0.5 { Side::Left } else { Side::Right }
+        if within < cw * 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        }
     }
 
     fn write(&self, bytes: impl Into<std::borrow::Cow<'static, [u8]>>) {
         let bytes = bytes.into();
         if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
             let escaped = String::from_utf8_lossy(&bytes).escape_debug().to_string();
-            eprintln!("[pty-write {:?}] {} bytes: {escaped}", std::time::Instant::now(), bytes.len());
+            eprintln!(
+                "[pty-write {:?}] {} bytes: {escaped}",
+                std::time::Instant::now(),
+                bytes.len()
+            );
         }
         self.session.terminal.write(bytes);
     }
@@ -766,8 +778,13 @@ impl TermSurface {
     fn paste_clipboard(&mut self) {
         let Some(clip) = &self.clipboard else { return };
         if let Ok(Some(text)) = pollster::block_on(clip.text()) {
-            let bracketed =
-                self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+            let bracketed = self
+                .session
+                .terminal
+                .term
+                .lock()
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE);
             let unsafe_text = text.contains('\n') || text.contains('\r');
             if unsafe_text && !bracketed && self.app.config(|c| c.paste_protection) {
                 self.session.pending_paste.set_from(Some(text.into()));
@@ -802,7 +819,11 @@ impl TermSurface {
         }
         self.app.refocus(self.session.id);
         if let Some(fmt) = fmt {
-            let text = if accept { self.clipboard_text() } else { String::new() };
+            let text = if accept {
+                self.clipboard_text()
+            } else {
+                String::new()
+            };
             self.write(fmt(&text).into_bytes());
         }
     }
@@ -838,8 +859,13 @@ impl TermSurface {
         }
         self.app.refocus(self.session.id);
         if accept && let Some(text) = text {
-            let bracketed =
-                self.session.terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+            let bracketed = self
+                .session
+                .terminal
+                .term
+                .lock()
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE);
             self.paste_text(&text, bracketed);
         }
     }
@@ -945,9 +971,7 @@ impl TermSurface {
                 .iter()
                 .rfind(|m| m.1 == point.line.0 && m.2 <= point.column.0)
                 .map(|m| m.0)?;
-            let (url_on, patterns) = self
-                .app
-                .config(|c| (c.link_url, c.link_patterns.clone()));
+            let (url_on, patterns) = self.app.config(|c| (c.link_url, c.link_patterns.clone()));
             url_at(&lm.chars, idx, &patterns, url_on)
         })
     }
@@ -1088,9 +1112,7 @@ impl TermSurface {
             TermAction::SelectTab(n) => self.app.select_tab(n),
             TermAction::FontReset => {
                 self.session.font_size_override.set(false);
-                self.session
-                    .font_size
-                    .set(self.app.config(|c| c.font_size));
+                self.session.font_size.set(self.app.config(|c| c.font_size));
             }
             TermAction::IncreaseFontSize(pts) | TermAction::DecreaseFontSize(pts) => {
                 let cur = self.session.font_size.snapshot();
@@ -1147,12 +1169,7 @@ impl TermSurface {
                 self.app.refocus(self.session.id);
             }
             TermAction::SearchSelection => {
-                let text = self
-                    .session
-                    .terminal
-                    .term
-                    .lock()
-                    .selection_to_string();
+                let text = self.session.terminal.term.lock().selection_to_string();
                 if let Some(text) = text.filter(|t| !t.is_empty()) {
                     self.session.search_query.set_from(text);
                     self.session.search_open.set(true);
@@ -1174,24 +1191,10 @@ impl TermSurface {
             TermAction::JumpToPrompt(n) => {
                 let dir = n.signum();
                 for _ in 0..n.abs() {
-                    let before = self
-                        .session
-                        .terminal
-                        .term
-                        .lock()
-                        .grid()
-                        .display_offset();
+                    let before = self.session.terminal.term.lock().grid().display_offset();
                     self.jump_prompt(dir);
                     // A markless direction ends the loop early.
-                    if self
-                        .session
-                        .terminal
-                        .term
-                        .lock()
-                        .grid()
-                        .display_offset()
-                        == before
-                    {
+                    if self.session.terminal.term.lock().grid().display_offset() == before {
                         break;
                     }
                 }
@@ -1279,7 +1282,10 @@ impl TermSurface {
                 }
             }
             TermAction::MoveTab(n) => self.app.move_tab(n as isize),
-            TermAction::FocusPaneDir { horizontal, forward } => {
+            TermAction::FocusPaneDir {
+                horizontal,
+                forward,
+            } => {
                 self.app.focus_pane_dir(horizontal, forward);
             }
             TermAction::ResizePane {
@@ -1315,11 +1321,9 @@ impl TermSurface {
             TermAction::OpenConfig => self.open_config(),
             TermAction::ScrollToSelection => {
                 let mut term = self.session.terminal.term.lock();
-                let (history, offset) =
-                    (term.grid().history_size(), term.grid().display_offset());
+                let (history, offset) = (term.grid().history_size(), term.grid().display_offset());
                 if let Some(range) = term.selection.as_ref().and_then(|s| s.to_range(&term)) {
-                    let delta =
-                        scroll_to_selection_delta(range.start.line.0, history, offset);
+                    let delta = scroll_to_selection_delta(range.start.line.0, history, offset);
                     term.scroll_display(Scroll::Delta(delta));
                 }
             }
@@ -1335,14 +1339,16 @@ impl TermSurface {
                     .split_pane(crate::app::auto_split_dir(w, h), self.session.id, false);
             }
             TermAction::SplitRight => {
-                self.app.split_pane(crate::app::SplitDir::Row, self.session.id, false);
+                self.app
+                    .split_pane(crate::app::SplitDir::Row, self.session.id, false);
             }
             TermAction::SplitDown => {
                 self.app
                     .split_pane(crate::app::SplitDir::Column, self.session.id, false);
             }
             TermAction::SplitLeft => {
-                self.app.split_pane(crate::app::SplitDir::Row, self.session.id, true);
+                self.app
+                    .split_pane(crate::app::SplitDir::Row, self.session.id, true);
             }
             TermAction::SplitUp => {
                 self.app
@@ -1414,9 +1420,7 @@ impl TermSurface {
                 self.session
                     .title_prompt_label
                     .set_from("Rename surface title");
-                self.session
-                    .title_query
-                    .set(self.session.title.snapshot());
+                self.session.title_query.set(self.session.title.snapshot());
                 self.session.title_prompt_open.set(true);
                 self.session.title_field_focus.set(Some(()));
             }
@@ -1424,9 +1428,7 @@ impl TermSurface {
                 self.session
                     .title_prompt_target
                     .set(crate::app::TitleTarget::Tab);
-                self.session
-                    .title_prompt_label
-                    .set_from("Rename tab title");
+                self.session.title_prompt_label.set_from("Rename tab title");
                 let seed = self
                     .app
                     .tab_title_of(self.session.id)
@@ -1523,7 +1525,8 @@ impl TermSurface {
                 self.session.key_tables.borrow_mut().clear();
             }
             TermAction::SetSurfaceTitle(title) => {
-                self.app.set_session_title(self.session.id, Str::from(title));
+                self.app
+                    .set_session_title(self.session.id, Str::from(title));
             }
             TermAction::SetTabTitle(title) => {
                 self.app
@@ -1619,10 +1622,7 @@ impl TermSurface {
                 .max()
                 // At the bottom, every mark is on screen; jump to the one
                 // before the prompt the user is typing at.
-                .or_else(|| {
-                    (offset == 0 && marks.len() >= 2)
-                        .then(|| marks[marks.len() - 2])
-                })
+                .or_else(|| (offset == 0 && marks.len() >= 2).then(|| marks[marks.len() - 2]))
         } else {
             marks.iter().copied().filter(|&m| m > top).min()
         };
@@ -1740,7 +1740,9 @@ impl TermSurface {
     /// makes a reflow or new output re-run the search.
     fn run_search(&mut self, reset_active: bool) {
         let generation = self.content_gen.get();
-        let Some(search) = &mut self.search else { return };
+        let Some(search) = &mut self.search else {
+            return;
+        };
         let keep_active = search.active;
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
@@ -1748,11 +1750,7 @@ impl TermSurface {
         search.stamp = (cols, history, lines, generation);
         search.matches.clear();
         if !search.query.is_empty() {
-            let query: Vec<char> = search
-                .query
-                .chars()
-                .flat_map(char::to_lowercase)
-                .collect();
+            let query: Vec<char> = search.query.chars().flat_map(char::to_lowercase).collect();
             for lm in logical_lines(grid, -(history as i32), lines as i32 - 1) {
                 search.matches.extend(line_map_matches(&lm, &query, cols));
             }
@@ -1767,13 +1765,15 @@ impl TermSurface {
         } else {
             keep_active.min(n.saturating_sub(1))
         };
-        self.session.search_status.set_from(if search.query.is_empty() {
-            String::new()
-        } else if n == 0 {
-            "no matches".to_string()
-        } else {
-            format!("{n} matches")
-        });
+        self.session
+            .search_status
+            .set_from(if search.query.is_empty() {
+                String::new()
+            } else if n == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{n} matches")
+            });
         if let Some(target) = self.search_scroll_target() {
             let cur = self.session.terminal.term.lock().grid().display_offset() as i32;
             let delta = target - cur;
@@ -1790,7 +1790,12 @@ impl TermSurface {
     /// Drain events pushed by the parser thread since last frame.
     fn drain_events(&mut self) {
         // Palette-queued actions share the key-chord dispatch path.
-        let queued: Vec<TermAction> = self.session.pending_actions.borrow_mut().drain(..).collect();
+        let queued: Vec<TermAction> = self
+            .session
+            .pending_actions
+            .borrow_mut()
+            .drain(..)
+            .collect();
         for action in queued {
             self.do_action(action);
         }
@@ -1816,9 +1821,9 @@ impl TermSurface {
                     // program-initiated writes; `clipboard-write-limit-bytes`
                     // discards an over-limit write whole (kitty EFBIG
                     // semantics — never a partial clipboard).
-                    let (allowed, limit) = self.app.config(|c| {
-                        (c.osc52_write, c.clipboard_write_limit)
-                    });
+                    let (allowed, limit) = self
+                        .app
+                        .config(|c| (c.osc52_write, c.clipboard_write_limit));
                     if allowed
                         && text.len() <= limit
                         && let Some(clip) = self.clipboard.as_mut()
@@ -1915,19 +1920,16 @@ impl TermSurface {
                     // with a non-zero code within N ms of spawn is
                     // abnormal — hold the surface and show the notice
                     // card instead of closing silently (Ghostty).
-                    let hold = self.session.ran_command
-                        && self.app.config(|c| c.wait_after_command);
+                    let hold =
+                        self.session.ran_command && self.app.config(|c| c.wait_after_command);
                     let abnormal_ms = self.app.config(|c| c.abnormal_command_exit_runtime);
                     let abnormal = abnormal_ms > 0
-                        && self
-                            .session
-                            .child_exit
-                            .lock()
-                            .unwrap()
-                            .is_some_and(|(code, elapsed)| {
+                        && self.session.child_exit.lock().unwrap().is_some_and(
+                            |(code, elapsed)| {
                                 code.is_some_and(|c| c != 0)
                                     && elapsed.as_millis() <= abnormal_ms as u128
-                            });
+                            },
+                        );
                     if hold || abnormal {
                         self.session.exited.set(true);
                         if abnormal {
@@ -1951,7 +1953,7 @@ impl TermSurface {
                 TermEvent::WindowResizeRequest { rows, cols } => {
                     self.vt_window_resize(rows, cols);
                 }
-                TermEvent::Tap(tap) => match tap {       
+                TermEvent::Tap(tap) => match tap {
                     // Marks + the redraw mode are recorded on the reader
                     // thread where the cursor still sits at the mark.
                     TapEvent::PromptStart | TapEvent::ShellRedraw(_) => {}
@@ -1974,8 +1976,10 @@ impl TermSurface {
                             .unwrap()
                             .map(|t| t.elapsed().as_secs_f64());
                         let long_enough = elapsed.is_some_and(|e| e >= after);
-                        let unfocused =
-                            self.app.focused_session().is_none_or(|s| s.id != self.session.id);
+                        let unfocused = self
+                            .app
+                            .focused_session()
+                            .is_none_or(|s| s.id != self.session.id);
                         let fire = long_enough
                             && match when {
                                 crate::config::NotifyWhen::Always => true,
@@ -1987,7 +1991,10 @@ impl TermSurface {
                             // `bell` (default) = the bell features,
                             // `notify` = the freedesktop hop.
                             let (do_bell, do_notify) = self.app.config(|c| {
-                                (c.notify_on_command_finish_bell, c.notify_on_command_finish_notify)
+                                (
+                                    c.notify_on_command_finish_bell,
+                                    c.notify_on_command_finish_notify,
+                                )
                             });
                             if do_bell {
                                 if self.app.config(|c| c.visual_bell) {
@@ -2032,9 +2039,15 @@ impl TermSurface {
                             self.bell_border = true;
                         }
                         if self.app.config(|c| c.bell_title) {
-                            let text = if title.is_empty() { body } else { format!("{title}: {body}") };
-                            self.app
-                                .set_session_title(self.session.id, Str::from(format!("\u{1f514} {text}")));
+                            let text = if title.is_empty() {
+                                body
+                            } else {
+                                format!("{title}: {body}")
+                            };
+                            self.app.set_session_title(
+                                self.session.id,
+                                Str::from(format!("\u{1f514} {text}")),
+                            );
                         }
                     }
                     TapEvent::Apc(_payload) => {}
@@ -2045,7 +2058,9 @@ impl TermSurface {
 
     /// kitty graphics: parse + store + reply `\x1b_Gi=<id>;<status>\x1b\\`.
     fn handle_apc(&mut self, payload: &[u8], line: i64, col: usize) {
-        let Some(cmd) = crate::kitty::parse(payload) else { return };
+        let Some(cmd) = crate::kitty::parse(payload) else {
+            return;
+        };
         let quiet = cmd.quiet();
         let limit = self.app.config(|c| c.image_storage_limit);
         let (id, status) = self
@@ -2200,9 +2215,7 @@ impl TermSurface {
         }
         if gained {
             self.app.focus_pane(self.session.id);
-        } else if self.app.is_quick_app()
-            && self.app.config(|c| c.quick_terminal_autohide)
-        {
+        } else if self.app.is_quick_app() && self.app.config(|c| c.quick_terminal_autohide) {
             // `quick-terminal-autohide`: the drop-down's surface losing
             // window focus closes the window (Ghostty). This runs at
             // Focus(false), so the closed state takes effect only when
@@ -2211,7 +2224,11 @@ impl TermSurface {
         }
         let mode = *self.session.terminal.term.lock().mode();
         if mode.contains(TermMode::FOCUS_IN_OUT) {
-            self.write(if gained { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
+            self.write(if gained {
+                b"\x1b[I".to_vec()
+            } else {
+                b"\x1b[O".to_vec()
+            });
         }
     }
 
@@ -2249,27 +2266,33 @@ impl TermSurface {
             return;
         };
         let m = self.fonts.metrics;
-        let (pad_x, pad_y) = self.app.config(|c| {
-            (
-                c.window_padding_x.max(0.0),
-                c.window_padding_y.max(0.0),
-            )
-        });
+        let (pad_x, pad_y) = self
+            .app
+            .config(|c| (c.window_padding_x.max(0.0), c.window_padding_y.max(0.0)));
         // The strip counts toward the window frame when it is showing.
-        let strip_visible = self.app.tab_bar_forced.snapshot().unwrap_or_else(|| {
-            self.app.tab_count.snapshot() >= self.app.tab_bar_min.snapshot()
-        });
-        let strip = if strip_visible { crate::app::tab_strip_height() } else { 0.0 };
+        let strip_visible =
+            self.app.tab_bar_forced.snapshot().unwrap_or_else(|| {
+                self.app.tab_count.snapshot() >= self.app.tab_bar_min.snapshot()
+            });
+        let strip = if strip_visible {
+            crate::app::tab_strip_height()
+        } else {
+            0.0
+        };
         // 0 keeps the current dimension (xterm); ≥40×10 cells is the
         // Ghostty floor.
         let cur = frame.snapshot();
         let want_cols = if cols == 0 {
-            ((cur.size().width - pad_x * 2.0) / m.cell_w).round().max(1.0) as u16
+            ((cur.size().width - pad_x * 2.0) / m.cell_w)
+                .round()
+                .max(1.0) as u16
         } else {
             cols.max(40)
         };
         let want_rows = if rows == 0 {
-            ((cur.size().height - pad_y * 2.0 - strip) / m.cell_h).round().max(1.0) as u16
+            ((cur.size().height - pad_y * 2.0 - strip) / m.cell_h)
+                .round()
+                .max(1.0) as u16
         } else {
             rows.max(10)
         };
@@ -2342,7 +2365,8 @@ impl TermSurface {
         if pressed && self.search.is_some() && self.search_key(key, mods) {
             return true;
         }
-        if pressed && self.session.title_prompt_open.snapshot() && self.title_prompt_key(key, mods) {
+        if pressed && self.session.title_prompt_open.snapshot() && self.title_prompt_key(key, mods)
+        {
             return true;
         }
         // Paste-protection overlay captures Enter/Escape; other keys
@@ -2574,13 +2598,10 @@ impl TermSurface {
                 let q = self.session.title_query.snapshot();
                 match self.session.title_prompt_target.get() {
                     crate::app::TitleTarget::Tab => {
-                        self.app
-                            .set_tab_title(self.session.id, Some(q.to_string()));
+                        self.app.set_tab_title(self.session.id, Some(q.to_string()));
                     }
                     crate::app::TitleTarget::Window => {
-                        self.app
-                            .window_title
-                            .set(self.app.title_with_subtitle(&q));
+                        self.app.window_title.set(self.app.title_with_subtitle(&q));
                     }
                     crate::app::TitleTarget::Surface => {
                         self.app.set_session_title(self.session.id, q);
@@ -2619,7 +2640,11 @@ impl TermSurface {
         match key {
             Key::Named(NamedKey::Enter) => {
                 // Enter: next match; Shift+Enter: previous.
-                self.search_step(if mods.contains(Modifiers::SHIFT) { -1 } else { 1 });
+                self.search_step(if mods.contains(Modifiers::SHIFT) {
+                    -1
+                } else {
+                    1
+                });
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -2706,15 +2731,13 @@ impl TermSurface {
                 self.session.terminal.term.lock().selection.is_some()
             }
             // Last-output copy needs the OSC 133 mark trail.
-            TermAction::CopyLastOutput | TermAction::WriteLastOutputFile(_) => {
-                !self
-                    .session
-                    .terminal
-                    .prompt_marks
-                    .lock()
-                    .unwrap()
-                    .is_empty()
-            }
+            TermAction::CopyLastOutput | TermAction::WriteLastOutputFile(_) => !self
+                .session
+                .terminal
+                .prompt_marks
+                .lock()
+                .unwrap()
+                .is_empty(),
             // URL copy needs a link under the pointer.
             TermAction::CopyUrlToClipboard => {
                 let (x, y) = self.pointer_at;
@@ -2734,17 +2757,9 @@ impl TermSurface {
             | TermAction::ScrollToFraction(_)
             | TermAction::JumpToPrompt(_)
             | TermAction::ClearScrollback => {
-                self.session
-                    .terminal
-                    .term
-                    .lock()
-                    .grid()
-                    .history_size()
-                    > 0
+                self.session.terminal.term.lock().grid().history_size() > 0
             }
-            TermAction::NavigateSearch(_) | TermAction::EndSearch => {
-                self.search.is_some()
-            }
+            TermAction::NavigateSearch(_) | TermAction::EndSearch => self.search.is_some(),
             // Everything else is performable whenever dispatched.
             _ => true,
         }
@@ -2875,7 +2890,9 @@ impl TermSurface {
         // drag bypasses the program and selects locally — unless
         // `always`, which reports the event (shift bit included).
         let shift_override = self.modifiers.contains(Modifiers::SHIFT)
-            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
+            && self
+                .app
+                .config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
         if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             // Drag while held, else any-cell motion tracking (1003) isn't in
             // TermMode — only report while a button is held (button-motion).
@@ -2915,9 +2932,7 @@ impl TermSurface {
     /// bits (1000/1002/1003 + encodings) so pointer events stay local.
     fn mouse_mode(&self) -> TermMode {
         let mode = *self.session.terminal.term.lock().mode();
-        if self.session.mouse_reporting_off.get()
-            || !self.app.config(|c| c.mouse_reporting)
-        {
+        if self.session.mouse_reporting_off.get() || !self.app.config(|c| c.mouse_reporting) {
             mode & !TermMode::MOUSE_MODE
         } else {
             mode
@@ -2956,9 +2971,10 @@ impl TermSurface {
     /// changes.
     fn update_hover(&mut self, x: f64, y: f64) {
         self.pointer_at = (x, y);
-        if self.app.config(|c| {
-            c.right_click_action == crate::config::RightClickAction::ContextMenu
-        }) {
+        if self
+            .app
+            .config(|c| c.right_click_action == crate::config::RightClickAction::ContextMenu)
+        {
             self.refresh_menu_ctx();
         }
         let segs = if self.modifiers.contains(self.link_modifier()) {
@@ -2971,9 +2987,7 @@ impl TermSurface {
         }
         // `link-hover` — publish the hovered link's target for the
         // pane's status chip (Ghostty shows the URL on modifier hover).
-        let hover_text = if self.hover_link.is_empty()
-            || !self.app.config(|c| c.link_hover)
-        {
+        let hover_text = if self.hover_link.is_empty() || !self.app.config(|c| c.link_hover) {
             String::new()
         } else {
             self.link_at(self.grid_point(x, y)).unwrap_or_default()
@@ -2998,13 +3012,14 @@ impl TermSurface {
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
         let osc8 = self.app.config(|c| c.link_osc8);
-        let uri_at = |p: Point| osc8.then(|| grid[p].hyperlink().map(|h| h.uri().to_string())).flatten();
+        let uri_at = |p: Point| {
+            osc8.then(|| grid[p].hyperlink().map(|h| h.uri().to_string()))
+                .flatten()
+        };
         if let Some(uri) = uri_at(point) {
             let line = point.line.0;
-            let same = |c: usize| {
-                uri_at(Point::new(Line(line), Column(c)))
-                    .is_some_and(|u| u == uri)
-            };
+            let same =
+                |c: usize| uri_at(Point::new(Line(line), Column(c))).is_some_and(|u| u == uri);
             let mut c0 = point.column.0;
             let mut c1 = c0 + 1;
             while c0 > 0 && same(c0 - 1) {
@@ -3023,9 +3038,7 @@ impl TermSurface {
         // `link-url = false` disables detected URLs; OSC8 hyperlinks
         // (explicit markup) still resolve above, like Ghostty — and
         // `link = <regex>` patterns still apply.
-        let (url_on, patterns) = self
-            .app
-            .config(|c| (c.link_url, c.link_patterns.clone()));
+        let (url_on, patterns) = self.app.config(|c| (c.link_url, c.link_patterns.clone()));
         if !url_on && patterns.is_empty() {
             return Vec::new();
         }
@@ -3080,7 +3093,9 @@ impl TermSurface {
         // `mouse-shift-capture`: same gate as motion — shift bypasses
         // reporting unless `always`.
         let shift_override = self.modifiers.contains(Modifiers::SHIFT)
-            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
+            && self
+                .app
+                .config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
         if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             let action = if pressed {
                 let b = mouse::press_button(button);
@@ -3112,9 +3127,7 @@ impl TermSurface {
                         .last_click
                         .filter(|(t, r, c, _)| {
                             now.duration_since(*t)
-                                < Duration::from_millis(
-                                    self.app.config(|c| c.click_interval),
-                                )
+                                < Duration::from_millis(self.app.config(|c| c.click_interval))
                                 && r.abs_diff(row) <= MULTI_CLICK_RANGE
                                 && c.abs_diff(col) <= MULTI_CLICK_RANGE
                         })
@@ -3156,9 +3169,7 @@ impl TermSurface {
                             }
                         }
                         // `clipboard-paste` — the standard clipboard.
-                        crate::config::MiddleClickAction::ClipboardPaste => {
-                            self.paste_clipboard()
-                        }
+                        crate::config::MiddleClickAction::ClipboardPaste => self.paste_clipboard(),
                         crate::config::MiddleClickAction::Ignore => {}
                     }
                 }
@@ -3193,8 +3204,7 @@ impl TermSurface {
                 // `cursor-click-to-move`: a click on the cursor's row
                 // emits left/right arrows so the line editor moves its
                 // input cursor (Ghostty `cursor-click-to-move`).
-                if self.app.config(|c| c.cursor_click_to_move)
-                    && term.grid().display_offset() == 0
+                if self.app.config(|c| c.cursor_click_to_move) && term.grid().display_offset() == 0
                 {
                     let cur = term.grid().cursor.point;
                     if row as i64 == i64::from(cur.line.0) && col != cur.column.0 {
@@ -3266,7 +3276,11 @@ impl TermSurface {
         if spans.is_empty() {
             self.hints = None;
         } else {
-            self.hints = Some(HintState { spans, urls, digits: String::new() });
+            self.hints = Some(HintState {
+                spans,
+                urls,
+                digits: String::new(),
+            });
         }
     }
 
@@ -3299,20 +3313,12 @@ impl TermSurface {
             Key::Named(NamedKey::ArrowRight) => {
                 cur.column = Column((cur.column.0 + 1).min(cols - 1))
             }
-            Key::Named(NamedKey::ArrowUp) => {
-                cur.line = Line((cur.line.0 - 1).max(-history))
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                cur.line = Line((cur.line.0 + 1).min(rows - 1))
-            }
+            Key::Named(NamedKey::ArrowUp) => cur.line = Line((cur.line.0 - 1).max(-history)),
+            Key::Named(NamedKey::ArrowDown) => cur.line = Line((cur.line.0 + 1).min(rows - 1)),
             Key::Named(NamedKey::Home) => cur.column = Column(0),
             Key::Named(NamedKey::End) => cur.column = Column(cols - 1),
-            Key::Named(NamedKey::PageUp) => {
-                cur.line = Line((cur.line.0 - rows).max(-history))
-            }
-            Key::Named(NamedKey::PageDown) => {
-                cur.line = Line((cur.line.0 + rows).min(rows - 1))
-            }
+            Key::Named(NamedKey::PageUp) => cur.line = Line((cur.line.0 - rows).max(-history)),
+            Key::Named(NamedKey::PageDown) => cur.line = Line((cur.line.0 + rows).min(rows - 1)),
             // Modifier presses are inert: the chord's own Shift/Ctrl/Alt
             // key-downs arrive as separate events before the real key,
             // and must not exit the mode they are part of.
@@ -3392,10 +3398,7 @@ impl TermSurface {
             return None;
         }
         let saved = term.selection.take();
-        let start = Point::new(
-            Line((start_abs - history) as i32),
-            Column(0),
-        );
+        let start = Point::new(Line((start_abs - history) as i32), Column(0));
         let last_col = term.grid().columns() - 1;
         let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
         sel.update(
@@ -3485,8 +3488,7 @@ impl TermSurface {
                 let editor = std::env::var("VISUAL")
                     .or_else(|_| std::env::var("EDITOR"))
                     .unwrap_or_else(|_| "vi".to_string());
-                let mut cmd: Vec<String> =
-                    editor.split_whitespace().map(str::to_string).collect();
+                let mut cmd: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
                 cmd.push(path);
                 self.app.new_tab_command(cmd);
             }
@@ -3542,13 +3544,18 @@ impl TermSurface {
         } * f64::from(self.app.config(|c| c.mouse_scroll_multiplier));
 
         let shift_override = self.modifiers.contains(Modifiers::SHIFT)
-            && self.app.config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
+            && self
+                .app
+                .config(|c| c.mouse_shift_capture != MouseShiftCapture::Always);
         if mode.intersects(TermMode::MOUSE_MODE) && !shift_override {
             if let Some((btn, count)) = mouse::wheel_button(lines_delta) {
                 for _ in 0..count {
-                    if let Some(bytes) =
-                        mouse::encode(MouseAction::Wheel(btn), CellPos { col, row }, self.modifiers, mode)
-                    {
+                    if let Some(bytes) = mouse::encode(
+                        MouseAction::Wheel(btn),
+                        CellPos { col, row },
+                        self.modifiers,
+                        mode,
+                    ) {
                         self.write(bytes);
                     }
                 }
@@ -3578,9 +3585,10 @@ impl TermSurface {
         term.scroll_display(Scroll::Delta(lines_delta as i32));
         drop(term);
         // The cell under a still pointer changed with the viewport.
-        if self.app.config(|c| {
-            c.right_click_action == crate::config::RightClickAction::ContextMenu
-        }) {
+        if self
+            .app
+            .config(|c| c.right_click_action == crate::config::RightClickAction::ContextMenu)
+        {
             self.refresh_menu_ctx();
         }
     }
@@ -3739,11 +3747,9 @@ impl TermSurface {
             bell_flash: bell_alpha,
             bell_border: self.bell_border,
             bg_opacity,
-            cell_bg_opacity: self
-                .app
-                .config(|c| {
-                    crate::config::cell_bg_alpha(c.background_opacity_cells, c.background_opacity)
-                }),
+            cell_bg_opacity: self.app.config(|c| {
+                crate::config::cell_bg_alpha(c.background_opacity_cells, c.background_opacity)
+            }),
             pad_mode: self.app.config(|c| c.window_padding_color),
             hints: &hint_spans,
             hint_digits: &hint_digits,
@@ -3773,22 +3779,38 @@ impl TermSurface {
             bg_image,
             unfocused_fill: self.app.config(|c| c.unfocused_split_fill),
             link_osc8: self.app.config(|c| c.link_osc8),
-            cursor_thickness: self
-                .app
-                .config(|c| if c.adjust_cursor_thickness == 0 { 1.0 } else { c.adjust_cursor_thickness as f32 / 100.0 }),
-            cursor_height: self
-                .app
-                .config(|c| if c.adjust_cursor_height == 0 { 1.0 } else { c.adjust_cursor_height as f32 / 100.0 }),
+            cursor_thickness: self.app.config(|c| {
+                if c.adjust_cursor_thickness == 0 {
+                    1.0
+                } else {
+                    c.adjust_cursor_thickness as f32 / 100.0
+                }
+            }),
+            cursor_height: self.app.config(|c| {
+                if c.adjust_cursor_height == 0 {
+                    1.0
+                } else {
+                    c.adjust_cursor_height as f32 / 100.0
+                }
+            }),
             underline_adjust: self.app.config(|c| {
                 (
                     c.adjust_underline_position as f32,
-                    if c.adjust_underline_thickness == 0 { 1.0 } else { c.adjust_underline_thickness as f32 / 100.0 },
+                    if c.adjust_underline_thickness == 0 {
+                        1.0
+                    } else {
+                        c.adjust_underline_thickness as f32 / 100.0
+                    },
                 )
             }),
             strikethrough_adjust: self.app.config(|c| {
                 (
                     c.adjust_strikethrough_position as f32,
-                    if c.adjust_strikethrough_thickness == 0 { 1.0 } else { c.adjust_strikethrough_thickness as f32 / 100.0 },
+                    if c.adjust_strikethrough_thickness == 0 {
+                        1.0
+                    } else {
+                        c.adjust_strikethrough_thickness as f32 / 100.0
+                    },
                 )
             }),
         };
@@ -3873,7 +3895,10 @@ impl SceneContent for TermSurface {
     fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
         let draw_start = Instant::now();
         if std::env::var_os("HYDRO_SNIFF").is_some() {
-            eprintln!("[scene] s{} @{self:p} {width:.0}x{height:.0}", self.session.id);
+            eprintln!(
+                "[scene] s{} @{self:p} {width:.0}x{height:.0}",
+                self.session.id
+            );
         }
         self.app.poll_config();
         self.drain_events();
@@ -3898,9 +3923,11 @@ impl SceneContent for TermSurface {
             for i in 0..g.screen_lines() {
                 let mut s = String::new();
                 for c in 0..g.columns() {
-                    s.push(g[alacritty_terminal::index::Line(i as i32)]
-                        [alacritty_terminal::index::Column(c)]
-                        .c);
+                    s.push(
+                        g[alacritty_terminal::index::Line(i as i32)]
+                            [alacritty_terminal::index::Column(c)]
+                        .c,
+                    );
                 }
                 rows.push_str(&format!("|{}|", s.trim_end()));
             }
@@ -3952,16 +3979,12 @@ impl SceneContent for TermSurface {
                 // future — running on the winit main thread via the local
                 // executor — drains it and calls the real invalidator.
                 let (tx, rx) = async_channel::unbounded::<()>();
-                let epoch = self
-                    .session
-                    .terminal
-                    .proxy
-                    .set_wake({
-                        let tx = tx.clone();
-                        move || {
-                            let _ = tx.try_send(());
-                        }
-                    });
+                let epoch = self.session.terminal.proxy.set_wake({
+                    let tx = tx.clone();
+                    move || {
+                        let _ = tx.try_send(());
+                    }
+                });
                 self.wake_epoch.set(epoch);
                 self.wake_alive.set(true);
                 // Events queued before this install (a fast child exit,
@@ -4048,24 +4071,44 @@ impl SceneContent for TermSurface {
             SurfaceInputEvent::PointerMove { position } => {
                 // `toggle_mouse_visibility` keeps the pointer hidden
                 // across motion until the action toggles it back.
-                if !self.pointer_hidden && let Some(h) = &mut self.cursor_hider {
+                if !self.pointer_hidden
+                    && let Some(h) = &mut self.cursor_hider
+                {
                     h.show();
                 }
                 self.on_pointer_move(position.x, position.y);
                 true
             }
-            SurfaceInputEvent::PointerButton { pressed, button, position } => {
-                if !self.pointer_hidden && let Some(h) = &mut self.cursor_hider {
+            SurfaceInputEvent::PointerButton {
+                pressed,
+                button,
+                position,
+            } => {
+                if !self.pointer_hidden
+                    && let Some(h) = &mut self.cursor_hider
+                {
                     h.show();
                 }
                 self.on_pointer_button(*pressed, *button, position.x, position.y);
                 true
             }
-            SurfaceInputEvent::Scroll { position, delta_x, delta_y, unit, .. } => {
+            SurfaceInputEvent::Scroll {
+                position,
+                delta_x,
+                delta_y,
+                unit,
+                ..
+            } => {
                 self.on_scroll(position.x, position.y, *delta_x, *delta_y, *unit);
                 true
             }
-            SurfaceInputEvent::Key { pressed, key, code, modifiers, repeat: _ } => {
+            SurfaceInputEvent::Key {
+                pressed,
+                key,
+                code,
+                modifiers,
+                repeat: _,
+            } => {
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                     eprintln!(
                         "[key] pressed={pressed} key={key:?} code={code:?} mods={modifiers:?}"
@@ -4121,9 +4164,7 @@ impl SceneContent for TermSurface {
                 true
             }
         };
-        if needs_frame
-            && let Some(invalidator) = &self.invalidator
-        {
+        if needs_frame && let Some(invalidator) = &self.invalidator {
             invalidator();
         }
     }
@@ -4187,7 +4228,9 @@ fn url_at(chars: &[char], col: usize, patterns: &[regex::Regex], url_on: bool) -
                         end += 1;
                     }
                     // Trailing sentence punctuation is almost never part of the URL.
-                    while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                    while end > off + sc.len()
+                        && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?')
+                    {
                         end -= 1;
                     }
                     if col >= off && col < end {
@@ -4233,7 +4276,9 @@ fn url_spans(chars: &[char], patterns: &[regex::Regex], url_on: bool) -> Vec<(us
                     while end < chars.len() && is_url_char(chars[end]) {
                         end += 1;
                     }
-                    while end > off + sc.len() && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                    while end > off + sc.len()
+                        && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?')
+                    {
                         end -= 1;
                     }
                     spans.push((off, end));
@@ -4402,15 +4447,9 @@ mod tests {
             drop_payload("file:///home/u/a%20b%20c.png"),
             "'/home/u/a b c.png'"
         );
-        assert_eq!(
-            drop_payload("file:///tmp/it's.txt"),
-            "'/tmp/it'\\''s.txt'"
-        );
+        assert_eq!(drop_payload("file:///tmp/it's.txt"), "'/tmp/it'\\''s.txt'");
         // Multiple items on one drop join space-separated.
-        assert_eq!(
-            drop_payload("file:///a%20b\nfile:///c"),
-            "'/a b' /c"
-        );
+        assert_eq!(drop_payload("file:///a%20b\nfile:///c"), "'/a b' /c");
         // Non-URI text passes through (still quoted when needed).
         assert_eq!(drop_payload("/x/y-z"), "/x/y-z");
         // UTF-8 percent sequences decode, not byte-as-char corruption
@@ -4422,7 +4461,10 @@ mod tests {
     #[test]
     fn url_at_finds_url_under_col() {
         let row = chars("see https://example.com/x for docs");
-        assert_eq!(url_at(&row, 10, &[], true), Some("https://example.com/x".to_string()));
+        assert_eq!(
+            url_at(&row, 10, &[], true),
+            Some("https://example.com/x".to_string())
+        );
         assert_eq!(url_at(&row, 0, &[], true), None);
         assert_eq!(url_at(&row, 30, &[], true), None);
     }
@@ -4430,14 +4472,20 @@ mod tests {
     #[test]
     fn url_at_trims_trailing_punct() {
         let row = chars("open https://a.b/c, then");
-        assert_eq!(url_at(&row, 6, &[], true), Some("https://a.b/c".to_string()));
+        assert_eq!(
+            url_at(&row, 6, &[], true),
+            Some("https://a.b/c".to_string())
+        );
     }
 
     #[test]
     fn url_at_trims_brackets() {
         let row = chars("[x](https://a.b/?q=(r)) ");
         // Click inside the link: parens stop the scan.
-        assert_eq!(url_at(&row, 8, &[], true), Some("https://a.b/?q=".to_string()));
+        assert_eq!(
+            url_at(&row, 8, &[], true),
+            Some("https://a.b/?q=".to_string())
+        );
     }
 
     #[test]
@@ -4445,14 +4493,23 @@ mod tests {
         let s = chars("open https://a.io/x then https://b.dev/y.");
         let spans = url_spans(&s, &[], true);
         assert_eq!(spans.len(), 2);
-        assert_eq!(s[spans[0].0..spans[0].1].iter().collect::<String>(), "https://a.io/x");
-        assert_eq!(s[spans[1].0..spans[1].1].iter().collect::<String>(), "https://b.dev/y");
+        assert_eq!(
+            s[spans[0].0..spans[0].1].iter().collect::<String>(),
+            "https://a.io/x"
+        );
+        assert_eq!(
+            s[spans[1].0..spans[1].1].iter().collect::<String>(),
+            "https://b.dev/y"
+        );
     }
 
     #[test]
     fn url_at_second_of_two() {
         let row = chars("https://a.b/ and http://c.d/e");
-        assert_eq!(url_at(&row, 22, &[], true), Some("http://c.d/e".to_string()));
+        assert_eq!(
+            url_at(&row, 22, &[], true),
+            Some("http://c.d/e".to_string())
+        );
     }
 
     #[test]
@@ -4461,13 +4518,22 @@ mod tests {
         // scheme; multi-byte chars before it keep byte→char mapping.
         let re = regex::Regex::new(r"GH-\d+").unwrap();
         let row = chars("fix GH-42 中GH-7 done");
-        assert_eq!(url_at(&row, 6, std::slice::from_ref(&re), true), Some("GH-42".to_string()));
+        assert_eq!(
+            url_at(&row, 6, std::slice::from_ref(&re), true),
+            Some("GH-42".to_string())
+        );
         // Inside the post-CJK match.
-        assert_eq!(url_at(&row, 12, std::slice::from_ref(&re), true), Some("GH-7".to_string()));
+        assert_eq!(
+            url_at(&row, 12, std::slice::from_ref(&re), true),
+            Some("GH-7".to_string())
+        );
         // `link-url = false` drops scheme matches but keeps patterns.
         let row = chars("see https://a.b/ GH-9");
         assert_eq!(url_at(&row, 5, std::slice::from_ref(&re), false), None);
-        assert_eq!(url_at(&row, 18, std::slice::from_ref(&re), false), Some("GH-9".to_string()));
+        assert_eq!(
+            url_at(&row, 18, std::slice::from_ref(&re), false),
+            Some("GH-9".to_string())
+        );
     }
 
     #[test]
@@ -4475,9 +4541,7 @@ mod tests {
         let t0 = Instant::now();
         assert!((bell_flash_alpha(Some(t0), t0) - BELL_FLASH_ALPHA).abs() < 1e-6);
         let mid = t0 + Duration::from_secs_f32(BELL_FLASH_SECS / 2.0);
-        assert!(
-            (bell_flash_alpha(Some(t0), mid) - BELL_FLASH_ALPHA).abs() < 1e-6
-        );
+        assert!((bell_flash_alpha(Some(t0), mid) - BELL_FLASH_ALPHA).abs() < 1e-6);
         let past = t0 + Duration::from_secs_f32(BELL_FLASH_SECS + 0.05);
         assert_eq!(bell_flash_alpha(Some(t0), past), 0.0);
         assert_eq!(bell_flash_alpha(None, t0), 0.0);
@@ -4548,7 +4612,10 @@ mod tests {
         assert_eq!(url, "https://example.com/alpha");
         // cols 4..20 of row 0 ("https://example."), then "com/alpha" on
         // row 1 cols 0..9.
-        assert_eq!(span_segments(&lm, s, e, grid.columns()), vec![(4, 20, 0), (0, 9, 1)]);
+        assert_eq!(
+            span_segments(&lm, s, e, grid.columns()),
+            vec![(4, 20, 0), (0, 9, 1)]
+        );
     }
 
     /// Wide chars occupy two cells: match segments span cells, not chars.
@@ -4559,7 +4626,10 @@ mod tests {
         let grid = term.grid();
         let lm = logical_line_at(grid, 0);
         let query: Vec<char> = "好a".chars().flat_map(char::to_lowercase).collect();
-        assert_eq!(line_map_matches(&lm, &query, grid.columns()), vec![vec![(2, 5, 0)]]);
+        assert_eq!(
+            line_map_matches(&lm, &query, grid.columns()),
+            vec![vec![(2, 5, 0)]]
+        );
     }
 
     /// `scroll_to_selection`: the delta puts the selection start at the

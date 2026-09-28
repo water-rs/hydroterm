@@ -248,7 +248,10 @@ impl OscScanner {
             }
             b"9" => {
                 if let Some(t) = params.get(1).and_then(|p| std::str::from_utf8(p).ok()) {
-                    tap(TapEvent::Notify(String::new(), t.to_owned()), &mut self.events);
+                    tap(
+                        TapEvent::Notify(String::new(), t.to_owned()),
+                        &mut self.events,
+                    );
                 }
             }
             b"133" => match params.get(1).copied().unwrap_or(b"") {
@@ -275,7 +278,10 @@ impl OscScanner {
                 if let (Some(t), Some(b)) = (params.get(2), params.get(3))
                     && let (Ok(t), Ok(b)) = (std::str::from_utf8(t), std::str::from_utf8(b))
                 {
-                    tap(TapEvent::Notify(t.to_owned(), b.to_owned()), &mut self.events);
+                    tap(
+                        TapEvent::Notify(t.to_owned(), b.to_owned()),
+                        &mut self.events,
+                    );
                 }
             }
             _ => (),
@@ -385,7 +391,14 @@ mod tests {
     #[test]
     fn osc133_marks() {
         let (ev, _) = scan(b"\x1b]133;A\x07prompt$ \x1b]133;B\x07ls\x1b]133;D;0\x07");
-        assert!(matches!(ev.as_slice(), [TapEvent::PromptStart, TapEvent::PromptEnd, TapEvent::CommandEnd(Some(0))]));
+        assert!(matches!(
+            ev.as_slice(),
+            [
+                TapEvent::PromptStart,
+                TapEvent::PromptEnd,
+                TapEvent::CommandEnd(Some(0))
+            ]
+        ));
     }
 
     #[test]
@@ -410,7 +423,10 @@ mod tests {
                 break;
             }
         }
-        assert!(matches!(events.as_slice(), [TapEvent::PromptStart, TapEvent::CommandEnd(Some(42))]));
+        assert!(matches!(
+            events.as_slice(),
+            [TapEvent::PromptStart, TapEvent::CommandEnd(Some(42))]
+        ));
     }
 
     #[test]
@@ -418,13 +434,24 @@ mod tests {
         let (ev, _) = scan(b"\x1b]133;A;redraw=last\x07");
         assert!(matches!(
             ev.as_slice(),
-            [TapEvent::PromptStart, TapEvent::ShellRedraw(ShellRedraw::Last)]
+            [
+                TapEvent::PromptStart,
+                TapEvent::ShellRedraw(ShellRedraw::Last)
+            ]
         ));
         let (ev, _) = scan(b"\x1b]133;A;redraw=0\x07");
-        assert!(ev.iter().any(|e| matches!(e, TapEvent::ShellRedraw(ShellRedraw::False))));
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, TapEvent::ShellRedraw(ShellRedraw::False)))
+        );
         // Unknown values are ignored; a bare A emits no redraw event.
         let (ev, _) = scan(b"\x1b]133;A;redraw=wat\x07\x1b]133;A\x07");
-        assert_eq!(ev.iter().filter(|e| matches!(e, TapEvent::ShellRedraw(_))).count(), 0);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, TapEvent::ShellRedraw(_)))
+                .count(),
+            0
+        );
     }
 
     #[test]

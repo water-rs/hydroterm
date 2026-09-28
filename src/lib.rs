@@ -29,15 +29,14 @@ mod terminal;
 mod theme;
 mod xcursor;
 
-use waterui::app::App;
-use waterui::theme::Theme;
+use crate::app::AppState;
 use waterui::Plugin;
+use waterui::app::App;
 use waterui::prelude::*;
+use waterui::theme::Theme;
 use waterui::window::Window;
 use waterui::window::WindowState::Fullscreen;
 use waterui::window::WindowStyle::{Borderless, Titled};
-use crate::app::AppState;
-
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...] [+ACTION]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
@@ -55,7 +54,9 @@ fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
             _ => {}
         }
     }
-    if let Some(cmd) = &command && cmd.is_empty() {
+    if let Some(cmd) = &command
+        && cmd.is_empty()
+    {
         command = None;
     }
     (config_path, command)
@@ -121,14 +122,10 @@ pub fn app(env: Environment) -> App {
     // transparent winit window; at 1.0 the window stays opaque.
     let opacity = state.config(|c| c.background_opacity);
     let bg = state.config(|c| c.resolve_theme().background);
-    let window = Window::new(
-        title,
-        state.window_state.clone(),
-        {
-            let state = state.clone();
-            move || app::app_root(state.clone())
-        },
-    )
+    let window = Window::new(title, state.window_state.clone(), {
+        let state = state.clone();
+        move || app::app_root(state.clone())
+    })
     // `window-decoration = false` maps the window borderless (Ghostty
     // `window-decoration`); the default keeps the titled frame.
     .style(if state.config(|c| c.window_decoration) {
@@ -178,9 +175,7 @@ pub fn material_style() -> hydrolysis_m3::Material3 {
         let argb = hydrolysis_m3::Argb(
             0xff << 24 | u32::from(bg.r) << 16 | u32::from(bg.g) << 8 | u32::from(bg.b),
         );
-        let dark = (0.2126 * f64::from(bg.r)
-            + 0.7152 * f64::from(bg.g)
-            + 0.0722 * f64::from(bg.b))
+        let dark = (0.2126 * f64::from(bg.r) + 0.7152 * f64::from(bg.g) + 0.0722 * f64::from(bg.b))
             < 127.5;
         hydrolysis_m3::Material3::with_seed_mode(
             argb,

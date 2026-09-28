@@ -247,10 +247,8 @@ fn in_selection(p: Point, sel: &alacritty_terminal::selection::SelectionRange) -
             && p.column >= sel.start.column
             && p.column <= sel.end.column
     } else {
-        (p.line > sel.start.line
-            || (p.line == sel.start.line && p.column >= sel.start.column))
-            && (p.line < sel.end.line
-                || (p.line == sel.end.line && p.column <= sel.end.column))
+        (p.line > sel.start.line || (p.line == sel.start.line && p.column >= sel.start.column))
+            && (p.line < sel.end.line || (p.line == sel.end.line && p.column <= sel.end.column))
     }
 }
 
@@ -299,7 +297,10 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         blinking: cursor_style.blinking,
     };
 
-    let mut grid = Grid { rows: Vec::new(), num_cols: 0 };
+    let mut grid = Grid {
+        rows: Vec::new(),
+        num_cols: 0,
+    };
 
     for indexed in content.display_iter {
         let p = indexed.point;
@@ -313,7 +314,10 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
         grid.num_cols = grid.num_cols.max(p.column.0 + 1);
         let row = &mut grid.rows[row_idx];
 
-        let is_sel = content.selection.as_ref().is_some_and(|s| in_selection(p, s));
+        let is_sel = content
+            .selection
+            .as_ref()
+            .is_some_and(|s| in_selection(p, s));
         let is_cursor =
             show_block && p.line == cursor.point.line && p.column == cursor.point.column;
 
@@ -523,9 +527,11 @@ pub fn draw_term(
         // the built-in palette stays a translucent tint.
         let (color, alpha) = if active {
             (
-                ctx.search_colors
-                    .selected_background
-                    .unwrap_or(Rgb { r: 0xff, g: 0xa5, b: 0x00 }),
+                ctx.search_colors.selected_background.unwrap_or(Rgb {
+                    r: 0xff,
+                    g: 0xa5,
+                    b: 0x00,
+                }),
                 if ctx.search_colors.selected_background.is_some() {
                     1.0
                 } else {
@@ -534,9 +540,11 @@ pub fn draw_term(
             )
         } else {
             (
-                ctx.search_colors
-                    .background
-                    .unwrap_or(Rgb { r: 0x8a, g: 0x6d, b: 0x3b }),
+                ctx.search_colors.background.unwrap_or(Rgb {
+                    r: 0x8a,
+                    g: 0x6d,
+                    b: 0x3b,
+                }),
                 if ctx.search_colors.background.is_some() {
                     1.0
                 } else {
@@ -549,7 +557,12 @@ pub fn draw_term(
             Affine::IDENTITY,
             &Brush::Solid(peniko_alpha(color, alpha)),
             None,
-            &rect(col_x(padx, cw, c0), row_y(pady, ch, r), (c1 - c0) as f32 * cw, ch),
+            &rect(
+                col_x(padx, cw, c0),
+                row_y(pady, ch, r),
+                (c1 - c0) as f32 * cw,
+                ch,
+            ),
         );
     }
 
@@ -563,7 +576,9 @@ pub fn draw_term(
         }
         let baseline_y = row_y(pady, ch, row_i) + m.baseline;
         for (start, end, style) in style_runs(row) {
-            draw_text_run(scene, row, start, end, style, row_i, padx, pady, baseline_y, ctx);
+            draw_text_run(
+                scene, row, start, end, style, row_i, padx, pady, baseline_y, ctx,
+            );
             draw_decorations(scene, start, end, style, row_i, padx, ch, baseline_y, ctx);
         }
     }
@@ -612,7 +627,13 @@ pub fn draw_term(
             let &(bc, _, brow) = &h.segments[0];
             let x = col_x(padx, cw, bc);
             let y = row_y(pady, ch, brow);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, &chip_bg, None, &rect(x, y, w, ch));
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &chip_bg,
+                None,
+                &rect(x, y, w, ch),
+            );
             draw_chip_text(scene, &label, x, y + m.baseline, palette.accent_fg, ctx);
         }
         if !ctx.hint_digits.is_empty() {
@@ -809,7 +830,14 @@ fn draw_decorations(
     let underline_y = baseline_y as f64 + m.underline_pos as f64 + ctx.underline_adjust.0 as f64;
     // Straight decorations are square-ended rects centered on the line y, so
     // the run's first and last cells bound them exactly.
-    let band = |y: f64| Rect::new(x as f64, y - stroke_w / 2.0, (x + w) as f64, y + stroke_w / 2.0);
+    let band = |y: f64| {
+        Rect::new(
+            x as f64,
+            y - stroke_w / 2.0,
+            (x + w) as f64,
+            y + stroke_w / 2.0,
+        )
+    };
 
     if style.deco & DECO_UNDERLINE != 0 {
         let p = band(underline_y).to_path(0.0);
@@ -832,7 +860,11 @@ fn draw_decorations(
         let mut up = true;
         while xx < (x + w) as f64 {
             let nx = (xx + period / 2.0).min((x + w) as f64);
-            let ny = if up { underline_y - amp } else { underline_y + amp * 0.4 };
+            let ny = if up {
+                underline_y - amp
+            } else {
+                underline_y + amp * 0.4
+            };
             p.quad_to(((xx + nx) / 2.0, ny), (nx, underline_y));
             xx = nx;
             up = !up;
@@ -867,8 +899,13 @@ fn draw_decorations(
     if style.deco & DECO_STRIKE != 0 {
         let y = baseline_y as f64 - m.strikeout_pos as f64 - ctx.strikethrough_adjust.0 as f64;
         let w_stroke = (m.stroke * ctx.strikethrough_adjust.1).max(1.0) as f64;
-        let p = Rect::new(x as f64, y - w_stroke / 2.0, (x + w) as f64, y + w_stroke / 2.0)
-            .to_path(0.0);
+        let p = Rect::new(
+            x as f64,
+            y - w_stroke / 2.0,
+            (x + w) as f64,
+            y + w_stroke / 2.0,
+        )
+        .to_path(0.0);
         scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
     }
 }
@@ -902,7 +939,13 @@ fn draw_cursor(
                     (x + cw) as f64 - 0.5,
                     (y + ch) as f64 - 0.5,
                 );
-                scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, &brush, None, &r.to_path(0.0));
+                scene.stroke(
+                    &Stroke::new(1.0),
+                    Affine::IDENTITY,
+                    &brush,
+                    None,
+                    &r.to_path(0.0),
+                );
             }
             // Focused: the block was painted as the cell bg during harvest
             // when (blink_on || !blinking); in the blink-off phase nothing is
@@ -910,8 +953,7 @@ fn draw_cursor(
         }
         CursorShape::Underline => {
             if ctx.blink_on || !cursor.blinking {
-                let t = (3.0 * ctx.cursor_thickness * ctx.cursor_height)
-                    .clamp(1.0, ch);
+                let t = (3.0 * ctx.cursor_thickness * ctx.cursor_height).clamp(1.0, ch);
                 scene.fill(
                     Fill::NonZero,
                     Affine::IDENTITY,
@@ -928,7 +970,13 @@ fn draw_cursor(
                 // height upward (bottom-anchored); it can only shrink,
                 // not exceed the cell.
                 let h = (ch * ctx.cursor_height).min(ch);
-                scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect(x, y + ch - h, t, h));
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    &brush,
+                    None,
+                    &rect(x, y + ch - h, t, h),
+                );
             }
         }
         CursorShape::HollowBlock => {
@@ -938,7 +986,13 @@ fn draw_cursor(
                 (x + cw) as f64 - 0.5,
                 (y + ch) as f64 - 0.5,
             );
-            scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, &brush, None, &r.to_path(0.0));
+            scene.stroke(
+                &Stroke::new(1.0),
+                Affine::IDENTITY,
+                &brush,
+                None,
+                &r.to_path(0.0),
+            );
         }
     }
 }
@@ -1187,11 +1241,17 @@ fn paint_pad_extend(
     // Top/bottom bands: per-column extension of the nearest row's bg.
     let last = grid.rows.len().saturating_sub(1);
     for (row_i, band_top) in [(0usize, 0.0f32), (last, row_y(pady, ch, last) + ch)] {
-        let h = if row_i == 0 { pady } else { ctx.height - band_top };
+        let h = if row_i == 0 {
+            pady
+        } else {
+            ctx.height - band_top
+        };
         if h <= 0.0 {
             continue;
         }
-        let Some(row) = grid.rows.get(row_i) else { continue };
+        let Some(row) = grid.rows.get(row_i) else {
+            continue;
+        };
         if row.is_empty() {
             continue;
         }
@@ -1249,16 +1309,58 @@ mod tests {
     #[test]
     fn pad_vertical_veto_matrix() {
         // `background` never extends; `extend-always` always does.
-        assert!(!pad_vertical_ok(WindowPaddingColor::Background, true, false, false, false));
-        assert!(pad_vertical_ok(WindowPaddingColor::ExtendAlways, false, true, true, true));
+        assert!(!pad_vertical_ok(
+            WindowPaddingColor::Background,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(pad_vertical_ok(
+            WindowPaddingColor::ExtendAlways,
+            false,
+            true,
+            true,
+            true
+        ));
         // `extend`: alternate screen always extends.
-        assert!(pad_vertical_ok(WindowPaddingColor::Extend, true, true, true, true));
+        assert!(pad_vertical_ok(
+            WindowPaddingColor::Extend,
+            true,
+            true,
+            true,
+            true
+        ));
         // Primary screen: veto on any default-bg cell, prompt row, or
         // powerline glyph.
-        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, true, false, false));
-        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, false, true, false));
-        assert!(!pad_vertical_ok(WindowPaddingColor::Extend, false, false, false, true));
+        assert!(!pad_vertical_ok(
+            WindowPaddingColor::Extend,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!pad_vertical_ok(
+            WindowPaddingColor::Extend,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!pad_vertical_ok(
+            WindowPaddingColor::Extend,
+            false,
+            false,
+            false,
+            true
+        ));
         // A fully-colored non-prompt row extends.
-        assert!(pad_vertical_ok(WindowPaddingColor::Extend, false, false, false, false));
+        assert!(pad_vertical_ok(
+            WindowPaddingColor::Extend,
+            false,
+            false,
+            false,
+            false
+        ));
     }
 }

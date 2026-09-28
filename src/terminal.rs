@@ -8,9 +8,9 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,9 +30,9 @@ use alacritty_terminal::grid::{Grid, GridCell};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{
-    self, Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Hyperlink,
-    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys,
-    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+    self, Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Hyperlink, KeyboardModes,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
+    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
@@ -93,10 +93,7 @@ pub enum TermEvent {
     /// `CSI 8 ; rows ; cols t` — a program asked to resize the window
     /// (xterm window op 8; vte drops it, so the raw scanner emits this).
     /// Either param may be 0 = keep that dimension (xterm semantics).
-    WindowResizeRequest {
-        rows: u16,
-        cols: u16,
-    },
+    WindowResizeRequest { rows: u16, cols: u16 },
 }
 
 /// Grid dimensions handed to `Term` — what `Dimensions` wants.
@@ -329,10 +326,7 @@ impl EventListener for EventProxy {
                 let _ = self.inner.events.send(TermEvent::TextAreaSizeRequest(fmt));
             }
             Event::ChildExit(status) => {
-                let _ = self
-                    .inner
-                    .events
-                    .send(TermEvent::ChildExit(status.code()));
+                let _ = self.inner.events.send(TermEvent::ChildExit(status.code()));
                 self.wake();
             }
             Event::Exit => {
@@ -457,8 +451,7 @@ impl Terminal {
         let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
         let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
         let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
-        let command_started_at: Arc<Mutex<Option<std::time::Instant>>> =
-            Arc::default();
+        let command_started_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
         let marks = Marks {
             sem: SemKind::Output,
             prompt_marks: prompt_marks.clone(),
@@ -477,7 +470,19 @@ impl Terminal {
         proxy.inner.notifier.set(IoNotifier(io.clone())).ok();
         let join = io_loop.spawn();
 
-        Ok(Self { term, io: Mutex::new(io), proxy, prompt_marks, last_output, shell_redraw, command_started_at, events: Mutex::new(events_rx), pty_file, shell_pid, _join: join })
+        Ok(Self {
+            term,
+            io: Mutex::new(io),
+            proxy,
+            prompt_marks,
+            last_output,
+            shell_redraw,
+            command_started_at,
+            events: Mutex::new(events_rx),
+            pty_file,
+            shell_pid,
+            _join: join,
+        })
     }
 
     /// The program holding the PTY's foreground process group, or `None`
@@ -525,16 +530,24 @@ impl Terminal {
             // Cell-flag marks were stamped at write time on the reader
             // thread, so reflow carries them with the rows they belong to.
             let pre_prompt_text = cursor_row_text(&term);
-            term.resize(TermSize { cols: cols as usize, lines: lines as usize });
+            term.resize(TermSize {
+                cols: cols as usize,
+                lines: lines as usize,
+            });
             if std::env::var_os("HYDRO_SNIFF").is_some() {
                 let g = term.grid();
                 let mut s = String::new();
                 for c in 0..g.columns() {
-                    s.push(g[alacritty_terminal::index::Line(0)]
-                        [alacritty_terminal::index::Column(c)]
-                        .c);
+                    s.push(
+                        g[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(c)]
+                            .c,
+                    );
                 }
-                eprintln!("[postreflow] shell={} row0=|{}|", self.shell_pid, s.trim_end());
+                eprintln!(
+                    "[postreflow] shell={} row0=|{}|",
+                    self.shell_pid,
+                    s.trim_end()
+                );
             }
             clear_prompt_for_redraw(
                 &mut term,
@@ -630,7 +643,9 @@ fn clear_prompt_for_redraw<T: EventListener>(
         // stale row above it back into the cleared rows, then blank the
         // cells (never erase rows — the shell expects the space).
         if start > 0 {
-            grid.grid_mut()[Line(start - 1)][last].flags_mut().remove(Flags::WRAPLINE);
+            grid.grid_mut()[Line(start - 1)][last]
+                .flags_mut()
+                .remove(Flags::WRAPLINE);
         }
         let grid = grid.grid_mut();
         for line in start..end {
@@ -705,7 +720,10 @@ fn shell_with_integration(
     }
     match name {
         "bash" => match bash_integration_rc(features) {
-            Some(rc) => (Shell::new(program, vec!["--rcfile".into(), rc]), HashMap::new()),
+            Some(rc) => (
+                Shell::new(program, vec!["--rcfile".into(), rc]),
+                HashMap::new(),
+            ),
             None => (Shell::new(program, Vec::new()), HashMap::new()),
         },
         "zsh" => match zsh_integration_dir() {
@@ -715,7 +733,10 @@ fn shell_with_integration(
             }
             None => (Shell::new(program, Vec::new()), HashMap::new()),
         },
-        "fish" => (Shell::new(program, vec!["-C".into(), FISH_INTEGRATION.into()]), HashMap::new()),
+        "fish" => (
+            Shell::new(program, vec!["-C".into(), FISH_INTEGRATION.into()]),
+            HashMap::new(),
+        ),
         _ => (Shell::new(program, Vec::new()), HashMap::new()),
     }
 }
@@ -724,7 +745,9 @@ fn shell_with_integration(
 fn integration_base() -> Option<PathBuf> {
     let base = std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache"))
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache")
+        })
         .join("hydroterm");
     std::fs::create_dir_all(&base).ok()?;
     Some(base)
@@ -787,7 +810,6 @@ const FISH_INTEGRATION: &str = "function __hydro_postexec --on-event fish_postex
 function __hydro_preexec --on-event fish_preexec; printf '\\e]133;C\\e\\\\'; end; \
 functions -c fish_prompt __hydro_orig_fish_prompt 2>/dev/null; or function __hydro_orig_fish_prompt; echo -n '> '; end; \
 function fish_prompt; printf '\\e]133;A\\e\\\\'; __hydro_orig_fish_prompt; printf '\\e]133;B\\e\\\\'; end";
-
 
 // -- Byte-stream tap ---------------------------------------------------------
 
@@ -915,7 +937,12 @@ impl EventedReadWrite for TapPty {
         unsafe { self.inner.register(poll, interest, poll_opts) }
     }
 
-    fn reregister(&mut self, poll: &Arc<Poller>, interest: PollingEvent, poll_opts: PollMode) -> io::Result<()> {
+    fn reregister(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: PollingEvent,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
         self.inner.reregister(poll, interest, poll_opts)
     }
 
@@ -989,8 +1016,7 @@ impl Marks {
     /// hand right after the parser consumed the sequence's bytes, so the
     /// cursor position is exactly where the shell placed the mark.
     fn dispatch<T: EventListener>(&mut self, term: &mut Term<T>, ev: &TapEvent) {
-        let abs = term.grid().history_size() as i64
-            + i64::from(term.grid().cursor.point.line.0);
+        let abs = term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0);
         match ev {
             TapEvent::PromptStart => {
                 self.sem = SemKind::Prompt;
@@ -1003,8 +1029,7 @@ impl Marks {
             TapEvent::CommandStart => {
                 self.sem = SemKind::Output;
                 *self.last_output.lock().unwrap() = Some((abs, None));
-                *self.command_started_at.lock().unwrap() =
-                    Some(std::time::Instant::now());
+                *self.command_started_at.lock().unwrap() = Some(std::time::Instant::now());
             }
             TapEvent::CommandEnd(_) => {
                 let mut out = self.last_output.lock().unwrap();
@@ -1023,7 +1048,6 @@ impl Marks {
         }
         let _ = self.sink.send(TermEvent::Tap(ev.clone()));
     }
-
 }
 
 /// `Handler` wrapper that stamps [`PROMPT_MARK`] on the cells each `input`
@@ -1439,7 +1463,10 @@ struct Writing {
 
 impl Writing {
     fn new(c: Cow<'static, [u8]>) -> Self {
-        Self { source: c, written: 0 }
+        Self {
+            source: c,
+            written: 0,
+        }
     }
 
     fn advance(&mut self, n: usize) {
@@ -1577,7 +1604,9 @@ fn parse_csi8t(params: &[u8]) -> Option<(u16, u16)> {
     let num = |p: Option<&[u8]>| -> u16 {
         p.unwrap_or(b"")
             .iter()
-            .fold(0u32, |a, &c| a.saturating_mul(10).saturating_add(u32::from(c - b'0')))
+            .fold(0u32, |a, &c| {
+                a.saturating_mul(10).saturating_add(u32::from(c - b'0'))
+            })
             .min(u16::MAX as u32) as u16
     };
     let rows = num(it.next());
@@ -1599,10 +1628,7 @@ impl CsiModeScan {
         if self.collecting {
             if b == b'h' || b == b'l' {
                 self.collecting = false;
-                let hit = self
-                    .params
-                    .split(|&c| c == b';')
-                    .any(|p| p == b"2");
+                let hit = self.params.split(|&c| c == b';').any(|p| p == b"2");
                 self.params.clear();
                 return hit.then_some(b == b'h');
             }
@@ -1636,7 +1662,10 @@ impl IoLoop {
     ) -> io::Result<(Self, IoSender)> {
         let (tx, rx) = mpsc::channel();
         let poll: Arc<Poller> = Poller::new()?.into();
-        let io = IoSender { sender: tx, poll: poll.clone() };
+        let io = IoSender {
+            sender: tx,
+            poll: poll.clone(),
+        };
         Ok((
             Self {
                 poll,
@@ -1688,7 +1717,7 @@ impl IoLoop {
                         // we hold makes the wait bounded).
                         None if self.pty.reader().scanner.pending_len() >= READ_BUFFER_SIZE => {
                             self.term.lock_unfair()
-                        },
+                        }
                         None => break 'fill,
                         Some(term) => term,
                     }),
@@ -1717,14 +1746,10 @@ impl IoLoop {
                                 self.proxy.maybe_report_title();
                             }
                         }
-                        if kam_scan
-                            && let Some(set) = self.csi_mode_scan.feed(b)
-                        {
+                        if kam_scan && let Some(set) = self.csi_mode_scan.feed(b) {
                             self.proxy.set_kam_locked(set);
                         }
-                        if resize_scan
-                            && let Some((rows, cols)) = self.csi8t_scan.feed(b)
-                        {
+                        if resize_scan && let Some((rows, cols)) = self.csi8t_scan.feed(b) {
                             self.proxy.window_resize_request(rows, cols);
                         }
                     }
@@ -1758,7 +1783,7 @@ impl IoLoop {
                     stat_add(&STAT_BYTES, got as u64);
                     report_reader_stats();
                     continue 'fill;
-                },
+                }
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'fill,
                     _ => return Err(err),
@@ -1784,21 +1809,21 @@ impl IoLoop {
                     Ok(0) => {
                         state.set_current(Some(current));
                         break 'write_many;
-                    },
+                    }
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
                             state.goto_next();
                             break 'write_one;
                         }
-                    },
+                    }
                     Err(err) => {
                         state.set_current(Some(current));
                         match err.kind() {
                             ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'write_many,
                             _ => return Err(err),
                         }
-                    },
+                    }
                 }
             }
         }
@@ -1837,7 +1862,7 @@ impl IoLoop {
                         _ => {
                             tracing::error!("io loop polling error: {err}");
                             break 'event_loop;
-                        },
+                        }
                     }
                 }
 
@@ -1856,9 +1881,7 @@ impl IoLoop {
                 for event in events.iter() {
                     match event.key {
                         PTY_CHILD_EVENT_TOKEN => {
-                            if let Some(ChildEvent::Exited(status)) =
-                                self.pty.next_child_event()
-                            {
+                            if let Some(ChildEvent::Exited(status)) = self.pty.next_child_event() {
                                 if let Some(status) = status {
                                     self.proxy.send_event(Event::ChildExit(status));
                                 }
@@ -1869,7 +1892,7 @@ impl IoLoop {
                                 self.proxy.send_event(Event::Wakeup);
                                 break 'event_loop;
                             }
-                        },
+                        }
                         PTY_READ_WRITE_TOKEN => {
                             if event.is_interrupt() {
                                 // Don't try to do I/O on a dead PTY.
@@ -1898,7 +1921,7 @@ impl IoLoop {
                                 tracing::error!("pty write error: {err}");
                                 break 'event_loop;
                             }
-                        },
+                        }
                         _ => (),
                     }
                 }
@@ -1909,7 +1932,9 @@ impl IoLoop {
                     interest.writable = needs_write;
 
                     // Re-register with new interest.
-                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                    self.pty
+                        .reregister(&self.poll, interest, poll_opts)
+                        .unwrap();
                 }
             }
 
@@ -1978,9 +2003,7 @@ pub fn fixup_graphemes<T: EventListener>(term: &mut Term<T>) {
 
             // Copy the spacer that completes a wide pair.
             if wide && col + 1 < columns {
-                out.push(
-                    grid[line][alacritty_terminal::index::Column(col + 1)].clone(),
-                );
+                out.push(grid[line][alacritty_terminal::index::Column(col + 1)].clone());
             }
             let mut next = col + if wide { 2 } else { 1 };
 
@@ -1996,11 +2019,7 @@ pub fn fixup_graphemes<T: EventListener>(term: &mut Term<T>) {
                 let donor = grid[line][alacritty_terminal::index::Column(donor_col)].clone();
                 let donor_wide = donor.flags.contains(Flags::WIDE_CHAR);
                 // Do not absorb a bare spacer or an untouched blank tail.
-                if donor.c == ' '
-                    && donor
-                        .zerowidth()
-                        .is_none_or(|zw| zw.is_empty())
-                {
+                if donor.c == ' ' && donor.zerowidth().is_none_or(|zw| zw.is_empty()) {
                     break;
                 }
                 let head = &mut out[head_i];
@@ -2041,8 +2060,7 @@ pub fn fixup_graphemes<T: EventListener>(term: &mut Term<T>) {
                 .sum();
             let new_col = old_col.saturating_sub(shrink);
             grid.cursor.point.column = alacritty_terminal::index::Column(new_col);
-            grid.cursor.input_needs_wrap =
-                grid.cursor.input_needs_wrap && new_col + 1 >= columns;
+            grid.cursor.input_needs_wrap = grid.cursor.input_needs_wrap && new_col + 1 >= columns;
         }
     }
 }
@@ -2219,19 +2237,46 @@ mod tests {
         };
 
         // Fill the screen so the prompt lands on the last row.
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"o1\r\no2\r\no3\r\n");
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"\x1b]133;A\x07P$ \x1b]133;B\x07");
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"o1\r\no2\r\no3\r\n",
+        );
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"\x1b]133;A\x07P$ \x1b]133;B\x07",
+        );
         assert_eq!(term.grid().cursor.point.line.0, 3);
         // Input wraps past the last column → the screen scrolls.
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg, b"abcdef");
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"abcdef",
+        );
 
         // After the scroll: row 2 holds the prompt text, row 3 the wrapped
         // input tail — only those rows may carry a mark.
         let row_marked = |term: &Term<VoidListener>, l: i32| {
             (0..8).any(|c| term.grid()[Line(l)][Column(c)].flags.contains(PROMPT_MARK))
         };
-        assert!(!row_marked(&term, 0), "scrolled output row must stay untagged");
-        assert!(!row_marked(&term, 1), "scrolled output row must stay untagged");
+        assert!(
+            !row_marked(&term, 0),
+            "scrolled output row must stay untagged"
+        );
+        assert!(
+            !row_marked(&term, 1),
+            "scrolled output row must stay untagged"
+        );
         assert!(row_marked(&term, 2), "prompt row must be tagged");
         assert!(row_marked(&term, 3), "input row must be tagged");
     }
@@ -2278,8 +2323,14 @@ mod tests {
 
         feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
             b"\x1b]133;A\x07bash-5.3# \x1b]133;B\x07echo ONE111\x1b]133;C\x07\r\nONE111\r\n\x1b]133;D;0\x07");
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
-            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07");
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07",
+        );
 
         let text_of = |term: &Term<VoidListener>, l: i32| -> String {
             let grid = term.grid();
@@ -2302,7 +2353,10 @@ mod tests {
 
         // The split halves the pane: 44 -> 20 columns.
         let pre = cursor_row_text(&term);
-        term.resize(TermSize { cols: 20, lines: 15 });
+        term.resize(TermSize {
+            cols: 20,
+            lines: 15,
+        });
         let hs = term.grid().history_size() as i32;
         eprintln!("history_size post-resize = {hs}");
         for l in (-hs)..0 {
@@ -2374,7 +2428,11 @@ mod tests {
             (0..grid.columns())
                 .map(|c| {
                     let cell = &grid[Line(l)][Column(c)];
-                    if cell.c == ' ' || cell.c == '\0' { ' ' } else { cell.c }
+                    if cell.c == ' ' || cell.c == '\0' {
+                        ' '
+                    } else {
+                        cell.c
+                    }
                 })
                 .collect::<String>()
                 .trim_end()
@@ -2385,23 +2443,49 @@ mod tests {
         // the clear must NOT fire (bash would not repaint until a key).
         feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
             b"o1\r\no2\r\no3\r\no4\r\no5\r\no6\r\no7\r\no8\r\no9\r\no10\r\no11\r\no12\r\no13\r\no14\r\n");
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
-            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07");
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"\x1b]133;A;redraw=last\x07bash-5.3# \x1b]133;B\x07",
+        );
         assert_eq!(text_of(&term, 14), "bash-5.3#");
         let pre = cursor_row_text(&term);
-        term.resize(TermSize { cols: 20, lines: 15 });
+        term.resize(TermSize {
+            cols: 20,
+            lines: 15,
+        });
         clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
-        assert_eq!(text_of(&term, 14), "bash-5.3#", "undisturbed prompt must survive");
+        assert_eq!(
+            text_of(&term, 14),
+            "bash-5.3#",
+            "undisturbed prompt must survive"
+        );
 
         // Input long enough to wrap at the new width: shrink displaces
         // the cursor row's content — the clear fires (bash repaints the
         // last line on its next input event).
-        feed(&mut scanner, &mut parser, &mut marks, &mut term, &mut seg,
-            b"abcdefghijklmnopqrstuvwxyzabcdef");
+        feed(
+            &mut scanner,
+            &mut parser,
+            &mut marks,
+            &mut term,
+            &mut seg,
+            b"abcdefghijklmnopqrstuvwxyzabcdef",
+        );
         let pre = cursor_row_text(&term);
-        term.resize(TermSize { cols: 16, lines: 15 });
+        term.resize(TermSize {
+            cols: 16,
+            lines: 15,
+        });
         clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
-        assert_eq!(text_of(&term, 14), "", "displaced prompt row must be cleared");
+        assert_eq!(
+            text_of(&term, 14),
+            "",
+            "displaced prompt row must be cleared"
+        );
     }
 
     // -- grapheme fixup -----------------------------------------------------
@@ -2579,7 +2663,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(text.contains("WAITMARK_DRAIN"), "drained output missing:\n{text}");
+        assert!(
+            text.contains("WAITMARK_DRAIN"),
+            "drained output missing:\n{text}"
+        );
         let evs: Vec<TermEvent> = terminal.events.lock().unwrap().try_iter().collect();
         assert!(
             evs.iter()

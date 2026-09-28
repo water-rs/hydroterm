@@ -174,7 +174,10 @@ impl KittyStore {
             "q" => (cmd.id(), "OK".to_string()),
             // `a=t` transmits only — kitty keeps the payload under `i=`
             // and displays nothing until a later `a=p`.
-            "t" => match self.decode(&cmd).and_then(|s| self.store_checked(cmd.id(), s, limit)) {
+            "t" => match self
+                .decode(&cmd)
+                .and_then(|s| self.store_checked(cmd.id(), s, limit))
+            {
                 Ok(()) => (cmd.id(), "OK".to_string()),
                 Err(e) => (cmd.id(), e),
             },
@@ -236,7 +239,10 @@ impl KittyStore {
             "c" => self.images.retain(|img| {
                 let rows = img.rows.max(1) as i64;
                 let cols = img.cols.max(1) as usize;
-                !(line >= img.line && line < img.line + rows && col >= img.col && col < img.col + cols)
+                !(line >= img.line
+                    && line < img.line + rows
+                    && col >= img.col
+                    && col < img.col + cols)
             }),
             // 'a' and any unknown selector: keep the pre-selector behavior —
             // `i=` narrows to one id, otherwise clear the whole store.
@@ -295,8 +301,7 @@ impl KittyStore {
             },
             // `t=f`: the payload is the base64 of the file's path.
             "f" => {
-                let Some(path) =
-                    b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
+                let Some(path) = b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
                     return Err("EBADMSG:path".to_string());
                 };
@@ -308,8 +313,7 @@ impl KittyStore {
             // `t=s`: payload is the base64 of a POSIX shm name (leading `/`);
             // on Linux it maps onto /dev/shm.<name>.
             "s" => {
-                let Some(name) =
-                    b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
+                let Some(name) = b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
                     return Err("EBADMSG:shm name".to_string());
                 };
@@ -364,11 +368,7 @@ impl KittyStore {
             }
             _ => (px, w, h),
         };
-        Ok(StoredImage {
-            rgba: px,
-            w,
-            h,
-        })
+        Ok(StoredImage { rgba: px, w, h })
     }
 
     /// One placement — `id`/`p=` replace any existing placement of the
@@ -392,7 +392,10 @@ impl KittyStore {
             col,
             cols: cmd.num('c').unwrap_or(0),
             rows: cmd.num('r').unwrap_or(0),
-            z: cmd.get('z').and_then(|v| v.parse::<i32>().ok()).unwrap_or(0),
+            z: cmd
+                .get('z')
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0),
             placement,
             px_w: w,
             px_h: h,
@@ -432,10 +435,7 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
             .chunks_exact(2)
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
-        png::ColorType::Grayscale => buf
-            .iter()
-            .flat_map(|&g| [g, g, g, 255])
-            .collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         _ => return None,
     };
     debug_assert_eq!(rgba.len(), w * h * 4);
@@ -629,7 +629,8 @@ mod tests {
         // proves the shm read path returned data rather than ENOENT.
         let name = crate::kitty::b64_decode("L2h5ZHJvdGVybS10ZXN0LXNobQ==").unwrap();
         assert_eq!(name, b"/hydroterm-test-shm");
-        let raw = b"Ga=T,f=32,s=1,v=1,t=s;".to_vec()
+        let raw = b"Ga=T,f=32,s=1,v=1,t=s;"
+            .to_vec()
             .into_iter()
             .chain(b"L2h5ZHJvdGVybS10ZXN0LXNobQ==".iter().copied())
             .collect::<Vec<_>>();

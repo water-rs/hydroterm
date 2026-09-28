@@ -2,8 +2,8 @@
 //! resolution (foreground/background/cursor/selection, ANSI 16, dim/bright
 //! variants).
 
-use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 /// A resolved color pair for one cell.
@@ -205,8 +205,9 @@ impl Palette {
                 | NamedColor::Cyan
                 | NamedColor::White),
             ) => self.named(colors, n.to_bright()),
-            Color::Indexed(i) if i < 8 => colors[(i + 8) as usize]
-                .unwrap_or(self.indexed[(i + 8) as usize]),
+            Color::Indexed(i) if i < 8 => {
+                colors[(i + 8) as usize].unwrap_or(self.indexed[(i + 8) as usize])
+            }
             // Ghostty `.rgb` arm — explicit colors keep their value
             // unless they match the default fg AND `color` is set.
             _ => {
@@ -258,8 +259,8 @@ impl Palette {
             DimForeground => self.dim_foreground,
             BrightForeground => self.foreground,
             Black | Red | Green | Yellow | Blue | Magenta | Cyan | White | BrightBlack
-            | BrightRed | BrightGreen | BrightYellow | BrightBlue | BrightMagenta
-            | BrightCyan | BrightWhite => self.indexed[named as usize],
+            | BrightRed | BrightGreen | BrightYellow | BrightBlue | BrightMagenta | BrightCyan
+            | BrightWhite => self.indexed[named as usize],
             DimBlack | DimRed | DimGreen | DimYellow | DimBlue | DimMagenta | DimCyan
             | DimWhite => self.dim(self.indexed[named.to_bright() as usize]),
         }
@@ -286,7 +287,6 @@ pub fn peniko_alpha(rgb: Rgb, a: f32) -> peniko::Color {
     ])
 }
 
-
 // ---------------------------------------------------------------------------
 // `minimum-contrast`: WCAG-ratio floor on cell foreground vs background
 // ---------------------------------------------------------------------------
@@ -294,7 +294,11 @@ pub fn peniko_alpha(rgb: Rgb, a: f32) -> peniko::Color {
 /// Relative luminance of one sRGB channel (IEC 61966-2-1 linearization).
 fn channel_luminance(c: u8) -> f64 {
     let v = f64::from(c) / 255.0;
-    if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    if v <= 0.03928 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// WCAG 2.x relative luminance of an sRGB triple.
@@ -320,7 +324,11 @@ pub fn enforce_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
     // Blend toward black or white — the WCAG `+0.05` offsets make the
     // ratio asymmetric, so pick whichever extreme actually scores higher
     // rather than comparing luminance to a midpoint.
-    let white = Rgb { r: 255, g: 255, b: 255 };
+    let white = Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
     let black = Rgb { r: 0, g: 0, b: 0 };
     let target = if contrast_ratio(white, bg) >= contrast_ratio(black, bg) {
         white
@@ -348,7 +356,6 @@ pub fn enforce_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
     blend(hi)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,21 +363,71 @@ mod tests {
     #[test]
     fn contrast_enforcement_reaches_the_ratio_floor() {
         // Grey-on-grey (~1.1:1) must lift to >= 4.5.
-        let fg = Rgb { r: 128, g: 128, b: 128 };
-        let bg = Rgb { r: 120, g: 120, b: 120 };
+        let fg = Rgb {
+            r: 128,
+            g: 128,
+            b: 128,
+        };
+        let bg = Rgb {
+            r: 120,
+            g: 120,
+            b: 120,
+        };
         let out = enforce_contrast(fg, bg, 4.5);
         assert!(contrast_ratio(out, bg) >= 4.5 - 1e-6, "{out:?}");
         // Already-sufficient colors pass through untouched.
-        let fg2 = Rgb { r: 250, g: 250, b: 250 };
-        let bg2 = Rgb { r: 10, g: 10, b: 10 };
+        let fg2 = Rgb {
+            r: 250,
+            g: 250,
+            b: 250,
+        };
+        let bg2 = Rgb {
+            r: 10,
+            g: 10,
+            b: 10,
+        };
         assert_eq!(enforce_contrast(fg2, bg2, 4.5), fg2);
         // White-on-white: the extreme wins and the blend stops at the
         // ratio floor — dark, and >= 4.5, not necessarily pure black.
-        let out = enforce_contrast(Rgb{r:255,g:255,b:255}, Rgb{r:255,g:255,b:255}, 4.5);
-        assert!(contrast_ratio(out, Rgb{r:255,g:255,b:255}) >= 4.5 - 1e-6, "{out:?}");
+        let out = enforce_contrast(
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            4.5,
+        );
+        assert!(
+            contrast_ratio(
+                out,
+                Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }
+            ) >= 4.5 - 1e-6,
+            "{out:?}"
+        );
         // Unreachable floor: max ratio vs a grey ~120 is 4.75 (black),
         // so a 21.0 request must still return the best possible = black.
-        let out = enforce_contrast(Rgb{r:128,g:128,b:128}, Rgb{r:120,g:120,b:120}, 21.0);
+        let out = enforce_contrast(
+            Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            },
+            Rgb {
+                r: 120,
+                g: 120,
+                b: 120,
+            },
+            21.0,
+        );
         assert_eq!(out, Rgb { r: 0, g: 0, b: 0 });
     }
 }

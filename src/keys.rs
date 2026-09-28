@@ -25,7 +25,9 @@ pub fn key_to_bytes(key: &Key, code: Code, mods: Modifiers, mode: TermMode) -> O
         return None;
     }
 
-    let Key::Character(text) = key else { return None };
+    let Key::Character(text) = key else {
+        return None;
+    };
     let ch = text.chars().next()?;
 
     // Ctrl+letter → C0 control codes; this is also the terminal-action lane
@@ -77,11 +79,15 @@ pub fn key_release_bytes(key: &Key, mods: Modifiers, mode: TermMode) -> Option<V
     if !mode.contains(TermMode::REPORT_EVENT_TYPES) {
         return None;
     }
-    if let Key::Character(text) = key && let Some(ch) = text.chars().next() {
+    if let Key::Character(text) = key
+        && let Some(ch) = text.chars().next()
+    {
         let m = kitty_mod(mods);
         return Some(format!("\x1b[{};{m}:3u", ch as u32).into_bytes());
     }
-    if let Key::Named(named) = key && let Some(num) = kitty_named_number(*named) {
+    if let Key::Named(named) = key
+        && let Some(num) = kitty_named_number(*named)
+    {
         let m = kitty_mod(mods);
         return Some(format!("\x1b[{num};{m}:3u").into_bytes());
     }
@@ -146,22 +152,46 @@ fn named_key_bytes(
     let num = |n: u8| -> Vec<u8> { csi_mod(n, mods, '~') };
     Some(match named {
         ArrowUp => {
-            if app { ss3(mods, 'A') } else { csi_mod(1, mods, 'A') }
+            if app {
+                ss3(mods, 'A')
+            } else {
+                csi_mod(1, mods, 'A')
+            }
         }
         ArrowDown => {
-            if app { ss3(mods, 'B') } else { csi_mod(1, mods, 'B') }
+            if app {
+                ss3(mods, 'B')
+            } else {
+                csi_mod(1, mods, 'B')
+            }
         }
         ArrowRight => {
-            if app { ss3(mods, 'C') } else { csi_mod(1, mods, 'C') }
+            if app {
+                ss3(mods, 'C')
+            } else {
+                csi_mod(1, mods, 'C')
+            }
         }
         ArrowLeft => {
-            if app { ss3(mods, 'D') } else { csi_mod(1, mods, 'D') }
+            if app {
+                ss3(mods, 'D')
+            } else {
+                csi_mod(1, mods, 'D')
+            }
         }
         Home => {
-            if app { ss3(mods, 'H') } else { csi_mod(1, mods, 'H') }
+            if app {
+                ss3(mods, 'H')
+            } else {
+                csi_mod(1, mods, 'H')
+            }
         }
         End => {
-            if app { ss3(mods, 'F') } else { csi_mod(1, mods, 'F') }
+            if app {
+                ss3(mods, 'F')
+            } else {
+                csi_mod(1, mods, 'F')
+            }
         }
         PageUp => num(5),
         PageDown => num(6),
@@ -440,7 +470,9 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             _ => return None,
         });
     }
-    let Key::Character(text) = key else { return None };
+    let Key::Character(text) = key else {
+        return None;
+    };
     Some(match text.to_ascii_lowercase().as_str() {
         "c" => TermAction::Copy,
         "v" => TermAction::Paste,
@@ -842,4 +874,3 @@ pub enum FileSink {
     /// Paste the file path into the terminal.
     Paste,
 }
-
