@@ -928,8 +928,9 @@ impl TermSurface {
         }
     }
 
-    /// Selection-end copy: `copy-on-select = clipboard|primary|both`
-    /// routes the just-made selection (default `both`).
+    /// Selection-end copy: `copy-on-select` routes the just-made
+    /// selection (Ghostty: `true`/default → selection clipboard only,
+    /// `clipboard` → system + selection).
     fn copy_on_select(&mut self, mode: crate::config::CopyOnSelect) {
         use crate::config::CopyOnSelect as CoS;
         let text = self.session.terminal.term.lock().selection_to_string();
@@ -942,7 +943,7 @@ impl TermSurface {
                     self.primary.is_some()
                 );
             }
-            if matches!(mode, CoS::Clipboard | CoS::Both)
+            if matches!(mode, CoS::Both)
                 && let Some(clip) = self.clipboard.as_mut()
                 && let Err(e) = clip.set_text(&text)
             {
@@ -3195,11 +3196,17 @@ impl TermSurface {
                 }
                 SurfacePointerButton::Middle => {
                     // `middle-click-action`: `primary-paste` pastes the
-                    // selection clipboard only (the xterm convention),
-                    // `clipboard-paste` the standard clipboard.
+                    // selection clipboard — following `copy-on-select`:
+                    // `clipboard` (Both) makes it read the standard
+                    // clipboard instead (Ghostty middle-click semantics).
                     match self.app.config(|c| c.middle_click_action) {
                         crate::config::MiddleClickAction::PrimaryPaste => {
-                            if let Some(text) = self.primary_text() {
+                            if matches!(
+                                self.app.config(|c| c.copy_on_select),
+                                crate::config::CopyOnSelect::Both
+                            ) {
+                                self.paste_clipboard();
+                            } else if let Some(text) = self.primary_text() {
                                 let bracketed = self
                                     .session
                                     .terminal
@@ -3777,6 +3784,7 @@ impl TermSurface {
             blink_on,
             focused,
             cursor_invert_fg_bg,
+            cursor_color: self.app.config(|c| c.cursor_color),
             cursor_text: self.app.config(|c| c.cursor_text),
             cursor_opacity: self.app.config(|c| c.cursor_opacity),
             preedit,

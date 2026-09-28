@@ -114,7 +114,10 @@ impl Palette {
         if let Some(c) = cfg.background {
             palette.background = c;
         }
-        if let Some(c) = cfg.cursor_color {
+        // `cursor-color` — a direct color lands on the palette slot;
+        // `cell-foreground`/`cell-background` are draw-time specs and
+        // leave the slot at its theme default (the draw resolves them).
+        if let Some(crate::config::CellColor::Rgb(c)) = cfg.cursor_color {
             palette.cursor = c;
         }
         if let Some(c) = cfg.selection_color {

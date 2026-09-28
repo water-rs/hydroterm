@@ -30,14 +30,36 @@ pub enum ThemeRef {
 }
 
 /// `copy-on-select` routing — where a finished selection lands
-/// (kitty semantics; `true`/`both` writes clipboard and PRIMARY,
-/// `clipboard`/`primary` pick one, `false` disables).
+/// (Ghostty semantics: `true` = selection clipboard only,
+/// `clipboard` = system clipboard AND selection, `false` = neither;
+/// `primary`/`both`/`on`/`no`/`disabled` accepted as aliases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyOnSelect {
     Disabled,
-    Clipboard,
     Primary,
     Both,
+}
+
+/// `cursor-color` / `cursor-text` / `search-*` color spec (Ghostty
+/// `TerminalColor`): a direct color, or `cell-foreground` /
+/// `cell-background` resolved against the cell's own colors at draw
+/// time (available since the reference's 1.2.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellColor {
+    Rgb(Rgb),
+    CellForeground,
+    CellBackground,
+}
+
+impl CellColor {
+    /// Resolve against a cell's effective colors.
+    pub fn resolve(self, cell_fg: Rgb, cell_bg: Rgb) -> Rgb {
+        match self {
+            Self::Rgb(c) => c,
+            Self::CellForeground => cell_fg,
+            Self::CellBackground => cell_bg,
+        }
+    }
 }
 
 /// `mouse-shift-capture` — under what circumstances Shift is reported to
@@ -491,7 +513,7 @@ pub struct AppConfig {
     /// applied on top of the resolved theme, live-reloaded.
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
-    pub cursor_color: Option<Rgb>,
+    pub cursor_color: Option<CellColor>,
     /// Selection text color — `selection-foreground` sets the ink; when unset
     /// the selected cell's own background becomes the ink (inverted).
     pub selection_color: Option<Rgb>,
@@ -590,7 +612,7 @@ pub struct AppConfig {
     pub quit_after_last_window_closed_delay: Option<f64>,
     /// Glyph color under the block cursor (Ghostty `cursor-text`);
     /// `None` = the inverted cell color.
-    pub cursor_text: Option<Rgb>,
+    pub cursor_text: Option<CellColor>,
     /// `split-divider-color` — pane separator color; `None` = theme
     /// Border token.
     pub split_divider_color: Option<Rgb>,
@@ -773,12 +795,12 @@ pub struct AppConfig {
     /// reaching the program.
     pub vt_kam_allowed: bool,
     /// `search-foreground` / `search-background` (candidate matches).
-    pub search_foreground: Option<Rgb>,
-    pub search_background: Option<Rgb>,
+    pub search_foreground: Option<CellColor>,
+    pub search_background: Option<CellColor>,
     /// `search-selected-foreground` / `search-selected-background`
     /// (the focused match).
-    pub search_selected_foreground: Option<Rgb>,
-    pub search_selected_background: Option<Rgb>,
+    pub search_selected_foreground: Option<CellColor>,
+    pub search_selected_background: Option<CellColor>,
     /// `split-preserve-zoom` — `navigation` moves the zoom to the
     /// split `goto_split` focuses instead of unzooming; every layout
     /// change (split/close/resize/equalize) still unzooms (Ghostty
@@ -890,7 +912,7 @@ impl Default for AppConfig {
             initial_command: None,
             quick_terminal_autohide: false,
             theme: ThemeRef::Named("hydroterm-dark".into()),
-            copy_on_select: CopyOnSelect::Both,
+            copy_on_select: CopyOnSelect::Primary,
             selection_clear_on_typing: true,
             shell_integration: ShellIntegration::Detect,
             shell_features: ShellFeatures {
@@ -1482,7 +1504,7 @@ impl AppConfig {
                     Some(c) => cfg.background = Some(c),
                     None => errors.push(format!("line {}: bad background {value:?}", n + 1)),
                 },
-                "cursor-color" => match parse_rgb(value) {
+                "cursor-color" => match parse_cell_color(value) {
                     Some(c) => cfg.cursor_color = Some(c),
                     None => errors.push(format!("line {}: bad cursor-color {value:?}", n + 1)),
                 },
@@ -1699,10 +1721,11 @@ impl AppConfig {
                     }
                 }
                 "copy-on-select" => cfg.copy_on_select = match value {
-                    "true" | "on" => CopyOnSelect::Both,
+                    // Ghostty values: `true` → selection clipboard only,
+                    // `clipboard` → system clipboard AND selection.
+                    "true" | "on" | "primary" => CopyOnSelect::Primary,
+                    "clipboard" | "both" => CopyOnSelect::Both,
                     "false" | "no" | "disabled" => CopyOnSelect::Disabled,
-                    "clipboard" => CopyOnSelect::Clipboard,
-                    "primary" => CopyOnSelect::Primary,
                     _ => {
                         errors.push(format!("line {}: bad copy-on-select {value:?}", n + 1));
                         cfg.copy_on_select
@@ -1828,7 +1851,15 @@ impl AppConfig {
                     cfg.initial_command = parse_command(value);
                 }
                 "working-directory" => {
-                    cfg.working_directory = (!value.is_empty()).then(|| expand_home(value));
+                    // Ghostty `WorkingDirectory`: `home` resolves to the
+                    // user's home at load, `inherit` means the launching
+                    // process's cwd (None = inherit at spawn).
+                    cfg.working_directory = match value {
+                        "home" => std::env::var_os("HOME").map(PathBuf::from),
+                        "inherit" => None,
+                        v if !v.is_empty() => Some(expand_home(v)),
+                        _ => cfg.working_directory,
+                    };
                 }
                 "unfocused-split-opacity" => {
                     match value.parse::<f32>() {
@@ -2099,7 +2130,7 @@ impl AppConfig {
                 "scroll-to-cursor" => {
                     cfg.scroll_to_cursor = bool_value(value, n, &mut errors);
                 }
-                "cursor-text" => match parse_rgb(value) {
+                "cursor-text" => match parse_cell_color(value) {
                     Some(rgb) => cfg.cursor_text = Some(rgb),
                     None => errors.push(format!("line {}: bad cursor-text {value:?}", n + 1)),
                 },
@@ -2364,24 +2395,24 @@ impl AppConfig {
                         n + 1
                     )),
                 },
-                "search-foreground" => match parse_rgb(value) {
+                "search-foreground" => match parse_cell_color(value) {
                     Some(c) => cfg.search_foreground = Some(c),
                     None => errors
                         .push(format!("line {}: bad search-foreground {value:?}", n + 1)),
                 },
-                "search-background" => match parse_rgb(value) {
+                "search-background" => match parse_cell_color(value) {
                     Some(c) => cfg.search_background = Some(c),
                     None => errors
                         .push(format!("line {}: bad search-background {value:?}", n + 1)),
                 },
-                "search-selected-foreground" => match parse_rgb(value) {
+                "search-selected-foreground" => match parse_cell_color(value) {
                     Some(c) => cfg.search_selected_foreground = Some(c),
                     None => errors.push(format!(
                         "line {}: bad search-selected-foreground {value:?}",
                         n + 1
                     )),
                 },
-                "search-selected-background" => match parse_rgb(value) {
+                "search-selected-background" => match parse_cell_color(value) {
                     Some(c) => cfg.search_selected_background = Some(c),
                     None => errors.push(format!(
                         "line {}: bad search-selected-background {value:?}",
@@ -2759,6 +2790,16 @@ fn expand_home(value: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(value)
+}
+
+/// `cell-foreground` / `cell-background` / a direct color —
+/// Ghostty `TerminalColor` (the two `cell-*` values since 1.2.0).
+fn parse_cell_color(value: &str) -> Option<CellColor> {
+    match value {
+        "cell-foreground" => Some(CellColor::CellForeground),
+        "cell-background" => Some(CellColor::CellBackground),
+        _ => parse_rgb(value).map(CellColor::Rgb),
+    }
 }
 
 /// `#rgb` / `#rrggbb` / `0xrrggbb` → a terminal RGB. No names,
@@ -3993,7 +4034,7 @@ mod tests {
         assert_eq!(cfg.font_family, "JetBrains Mono");
         assert_eq!(cfg.scrollback, 5000);
         assert_eq!(cfg.theme, ThemeRef::Named("solarized-light".into()));
-        assert_eq!(cfg.copy_on_select, CopyOnSelect::Both);
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Primary);
         assert_eq!(cfg.cursor_shape, CursorShape::Beam);
         assert_eq!(cfg.cursor_blink, Some(false));
         assert_eq!(cfg.shell.as_deref(), Some("/bin/zsh"));
@@ -4617,11 +4658,11 @@ mod tests {
         );
         assert_eq!(
             cfg.cursor_color,
-            Some(Rgb {
+            Some(CellColor::Rgb(Rgb {
                 r: 0xff,
                 g: 0xcc,
                 b: 0x00
-            })
+            }))
         );
         assert_eq!(
             cfg.selection_color,
@@ -5131,19 +5172,19 @@ mod tests {
         assert!(cfg.title_report);
         assert_eq!(
             cfg.search_background,
-            Some(Rgb {
+            Some(CellColor::Rgb(Rgb {
                 r: 0xff,
                 g: 0xd7,
                 b: 0x5f
-            })
+            }))
         );
         assert_eq!(
             cfg.search_selected_background,
-            Some(Rgb {
+            Some(CellColor::Rgb(Rgb {
                 r: 0xff,
                 g: 0xaf,
                 b: 0x00
-            })
+            }))
         );
 
         // `no-` disables one without touching the other; re-adding the
@@ -5451,5 +5492,57 @@ mod key_table_tests {
         assert!(cfg.key_remap.contains(&(Code::AltLeft, Modifiers::CONTROL)));
         let (_, errs) = AppConfig::parse("key-remap = ctrl\nkey-remap = f1=super\n");
         assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    #[test]
+    fn parses_r62_keys() {
+        // `cell-foreground`/`cell-background` on every TerminalColor key
+        // (Ghostty 1.2) — `cursor-color`, `cursor-text`, `search-*`.
+        let (cfg, errs) = AppConfig::parse(
+            "cursor-color = cell-foreground\n\
+             cursor-text = cell-background\n\
+             search-foreground = cell-background\n\
+             search-background = cell-foreground\n\
+             search-selected-background = #ff0000\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.cursor_color, Some(CellColor::CellForeground));
+        assert_eq!(cfg.cursor_text, Some(CellColor::CellBackground));
+        assert_eq!(cfg.search_foreground, Some(CellColor::CellBackground));
+        assert_eq!(cfg.search_background, Some(CellColor::CellForeground));
+        assert_eq!(
+            cfg.search_selected_background,
+            Some(CellColor::Rgb(Rgb {
+                r: 0xff,
+                g: 0,
+                b: 0
+            }))
+        );
+        let (_, errs) = AppConfig::parse("cursor-color = cell-middle\n");
+        assert_eq!(errs.len(), 1);
+
+        // `working-directory` — Ghostty `home`/`inherit` keywords plus
+        // plain paths (with `~/` expansion).
+        let (cfg, errs) = AppConfig::parse("working-directory = home\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.working_directory.as_deref(),
+            std::env::var_os("HOME").map(PathBuf::from).as_deref()
+        );
+        let (cfg, errs) = AppConfig::parse("working-directory = inherit\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.working_directory, None);
+        let (cfg, _) = AppConfig::parse("working-directory = ~/code\n");
+        assert!(cfg.working_directory.unwrap().ends_with("code"));
+
+        // `copy-on-select` — Ghostty routing: `true` = selection only,
+        // `clipboard` = both clipboards, `false` = neither.
+        let (cfg, errs) = AppConfig::parse("copy-on-select = true\n");
+        assert!(errs.is_empty());
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Primary);
+        let (cfg, _) = AppConfig::parse("copy-on-select = clipboard\n");
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Both);
+        let (cfg, _) = AppConfig::parse("copy-on-select = false\n");
+        assert_eq!(cfg.copy_on_select, CopyOnSelect::Disabled);
     }
 }

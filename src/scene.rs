@@ -11,6 +11,7 @@ use kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use peniko::{Brush, Color, Fill, StyleRef};
 use waterui_graphics::scene2d::{Glyph, GlyphRun, Scene2D};
 
+use crate::config::CellColor;
 use crate::fonts::TermFonts;
 use crate::palette::{Palette, peniko, peniko_alpha};
 use crate::terminal::EventProxy;
@@ -41,26 +42,36 @@ pub struct HintSpan {
 }
 
 /// Runtime state the scene pass needs beyond the term's renderable content.
-/// `search-*` color config — `None` keeps the built-in match tint.
+/// `search-*` color config (Ghostty `TerminalColor` — hex or
+/// `cell-foreground`/`cell-background`); `None` takes the reference
+/// defaults (black on golden `#FFE082` for candidates, black on soft
+/// peach `#F2A57E` for the focused match).
 #[derive(Clone, Copy, Default)]
 pub struct SearchColors {
     /// `search-foreground` — candidate-match glyph color.
-    pub foreground: Option<Rgb>,
+    pub foreground: Option<CellColor>,
     /// `search-background` — candidate-match fill.
-    pub background: Option<Rgb>,
+    pub background: Option<CellColor>,
     /// `search-selected-foreground` — focused-match glyph color.
-    pub selected_foreground: Option<Rgb>,
+    pub selected_foreground: Option<CellColor>,
     /// `search-selected-background` — focused-match fill.
-    pub selected_background: Option<Rgb>,
+    pub selected_background: Option<CellColor>,
 }
 
 impl SearchColors {
-    fn any(&self) -> bool {
-        self.foreground.is_some()
-            || self.background.is_some()
-            || self.selected_foreground.is_some()
-            || self.selected_background.is_some()
-    }
+    /// Ghostty defaults: black text on golden yellow (candidates).
+    const CANDIDATE_BG: Rgb = Rgb {
+        r: 0xFF,
+        g: 0xE0,
+        b: 0x82,
+    };
+    /// Ghostty defaults: black text on soft peach (focused match).
+    const SELECTED_BG: Rgb = Rgb {
+        r: 0xF2,
+        g: 0xA5,
+        b: 0x7E,
+    };
+    const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
 }
 
 pub struct DrawContext<'a> {
@@ -75,9 +86,12 @@ pub struct DrawContext<'a> {
     pub focused: bool,
     /// `cursor-invert-fg-bg` — swap cell fg onto the block cursor.
     pub cursor_invert_fg_bg: bool,
+    /// `cursor-color` — the block cursor's fill; `cell-*` values and
+    /// `None` resolve at draw time (None = theme cursor palette slot).
+    pub cursor_color: Option<CellColor>,
     /// `cursor-text` — glyph color under the block cursor (None = the
     /// inverted cell fg).
-    pub cursor_text: Option<Rgb>,
+    pub cursor_text: Option<CellColor>,
     /// `cursor-opacity` — alpha of the block cursor fill over the cell.
     pub cursor_opacity: f32,
     /// IME preedit text shown at the caret, if any: (text, caret byte offset).
@@ -345,25 +359,29 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             fg = bg;
         }
         // `search-foreground`/`search-selected-foreground` recolor the
-        // matched glyph; the translucent band covers the bg and
-        // selection/cursor overrides still win below.
-        if ctx.search_colors.any() {
+        // matched glyph — Ghostty defaults them to black on the
+        // golden/peach fills below; `cell-*` resolves against the
+        // cell's own colors. Selection/cursor overrides still win.
+        {
             let col = p.column.0;
-            if ctx
+            let in_active = ctx
                 .search_active
                 .iter()
-                .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1)
-            {
-                if let Some(c) = ctx.search_colors.selected_foreground {
-                    fg = c;
-                }
-            } else if ctx
-                .search_matches
-                .iter()
-                .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1)
-                && let Some(c) = ctx.search_colors.foreground
-            {
-                fg = c;
+                .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1);
+            let in_match = in_active
+                || ctx
+                    .search_matches
+                    .iter()
+                    .any(|&(c0, c1, r)| r == row_idx && col >= c0 && col < c1);
+            if in_match {
+                let spec = if in_active {
+                    ctx.search_colors.selected_foreground
+                } else {
+                    ctx.search_colors.foreground
+                };
+                fg = spec
+                    .map(|s| s.resolve(fg, bg))
+                    .unwrap_or(SearchColors::BLACK);
             }
         }
         if is_sel {
@@ -380,14 +398,19 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
             }
         }
         if is_cursor {
+            let (of, ob) = (fg, bg);
             // `cursor-text` wins, then `cursor-invert-fg-bg`'s swap;
             // neither = the glyph keeps its own fg under the block.
+            // `cell-*` values resolve against the cell's own colors.
             if let Some(ct) = ctx.cursor_text {
-                fg = ct;
+                fg = ct.resolve(of, ob);
             } else if ctx.cursor_invert_fg_bg {
                 fg = bg;
             }
-            let cc = palette.named(colors, NamedColor::Cursor);
+            let cc = ctx
+                .cursor_color
+                .map(|s| s.resolve(of, ob))
+                .unwrap_or_else(|| palette.named(colors, NamedColor::Cursor));
             bg = if ctx.cursor_opacity < 1.0 {
                 lerp_rgb(bg, cc, ctx.cursor_opacity)
             } else {
@@ -534,38 +557,34 @@ pub fn draw_term(
     for &(c0, c1, r) in ctx.search_matches {
         let active = ctx.search_active.contains(&(c0, c1, r));
         // `search-(selected-)background` configures the match fill;
-        // the built-in palette stays a translucent tint.
-        let (color, alpha) = if active {
-            (
-                ctx.search_colors.selected_background.unwrap_or(Rgb {
-                    r: 0xff,
-                    g: 0xa5,
-                    b: 0x00,
-                }),
-                if ctx.search_colors.selected_background.is_some() {
-                    1.0
-                } else {
-                    0.55
-                },
-            )
+        // Ghostty defaults are opaque golden `#FFE082` (candidates)
+        // and soft peach `#F2A57E` (focused). `cell-*` resolves
+        // against the span's first cell (the fill is one rect).
+        let spec = if active {
+            ctx.search_colors.selected_background
         } else {
-            (
-                ctx.search_colors.background.unwrap_or(Rgb {
-                    r: 0x8a,
-                    g: 0x6d,
-                    b: 0x3b,
-                }),
-                if ctx.search_colors.background.is_some() {
-                    1.0
+            ctx.search_colors.background
+        };
+        let color = match spec {
+            Some(crate::config::CellColor::Rgb(c)) => c,
+            Some(spec) => grid
+                .rows
+                .get(r)
+                .and_then(|row| row.get(c0))
+                .map(|cd| spec.resolve(cd.style.fg, cd.style.bg))
+                .unwrap_or(theme_bg),
+            None => {
+                if active {
+                    SearchColors::SELECTED_BG
                 } else {
-                    0.30
-                },
-            )
+                    SearchColors::CANDIDATE_BG
+                }
+            }
         };
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(color, alpha)),
+            &Brush::Solid(peniko_alpha(color, 1.0)),
             None,
             &rect(
                 col_x(padx, cw, c0),
