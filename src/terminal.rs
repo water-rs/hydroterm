@@ -90,6 +90,13 @@ pub enum TermEvent {
     /// kitty graphics payload with the cursor position at transmit time:
     /// `(payload, absolute line, col)` — same line convention as marks.
     Apc(Vec<u8>, i64, usize),
+    /// `CSI 8 ; rows ; cols t` — a program asked to resize the window
+    /// (xterm window op 8; vte drops it, so the raw scanner emits this).
+    /// Either param may be 0 = keep that dimension (xterm semantics).
+    WindowResizeRequest {
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// Grid dimensions handed to `Term` — what `Dimensions` wants.
@@ -141,6 +148,10 @@ struct ProxyInner {
     /// while true (app-level keybinds still fire — KAM only locks
     /// transmission to the program).
     kam_locked: AtomicBool,
+    /// `vt-window-resize-allowed` — whether `CSI 8 ; rows ; cols t`
+    /// may resize the window (Ghostty default off: a remote program
+    /// must not change the window size uninvited).
+    window_resize_allowed: AtomicBool,
     /// Latest title seen through `Event::Title`/`ResetTitle` — the
     /// `CSI 21 t` reply needs it where `Term.title` isn't public.
     title: Mutex<String>,
@@ -157,6 +168,7 @@ impl EventProxy {
             title_report: AtomicBool::new(false),
             kam_allowed: AtomicBool::new(false),
             kam_locked: AtomicBool::new(false),
+            window_resize_allowed: AtomicBool::new(false),
             title: Mutex::new(String::new()),
         });
         (Self { inner }, rx)
@@ -192,6 +204,29 @@ impl EventProxy {
 
     fn set_kam_locked(&self, on: bool) {
         self.inner.kam_locked.store(on, Ordering::Relaxed);
+    }
+
+    /// `vt-window-resize-allowed` — allow/deny `CSI 8 ; rows ; cols t`.
+    pub fn set_window_resize_allowed(&self, on: bool) {
+        self.inner
+            .window_resize_allowed
+            .store(on, Ordering::Relaxed);
+    }
+
+    fn window_resize_allowed(&self) -> bool {
+        self.inner.window_resize_allowed.load(Ordering::Relaxed)
+    }
+
+    /// Forward a scanned `CSI 8 ; rows ; cols t` as a resize request.
+    /// Called from the reader thread only after `window_resize_allowed`
+    /// passed (and only as a `WindowResizeRequest` — never honoured
+    /// silently).
+    fn window_resize_request(&self, rows: u16, cols: u16) {
+        let _ = self
+            .inner
+            .events
+            .send(TermEvent::WindowResizeRequest { rows, cols });
+        self.wake();
     }
 
     /// True while ANSI KAM holds — the surface suppresses key bytes.
@@ -1473,6 +1508,10 @@ struct IoLoop {
     /// reaches the Handler as `Mode::Unknown(2)` and is dropped, so
     /// `vt-kam-allowed` needs the same raw-byte path as `title-report`.
     csi_mode_scan: CsiModeScan,
+    /// Collector for `\e[8;rows;cols t` — vte's `('t', [])` arm only
+    /// dispatches ops 14/18/22/23, so `vt-window-resize-allowed` sees
+    /// op 8 on the raw bytes like the other scans.
+    csi8t_scan: Csi8tScan,
 }
 
 /// Rolling `CSI <params> h|l` collector. `mode2_hit` reports whether the
@@ -1483,6 +1522,67 @@ struct CsiModeScan {
     /// `ESC [` has been seen; collect param bytes until a final.
     collecting: bool,
     params: Vec<u8>,
+}
+
+/// Rolling `CSI 8 ; rows ; cols t` collector. `feed` returns
+/// `Some((rows, cols))` on completion; a param of 0 or absent keeps
+/// the current dimension (xterm semantics) — the consumer substitutes.
+#[derive(Default)]
+struct Csi8tScan {
+    /// `ESC [` has been seen; collect param bytes until a final.
+    collecting: bool,
+    params: Vec<u8>,
+}
+
+impl Csi8tScan {
+    fn feed(&mut self, b: u8) -> Option<(u16, u16)> {
+        // ESC re-arms from any state.
+        if b == 0x1b {
+            self.collecting = false;
+            self.params.clear();
+            self.params.push(0x1b);
+            return None;
+        }
+        if self.collecting {
+            if (0x30..=0x3f).contains(&b) && self.params.len() < 16 {
+                self.params.push(b);
+                return None;
+            }
+            self.collecting = false;
+            let hit = if b == b't' {
+                parse_csi8t(&self.params)
+            } else {
+                None
+            };
+            self.params.clear();
+            return hit;
+        }
+        if self.params.first() == Some(&0x1b) {
+            if b == b'[' {
+                self.collecting = true;
+            }
+            self.params.clear();
+        }
+        None
+    }
+}
+
+/// `params` of a completed `CSI … t` — `8 ; rows ; cols` only;
+/// `0`/missing params mean "keep that dimension".
+fn parse_csi8t(params: &[u8]) -> Option<(u16, u16)> {
+    let mut it = params.split(|&c| c == b';');
+    if it.next()? != b"8" {
+        return None;
+    }
+    let num = |p: Option<&[u8]>| -> u16 {
+        p.unwrap_or(b"")
+            .iter()
+            .fold(0u32, |a, &c| a.saturating_mul(10).saturating_add(u32::from(c - b'0')))
+            .min(u16::MAX as u32) as u16
+    };
+    let rows = num(it.next());
+    let cols = num(it.next());
+    (rows > 0 || cols > 0).then_some((rows, cols))
 }
 
 impl CsiModeScan {
@@ -1548,6 +1648,7 @@ impl IoLoop {
                 marks,
                 csi21t_tail: 0,
                 csi_mode_scan: CsiModeScan::default(),
+                csi8t_scan: Csi8tScan::default(),
             },
             io,
         ))
@@ -1606,7 +1707,8 @@ impl IoLoop {
                 // the raw output bytes here.
                 let title_scan = self.proxy.title_report_enabled();
                 let kam_scan = self.proxy.kam_allowed();
-                if title_scan || kam_scan {
+                let resize_scan = self.proxy.window_resize_allowed();
+                if title_scan || kam_scan || resize_scan {
                     for &b in &seg[..n] {
                         if title_scan {
                             self.csi21t_tail = (self.csi21t_tail << 8) | u64::from(b);
@@ -1619,6 +1721,11 @@ impl IoLoop {
                             && let Some(set) = self.csi_mode_scan.feed(b)
                         {
                             self.proxy.set_kam_locked(set);
+                        }
+                        if resize_scan
+                            && let Some((rows, cols)) = self.csi8t_scan.feed(b)
+                        {
+                            self.proxy.window_resize_request(rows, cols);
                         }
                     }
                 }

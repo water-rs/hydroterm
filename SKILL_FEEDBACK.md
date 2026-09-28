@@ -409,3 +409,21 @@ patched in-repo.
   `frame` writes no longer clamped → WATERUI_FEEDBACK #69 resolved,
   `quick-terminal-animation-duration` verified sliding both ways) and
   #269 (over-sibling occlusion).
+
+- **r59 — spawn-time proxy flags.** Config gated through the
+  `EventProxy` (`*_allowed` AtomicBools like `vt_window_resize_allowed`,
+  `vt_kam_allowed`) must be set at BOTH sites: `apply_config` covers
+  reloads, but a fresh session needs the flag at spawn
+  (`Session::new`) — setting it only in `apply_config` silently no-ops
+  the feature until the first config reload. Pattern that avoids the
+  bug class entirely: set it once where the proxy is created and let
+  reload drive later changes.
+- **r59 — `keyboard_types::Code` names sided super as `Meta*`.** There
+  is no `Code::SuperLeft`/`SuperRight` — the keys are `MetaLeft`/
+  `MetaRight` (rustdoc mentions "Super" only as an alias). Modifiers
+  side matches `Modifiers::SUPER`.
+- **r59 — Xvfb focus: `windowactivate` fails, `windowfocus` works.**
+  Xvfb has no `_NET_ACTIVE_WINDOW` support, so `xdotool windowactivate`
+  exits 1 while `xdotool windowfocus <wid>` raises+fine. If `type`/
+  `key` lands nothing on a real `search`-found window under Xvfb,
+  focus it with `windowfocus` first.

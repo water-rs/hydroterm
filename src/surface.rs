@@ -27,7 +27,9 @@ use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::snackbar::Snackbar;
 use waterui::task::spawn_local;
+use waterui::window::WindowState;
 use waterui_core::Str;
+use waterui_core::layout::{Rect as UiRect, Size as UiSize};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::scene2d::Scene2D;
 use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
@@ -466,6 +468,10 @@ pub struct TermSurface {
     // cross-thread wake pipe: parser thread → channel → local future →
     // SceneInvalidator on the main thread.
     wake_tx: Option<async_channel::Sender<()>>,
+    /// Physical modifier `Code`s currently held — the `key-remap`
+    /// map translates these before semantic `Modifiers` are built.
+    /// Cleared on focus loss so a missed release can't wedge a bit.
+    held_mod_codes: std::collections::HashSet<Code>,
     /// Bumped on every drained parser wake — part of the search stamp,
     /// so new output re-runs an open search.
     content_gen: Rc<Cell<u64>>,
@@ -545,6 +551,18 @@ pub struct TermSurface {
 /// `background-image` decode cache: (config path, decoded brush + pixel dims).
 type BgImageCache = (Option<std::path::PathBuf>, Option<(peniko::ImageBrush, u32, u32)>);
 
+/// The semantic `Modifiers` bit a physical modifier `Code` contributes
+/// when unmapped (the `key-remap` fallback).
+fn natural_mod(code: Code) -> Modifiers {
+    match code {
+        Code::ShiftLeft | Code::ShiftRight => Modifiers::SHIFT,
+        Code::ControlLeft | Code::ControlRight => Modifiers::CONTROL,
+        Code::AltLeft | Code::AltRight => Modifiers::ALT,
+        Code::MetaLeft | Code::MetaRight => Modifiers::META,
+        _ => Modifiers::empty(),
+    }
+}
+
 impl TermSurface {
     /// Scene content for one session — the host's shared font collection is
     /// resolved once here, per pane.
@@ -609,6 +627,7 @@ impl TermSurface {
             pad_y: PADDING,
             invalidator: None,
             wake_tx: None,
+            held_mod_codes: std::collections::HashSet::new(),
             content_gen: Rc::new(Cell::new(0)),
             wake_alive: Rc::new(Cell::new(false)),
             wake_epoch: Cell::new(0),
@@ -910,9 +929,15 @@ impl TermSurface {
     /// plain-text URL scanned off the row. `link-url = false` gates
     /// only the detected-URL scan — `link = <regex>` patterns still
     /// apply (they are a separate feature in the reference).
+    /// `link-osc8 = false` disables the stored-OSC8 side entirely
+    /// (Ghostty: the cell keeps the annotation; it just does not act
+    /// as a link).
     fn link_at(&self, point: Point) -> Option<String> {
         let term = self.session.terminal.term.lock();
-        let uri = term.grid()[point].hyperlink().map(|h| h.uri().to_string());
+        let osc8 = self.app.config(|c| c.link_osc8);
+        let uri = osc8
+            .then(|| term.grid()[point].hyperlink().map(|h| h.uri().to_string()))
+            .flatten();
         uri.or_else(|| {
             let lm = logical_line_at(term.grid(), point.line.0);
             let idx = lm
@@ -1787,9 +1812,15 @@ impl TermSurface {
                     self.app.set_session_title(self.session.id, t);
                 }
                 TermEvent::ClipboardStore(_ty, text) => {
-                    // `osc52-write` config (Ghostty clipboard-write): deny
-                    // drops program-initiated clipboard writes.
-                    if self.app.config(|c| c.osc52_write)
+                    // `osc52-write` (Ghostty clipboard-write): deny drops
+                    // program-initiated writes; `clipboard-write-limit-bytes`
+                    // discards an over-limit write whole (kitty EFBIG
+                    // semantics — never a partial clipboard).
+                    let (allowed, limit) = self.app.config(|c| {
+                        (c.osc52_write, c.clipboard_write_limit)
+                    });
+                    if allowed
+                        && text.len() <= limit
                         && let Some(clip) = self.clipboard.as_mut()
                     {
                         let _ = clip.set_text(&text);
@@ -1917,7 +1948,10 @@ impl TermSurface {
                 TermEvent::Apc(payload, line, col) => {
                     self.handle_apc(&payload, line, col);
                 }
-                TermEvent::Tap(tap) => match tap {
+                TermEvent::WindowResizeRequest { rows, cols } => {
+                    self.vt_window_resize(rows, cols);
+                }
+                TermEvent::Tap(tap) => match tap {       
                     // Marks + the redraw mode are recorded on the reader
                     // thread where the cursor still sits at the mark.
                     TapEvent::PromptStart | TapEvent::ShellRedraw(_) => {}
@@ -2161,6 +2195,9 @@ impl TermSurface {
 
     fn on_focus(&mut self, gained: bool) {
         self.focused = gained;
+        if !gained {
+            self.held_mod_codes.clear();
+        }
         if gained {
             self.app.focus_pane(self.session.id);
         } else if self.app.is_quick_app()
@@ -2196,10 +2233,104 @@ impl TermSurface {
     /// frame now (overlay/edit/action paths); a key that only writes bytes
     /// to the PTY returns false — its visible effect is the echoed output,
     /// which the wake pipe draws on arrival.
+    /// `vt-window-resize-allowed` — a program's `CSI 8 ; rows ; cols t`
+    /// asked for a window resize (raw-scanned; vte drops op 8).
+    /// Ghostty constraints: ignored when the terminal is in a split,
+    /// the window has multiple tabs, it is the quick terminal, or the
+    /// window is fullscreen/maximized; clamped to ≥ 40×10 cells.
+    fn vt_window_resize(&mut self, rows: u16, cols: u16) {
+        if self.app.is_quick_app()
+            || self.app.all_sessions().len() != 1
+            || !matches!(self.app.window_state.snapshot(), WindowState::Normal)
+        {
+            return;
+        }
+        let Some(frame) = self.app.window_frame.borrow().clone() else {
+            return;
+        };
+        let m = self.fonts.metrics;
+        let (pad_x, pad_y) = self.app.config(|c| {
+            (
+                c.window_padding_x.max(0.0),
+                c.window_padding_y.max(0.0),
+            )
+        });
+        // The strip counts toward the window frame when it is showing.
+        let strip_visible = self.app.tab_bar_forced.snapshot().unwrap_or_else(|| {
+            self.app.tab_count.snapshot() >= self.app.tab_bar_min.snapshot()
+        });
+        let strip = if strip_visible { crate::app::tab_strip_height() } else { 0.0 };
+        // 0 keeps the current dimension (xterm); ≥40×10 cells is the
+        // Ghostty floor.
+        let cur = frame.snapshot();
+        let want_cols = if cols == 0 {
+            ((cur.size().width - pad_x * 2.0) / m.cell_w).round().max(1.0) as u16
+        } else {
+            cols.max(40)
+        };
+        let want_rows = if rows == 0 {
+            ((cur.size().height - pad_y * 2.0 - strip) / m.cell_h).round().max(1.0) as u16
+        } else {
+            rows.max(10)
+        };
+        // Upper bound: no monitor-size API exists, so an absurd request
+        // (e.g. 65535) is capped at a sane ceiling instead of the
+        // screen edge Ghostty would use.
+        let want_cols = want_cols.min(400);
+        let want_rows = want_rows.min(200);
+        let size = UiSize::new(
+            want_cols as f32 * m.cell_w + pad_x * 2.0,
+            want_rows as f32 * m.cell_h + pad_y * 2.0 + strip,
+        );
+        frame.set(UiRect::new(cur.origin(), size));
+    }
+
+    /// `key-remap` (Ghostty): translate the held physical modifier
+    /// keys through the config map into the effective `Modifiers`.
+    /// Bits the event reports but no tracked key explains (a press we
+    /// never saw) pass through untouched.
+    fn effective_mods(&self, mods: Modifiers) -> Modifiers {
+        if self.held_mod_codes.is_empty() {
+            return mods;
+        }
+        let remap = self.app.config(|c| c.key_remap.clone());
+        if remap.is_empty() {
+            return mods;
+        }
+        let mut seen = Modifiers::empty();
+        let mut out = Modifiers::empty();
+        for &code in &self.held_mod_codes {
+            let natural = natural_mod(code);
+            seen |= natural;
+            out |= remap
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, m)| *m)
+                .unwrap_or(natural);
+        }
+        out | (mods & !seen)
+    }
+
+    /// Track a held/released physical modifier `Code` (no-op for
+    /// non-modifier keys). Runs at the top of `on_key` so the updated
+    /// set is what `effective_mods` sees for this same event.
+    fn track_held_modifier(&mut self, pressed: bool, code: Code) {
+        if natural_mod(code).is_empty() {
+            return;
+        }
+        if pressed {
+            self.held_mod_codes.insert(code);
+        } else {
+            self.held_mod_codes.remove(&code);
+        }
+    }
+
     fn on_key(&mut self, pressed: bool, key: &Key, code: Code, mods: Modifiers) -> bool {
         if pressed {
             self.clear_notify_badge();
         }
+        self.track_held_modifier(pressed, code);
+        let mods = self.effective_mods(mods);
         // Overlay pages capture keys first: palette query, settings
         // commit/close, then the search bar's query.
         if pressed && self.app.palette_open.snapshot() && self.palette_key(key, mods) {
@@ -2866,12 +2997,13 @@ impl TermSurface {
     fn link_span_at(&self, point: Point) -> Vec<(usize, usize, usize)> {
         let term = self.session.terminal.term.lock();
         let grid = term.grid();
-        if let Some(uri) = grid[point].hyperlink().map(|h| h.uri().to_string()) {
+        let osc8 = self.app.config(|c| c.link_osc8);
+        let uri_at = |p: Point| osc8.then(|| grid[p].hyperlink().map(|h| h.uri().to_string())).flatten();
+        if let Some(uri) = uri_at(point) {
             let line = point.line.0;
             let same = |c: usize| {
-                grid[Point::new(Line(line), Column(c))]
-                    .hyperlink()
-                    .is_some_and(|h| h.uri() == uri)
+                uri_at(Point::new(Line(line), Column(c)))
+                    .is_some_and(|u| u == uri)
             };
             let mut c0 = point.column.0;
             let mut c1 = c0 + 1;
@@ -3640,6 +3772,7 @@ impl TermSurface {
             hover_link: &self.hover_link,
             bg_image,
             unfocused_fill: self.app.config(|c| c.unfocused_split_fill),
+            link_osc8: self.app.config(|c| c.link_osc8),
             cursor_thickness: self
                 .app
                 .config(|c| if c.adjust_cursor_thickness == 0 { 1.0 } else { c.adjust_cursor_thickness as f32 / 100.0 }),
@@ -3906,7 +4039,7 @@ impl SceneContent for TermSurface {
                 true
             }
             SurfaceInputEvent::Modifiers(mods) => {
-                self.modifiers = *mods;
+                self.modifiers = self.effective_mods(*mods);
                 // Ctrl toggles the link-hover affordance without a move.
                 let (x, y) = self.pointer_at;
                 self.update_hover(x, y);

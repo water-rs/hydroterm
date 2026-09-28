@@ -450,6 +450,13 @@ pub struct AppConfig {
     /// Whether programs may write the clipboard through OSC 52
     /// (Ghostty `clipboard-write` allow/deny).
     pub osc52_write: bool,
+    /// `clipboard-write-limit-bytes` — maximum bytes a single
+    /// program-initiated clipboard write may carry (Ghostty default
+    /// 64 MiB). Ghostty applies the cap to the kitty OSC 5522
+    /// protocol; our only program-write path is OSC 52, so the cap
+    /// lands there: an over-limit write is discarded whole (kitty's
+    /// EFBIG semantics — no partial clipboard state).
+    pub clipboard_write_limit: usize,
     /// `bold-color` — bold-text color override (Ghostty 1.2, replacing
     /// the deprecated `bold-is-bright`, which maps `true`→`bright`,
     /// `false`→unset). Default `bright`.
@@ -488,6 +495,21 @@ pub struct AppConfig {
     pub selection_color: Option<Rgb>,
     /// `palette = 1=#ff0000` — indexed 0-255 slot overrides.
     pub palette_overrides: Vec<(u8, Rgb)>,
+    /// `window-titlebar-background`/`window-titlebar-foreground` —
+    /// titlebar colors (Ghostty GTK keys). Our chrome is the WaterUI
+    /// tab strip, so the pair tints that band and its labels instead.
+    pub titlebar_background: Option<Rgb>,
+    pub titlebar_foreground: Option<Rgb>,
+    /// `key-remap` — `from=to` modifier remaps, repeatable (Ghostty).
+    /// Generic names (`ctrl`/`alt`/`shift`/`super`, aliases
+    /// `cmd`/`command`/`opt`/`option`/`control`) cover both sides;
+    /// sided `left_x`/`right_x` hit one key. Stored flattened:
+    /// `(physical modifier code, replacement Modifiers bit)`.
+    pub key_remap: Vec<(Code, Modifiers)>,
+    /// `vt-window-resize-allowed` — programs may resize the window
+    /// with `CSI 8 ; rows ; cols t` (Ghostty, default false: a remote
+    /// program must not change the window size uninvited).
+    pub vt_window_resize_allowed: bool,
     /// `command-palette-entry` — custom rows appended to the command
     /// palette (Ghostty, repeat key).
     pub palette_entries: Vec<PaletteEntryCfg>,
@@ -514,6 +536,10 @@ pub struct AppConfig {
     /// `= false` hides the preview; the underline/click affordance
     /// still follows `link-url`.
     pub link_hover: bool,
+    /// `link-osc8` — OSC 8 hyperlinks are highlighted, previewed and
+    /// openable (Ghostty, default true). Independent of `link-url`,
+    /// which controls detected plain-text URLs only.
+    pub link_osc8: bool,
     /// Modifier that must be held for click-to-open-link (Ghostty
     /// `open-link-modifier`-style); default Control.
     pub open_link_modifier: LinkMod,
@@ -844,6 +870,11 @@ impl Default for AppConfig {
             right_click_action: RightClickAction::ContextMenu,
             term: "xterm-256color".to_string(),
             osc52_write: true,
+            clipboard_write_limit: 64 * 1024 * 1024,
+            titlebar_background: None,
+            titlebar_foreground: None,
+            key_remap: Vec::new(),
+            vt_window_resize_allowed: false,
             bold_color: BoldColor::Bright,
             faint_opacity: 0.5,
             working_directory: None,
@@ -913,6 +944,7 @@ impl Default for AppConfig {
             tab_bar_min_tabs: 1,
             link_url: true,
             link_hover: true,
+            link_osc8: true,
             word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
             visual_bell: true,
             visual_bell_color: None,
@@ -1462,6 +1494,33 @@ impl AppConfig {
                     "deny" | "false" | "0" => cfg.osc52_write = false,
                     _ => errors.push(format!("line {}: bad clipboard-write {value:?}", n + 1)),
                 },
+                "clipboard-write-limit-bytes" => match value.parse::<usize>() {
+                    Ok(v) => cfg.clipboard_write_limit = v,
+                    Err(_) => errors.push(format!(
+                        "line {}: bad clipboard-write-limit-bytes {value:?}",
+                        n + 1
+                    )),
+                },
+                "window-titlebar-background" => match parse_rgb(value) {
+                    Some(c) => cfg.titlebar_background = Some(c),
+                    None => errors.push(format!(
+                        "line {}: bad window-titlebar-background {value:?}",
+                        n + 1
+                    )),
+                },
+                "window-titlebar-foreground" => match parse_rgb(value) {
+                    Some(c) => cfg.titlebar_foreground = Some(c),
+                    None => errors.push(format!(
+                        "line {}: bad window-titlebar-foreground {value:?}",
+                        n + 1
+                    )),
+                },
+                // `key-remap = from=to` — repeatable. Generic names
+                // expand to both sides; sided names hit one key.
+                "key-remap" => match parse_key_remap(value) {
+                    Ok(entries) => cfg.key_remap.extend(entries),
+                    Err(e) => errors.push(format!("line {}: {e}", n + 1)),
+                },
                 "clipboard-read" => match value {
                     "allow" | "always" => cfg.clipboard_read = ClipboardRead::Allow,
                     "ask" => cfg.clipboard_read = ClipboardRead::Ask,
@@ -1790,6 +1849,9 @@ impl AppConfig {
                 }
                 "link-hover" => {
                     cfg.link_hover = bool_value(value, n, &mut errors);
+                }
+                "link-osc8" => {
+                    cfg.link_osc8 = bool_value(value, n, &mut errors);
                 }
                 "open-link-modifier" => {
                     match value.parse::<LinkMod>() {
@@ -2190,6 +2252,14 @@ impl AppConfig {
                     "true" | "yes" => cfg.vt_kam_allowed = true,
                     "false" | "no" => cfg.vt_kam_allowed = false,
                     _ => errors.push(format!("line {}: bad vt-kam-allowed {value:?}", n + 1)),
+                },
+                "vt-window-resize-allowed" => match value {
+                    "true" | "yes" => cfg.vt_window_resize_allowed = true,
+                    "false" | "no" => cfg.vt_window_resize_allowed = false,
+                    _ => errors.push(format!(
+                        "line {}: bad vt-window-resize-allowed {value:?}",
+                        n + 1
+                    )),
                 },
                 "search-foreground" => match parse_rgb(value) {
                     Some(c) => cfg.search_foreground = Some(c),
@@ -2751,6 +2821,49 @@ fn bool_value(value: &str, line: usize, errors: &mut Vec<String>) -> bool {
             false
         }
     }
+}
+
+/// One modifier name → the physical `Code`s it covers and the
+/// `Modifiers` bit it stands for. Generic names cover both sides
+/// (Ghostty: `ctrl` remaps `left_ctrl` and `right_ctrl`).
+fn mod_name_codes(name: &str) -> Option<(Vec<Code>, Modifiers)> {
+    let (codes, bit) = match name {
+        "shift" => (vec![Code::ShiftLeft, Code::ShiftRight], Modifiers::SHIFT),
+        "ctrl" | "control" => (
+            vec![Code::ControlLeft, Code::ControlRight],
+            Modifiers::CONTROL,
+        ),
+        "alt" | "opt" | "option" => (vec![Code::AltLeft, Code::AltRight], Modifiers::ALT),
+        "super" | "cmd" | "command" => {
+            (vec![Code::MetaLeft, Code::MetaRight], Modifiers::META)
+        }
+        "left_shift" => (vec![Code::ShiftLeft], Modifiers::SHIFT),
+        "right_shift" => (vec![Code::ShiftRight], Modifiers::SHIFT),
+        "left_ctrl" | "left_control" => (vec![Code::ControlLeft], Modifiers::CONTROL),
+        "right_ctrl" | "right_control" => (vec![Code::ControlRight], Modifiers::CONTROL),
+        "left_alt" | "left_opt" | "left_option" => (vec![Code::AltLeft], Modifiers::ALT),
+        "right_alt" | "right_opt" | "right_option" => (vec![Code::AltRight], Modifiers::ALT),
+        "left_super" | "left_cmd" | "left_command" => (vec![Code::MetaLeft], Modifiers::META),
+        "right_super" | "right_cmd" | "right_command" => {
+            (vec![Code::MetaRight], Modifiers::META)
+        }
+        _ => return None,
+    };
+    Some((codes, bit))
+}
+
+/// `key-remap` value — `from=to`. Ghostty semantics: remaps are not
+/// transitive, generic `from` expands to both sides, `to` sidedness is
+/// irrelevant to a bitfield of semantic modifiers.
+fn parse_key_remap(value: &str) -> Result<Vec<(Code, Modifiers)>, String> {
+    let (from, to) = value
+        .split_once('=')
+        .ok_or_else(|| format!("bad key-remap {value:?} (want from=to)"))?;
+    let (from_codes, _) = mod_name_codes(from.trim())
+        .ok_or_else(|| format!("bad key-remap source {from:?}"))?;
+    let (_, to_bit) = mod_name_codes(to.trim())
+        .ok_or_else(|| format!("bad key-remap target {to:?}"))?;
+    Ok(from_codes.iter().map(|c| (*c, to_bit)).collect())
 }
 
 /// A key-table name is non-empty and excludes `/`, `=`, `+`, `>`
@@ -5058,5 +5171,46 @@ mod key_table_tests {
         assert!(cfg.notify_on_command_finish_notify);
         let (_, errs) = AppConfig::parse("notify-on-command-finish-action = sparkle\n");
         assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn parses_r59_keys() {
+        // `vt-window-resize-allowed` bool.
+        let (cfg, errs) = AppConfig::parse("vt-window-resize-allowed = true\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.vt_window_resize_allowed);
+
+        // `clipboard-write-limit-bytes` usize.
+        let (cfg, errs) = AppConfig::parse("clipboard-write-limit-bytes = 1024\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.clipboard_write_limit, 1024);
+        let (_, errs) = AppConfig::parse("clipboard-write-limit-bytes = lots\n");
+        assert_eq!(errs.len(), 1);
+
+        // `link-osc8` bool, default on.
+        let (cfg, errs) = AppConfig::parse("link-osc8 = false\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.link_osc8);
+
+        // `window-titlebar-*` colors.
+        let (cfg, errs) = AppConfig::parse(
+            "window-titlebar-background = #3366cc\n\
+             window-titlebar-foreground = #ffffff\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.titlebar_background.unwrap().r, 0x33);
+        assert_eq!(cfg.titlebar_foreground.unwrap().g, 0xff);
+
+        // `key-remap` — generic expands to both sides, sided hits one.
+        let (cfg, errs) = AppConfig::parse(
+            "key-remap = ctrl=super\nkey-remap = left_alt=right_ctrl\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.key_remap.len(), 3);
+        assert!(cfg.key_remap.contains(&(Code::ControlLeft, Modifiers::META)));
+        assert!(cfg.key_remap.contains(&(Code::ControlRight, Modifiers::META)));
+        assert!(cfg.key_remap.contains(&(Code::AltLeft, Modifiers::CONTROL)));
+        let (_, errs) = AppConfig::parse("key-remap = ctrl\nkey-remap = f1=super\n");
+        assert_eq!(errs.len(), 2, "{errs:?}");
     }
 }

@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty::Shell;
-use alacritty_terminal::vte::ansi::CursorStyle;
+use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
 use nami::collection::{Collection, List as NamiList};
+use nami::impl_constant;
 use nami::zip::zip;
 use nami::{Binding, Signal, binding};
 use waterui::state;
@@ -29,7 +30,8 @@ use waterui_core::layout::{Point, Rect, Size};
 use waterui_graphics::SceneView;
 use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::accessibility::{AccessibilityRole, AccessibilityState};
-use waterui::drag_drop::DragData;
+use waterui::Url;
+use waterui::drag_drop::{Files, Transferable};
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
 use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
@@ -48,11 +50,23 @@ use waterui::form::picker::picker;
 
 /// Fixed height of the tab strip at every window size.
 const TAB_STRIP_HEIGHT: f32 = 30.0;
-/// Payload prefix for internal tab-chip drags — must never reach a pane's
-/// drop handler, where it would be pasted into the PTY as shell text.
-/// Workaround for `DragData` having only Text/Url payloads; remove once
-/// typed drag payloads land (water-rs/waterui#1254).
-const TAB_DRAG_PREFIX: &str = "hydroterm-tab:";
+
+/// Strip height for geometry math outside this module (the
+/// `vt-window-resize-allowed` content→frame conversion).
+pub(crate) fn tab_strip_height() -> f32 {
+    TAB_STRIP_HEIGHT
+}
+/// The payload a tab-chip drag carries. An in-process `Transferable`, so a
+/// chip dragged onto a pane detaches the tab while a chip that leaves the
+/// window writes nothing to the pasteboard — the text payload never reaches
+/// a pane's file-drop handler as shell text.
+#[derive(Clone)]
+struct TabDrag {
+    tab_id: u64,
+}
+
+impl_constant!(TabDrag);
+impl Transferable for TabDrag {}
 
 /// Shared per-session UI state: the bindings a pane surface reads, plus
 /// the owning `Terminal` (PTY + grid).
@@ -288,6 +302,10 @@ impl Session {
         terminal.proxy.set_title_report(cfg.title_report);
         // `vt-kam-allowed` — let `CSI 2 h` lock the keyboard at all.
         terminal.proxy.set_kam_allowed(cfg.vt_kam_allowed);
+        // `vt-window-resize-allowed` — let `CSI 8 ; r ; c t` resize.
+        terminal
+            .proxy
+            .set_window_resize_allowed(cfg.vt_window_resize_allowed);
         Self {
             id,
             terminal: Arc::new(terminal),
@@ -661,6 +679,11 @@ pub struct AppState {
     pub focus_owner: Binding<Option<(u64, u64)>>,
     /// Window title binding.
     pub window_title: Binding<Str>,
+    /// `window-titlebar-background`/`-foreground` — Ghostty's GTK
+    /// titlebar tint pair; our chrome is the tab strip, so these tint
+    /// the band and its labels. `None` keeps the theme look.
+    pub titlebar_bg: Binding<Option<Rgb>>,
+    pub titlebar_fg: Binding<Option<Rgb>>,
     /// Window state binding — normal/minimized/fullscreen/closed.
     /// Owned by us so keybinds can toggle fullscreen.
     pub window_state: Binding<WindowState>,
@@ -855,6 +878,8 @@ impl AppState {
                 }
             }),
             window_state: binding(WindowState::Normal),
+            titlebar_bg: Binding::container(watcher.config.titlebar_background),
+            titlebar_fg: Binding::container(watcher.config.titlebar_foreground),
             window_frame: Rc::new(RefCell::new(None)),
             window_scheme: Binding::container(crate::theme::scheme_for(
                 &watcher.config.window_theme,
@@ -1133,6 +1158,8 @@ impl AppState {
                 .clone()
                 .map(Str::from),
         );
+        self.titlebar_bg.set(config.titlebar_background);
+        self.titlebar_fg.set(config.titlebar_foreground);
         // `title` — a configured window title re-applies on reload
         // (Ghostty updates every window's title).
         if let Some(t) = &config.title {
@@ -1154,6 +1181,9 @@ impl AppState {
         for s in self.sessions.borrow().iter() {
             s.terminal.proxy.set_title_report(config.title_report);
             s.terminal.proxy.set_kam_allowed(config.vt_kam_allowed);
+            s.terminal
+                .proxy
+                .set_window_resize_allowed(config.vt_window_resize_allowed);
             // `font-size` applies on reload — but only to terminals
             // that never took a zoom override (`increase_font_size`, …).
             if !s.font_size_override.get() {
@@ -2743,20 +2773,31 @@ impl View for PaneLeaf {
             .focused(&self.state.focus_owner, (self.tab_id, self.session.id))
             .cursor(hover_cursor)
             // Drag-and-drop: a file dropped on the pane pastes its
-            // shell-quoted path into the PTY (Ghostty/kitty behaviour).
+            // shell-quoted path into the PTY (Ghostty/kitty behaviour), and
+            // a tab chip dropped on a pane detaches into its own window
+            // (Ghostty's drag-out). One destination per payload kind — the
+            // hit test delivers to the topmost acceptor.
+            .drop_destination(move |files: Files, session: PaneSession| {
+                let text = files
+                    .urls()
+                    .iter()
+                    .map(|url| url.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !text.is_empty() {
+                    session.push_action(TermAction::DropText(text));
+                }
+            })
+            .drop_destination(move |text: Str, session: PaneSession| {
+                session.push_action(TermAction::DropText(text.to_string()));
+            })
+            .drop_destination(move |url: Url, session: PaneSession| {
+                session.push_action(TermAction::DropText(url.to_string()));
+            })
             .drop_destination({
                 let app = self.state.clone();
-                move |session: PaneSession, data: DragData| {
-                    let text = data.as_str();
-                    if let Some(id) = text.strip_prefix(TAB_DRAG_PREFIX) {
-                        // Tab tear-off: a chip dropped on a pane detaches
-                        // the tab into its own window (Ghostty's drag-out).
-                        if let Ok(tab_id) = id.parse::<u64>() {
-                            app.detach_tab_to_window(tab_id);
-                        }
-                    } else {
-                        session.push_action(TermAction::DropText(text.to_string()));
-                    }
+                move |drag: TabDrag, _session: PaneSession| {
+                    app.detach_tab_to_window(drag.tab_id);
                 }
             });
         let surface = Frame::new(surface);
@@ -3537,9 +3578,17 @@ pub fn tabs_view(state: AppState) -> impl View {
                     let app = app.clone();
                     let tab_id = tab.id;
                     let active = app.selected.equal_to(tab_id);
-                    // M3 primary-tab look: accent label + indicator bar when active.
+                    // M3 primary-tab look: accent label + indicator bar when
+                    // active; `window-titlebar-foreground` overrides the
+                    // label ink when configured.
                     let label_color = signal_color(
-                        active.select(Color::new(Accent), Color::new(MutedForeground)),
+                        zip(
+                            active.select(Color::new(Accent), Color::new(MutedForeground)),
+                            app.titlebar_fg.clone(),
+                        )
+                        .map(|(base, over)| {
+                            over.map(|c| Color::srgb(c.r, c.g, c.b)).unwrap_or(base)
+                        }),
                     );
                     let indicator_color = signal_color(
                         active.select(Color::new(Accent), Color::new(Background)),
@@ -3627,19 +3676,12 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .state(&hovered)
                     .on_hover_enter(|State(h): State<Binding<bool>>| h.set(true))
                     .on_hover_exit(|State(h): State<Binding<bool>>| h.set(false))
-                    // Drag-to-reorder: the chip carries its tab id as
-                    // text payload; every sibling chip is a drop slot.
-                    .draggable(drag_drop::DragData::text(format!(
-                        "{TAB_DRAG_PREFIX}{tab_id}"
-                    )))
-                    .drop_destination(move |app: AppState, data: drag_drop::DragData| {
-                        if let Some(id) = data
-                            .as_str()
-                            .strip_prefix(TAB_DRAG_PREFIX)
-                            .and_then(|s| s.parse::<u64>().ok())
-                        {
-                            app.move_tab_before(id, tab_id);
-                        }
+                    // Drag-to-reorder: the chip carries its tab id as an
+                    // in-process `TabDrag` payload; every sibling chip is a
+                    // drop slot for it.
+                    .draggable(TabDrag { tab_id })
+                    .drop_destination(move |drag: TabDrag, app: AppState| {
+                        app.move_tab_before(drag.tab_id, tab_id);
                     })
                     // Middle-click closes the tab (Ghostty/tab-browser
                     // convention) — water-rs/waterui#1290 routed non-primary
@@ -3666,6 +3708,12 @@ pub fn tabs_view(state: AppState) -> impl View {
             ))
             .spacing(4.0)
             .padding()
+            // `window-titlebar-background` — transparent when unset so
+            // the default strip look is unchanged.
+            .background(signal_color(state.titlebar_bg.map(|o| {
+                o.map(|c| Color::srgb(c.r, c.g, c.b))
+                    .unwrap_or(Color::srgb_hex("#000000").with_opacity(0.0))
+            })))
         }
     });
 

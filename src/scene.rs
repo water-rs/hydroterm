@@ -122,6 +122,10 @@ pub struct DrawContext<'a> {
     /// `unfocused-split-fill` — replaces the pane's default background
     /// while it is unfocused (cells with explicit backgrounds keep them).
     pub unfocused_fill: Option<Rgb>,
+    /// `link-osc8` — when false, stored OSC8 hyperlinks draw no
+    /// underline (Ghostty "not highlighted"), matching the dead
+    /// interaction path.
+    pub link_osc8: bool,
     /// Cursor thickness multiplier (Ghostty `adjust-cursor-thickness`);
     /// 1.0 = the default beam/underline size.
     pub cursor_thickness: f32,
@@ -171,7 +175,7 @@ const DECO_DOTTED: u8 = 8;
 const DECO_DASHED: u8 = 16;
 const DECO_STRIKE: u8 = 32;
 
-fn deco_bits(cell: &Cell) -> u8 {
+fn deco_bits(cell: &Cell, link_osc8: bool) -> u8 {
     let f = cell.flags;
     let mut d = 0u8;
     if f.contains(Flags::UNDERCURL) {
@@ -188,7 +192,7 @@ fn deco_bits(cell: &Cell) -> u8 {
     if f.contains(Flags::STRIKEOUT) {
         d |= DECO_STRIKE;
     }
-    if cell.hyperlink().is_some() {
+    if link_osc8 && cell.hyperlink().is_some() {
         d |= DECO_UNDERLINE;
     }
     d
@@ -384,7 +388,7 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
                 bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                deco: deco_bits(cell),
+                deco: deco_bits(cell, ctx.link_osc8),
                 ul_color: cell.underline_color().map(|c| palette.lookup(colors, c)),
             },
         });
