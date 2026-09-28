@@ -1156,6 +1156,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2192,7 +2201,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis?rev=68ec29a54586cbecbbaaa75c4cf31156428c6cec#68ec29a54586cbecbbaaa75c4cf31156428c6cec"
+source = "git+https://github.com/water-rs/hydrolysis?rev=0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a#0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2205,6 +2214,7 @@ dependencies = [
  "js-sys",
  "keyboard-types",
  "lru",
+ "muda",
  "nami",
  "native-executor",
  "objc2 0.6.4",
@@ -3503,6 +3513,25 @@ dependencies = [
  "log",
  "num-traits",
  "static_assertions",
+]
+
+[[package]]
+name = "muda"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cca139e57da4383727f189e43e66e84fa372347027fc996f9f1a007ec0a37996"
+dependencies = [
+ "crossbeam-channel",
+ "dpi",
+ "keyboard-types",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "once_cell",
+ "png 0.18.1",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

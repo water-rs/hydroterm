@@ -65,7 +65,7 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "68ec29a54586cbecbbaaa75c4cf31156428c6cec"
+rev = "0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a"
 default-features = false
 features = ["winit"]
 
@@ -107,7 +107,7 @@ wasm-bindgen = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "68ec29a54586cbecbbaaa75c4cf31156428c6cec"
+rev = "0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a"
 default-features = false
 features = ["web"]
 
@@ -124,7 +124,7 @@ rev = "a01e5039c290fa869e0f6f3708e621056740f49b"
 
 [patch.crates-io.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "68ec29a54586cbecbbaaa75c4cf31156428c6cec"
+rev = "0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a"
 
 [patch.crates-io.hydrolysis-m3]
 git = "https://github.com/water-rs/hydrolysis-m3"
