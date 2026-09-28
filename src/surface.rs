@@ -703,8 +703,9 @@ impl TermSurface {
         }
         let (brush, iw, ih) = cache.1.clone()?;
         let (iw, ih) = (f64::from(iw), f64::from(ih));
-        let tile = matches!(fit, BgFit::Tile) || repeat;
-        let ext = if tile {
+        // `background-image-repeat`: repeat into space the fit leaves
+        // blank (Ghostty); otherwise the brush edge-pads.
+        let ext = if repeat {
             peniko::Extend::Repeat
         } else {
             peniko::Extend::Pad
@@ -716,9 +717,9 @@ impl TermSurface {
         // brush_transform maps image-pixel space into the surface rect.
         let transform = match fit {
             BgFit::Stretch => kurbo::Affine::scale_non_uniform(w / iw, h / ih),
-            // Tiles repeat past every edge, so the position just shifts
-            // the pattern origin to the anchored edge (Ghostty).
-            BgFit::Tile => kurbo::Affine::translate(((w - iw) * fx, (h - ih) * fy)),
+            // `none`: native size, positioned; `repeat` then tiles it
+            // around that origin (Ghostty's tile recipe).
+            BgFit::None => kurbo::Affine::translate(((w - iw) * fx, (h - ih) * fy)),
             BgFit::Contain | BgFit::Cover => {
                 let s = if matches!(fit, BgFit::Contain) {
                     (w / iw).min(h / ih)
@@ -2321,26 +2322,9 @@ impl TermSurface {
         } else {
             rows.max(10)
         };
-        // Ghostty clamps to the screen. The platform only clamps a
-        // first-mapped window's position, never a mapped window's size
-        // (hydrolysis#270), and an over-screen request here wraps at the
-        // X11 CARD16 boundary — so clamp cell counts to what fits the
-        // X root (no monitor API exists; Wayland gets no clamp).
-        let (want_cols, want_rows) = match crate::quickterm::screen_size() {
-            Some((sw, sh)) => (
-                want_cols.min(
-                    (((sw - f64::from(pad_x) * 2.0) / f64::from(m.cell_w))
-                        .floor()
-                        .max(1.0)) as u16,
-                ),
-                want_rows.min(
-                    (((sh - f64::from(pad_y) * 2.0 - f64::from(strip)) / f64::from(m.cell_h))
-                        .floor()
-                        .max(1.0)) as u16,
-                ),
-            ),
-            None => (want_cols, want_rows),
-        };
+        // Ghostty clamps the request to the monitor; the platform does
+        // the same on every frame write (hydrolysis frame clamp), so the
+        // cell counts go through as-is.
         let size = UiSize::new(
             want_cols as f32 * m.cell_w + pad_x * 2.0,
             want_rows as f32 * m.cell_h + pad_y * 2.0 + strip,
@@ -3833,6 +3817,7 @@ impl TermSurface {
                 }
             }),
             bold_color: self.app.config(|c| c.bold_color),
+            cursor_blink: self.app.config(|c| c.cursor_blink),
             faint_opacity: self.app.config(|c| c.faint_opacity),
             min_contrast: self.app.config(|c| c.minimum_contrast),
             selection_invert: self.app.config(|c| c.selection_invert),
@@ -4005,7 +3990,11 @@ impl SceneContent for TermSurface {
 
         // A blinking cursor or live bell flash needs the next frame anyway;
         // the wake pipe covers PTY output between frames.
-        let cursor_blinking = self.session.terminal.term.lock().cursor_style().blinking;
+        // `cursor-style-blink` (Some) overrides the program's flag.
+        let cursor_blinking = self
+            .app
+            .config(|c| c.cursor_blink)
+            .unwrap_or_else(|| self.session.terminal.term.lock().cursor_style().blinking);
         let bell_live = self
             .bell_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(BELL_FLASH_SECS));

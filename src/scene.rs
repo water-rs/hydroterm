@@ -104,6 +104,10 @@ pub struct DrawContext<'a> {
     /// `bold-color` config — bold-cell color override (bright slot,
     /// a fixed color, or unset).
     pub bold_color: crate::config::BoldColor,
+    /// `cursor-style-blink` — `Some` forces the cursor's blink flag
+    /// regardless of the program's DECSCUSR request (Ghostty).
+    pub cursor_blink: Option<bool>,
+
     /// `faint-opacity` — opacity of faint (SGR 2) text (1.0 = opaque).
     pub faint_opacity: f32,
     /// `minimum-contrast` — WCAG ratio floor applied to each cell's
@@ -289,7 +293,10 @@ fn harvest(term: &Term<EventProxy>, ctx: &DrawContext<'_>) -> (Grid, CursorInfo)
     let colors = content.colors;
 
     let cursor = content.cursor;
-    let cursor_style = term.cursor_style();
+    let mut cursor_style = term.cursor_style();
+    if let Some(blink) = ctx.cursor_blink {
+        cursor_style.blinking = blink;
+    }
     let show_block = matches!(cursor.shape, CursorShape::Block)
         && ctx.focused
         && (ctx.blink_on || !cursor_style.blinking);

@@ -74,7 +74,10 @@ glifo = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6
 # `0.3.0`, which is this package; a registry copy would be pre-freeze code
 # that no longer builds against the revision below. Drop the entry once
 # hydrolysis 0.3.0 ships.
-hydrolysis = { git = "https://github.com/water-rs/hydrolysis", rev = "68ec29a54586cbecbbaaa75c4cf31156428c6cec" }
+# r61: path-patched to the local clone carrying the frame-monitor clamp
+# (clamp every frame write to the window's monitor). Repin to the git rev
+# once the hydrolysis branch lands on dev.
+hydrolysis = { path = "../hydrolysis-src" }
 hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "f4fbd90c91a45dd8149b790e841ed84ec252761d" }
 
 # water-rs/nami#26: `Signal::get` renamed to `snapshot`. Pinned to the nami dev

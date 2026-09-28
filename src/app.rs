@@ -264,7 +264,9 @@ impl Session {
             kitty_keyboard: true,
             default_cursor_style: CursorStyle {
                 shape: cfg.cursor_shape,
-                blinking: cfg.cursor_blink,
+                // Program-set DECSCUSR styles still override at draw
+                // time unless `cursor-style-blink` is set (Ghostty).
+                blinking: cfg.cursor_blink.unwrap_or(true),
             },
             // `word-select-chars` — double-click word separators
             // (alacritty `semantic_escape_chars`).
@@ -1206,7 +1208,7 @@ impl AppState {
             // exactly as spawn does so kitty-keyboard survives intact.
             let cursor_style = CursorStyle {
                 shape: config.cursor_shape,
-                blinking: config.cursor_blink,
+                blinking: config.cursor_blink.unwrap_or(true),
             };
             if *s.scrollback.lock().unwrap() != config.scrollback
                 || *s.cursor_style.lock().unwrap() != cursor_style
@@ -4206,8 +4208,13 @@ impl AppState {
     pub fn toggle_settings(&self) {
         let next = !self.settings_open.snapshot();
         if next {
-            let (font, theme, blink) =
-                self.config(|c| (c.font_size as i32, theme_index(&c.theme), c.cursor_blink));
+            let (font, theme, blink) = self.config(|c| {
+                (
+                    c.font_size as i32,
+                    theme_index(&c.theme),
+                    c.cursor_blink.unwrap_or(true),
+                )
+            });
             self.set_font.set(font);
             self.set_theme.set(theme);
             self.set_blink.set(blink);

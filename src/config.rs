@@ -356,7 +356,9 @@ pub struct AppConfig {
     /// `title` feature). Default on.
     pub bell_title: bool,
     pub cursor_shape: CursorShape,
-    pub cursor_blink: bool,
+    /// Ghostty `cursor-style-blink`: `None` (unset) honors the program's
+    /// DECSCUSR blink flag; `Some` forces blink on or off regardless.
+    pub cursor_blink: Option<bool>,
     /// Shell program override; `None` = `$SHELL` with integration.
     pub shell: Option<String>,
     /// `command` — program for every new surface (Ghostty semantics:
@@ -682,7 +684,8 @@ pub struct AppConfig {
     /// Opacity of `background-image` (0–1, Ghostty `background-image-opacity`).
     pub background_image_opacity: f32,
     /// Fit of `background-image` inside the surface rect (Ghostty
-    /// `background-image-fit`): contain/cover/stretch/tile.
+    /// `background-image-fit`): contain/cover/stretch/none
+    /// (Ghostty's four values; `none` = native size, positioned).
     pub background_image_fit: BgFit,
     /// Repeat `background-image` instead of stretching one copy
     /// (Ghostty `background-image-repeat`).
@@ -811,8 +814,8 @@ pub enum BgFit {
     Cover,
     /// Scale to fill, distorting aspect.
     Stretch,
-    /// Native size, repeated to fill.
-    Tile,
+    /// Native size, positioned; `background-image-repeat` tiles it.
+    None,
 }
 
 /// `link-previews` values (Ghostty `true|false|osc8`).
@@ -902,7 +905,7 @@ impl Default for AppConfig {
             bell_title: true,
             grapheme_width_method: GraphemeWidthMethod::Unicode,
             cursor_shape: CursorShape::Block,
-            cursor_blink: true,
+            cursor_blink: None,
             shell: None,
             command: None,
             keybinds: Vec::new(),
@@ -998,7 +1001,7 @@ impl Default for AppConfig {
             window_decoration: true,
             background_image: None,
             background_image_opacity: 1.0,
-            background_image_fit: BgFit::Cover,
+            background_image_fit: BgFit::Contain,
             background_image_repeat: false,
             background_image_position: BgPos::Center,
             new_tab_position: NewTabPosition::End,
@@ -1808,7 +1811,7 @@ impl AppConfig {
                     }
                 }
                 "cursor-style-blink" => {
-                    cfg.cursor_blink = bool_value(value, n, &mut errors)
+                    cfg.cursor_blink = Some(bool_value(value, n, &mut errors))
                 }
                 "cursor-style" => match value {
                     "block" => cfg.cursor_shape = CursorShape::Block,
@@ -2042,7 +2045,7 @@ impl AppConfig {
                     "contain" => cfg.background_image_fit = BgFit::Contain,
                     "cover" => cfg.background_image_fit = BgFit::Cover,
                     "stretch" => cfg.background_image_fit = BgFit::Stretch,
-                    "tile" => cfg.background_image_fit = BgFit::Tile,
+                    "none" => cfg.background_image_fit = BgFit::None,
                     _ => errors.push(format!(
                         "line {}: bad background-image-fit {value:?}",
                         n + 1
@@ -3992,7 +3995,7 @@ mod tests {
         assert_eq!(cfg.theme, ThemeRef::Named("solarized-light".into()));
         assert_eq!(cfg.copy_on_select, CopyOnSelect::Both);
         assert_eq!(cfg.cursor_shape, CursorShape::Beam);
-        assert!(!cfg.cursor_blink);
+        assert_eq!(cfg.cursor_blink, Some(false));
         assert_eq!(cfg.shell.as_deref(), Some("/bin/zsh"));
     }
 
@@ -4145,7 +4148,7 @@ mod tests {
         let (cfg, errs) = AppConfig::parse("cursor-style = beam\ncursor-style-blink = false");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.cursor_shape, CursorShape::Beam);
-        assert!(!cfg.cursor_blink);
+        assert_eq!(cfg.cursor_blink, Some(false));
         let (_, errs2) = AppConfig::parse("cursor-shape = underline\ncursor-blink = true");
         assert_eq!(errs2.len(), 2, "legacy names must be rejected: {errs2:?}");
     }
