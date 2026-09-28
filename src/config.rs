@@ -281,6 +281,14 @@ pub struct AppConfig {
     pub font_style_bold: Option<String>,
     pub font_style_italic: Option<String>,
     pub font_style_bold_italic: Option<String>,
+    /// `font-variation`/`font-variation-bold`/`font-variation-italic`/
+    /// `font-variation-bold-italic` — OpenType variable-font axis settings
+    /// per face, Ghostty `tag=value` comma syntax (e.g. `wght=700,wdth=85`).
+    /// Each applies only to its face; unset faces get no variations.
+    pub font_variation: Option<String>,
+    pub font_variation_bold: Option<String>,
+    pub font_variation_italic: Option<String>,
+    pub font_variation_bold_italic: Option<String>,
     /// Allow fontique's synthesis for missing faces (Ghostty
     /// `font-synthetic`): `(embolden, oblique)`; `None` = both allowed
     /// (default). Each `font-synthetic = bold|italic|bold-italic` line
@@ -678,6 +686,10 @@ pub struct AppConfig {
     /// `title-report` — answer `CSI 21 t` with `OSC l <title> ST`;
     /// default off (the reference treats it as an information leak).
     pub title_report: bool,
+    /// `vt-kam-allowed` — let `CSI 2 h` (ANSI KAM) lock the keyboard.
+    /// Ghostty default false: the request is refused and typing keeps
+    /// reaching the program.
+    pub vt_kam_allowed: bool,
     /// `search-foreground` / `search-background` (candidate matches).
     pub search_foreground: Option<Rgb>,
     pub search_background: Option<Rgb>,
@@ -737,6 +749,10 @@ impl Default for AppConfig {
             font_style_bold: None,
             font_style_italic: None,
             font_style_bold_italic: None,
+            font_variation: None,
+            font_variation_bold: None,
+            font_variation_italic: None,
+            font_variation_bold_italic: None,
             font_synthetic: None,
             font_codepoint_map: Vec::new(),
             font_thicken: false,
@@ -861,6 +877,7 @@ impl Default for AppConfig {
             selection_clear_on_copy: false,
             undo_timeout_ms: 5000,
             title_report: false,
+            vt_kam_allowed: false,
             search_foreground: None,
             search_background: None,
             search_selected_foreground: None,
@@ -976,6 +993,8 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # font-style-bold = Demi Bold      # named styles for the bold/italic/bold-italic variants
 # font-style-italic = Light Italic
 # font-style-bold-italic = Bold Italic
+# font-variation = wght=400        # variable-font axes, per face: tag=value[,tag=value…]
+# font-variation-bold = wght=700
 # font-thicken-strength = 255      # 0-255 thicken amount when font-thicken = true
 # font-synthetic-style = bold      # allow embolden synthesis; repeat for italic (or no-bold,no-italic,true,false)
 # font-codepoint-map = U+2500-U+257F=DejaVu Sans Mono  # per-codepoint family
@@ -1127,6 +1146,14 @@ impl AppConfig {
                 "font-style-italic" => cfg.font_style_italic = Some(value.to_string()),
                 "font-style-bold-italic" => {
                     cfg.font_style_bold_italic = Some(value.to_string());
+                }
+                "font-variation" => cfg.font_variation = Some(value.to_string()),
+                "font-variation-bold" => cfg.font_variation_bold = Some(value.to_string()),
+                "font-variation-italic" => {
+                    cfg.font_variation_italic = Some(value.to_string());
+                }
+                "font-variation-bold-italic" => {
+                    cfg.font_variation_bold_italic = Some(value.to_string());
                 }
                 "font-synthetic-style" => {
                     // Ghostty's form is `no-bold`,`no-italic`,`no-bold-italic`
@@ -2004,6 +2031,11 @@ impl AppConfig {
                     "false" | "no" => cfg.title_report = false,
                     _ => errors.push(format!("line {}: bad title-report {value:?}", n + 1)),
                 },
+                "vt-kam-allowed" => match value {
+                    "true" | "yes" => cfg.vt_kam_allowed = true,
+                    "false" | "no" => cfg.vt_kam_allowed = false,
+                    _ => errors.push(format!("line {}: bad vt-kam-allowed {value:?}", n + 1)),
+                },
                 "search-foreground" => match parse_rgb(value) {
                     Some(c) => cfg.search_foreground = Some(c),
                     None => errors
@@ -2420,6 +2452,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "toggle_split_zoom", "equalize_splits",
     "sequence:<a,b,…>  (run every action on one chord)",
     "undo", "redo", "toggle_mark", "jump_to_mark:<previous|next>",
+    "cursor_key:<up|down|left|right|home|end|page_up|page_down>",
+    "hide_all_windows",
     "none | unbind  (disable a chord; unbound keys reach the pty)",
 ];
 
@@ -2935,6 +2969,25 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
                 _ => return None,
             }
         }
+        // Ghostty `cursor_key:<up|down|left|right|home|end|page_up|
+        // page_down>` — emits the escape sequence a physical cursor
+        // keypress would send, honoring DECCKM application mode.
+        _ if name.starts_with("cursor_key:") => {
+            use crate::keys::CursorKeyDir as D;
+            TermAction::CursorKey(match &name["cursor_key:".len()..] {
+                "up" => D::Up,
+                "down" => D::Down,
+                "right" => D::Right,
+                "left" => D::Left,
+                "home" => D::Home,
+                "end" => D::End,
+                "page_up" => D::PageUp,
+                "page_down" => D::PageDown,
+                _ => return None,
+            })
+        }
+        // Ghostty `hide_all_windows` — minimize every window.
+        "hide_all_windows" => TermAction::HideAllWindows,
         "inspector" => TermAction::Inspector,
         "inspector:toggle" => TermAction::Inspector,
         "inspector:show" => TermAction::InspectorSet(true),
@@ -3646,6 +3699,73 @@ mod tests {
             Some(TermAction::WriteLastOutputFile(FileSink::Open))
         );
         assert_eq!(cfg.keybinds[3].1, Some(TermAction::OpenConfig));
+    }
+
+    #[test]
+    fn cursor_key_and_hide_all_windows_parse() {
+        use crate::keys::CursorKeyDir as D;
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+u=cursor_key:up\nkeybind = ctrl+alt+h=cursor_key:home\nkeybind = ctrl+alt+n=cursor_key:page_down\nkeybind = ctrl+alt+m=hide_all_windows\nkeybind = ctrl+alt+b=cursor_key:diagonal",
+        );
+        assert_eq!(errs.len(), 1, "bad dir rejected: {errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::CursorKey(D::Up))
+        );
+        assert_eq!(
+            cfg.keybinds[1].1,
+            Some(TermAction::CursorKey(D::Home))
+        );
+        assert_eq!(
+            cfg.keybinds[2].1,
+            Some(TermAction::CursorKey(D::PageDown))
+        );
+        assert_eq!(cfg.keybinds[3].1, Some(TermAction::HideAllWindows));
+        // Works inside `sequence:` too.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = ctrl+alt+s=sequence:cursor_key:left,cursor_key:up",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            cfg.keybinds[0].1,
+            Some(TermAction::Sequence(vec![
+                TermAction::CursorKey(D::Left),
+                TermAction::CursorKey(D::Up),
+            ]))
+        );
+    }
+
+    #[test]
+    fn vt_kam_allowed_parse() {
+        let (cfg, errs) = AppConfig::parse("vt-kam-allowed = true");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.vt_kam_allowed);
+        let (cfg, errs) = AppConfig::parse("vt-kam-allowed = false");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.vt_kam_allowed);
+        let (_, errs) = AppConfig::parse("vt-kam-allowed = maybe");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn font_variation_parse() {
+        use crate::fonts::parse_font_variation;
+        // `wght=700,wdth=85` → two axes; bad tag/number/entry → whole
+        // spec rejected (all-or-nothing like the reference).
+        let v = parse_font_variation("wght=700, wdth=85").unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(parse_font_variation("wght").is_none());
+        assert!(parse_font_variation("wght=seven").is_none());
+        assert!(parse_font_variation("wght=700,bad").is_none());
+        assert!(parse_font_variation("wght=700,,wdth=85").is_none());
+        let (cfg, errs) = AppConfig::parse(
+            "font-variation = wght=200\nfont-variation-bold = wght=100",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.font_variation.as_deref(), Some("wght=200"));
+        assert_eq!(cfg.font_variation_bold.as_deref(), Some("wght=100"));
+        assert!(cfg.font_variation_italic.is_none());
+        assert!(cfg.font_variation_bold_italic.is_none());
     }
 
     #[test]

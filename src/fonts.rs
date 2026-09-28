@@ -8,7 +8,7 @@
 //! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
 
 use parley::fontique::Synthesis;
-use parley::style::{FontFeature, FontFeatures};
+use parley::style::{FontFeature, FontFeatures, FontVariation, FontVariations};
 use parley::setting::Tag;
 use parley::{Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle,
              FontWeight, Layout, LayoutContext, StyleProperty, style::GenericFamily};
@@ -98,6 +98,10 @@ pub struct TermFonts {
     style_bold: Option<(FontWeight, FontStyle)>,
     style_italic: Option<(FontWeight, FontStyle)>,
     style_bold_italic: Option<(FontWeight, FontStyle)>,
+    /// `font-variation` family — OpenType axis settings per face
+    /// (`wght=700,wdth=85`); each applies only to its own run and does
+    /// not inherit.
+    variations: [Option<Vec<FontVariation>>; 4],
     pub metrics: CellMetrics,
 }
 
@@ -189,6 +193,7 @@ impl TermFonts {
             style_bold: None,
             style_italic: None,
             style_bold_italic: None,
+            variations: [None, None, None, None],
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
@@ -274,6 +279,21 @@ impl TermFonts {
             self.family_italic = resolve(italic);
             self.family_bold_italic = resolve(bold_italic);
         });
+    }
+
+    /// Set `font-variation`/`font-variation-bold`/`font-variation-italic`/
+    /// `font-variation-bold-italic` — Ghostty `tag=value` comma lists, one
+    /// per face (`[regular, bold, italic, bold-italic]`); `None` or
+    /// unparsable clears that face's set. Re-measure since `wght`/`wdth`
+    /// move the advance.
+    pub fn set_variations(&mut self, specs: &[Option<String>; 4]) {
+        let parsed: [Option<Vec<FontVariation>>; 4] = std::array::from_fn(|i| {
+            specs[i].as_deref().and_then(parse_font_variation)
+        });
+        if self.variations != parsed {
+            self.variations = parsed;
+            self.metrics = self.probe_metrics();
+        }
     }
 
     /// Re-measure after a font-size change.
@@ -364,6 +384,20 @@ impl TermFonts {
             };
             builder.push_default(StyleProperty::FontWeight(weight));
             builder.push_default(StyleProperty::FontStyle(style));
+            // `font-variation*` axes ride the same (bold, italic) slot —
+            // the regular axis set is face 0, per-variant overrides are
+            // 1..3 and never inherit the regular set.
+            let variant_idx = match (bold, italic) {
+                (false, false) => 0usize,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
+            };
+            if let Some(v) = &self.variations[variant_idx] {
+                builder.push_default(StyleProperty::FontVariations(
+                    FontVariations::List(std::borrow::Cow::Owned(v.clone())),
+                ));
+            }
             if !self.features.is_empty() {
                 builder.push_default(StyleProperty::FontFeatures(
                     FontFeatures::List(std::borrow::Cow::Owned(self.features.clone())),
@@ -438,6 +472,21 @@ impl TermFonts {
         metrics.finish();
         metrics
     }
+}
+
+/// Parse one `font-variation*` value: Ghostty's `tag=value` comma list
+/// (`wght=700,wdth=85`) — tags are 4-byte OpenType axis tags, values f32.
+/// `None` on any malformed entry (the whole line is rejected, matching
+/// the config parser's all-or-nothing convention for bad values).
+pub fn parse_font_variation(spec: &str) -> Option<Vec<FontVariation>> {
+    let mut out = Vec::new();
+    for entry in spec.split(',') {
+        let (tag_s, val_s) = entry.trim().split_once('=')?;
+        let tag = Tag::parse(tag_s.trim())?;
+        let value = val_s.trim().parse::<f32>().ok()?;
+        out.push(FontVariation::new(tag, value));
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Parse a Ghostty named style (`Italic`, `Bold`, `Bold Italic`,

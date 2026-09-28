@@ -260,6 +260,8 @@ impl Session {
             .set_enquiry_response(cfg.enquiry_response.clone());
         // `title-report` — allow `CSI 21 t` only when configured on.
         terminal.proxy.set_title_report(cfg.title_report);
+        // `vt-kam-allowed` — let `CSI 2 h` lock the keyboard at all.
+        terminal.proxy.set_kam_allowed(cfg.vt_kam_allowed);
         Self {
             id,
             terminal: Arc::new(terminal),
@@ -709,6 +711,15 @@ pub struct AppState {
 // `.state(&app)` injection rows read the state back through a plain
 // `AppState` extractor parameter.
 
+thread_local! {
+    /// Every window's `WindowState` binding — each `AppState` registers
+    /// on construction. `hide_all_windows` walks this list; bindings of
+    /// closed windows linger harmlessly (setting Minimized on a dead
+    /// window's state is a no-op).
+    static WINDOW_STATES: RefCell<Vec<Binding<WindowState>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 
 /// Extractor key for a pane's session — a local newtype because the
 /// orphan rule won't let `Extractor` (foreign) be implemented for
@@ -884,7 +895,21 @@ impl AppState {
                 }
             });
         }
+        // `hide_all_windows` — every AppState (main window + each
+        // spawned/torn-off window) registers its window-state binding
+        // here; the action minimizes them all. The drop-down keeps its
+        // own Closed/Normal toggle contract and is not registered.
+        WINDOW_STATES.with(|w| w.borrow_mut().push(state.window_state.clone()));
         state
+    }
+
+    /// `hide_all_windows` — minimize every registered window.
+    pub fn hide_all_windows(&self) {
+        WINDOW_STATES.with(|w| {
+            for s in w.borrow().iter() {
+                s.set(WindowState::Minimized);
+            }
+        });
     }
 
     /// Register a live surface's frame-wake for the theme monitor.
@@ -1090,6 +1115,7 @@ impl AppState {
         self.regrab_globals(config);
         for s in self.sessions.borrow().iter() {
             s.terminal.proxy.set_title_report(config.title_report);
+            s.terminal.proxy.set_kam_allowed(config.vt_kam_allowed);
             // `font-size` applies on reload — but only to terminals
             // that never took a zoom override (`increase_font_size`, …).
             if !s.font_size_override.get() {

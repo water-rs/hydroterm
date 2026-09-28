@@ -132,6 +132,15 @@ struct ProxyInner {
     enquiry: Mutex<Option<String>>,
     /// `title-report` — gate for `CSI 21 t` title queries (default off).
     title_report: AtomicBool,
+    /// `vt-kam-allowed` — whether `CSI 2 h` (ANSI KAM keyboard lock)
+    /// may engage (Ghostty default off: a program locking the keyboard
+    /// is refused, so input keeps working).
+    kam_allowed: AtomicBool,
+    /// Whether KAM is currently locked — set by the output scanner's
+    /// `CSI 2 h`/`CSI 2 l` detection; the surface drops key bytes
+    /// while true (app-level keybinds still fire — KAM only locks
+    /// transmission to the program).
+    kam_locked: AtomicBool,
     /// Latest title seen through `Event::Title`/`ResetTitle` — the
     /// `CSI 21 t` reply needs it where `Term.title` isn't public.
     title: Mutex<String>,
@@ -146,6 +155,8 @@ impl EventProxy {
             wake: Mutex::new((0, Box::new(|| {}))),
             enquiry: Mutex::new(None),
             title_report: AtomicBool::new(false),
+            kam_allowed: AtomicBool::new(false),
+            kam_locked: AtomicBool::new(false),
             title: Mutex::new(String::new()),
         });
         (Self { inner }, rx)
@@ -163,6 +174,29 @@ impl EventProxy {
 
     fn title_report_enabled(&self) -> bool {
         self.inner.title_report.load(Ordering::Relaxed)
+    }
+
+    /// `vt-kam-allowed` — allow/deny ANSI KAM (`CSI 2 h`).
+    pub fn set_kam_allowed(&self, on: bool) {
+        self.inner.kam_allowed.store(on, Ordering::Relaxed);
+        if !on {
+            // A refused lock releases immediately (Ghostty semantics:
+            // the lock is never taken, so there is nothing to undo).
+            self.inner.kam_locked.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn kam_allowed(&self) -> bool {
+        self.inner.kam_allowed.load(Ordering::Relaxed)
+    }
+
+    fn set_kam_locked(&self, on: bool) {
+        self.inner.kam_locked.store(on, Ordering::Relaxed);
+    }
+
+    /// True while ANSI KAM holds — the surface suppresses key bytes.
+    pub fn kam_locked(&self) -> bool {
+        self.inner.kam_locked.load(Ordering::Relaxed)
     }
 
     /// Answer a `CSI 21 t` (`\x1b[21t`) query observed on the output
@@ -1435,6 +1469,61 @@ struct IoLoop {
     /// is swallowed by vte's own `('t', [])` dispatch, so it's matched on
     /// the raw byte stream before the parser sees it.
     csi21t_tail: u64,
+    /// Collector for `\e[…h`/`\e[…l` — ANSI mode 2 (KAM keyboard lock)
+    /// reaches the Handler as `Mode::Unknown(2)` and is dropped, so
+    /// `vt-kam-allowed` needs the same raw-byte path as `title-report`.
+    csi_mode_scan: CsiModeScan,
+}
+
+/// Rolling `CSI <params> h|l` collector. `mode2_hit` reports whether the
+/// completed sequence contained a bare `2` param (`\e[?2h` starts with
+/// `?`, so private modes never match).
+#[derive(Default)]
+struct CsiModeScan {
+    /// `ESC [` has been seen; collect param bytes until a final.
+    collecting: bool,
+    params: Vec<u8>,
+}
+
+impl CsiModeScan {
+    /// Feed one output byte; `Some(set)` when a KAM `\e[…2…]h` (set)
+    /// or `l` (reset) completed.
+    fn feed(&mut self, b: u8) -> Option<bool> {
+        // ESC re-arms from any state — `ESC [ 2 ESC [ 2 h` still locks.
+        if b == 0x1b {
+            self.collecting = false;
+            self.params.clear();
+            self.params.push(0x1b);
+            return None;
+        }
+        if self.collecting {
+            if b == b'h' || b == b'l' {
+                self.collecting = false;
+                let hit = self
+                    .params
+                    .split(|&c| c == b';')
+                    .any(|p| p == b"2");
+                self.params.clear();
+                return hit.then_some(b == b'h');
+            }
+            // params/intermediates only, and bounded — a giant or
+            // malformed sequence abandons the collection.
+            if (0x30..=0x3f).contains(&b) && self.params.len() < 32 {
+                self.params.push(b);
+            } else {
+                self.collecting = false;
+                self.params.clear();
+            }
+            return None;
+        }
+        if self.params.first() == Some(&0x1b) {
+            if b == b'[' {
+                self.collecting = true;
+            }
+            self.params.clear();
+        }
+        None
+    }
 }
 
 impl IoLoop {
@@ -1458,6 +1547,7 @@ impl IoLoop {
                 drain_on_exit,
                 marks,
                 csi21t_tail: 0,
+                csi_mode_scan: CsiModeScan::default(),
             },
             io,
         ))
@@ -1509,15 +1599,26 @@ impl IoLoop {
                 if n == 0 && events.is_empty() {
                     break;
                 }
-                // `title-report`: `\x1b[21t` never reaches the Handler
-                // (vte's `('t', [])` arm only dispatches 14/18/22/23), so
-                // it is matched on the raw output bytes here.
-                if self.proxy.title_report_enabled() {
+                // `title-report` + `vt-kam-allowed`: `\x1b[21t` never
+                // reaches the Handler (vte's `('t', [])` arm only
+                // dispatches 14/18/22/23), and KAM `CSI 2 h`/`l`
+                // arrives as `Mode::Unknown(2)` — both are matched on
+                // the raw output bytes here.
+                let title_scan = self.proxy.title_report_enabled();
+                let kam_scan = self.proxy.kam_allowed();
+                if title_scan || kam_scan {
                     for &b in &seg[..n] {
-                        self.csi21t_tail = (self.csi21t_tail << 8) | u64::from(b);
-                        // `ESC [ 2 1 t`
-                        if self.csi21t_tail & 0xff_ffff_ffff == 0x1b_5b_32_31_74 {
-                            self.proxy.maybe_report_title();
+                        if title_scan {
+                            self.csi21t_tail = (self.csi21t_tail << 8) | u64::from(b);
+                            // `ESC [ 2 1 t`
+                            if self.csi21t_tail & 0xff_ffff_ffff == 0x1b_5b_32_31_74 {
+                                self.proxy.maybe_report_title();
+                            }
+                        }
+                        if kam_scan
+                            && let Some(set) = self.csi_mode_scan.feed(b)
+                        {
+                            self.proxy.set_kam_locked(set);
                         }
                     }
                 }
@@ -1843,6 +1944,36 @@ pub fn fixup_graphemes<T: EventListener>(term: &mut Term<T>) {
 mod tests {
     use super::*;
     use crate::config::ShellFeatures;
+
+    /// `vt-kam-allowed`: the raw-byte CSI scanner reports KAM set/reset
+    /// on `\e[2h`/`\e[2l`, handles multi-param forms, and never matches
+    /// DEC private mode `\e[?2h` or `CSI 21 t` (`title-report`).
+    #[test]
+    fn csi_mode_scan_kam() {
+        let mut s = CsiModeScan::default();
+        let mut feed = |bytes: &[u8]| {
+            let mut out = None;
+            for &b in bytes {
+                if let Some(v) = s.feed(b) {
+                    out = Some(v);
+                }
+            }
+            out
+        };
+        assert_eq!(feed(b"\x1b[2h"), Some(true));
+        assert_eq!(feed(b"\x1b[2l"), Some(false));
+        // Multi-param: `\e[2;4h` sets both; `?2` (DECSET) is not KAM.
+        assert_eq!(feed(b"\x1b[2;4h"), Some(true));
+        assert_eq!(feed(b"\x1b[?2h"), None);
+        assert_eq!(feed(b"\x1b[?2l"), None);
+        assert_eq!(feed(b"\x1b[4h"), None);
+        assert_eq!(feed(b"\x1b[12h"), None);
+        assert_eq!(feed(b"\x1b[21t"), None);
+        // Abandoned sequences never match.
+        assert_eq!(feed(b"\x1b[2x\x1b[2h"), Some(true));
+        // ESC-ESC-[ self-re-sync.
+        assert_eq!(feed(b"\x1b\x1b[2l"), Some(false));
+    }
 
     /// Prompt-mark escapes injected into PS1/PS0 must be wrapped in the
     /// shell's non-printing markers (`\[ \]` for bash, `%{ %}` for zsh) or

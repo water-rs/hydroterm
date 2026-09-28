@@ -8,8 +8,8 @@ bundle_identifier = "dev.lexoliu.hydroterm"
 [framework]
 channel = "dev"
 repository = "https://github.com/water-rs/waterui"
-revision = "697f5a297be95a596cf93265ae7a20d01ec78d6a"
-lock_sha256 = "f6396039ff9fc93259760d222aaff74898085de382170ab69316314facda352b"
+revision = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
+lock_sha256 = "1de91ba7c6adb95461d0fcb7a620987047f906df8bd6a601393ee7b467c597d5"
 minimum-cli-version = "0.4.0"
 rust-version = "1.95.0"
 
@@ -66,11 +66,11 @@ version = "=0.3.1"
 
 [framework.packages.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "a97f58fe68507174bbce6ad181b0def242ef149d"
+rev = "72ae62663efd5a289b77bd9bb5b45cd6950c3842"
 
 [framework.packages.hydrolysis-m3]
 git = "https://github.com/water-rs/hydrolysis-m3"
-rev = "631ba9d656c23280138eb272e11104fed40dce11"
+rev = "303b21a9645e85c31e7cc8fcbcb8d329e7c1d36b"
 
 [framework.packages.objc2]
 version = "=0.5.2"
@@ -131,57 +131,57 @@ version = "=0.15.0"
 
 [framework.packages.waterui]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-assets]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-assets-core]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-backend-core]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-browser-cef]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-controls]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-core]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-dew]
 version = "=0.3.0"
 
 [framework.packages.waterui-dylib]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-ffi]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-form]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-graphics]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-gtk]
 version = "=0.2.1"
 
 [framework.packages.waterui-icon]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-image]
 git = "https://github.com/water-rs/image"
@@ -189,51 +189,51 @@ rev = "5625b8a224600c57fd8f9d464762bf78792a40fc"
 
 [framework.packages.waterui-inspector-protocol]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-internal]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-layout]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-locale]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-macros]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-map]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-mcp]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-media]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-navigation]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-preview]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-preview-protocol]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-shape]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-svg]
 git = "https://github.com/water-rs/svg"
@@ -241,30 +241,92 @@ rev = "03b9f0d5550610a89ecaacc256b5939ff3ce7c95"
 
 [framework.packages.waterui-testing]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-text]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-url]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-video]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-watcher-set]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-webview]
 git = "https://github.com/water-rs/waterui"
-rev = "9971190d7305bff27db2efef17c664bafc365b6c"
+rev = "ee85dc47f2b93d11f1a8ac07a6e1b818511ade7c"
 
 [framework.packages.waterui-winui]
 version = "=0.1.0"
+
+# r54 explicit channel selection: the pinned dev heads (hydrolysis
+# 72ae6266, hydrolysis-m3 303b21a9, nami 78d8fd4f) resolve ahead of the
+# framework lock Water.lock records — each divergent package the
+# framework graph reaches is declared here so the compat check
+# (`sanctioned_source`) certifies it.
+[framework.packages.nami]
+git = "https://github.com/water-rs/nami"
+rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
+
+[framework.packages.nami-core]
+git = "https://github.com/water-rs/nami"
+rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
+
+[framework.packages.nami-derive]
+git = "https://github.com/water-rs/nami"
+rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
+
+[framework.packages.accesskit]
+version = "=0.25.1"
+
+[framework.packages.cc]
+version = "=1.5.1"
+
+[framework.packages.find-msvc-tools]
+version = "=0.1.14"
+
+[framework.packages.js-sys]
+version = "=0.3.106"
+
+[framework.packages.siphasher]
+version = "=1.0.4"
+
+[framework.packages.smallvec]
+version = "=1.16.2"
+
+[framework.packages.wasm-bindgen]
+version = "=0.2.129"
+
+[framework.packages.wasm-bindgen-futures]
+version = "=0.4.79"
+
+[framework.packages.wasm-bindgen-macro]
+version = "=0.2.129"
+
+[framework.packages.wasm-bindgen-macro-support]
+version = "=0.2.129"
+
+[framework.packages.wasm-bindgen-shared]
+version = "=0.2.129"
+
+[framework.packages.web-sys]
+version = "=0.3.106"
+
+[framework.packages.wl-clipboard-rs]
+version = "=0.9.4"
+
+[framework.packages.zerocopy]
+version = "=0.8.59"
+
+[framework.packages.zerocopy-derive]
+version = "=0.8.59"
 
 [framework.patches.crates-io.block]
 git = "https://github.com/Dicklesworthstone/rust-block"
@@ -276,11 +338,11 @@ rev = "a01e5039c290fa869e0f6f3708e621056740f49b"
 
 [framework.patches.crates-io.nami]
 git = "https://github.com/water-rs/nami"
-rev = "f1db5017f5d64cb45b9b304c74ff420377258476"
+rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
 
 [framework.patches.crates-io.nami-core]
 git = "https://github.com/water-rs/nami"
-rev = "f1db5017f5d64cb45b9b304c74ff420377258476"
+rev = "78d8fd4f79c871e2d3d39e6981ff60b184972feb"
 
 [framework.patches.crates-io.vello]
 git = "https://github.com/lexoliu/vello"

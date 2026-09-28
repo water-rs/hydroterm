@@ -758,6 +758,31 @@ pub enum TermAction {
     /// Ghostty `jump_to_mark:previous|next` — scroll the viewport to
     /// the nearest toggled mark (-1 / +1).
     JumpToMark(i32),
+    /// Ghostty `cursor_key:<key>` — emit the escape sequence a physical
+    /// cursor keypress would produce, honoring the terminal's DECCKM
+    /// application-cursor mode.
+    CursorKey(CursorKeyDir),
+    /// Ghostty `hide_all_windows` — minimize every window of this
+    /// instance (main, spawned, torn-off).
+    HideAllWindows,
+}
+
+/// Ghostty `cursor_key:<key>` key set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKeyDir {
+    /// Arrow keys — `\e[A`…`\e[D`, or SS3 `\eOA`…`\eOD` under DECCKM.
+    Up,
+    Down,
+    Right,
+    Left,
+    /// `\e[H` / `\eOH` under DECCKM.
+    Home,
+    /// `\e[F` / `\eOF` under DECCKM.
+    End,
+    /// `\e[5~` (same sequence in both modes).
+    PageUp,
+    /// `\e[6~` (same sequence in both modes).
+    PageDown,
 }
 
 /// Ghostty `adjust_selection:dir` direction set.

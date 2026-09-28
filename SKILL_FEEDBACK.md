@@ -312,3 +312,46 @@ patched in-repo.
   `.detach()` or store the handle."
 - **Lint candidate:** `unused_spawn_handle` — recorded under "Lint
   candidates" above.
+
+### Committed text bypasses `on_key` — input gates need both paths (r54)
+- **Tried:** gating KAM (ANSI mode 2 keyboard lock) on `on_key`'s return.
+- **Skill said:** nothing — the input reference documents `on_key` only.
+- **Actually true:** text that arrives through IME/XIM commit —
+  `SurfaceInputEvent::CompositionCommit` — is delivered to
+  `Surface::on_text` (hydrolysis `src/runner/window.rs`), NOT `on_key`.
+  `xdotool type` goes through the same path, so a key-only gate is
+  trivially bypassed even without a real IME. Any handler that must
+  drop input (KAM, a grab, a modal prompt) belongs in both `on_key`
+  (raw keys) and `on_text` (committed strings).
+- **Concrete edit:** input/keys reference — one line: "`on_key` sees
+  key presses only; IME/commit text reaches `on_text`. Gate both when
+  suppressing input."
+
+### `water run` compat model — Water.lock must be the resolved graph (r54)
+- **Tried:** repinning hydrolysis/nami/hydrolysis-m3 ahead of the
+  framework manifest's gitlinks while Water.lock stayed a byte-copy of
+  waterui's lock.
+- **Skill said:** (r47 entry) Water.lock = byte-copy of waterui's
+  Cargo.lock — true only while pins equal the gitlinks.
+- **Actually true:** `prepare_build` (cli
+  `src/project_model/framework.rs:767`) merges three locks into the
+  scaffold's Cargo.lock keyed by (name,version,source): the previous
+  scaffold lock + `cargo_lock(Water.lock)` (no-source packages are
+  rewritten to `git+<repo>?rev=<framework rev>`) + the app Cargo.lock.
+  A version the canonical lock and the resolved graph disagree on
+  (e.g. accesskit 0.25.0 vs 0.25.1) enters the seed twice and cargo
+  metadata cannot unify the edges — hard fail. Then
+  `validate_dependencies` walks the scaffold graph and fails any
+  ecosystem package whose (name,version,source) ∉ lock ∪
+  `[framework.packages]` sanctions; `[framework.patches]` does NOT
+  sanction.
+- **Working recipe for ahead-of-gitlink pins:** pin every rev in
+  `[framework.packages.<name>] git+rev`; resolve the app
+  (`cargo metadata`) and the scaffold (`cargo metadata` in
+  `hydrolysis/`) once; set Water.lock = union of both resolved locks;
+  refresh `[framework].lock_sha256 = sha256(Water.lock)`. Then the
+  merge is consistent and validation passes trivially.
+- **Concrete edit:** the Water.toml section — document the three-input
+  merge and that Water.lock is the certified resolution of the WHOLE
+  managed build (app + scaffold extras like waterui-mcp), not a copy of
+  upstream's lock.

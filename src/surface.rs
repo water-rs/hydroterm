@@ -447,6 +447,8 @@ pub struct TermSurface {
     style_prefs: (Option<String>, Option<String>, Option<String>),
     font_style_pref: Option<String>,
     variant_style_prefs: (Option<String>, Option<String>, Option<String>),
+    /// `font-variation*` specs — [regular, bold, italic, bold-italic].
+    variation_prefs: [Option<String>; 4],
     codepoint_map_pref: Vec<(u32, u32, String)>,
 
     // geometry (grid size in cells, logical units at draw time)
@@ -565,6 +567,14 @@ impl TermSurface {
             )
         });
         let codepoint_map_pref = app.config(|c| c.font_codepoint_map.clone());
+        let variation_prefs = app.config(|c| {
+            [
+                c.font_variation.clone(),
+                c.font_variation_bold.clone(),
+                c.font_variation_italic.clone(),
+                c.font_variation_bold_italic.clone(),
+            ]
+        });
         let mut fonts = TermFonts::load(fonts, font_size, &family_pref);
         fonts.set_style_families(&style_prefs.0, &style_prefs.1, &style_prefs.2);
         fonts.set_font_style(&font_style_pref);
@@ -573,6 +583,7 @@ impl TermSurface {
             &variant_style_prefs.1,
             &variant_style_prefs.2,
         );
+        fonts.set_variations(&variation_prefs);
         fonts.set_codepoint_map(&codepoint_map_pref);
         Self {
             session,
@@ -581,6 +592,7 @@ impl TermSurface {
             style_prefs,
             font_style_pref,
             variant_style_prefs,
+            variation_prefs,
             codepoint_map_pref,
             palette,
             font_size_pt: font_size,
@@ -1147,6 +1159,8 @@ impl TermSurface {
             TermAction::Redo => self.app.redo_close(),
             TermAction::ToggleMark => self.toggle_mark(),
             TermAction::JumpToMark(dir) => self.jump_mark(dir),
+            TermAction::CursorKey(dir) => self.send_cursor_key(dir),
+            TermAction::HideAllWindows => self.app.hide_all_windows(),
             TermAction::SelectAll => {
                 let mut term = self.session.terminal.term.lock();
                 let history = term.grid().history_size();
@@ -1511,6 +1525,37 @@ impl TermSurface {
         if delta != 0 {
             term.scroll_display(Scroll::Delta(delta));
         }
+    }
+
+    /// `cursor_key:<key>` — emit the sequence a physical keypress would
+    /// send. Arrows and Home/End flip to SS3 under DECCKM application
+    /// cursor mode; PageUp/PageDown are CSI `~` in both modes.
+    fn send_cursor_key(&mut self, dir: crate::keys::CursorKeyDir) {
+        use crate::keys::CursorKeyDir as D;
+        let app = self
+            .session
+            .terminal
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::APP_CURSOR);
+        let seq: &[u8] = match (dir, app) {
+            (D::Up, true) => b"\x1bOA",
+            (D::Up, false) => b"\x1b[A",
+            (D::Down, true) => b"\x1bOB",
+            (D::Down, false) => b"\x1b[B",
+            (D::Right, true) => b"\x1bOC",
+            (D::Right, false) => b"\x1b[C",
+            (D::Left, true) => b"\x1bOD",
+            (D::Left, false) => b"\x1b[D",
+            (D::Home, true) => b"\x1bOH",
+            (D::Home, false) => b"\x1b[H",
+            (D::End, true) => b"\x1bOF",
+            (D::End, false) => b"\x1b[F",
+            (D::PageUp, _) => b"\x1b[5~",
+            (D::PageDown, _) => b"\x1b[6~",
+        };
+        self.write(seq.to_vec());
     }
 
     /// (col, row) the active search match should scroll to center.
@@ -1886,6 +1931,18 @@ impl TermSurface {
             );
             self.variant_style_prefs = variant_style_prefs;
         }
+        let variation_prefs = self.app.config(|c| {
+            [
+                c.font_variation.clone(),
+                c.font_variation_bold.clone(),
+                c.font_variation_italic.clone(),
+                c.font_variation_bold_italic.clone(),
+            ]
+        });
+        if variation_prefs != self.variation_prefs {
+            self.fonts.set_variations(&variation_prefs);
+            self.variation_prefs = variation_prefs;
+        }
         let codepoint_map_pref = self.app.config(|c| c.font_codepoint_map.clone());
         if codepoint_map_pref != self.codepoint_map_pref {
             self.fonts.set_codepoint_map(&codepoint_map_pref);
@@ -2124,6 +2181,12 @@ impl TermSurface {
                 return true;
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
+                // ANSI KAM (`CSI 2 h`, gated by `vt-kam-allowed`):
+                // the program holds the keyboard lock — key bytes are
+                // dropped, not queued. App keybinds above still fire.
+                if self.session.terminal.proxy.kam_locked() {
+                    return true;
+                }
                 self.write(bytes);
                 self.clear_selection_on_input();
                 self.hide_cursor_on_typing();
@@ -2131,8 +2194,10 @@ impl TermSurface {
             }
             false
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
-            self.write(bytes);
-            self.clear_selection_on_input();
+            if !self.session.terminal.proxy.kam_locked() {
+                self.write(bytes);
+                self.clear_selection_on_input();
+            }
             false
         } else {
             false
@@ -2432,6 +2497,12 @@ impl TermSurface {
         // Hint-mode digits are already consumed by `hint_key`'s Character
         // arm — swallow the paired TextInput so nothing reaches the PTY.
         if self.hints.is_some() {
+            return true;
+        }
+        // ANSI KAM: committed text (the IME/composition path — xdotool
+        // and IME input land here, not in `on_key`) is dropped while
+        // the program holds the keyboard lock.
+        if self.session.terminal.proxy.kam_locked() {
             return true;
         }
         self.write(text.as_bytes().to_vec());
