@@ -824,6 +824,9 @@ pub enum TermAction {
     DeactivateKeyTable,
     /// Ghostty `deactivate_all_key_tables` — clear the whole stack.
     DeactivateAllKeyTables,
+    /// Ghostty `crash` / `crash:<cause>` — crash the process on purpose
+    /// (the reference uses it to exercise crash reporting).
+    Crash,
 }
 
 /// Ghostty `cursor_key:<key>` key set.

@@ -48,6 +48,10 @@ pub enum TapEvent {
     Cwd(PathBuf),
     /// OSC 9 ; text / OSC 777 ; notify ; title ; body — notification.
     Notify(String, String),
+    /// OSC 9 ; 4 ; state ; percent — ConEmu progress report (Ghostty
+    /// `progress-style`). `state`: 1 normal, 2 error, 3 indeterminate,
+    /// 4 warning; `percent` 0-100. `None` = state 0, clear the report.
+    Progress(Option<(u8, u8)>),
     /// APC kitty graphics payload — the bytes after `ESC _` up to ST.
     Apc(Vec<u8>),
 }
@@ -247,7 +251,24 @@ impl OscScanner {
                 }
             }
             b"9" => {
-                if let Some(t) = params.get(1).and_then(|p| std::str::from_utf8(p).ok()) {
+                if params.get(1).copied() == Some(b"4" as &[u8]) {
+                    // ConEmu progress: `9;4;st;pr`. Without the split a
+                    // progress update would misfire as a notification
+                    // with body "4".
+                    let num = |i: usize| {
+                        params
+                            .get(i)
+                            .and_then(|p| std::str::from_utf8(p).ok())
+                            .and_then(|s| s.parse::<u8>().ok())
+                            .unwrap_or(0)
+                    };
+                    let st = num(2);
+                    let pr = num(3).min(100);
+                    tap(
+                        TapEvent::Progress(if st == 0 { None } else { Some((st, pr)) }),
+                        &mut self.events,
+                    );
+                } else if let Some(t) = params.get(1).and_then(|p| std::str::from_utf8(p).ok()) {
                     tap(
                         TapEvent::Notify(String::new(), t.to_owned()),
                         &mut self.events,

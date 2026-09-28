@@ -533,13 +533,20 @@ pub struct AppConfig {
     /// `link-hover` — while the link modifier is held and the pointer
     /// is over a link, show the target URL in a status chip at the
     /// bottom-left of the pane (Ghostty `link-hover`, default true).
-    /// `= false` hides the preview; the underline/click affordance
-    /// still follows `link-url`.
+    /// `= false` disables the hover response entirely — no underline,
+    /// no pointer cursor, no preview chip (click-to-open still follows
+    /// `link-url`).
     pub link_hover: bool,
     /// `link-osc8` — OSC 8 hyperlinks are highlighted, previewed and
     /// openable (Ghostty, default true). Independent of `link-url`,
     /// which controls detected plain-text URLs only.
     pub link_osc8: bool,
+    /// `link-previews` — which hovered links show their target in the
+    /// status chip (Ghostty `link-previews`, default true): `true`
+    /// previews both detected URLs and OSC8 links, `osc8` previews only
+    /// OSC8 links (a detected URL's text may differ from its target),
+    /// `false` never shows the chip.
+    pub link_previews: LinkPreviews,
     /// Modifier that must be held for click-to-open-link (Ghostty
     /// `open-link-modifier`-style); default Control.
     pub open_link_modifier: LinkMod,
@@ -567,6 +574,10 @@ pub struct AppConfig {
     /// (Ghostty `desktop-notifications`, default true). Gates only the
     /// freedesktop notify-send hop; in-app badges still apply.
     pub desktop_notifications: bool,
+    /// `progress-style` — whether OSC 9;4 progress sequences show the
+    /// per-pane progress bar (Ghostty `progress-style`, default true).
+    /// `= false` makes OSC 9;4 a silent no-op.
+    pub progress_style: bool,
     /// Quit the app when the last tab/surface closes (Ghostty
     /// `quit-after-last-window-closed`, default true on Linux).
     pub quit_after_last_window_closed: bool,
@@ -676,6 +687,9 @@ pub struct AppConfig {
     /// Repeat `background-image` instead of stretching one copy
     /// (Ghostty `background-image-repeat`).
     pub background_image_repeat: bool,
+    /// Anchor of `background-image` when it does not cover the surface
+    /// (Ghostty `background-image-position`, default center).
+    pub background_image_position: BgPos,
     /// `window-new-tab-position = end|current` — where a new tab is
     /// inserted in the strip (Ghostty `window-new-tab-position`).
     pub new_tab_position: NewTabPosition,
@@ -801,6 +815,52 @@ pub enum BgFit {
     Tile,
 }
 
+/// `link-previews` values (Ghostty `true|false|osc8`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LinkPreviews {
+    /// Preview every hovered link's target.
+    #[default]
+    True,
+    /// Preview only OSC8 hyperlinks.
+    Osc8,
+    /// Never show the link preview chip.
+    False,
+}
+
+/// `background-image-position` anchors (Ghostty, default `center`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BgPos {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    /// `center` — the reference default.
+    #[default]
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl BgPos {
+    /// Anchor factors along each axis: 0.0 = leading edge, 0.5 = center,
+    /// 1.0 = trailing edge.
+    pub fn factors(self) -> (f64, f64) {
+        match self {
+            Self::TopLeft => (0.0, 0.0),
+            Self::TopCenter => (0.5, 0.0),
+            Self::TopRight => (1.0, 0.0),
+            Self::CenterLeft => (0.0, 0.5),
+            Self::Center => (0.5, 0.5),
+            Self::CenterRight => (1.0, 0.5),
+            Self::BottomLeft => (0.0, 1.0),
+            Self::BottomCenter => (0.5, 1.0),
+            Self::BottomRight => (1.0, 1.0),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -907,6 +967,7 @@ impl Default for AppConfig {
             wait_after_command: false,
             abnormal_command_exit_runtime: 250,
             desktop_notifications: true,
+            progress_style: true,
             quit_after_last_window_closed: true,
             quit_after_last_window_closed_delay: None,
             split_divider_color: None,
@@ -939,6 +1000,7 @@ impl Default for AppConfig {
             background_image_opacity: 1.0,
             background_image_fit: BgFit::Cover,
             background_image_repeat: false,
+            background_image_position: BgPos::Center,
             new_tab_position: NewTabPosition::End,
             inherit_working_directory: true,
             tab_inherit_working_directory: true,
@@ -949,6 +1011,7 @@ impl Default for AppConfig {
             link_url: true,
             link_hover: true,
             link_osc8: true,
+            link_previews: LinkPreviews::True,
             word_select_chars: alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.to_string(),
             visual_bell: true,
             visual_bell_color: None,
@@ -1855,6 +1918,15 @@ impl AppConfig {
                 "link-hover" => {
                     cfg.link_hover = bool_value(value, n, &mut errors);
                 }
+                "link-previews" => match value {
+                    "true" => cfg.link_previews = LinkPreviews::True,
+                    "osc8" => cfg.link_previews = LinkPreviews::Osc8,
+                    "false" => cfg.link_previews = LinkPreviews::False,
+                    _ => errors.push(format!(
+                        "line {}: bad link-previews {value:?} (true|osc8|false)",
+                        n + 1
+                    )),
+                },
                 "link-osc8" => {
                     cfg.link_osc8 = bool_value(value, n, &mut errors);
                 }
@@ -1979,6 +2051,26 @@ impl AppConfig {
                 "background-image-repeat" => {
                     cfg.background_image_repeat = bool_value(value, n, &mut errors);
                 }
+                "background-image-position" => {
+                    cfg.background_image_position = match value {
+                        "top-left" => BgPos::TopLeft,
+                        "top-center" => BgPos::TopCenter,
+                        "top-right" => BgPos::TopRight,
+                        "center-left" => BgPos::CenterLeft,
+                        "center" => BgPos::Center,
+                        "center-right" => BgPos::CenterRight,
+                        "bottom-left" => BgPos::BottomLeft,
+                        "bottom-center" => BgPos::BottomCenter,
+                        "bottom-right" => BgPos::BottomRight,
+                        _ => {
+                            errors.push(format!(
+                                "line {}: bad background-image-position {value:?}",
+                                n + 1
+                            ));
+                            BgPos::Center
+                        }
+                    };
+                }
                 "window-new-tab-position" => {
                     match value {
                         "end" => cfg.new_tab_position = NewTabPosition::End,
@@ -2098,6 +2190,9 @@ impl AppConfig {
                         n + 1
                     )),
                 },
+                "progress-style" => {
+                    cfg.progress_style = bool_value(value, n, &mut errors);
+                }
                 "desktop-notifications" => {
                     cfg.desktop_notifications = bool_value(value, n, &mut errors);
                 }
@@ -3512,6 +3607,17 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "clear_scrollback" => TermAction::ClearScrollback,
         "clear_screen" => TermAction::ClearScreen,
         "reset" => TermAction::Reset,
+        // Ghostty `crash:<thread>` — a deliberate fatal crash for
+        // exercising crash reporting. The reference parameter picks
+        // the thread (main|io|render); SIGABRT on any thread aborts the
+        // process identically, so we validate the name and crash here.
+        "crash" => TermAction::Crash,
+        _ if name
+            .strip_prefix("crash:")
+            .is_some_and(|t| matches!(t, "main" | "io" | "render")) =>
+        {
+            TermAction::Crash
+        }
         "search" => TermAction::Search,
         "start_search" => TermAction::StartSearch,
         "end_search" => TermAction::EndSearch,

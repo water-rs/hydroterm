@@ -126,6 +126,9 @@ pub struct DrawContext<'a> {
     /// underline (Ghostty "not highlighted"), matching the dead
     /// interaction path.
     pub link_osc8: bool,
+    /// `progress-style` — the pane's OSC 9;4 report `(state, percent)`;
+    /// a 3px bar along the pane's bottom edge. `None` = hidden.
+    pub progress: Option<(u8, u8)>,
     /// Cursor thickness multiplier (Ghostty `adjust-cursor-thickness`);
     /// 1.0 = the default beam/underline size.
     pub cursor_thickness: f32,
@@ -692,6 +695,27 @@ pub fn draw_term(
             )),
             None,
             &rect(1.5, 1.5, ctx.width - 1.5, ctx.height - 1.5).to_path(0.0),
+        );
+    }
+
+    // -- OSC 9;4 progress (`progress-style`) ----------------------------------
+    // A 3px bar along the pane's bottom edge — the Ghostty surface's
+    // progress channel. States: 1 normal / 2 error / 3 indeterminate /
+    // 4 warning; the bar fills to `percent` for the deterministic states
+    // and runs full-width at half alpha while indeterminate.
+    if let Some((state, pct)) = ctx.progress {
+        let (color, frac, alpha) = match state {
+            2 => (palette.at(9), f32::from(pct).min(100.0) / 100.0, 0.9),
+            3 => (palette.accent, 1.0, 0.45),
+            4 => (palette.at(11), f32::from(pct).min(100.0) / 100.0, 0.9),
+            _ => (palette.accent, f32::from(pct).min(100.0) / 100.0, 0.9),
+        };
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &Brush::Solid(peniko_alpha(color, alpha)),
+            None,
+            &rect(0.0, ctx.height - 3.0, ctx.width * frac, 3.0),
         );
     }
 }

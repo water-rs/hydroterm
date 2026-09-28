@@ -673,14 +673,16 @@ impl TermSurface {
     /// cached; opacity/fit/repeat are applied per frame (hot reload).
     fn bg_image_draw(&self, w: f64, h: f64) -> Option<(peniko::ImageBrush, kurbo::Affine)> {
         use crate::config::BgFit;
-        let (path, opacity, fit, repeat) = self.app.config(|c| {
+        let (path, opacity, fit, repeat, pos) = self.app.config(|c| {
             (
                 c.background_image.clone(),
                 c.background_image_opacity,
                 c.background_image_fit,
                 c.background_image_repeat,
+                c.background_image_position,
             )
         });
+        let (fx, fy) = pos.factors();
         let path = path?;
         let mut cache = self.bg_img.borrow_mut();
         if cache.0.as_deref() != Some(path.as_path()) {
@@ -714,14 +716,18 @@ impl TermSurface {
         // brush_transform maps image-pixel space into the surface rect.
         let transform = match fit {
             BgFit::Stretch => kurbo::Affine::scale_non_uniform(w / iw, h / ih),
-            BgFit::Tile => kurbo::Affine::IDENTITY,
+            // Tiles repeat past every edge, so the position just shifts
+            // the pattern origin to the anchored edge (Ghostty).
+            BgFit::Tile => kurbo::Affine::translate(((w - iw) * fx, (h - ih) * fy)),
             BgFit::Contain | BgFit::Cover => {
                 let s = if matches!(fit, BgFit::Contain) {
                     (w / iw).min(h / ih)
                 } else {
                     (w / iw).max(h / ih)
                 };
-                kurbo::Affine::translate(((w - iw * s) / 2.0, (h - ih * s) / 2.0))
+                // `background-image-position`: fx/fy are the anchor
+                // fractions (0 = leading edge, 1 = trailing).
+                kurbo::Affine::translate(((w - iw * s) * fx, (h - ih * s) * fy))
                     * kurbo::Affine::scale(s)
             }
         };
@@ -901,8 +907,10 @@ impl TermSurface {
         let text = self.session.terminal.term.lock().selection_to_string();
         if let Some(text) = text {
             let text = self.trimmed_copy(text);
-            if let Some(clip) = self.clipboard.as_mut() {
-                let _ = clip.set_text(&text);
+            if let Some(clip) = self.clipboard.as_mut()
+                && let Err(e) = clip.set_text(&text)
+            {
+                tracing::warn!(bytes = text.len(), error = %e, "clipboard write failed");
             }
             // `app-notifications = clipboard-copy` — the copy toast.
             if self.app.config(|c| c.app_notify_clipboard_copy)
@@ -935,8 +943,9 @@ impl TermSurface {
             }
             if matches!(mode, CoS::Clipboard | CoS::Both)
                 && let Some(clip) = self.clipboard.as_mut()
+                && let Err(e) = clip.set_text(&text)
             {
-                let _ = clip.set_text(&text);
+                tracing::warn!(bytes = text.len(), error = %e, "clipboard write failed");
             }
             // PRIMARY tracks the last selection — a middle click
             // anywhere pastes what was last selected.
@@ -1540,20 +1549,28 @@ impl TermSurface {
                 self.session.inspector_open.set(open);
             }
             TermAction::Ignore => {}
+            // Ghostty `crash:<cause>` — an intentional fatal crash for
+            // exercising the host's crash reporter. SIGABRT, matching
+            // the reference's abort semantics.
+            TermAction::Crash => std::process::abort(),
             TermAction::CopyUrlToClipboard => {
                 let (x, y) = self.pointer_at;
                 if let Some(uri) = self.link_at(self.grid_point(x, y))
                     && let Some(clip) = self.clipboard.as_mut()
+                    && let Err(e) = clip.set_text(&uri)
                 {
-                    let _ = clip.set_text(&uri);
+                    tracing::warn!(bytes = uri.len(), error = %e, "clipboard write failed");
                 }
             }
             TermAction::OpenUrl(uri) => {
                 self.open_uri(&uri);
             }
             TermAction::CopyTitleToClipboard => {
-                if let Some(clip) = self.clipboard.as_mut() {
-                    let _ = clip.set_text(self.session.title.snapshot().as_ref());
+                let title = self.session.title.snapshot();
+                if let Some(clip) = self.clipboard.as_mut()
+                    && let Err(e) = clip.set_text(title.as_ref())
+                {
+                    tracing::warn!(bytes = title.len(), error = %e, "clipboard write failed");
                 }
             }
             TermAction::ToggleMouseVisibility => {
@@ -1827,8 +1844,9 @@ impl TermSurface {
                     if allowed
                         && text.len() <= limit
                         && let Some(clip) = self.clipboard.as_mut()
+                        && let Err(e) = clip.set_text(&text)
                     {
-                        let _ = clip.set_text(&text);
+                        tracing::warn!(bytes = text.len(), error = %e, "clipboard write failed");
                     }
                 }
                 TermEvent::ClipboardLoad(_ty, fmt) => {
@@ -2048,6 +2066,13 @@ impl TermSurface {
                                 self.session.id,
                                 Str::from(format!("\u{1f514} {text}")),
                             );
+                        }
+                    }
+                    TapEvent::Progress(p) => {
+                        // `progress-style = false` makes OSC 9;4 a
+                        // silent no-op (Ghostty).
+                        if self.app.config(|c| c.progress_style) {
+                            self.session.progress.set(p);
                         }
                     }
                     TapEvent::Apc(_payload) => {}
@@ -2296,11 +2321,26 @@ impl TermSurface {
         } else {
             rows.max(10)
         };
-        // Upper bound: no monitor-size API exists, so an absurd request
-        // (e.g. 65535) is capped at a sane ceiling instead of the
-        // screen edge Ghostty would use.
-        let want_cols = want_cols.min(400);
-        let want_rows = want_rows.min(200);
+        // Ghostty clamps to the screen. The platform only clamps a
+        // first-mapped window's position, never a mapped window's size
+        // (hydrolysis#270), and an over-screen request here wraps at the
+        // X11 CARD16 boundary — so clamp cell counts to what fits the
+        // X root (no monitor API exists; Wayland gets no clamp).
+        let (want_cols, want_rows) = match crate::quickterm::screen_size() {
+            Some((sw, sh)) => (
+                want_cols.min(
+                    (((sw - f64::from(pad_x) * 2.0) / f64::from(m.cell_w))
+                        .floor()
+                        .max(1.0)) as u16,
+                ),
+                want_rows.min(
+                    (((sh - f64::from(pad_y) * 2.0 - f64::from(strip)) / f64::from(m.cell_h))
+                        .floor()
+                        .max(1.0)) as u16,
+                ),
+            ),
+            None => (want_cols, want_rows),
+        };
         let size = UiSize::new(
             want_cols as f32 * m.cell_w + pad_x * 2.0,
             want_rows as f32 * m.cell_h + pad_y * 2.0 + strip,
@@ -2316,22 +2356,24 @@ impl TermSurface {
         if self.held_mod_codes.is_empty() {
             return mods;
         }
-        let remap = self.app.config(|c| c.key_remap.clone());
-        if remap.is_empty() {
-            return mods;
-        }
-        let mut seen = Modifiers::empty();
-        let mut out = Modifiers::empty();
-        for &code in &self.held_mod_codes {
-            let natural = natural_mod(code);
-            seen |= natural;
-            out |= remap
-                .iter()
-                .find(|(c, _)| *c == code)
-                .map(|(_, m)| *m)
-                .unwrap_or(natural);
-        }
-        out | (mods & !seen)
+        self.app.config(|c| {
+            let remap = &c.key_remap;
+            if remap.is_empty() {
+                return mods;
+            }
+            let mut seen = Modifiers::empty();
+            let mut out = Modifiers::empty();
+            for &code in &self.held_mod_codes {
+                let natural = natural_mod(code);
+                seen |= natural;
+                out |= remap
+                    .iter()
+                    .find(|(rc, _)| *rc == code)
+                    .map(|(_, m)| *m)
+                    .unwrap_or(natural);
+            }
+            out | (mods & !seen)
+        })
     }
 
     /// Track a held/released physical modifier `Code` (no-op for
@@ -2977,20 +3019,36 @@ impl TermSurface {
         {
             self.refresh_menu_ctx();
         }
-        let segs = if self.modifiers.contains(self.link_modifier()) {
-            self.link_span_at(self.grid_point(x, y))
-        } else {
-            Vec::new()
-        };
+        // `link-hover = false` disables the whole hover response —
+        // underline, pointer cursor and preview chip (Ghostty).
+        let segs =
+            if self.modifiers.contains(self.link_modifier()) && self.app.config(|c| c.link_hover) {
+                self.link_span_at(self.grid_point(x, y))
+            } else {
+                Vec::new()
+            };
         if segs != self.hover_link {
             self.hover_link = segs;
         }
-        // `link-hover` — publish the hovered link's target for the
-        // pane's status chip (Ghostty shows the URL on modifier hover).
-        let hover_text = if self.hover_link.is_empty() || !self.app.config(|c| c.link_hover) {
+        // `link-previews` — the hovered link's target in the pane's
+        // status chip; `osc8` previews only stored hyperlinks, since a
+        // detected URL's text may differ from its target (Ghostty).
+        let hover_text = if self.hover_link.is_empty()
+            || self.app.config(|c| c.link_previews) == crate::config::LinkPreviews::False
+        {
             String::new()
         } else {
-            self.link_at(self.grid_point(x, y)).unwrap_or_default()
+            let point = self.grid_point(x, y);
+            let is_osc8 = {
+                let term = self.session.terminal.term.lock();
+                term.grid()[point].hyperlink().is_some()
+            };
+            if is_osc8 || self.app.config(|c| c.link_previews) == crate::config::LinkPreviews::True
+            {
+                self.link_at(point).unwrap_or_default()
+            } else {
+                String::new()
+            }
         };
         if self.session.link_hover_text.snapshot().as_str() != hover_text.as_str() {
             self.session.link_hover_text.set_from(hover_text);
@@ -3415,8 +3473,9 @@ impl TermSurface {
     fn copy_last_output(&mut self) {
         if let (Some(text), Some(clip)) = (self.last_output_text(), self.clipboard.as_mut())
             && !text.is_empty()
+            && let Err(e) = clip.set_text(&text)
         {
-            let _ = clip.set_text(&text);
+            tracing::warn!(bytes = text.len(), error = %e, "clipboard write failed");
         }
     }
 
@@ -3493,8 +3552,10 @@ impl TermSurface {
                 self.app.new_tab_command(cmd);
             }
             FileSink::Copy => {
-                if let Some(clip) = self.clipboard.as_mut() {
-                    let _ = clip.set_text(&path);
+                if let Some(clip) = self.clipboard.as_mut()
+                    && let Err(e) = clip.set_text(&path)
+                {
+                    tracing::warn!(bytes = path.len(), error = %e, "clipboard write failed");
                 }
             }
             FileSink::Paste => {
@@ -3779,6 +3840,7 @@ impl TermSurface {
             bg_image,
             unfocused_fill: self.app.config(|c| c.unfocused_split_fill),
             link_osc8: self.app.config(|c| c.link_osc8),
+            progress: self.session.progress.snapshot(),
             cursor_thickness: self.app.config(|c| {
                 if c.adjust_cursor_thickness == 0 {
                     1.0

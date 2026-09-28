@@ -205,6 +205,10 @@ pub struct Session {
     /// bottom-left chip while the open-link modifier is held and the
     /// pointer is over a link; empty when hidden.
     pub link_hover_text: Binding<Str>,
+    /// `progress-style` — the pane's latest OSC 9;4 report
+    /// (`(state, percent)`; state 1 normal, 2 error, 3 indeterminate,
+    /// 4 warning). `None` clears the bottom-edge progress bar.
+    pub progress: Binding<Option<(u8, u8)>>,
     /// `toggle_mark` rows — absolute grid rows (`history_size + screen
     /// line`, the same convention `prompt_marks` uses; rows drift when
     /// scrollback overflows and drops its oldest lines). Invisible —
@@ -327,6 +331,7 @@ impl Session {
             search_field_focus: Binding::default(),
             search_status: binding(Str::from("")),
             link_hover_text: binding(Str::from("")),
+            progress: Binding::default(),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             key_tables: RefCell::new(Vec::new()),
             mouse_reporting_off: Cell::new(false),
