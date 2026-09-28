@@ -618,6 +618,10 @@ pub struct PaneTab {
     pub badge: Binding<bool>,
 }
 
+/// One live `keybind = global:chord=action` grab: `(chord, action,
+/// stop-flag)` — the flag tells its X11 grab thread to release.
+type GlobalGrab = (String, TermAction, std::sync::Arc<AtomicBool>);
+
 /// Everything tabs and surfaces share.
 #[derive(Clone)]
 #[state]
@@ -639,10 +643,10 @@ pub struct AppState {
     /// Live `keybind = global:chord=action` X11 grabs — each entry's
     /// flag stops its grab thread (dropping the connection releases
     /// the key). Config reloads diff this against the new keybinds.
-    pub global_grabs: RefCell<Vec<(String, TermAction, std::sync::Arc<AtomicBool>)>>,
+    pub global_grabs: Rc<RefCell<Vec<GlobalGrab>>>,
     /// The `quick-terminal-position`/`quick-terminal-size` pair the
     /// cached quick app was built with — a changed value drops it.
-    applied_quick_geo: RefCell<QuickGeo>,
+    applied_quick_geo: Rc<RefCell<QuickGeo>>,
     /// Live-applied `tab-bar-min-tabs` config value.
     pub tab_bar_min: Binding<usize>,
     /// `toggle_tab_bar` manual override: `Some(true)` forces the strip
@@ -711,13 +715,13 @@ pub struct AppState {
     quick_presentation: WindowPresentation,
     /// Lazily-created session set for the quick window — kept alive across
     /// show/hide cycles so the drop-down keeps its shell + scrollback.
-    quick_app: RefCell<Option<Rc<AppState>>>,
+    quick_app: Rc<RefCell<Option<Rc<AppState>>>>,
     /// The X11 grab listener spawn only happens once per process.
     quick_listener_started: Rc<AtomicBool>,
     /// Retained drain-future handle — dropping a spawned task cancels it.
     quick_task: Rc<RefCell<Option<Box<dyn std::any::Any>>>>,
     /// Hotkey fires but grab failed (no X11) — surface it once.
-    pub quick_unavailable: RefCell<bool>,
+    pub quick_unavailable: Rc<RefCell<bool>>,
     /// True for the drop-down's own AppState: it neither hosts a quick
     /// window itself nor spawns a second key grab.
     /// Ghostty `undo` — the most recently closed tabs, newest last.
@@ -729,7 +733,7 @@ pub struct AppState {
     last_restored: Rc<RefCell<Option<u64>>>,
     /// True after the first `spawn_session` — `command` is consumed as
     /// initial-surface-only and never re-applied by a hot reload.
-    initial_spawn: std::cell::Cell<bool>,
+    initial_spawn: Rc<std::cell::Cell<bool>>,
     is_quick: bool,
     /// Weak handles to live terminals so the theme monitor thread can
     /// request frames (dirty is only read inside `poll_config`).
@@ -868,15 +872,15 @@ impl AppState {
             quick_state: quick_binding.clone(),
             quick_frame: Rc::new(RefCell::new(None)),
             quick_presentation: WindowPresentation::new(&quick_binding),
-            quick_app: RefCell::new(None),
-            global_grabs: RefCell::new(Vec::new()),
-            applied_quick_geo: RefCell::new(applied_quick_geo),
+            quick_app: Rc::new(RefCell::new(None)),
+            global_grabs: Rc::new(RefCell::new(Vec::new())),
+            applied_quick_geo: Rc::new(RefCell::new(applied_quick_geo)),
             quick_listener_started: Rc::new(AtomicBool::new(false)),
             quick_task: Rc::new(RefCell::new(None)),
-            quick_unavailable: RefCell::new(false),
+            quick_unavailable: Rc::new(RefCell::new(false)),
             closed_stack: Rc::new(RefCell::new(Vec::new())),
             last_restored: Rc::new(RefCell::new(None)),
-            initial_spawn: std::cell::Cell::new(false),
+            initial_spawn: Rc::new(std::cell::Cell::new(false)),
             is_quick: false,
             theme_wakes: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -1987,10 +1991,6 @@ impl AppState {
         let armed = self
             .session(session_id)
             .is_some_and(|s| *s.notify_badge.lock().unwrap());
-        #[expect(
-            if_else_view,
-            reason = "the arms produce a Str, not a View — when().otherwise() is not applicable"
-        )]
         let prefixed = if armed && self.config(|c| c.bell_title) {
             Str::from(format!("\u{1f514} {title}"))
         } else {

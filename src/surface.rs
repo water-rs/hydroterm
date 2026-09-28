@@ -514,16 +514,12 @@ pub struct TermSurface {
     /// `toggle_mouse_visibility` manual hide state — survives pointer
     /// motion until toggled off (Ghostty).
     pointer_hidden: bool,
-    /// Text staged by the `TextInput` event hydrolysis delivers BEFORE
-    /// the `Key` press it pairs with (platform.rs queues text first).
-    /// The key's verdict decides it: an action-consumed press drops the
-    /// text, anything else flushes it through `on_text`.
-    pending_text: Option<String>,
     /// Set inside `on_key` when the press was claimed by an action
-    /// (keybind, built-in chord, keysel, modal prompt) — drops
-    /// `pending_text` so a bound key never echoes into the PTY. Text
-    /// prompts leave it unset: their `on_text` arm still wants the char.
-    suppress_pending_text: bool,
+    /// (keybind, built-in chord, keysel, modal prompt) — suppresses the
+    /// `TextInput` hydrolysis delivers right after the press so a bound
+    /// key never echoes into the PTY. Text prompts leave it unset:
+    /// their `on_text` arm still wants the char.
+    suppress_key_text: bool,
     /// `content_gen` seen by the last `build()` — `scroll-to-bottom
     /// output` snaps when the term publishes new cells while scrolled.
     last_output_gen: Cell<u64>,
@@ -637,8 +633,7 @@ impl TermSurface {
             cursor_hider: None,
             cursor_hider_tried: false,
             pointer_hidden: false,
-            pending_text: None,
-            suppress_pending_text: false,
+            suppress_key_text: false,
             last_output_gen: Cell::new(0),
             primary: waterkit_clipboard::PrimarySelection::new().ok(),
             pointer_at: (0.0, 0.0),
@@ -1349,12 +1344,15 @@ impl TermSurface {
                     self.paste_text(&t, bracketed);
                 }
             }
-            // No `Scroll::Row` variant in the pinned alacritty — the
-            // targets convert to a delta off `display_offset`.
+            // Ghostty counts the target down from the scrollback top
+            // (`scroll_to_fraction:0` = oldest line, `1` = live edge;
+            // `scroll_to_row:n` puts scrollback row `n` at the viewport
+            // top); alacritty's `display_offset` counts up from the
+            // bottom, so the desired offset is `history - target`.
             TermAction::ScrollToFraction(f) => {
                 let mut term = self.session.terminal.term.lock();
                 let history = term.grid().history_size();
-                let target = (history as f64 * f).round() as usize;
+                let target = (history as f64 * (1.0 - f)).round() as usize;
                 let delta = target as i32 - term.grid().display_offset() as i32;
                 if delta != 0 {
                     term.scroll_display(Scroll::Delta(delta));
@@ -1363,7 +1361,7 @@ impl TermSurface {
             TermAction::ScrollToRow(n) => {
                 let mut term = self.session.terminal.term.lock();
                 let history = term.grid().history_size();
-                let target = n.min(history);
+                let target = history.saturating_sub(n);
                 let delta = target as i32 - term.grid().display_offset() as i32;
                 if delta != 0 {
                     term.scroll_display(Scroll::Delta(delta));
@@ -2214,7 +2212,7 @@ impl TermSurface {
                 Key::Named(NamedKey::Escape) => self.clipboard_read_confirm(false),
                 _ => {}
             }
-            self.suppress_pending_text = true;
+            self.suppress_key_text = true;
             return true;
         }
         // `confirm-close` snackbar: Enter closes, Escape cancels —
@@ -2238,14 +2236,14 @@ impl TermSurface {
         // Enter opens, Escape cancels — everything else cancels and falls
         // through to normal handling.
         if pressed && self.hints.is_some() && self.hint_key(key) {
-            self.suppress_pending_text = true;
+            self.suppress_key_text = true;
             return true;
         }
         // Keyboard selection mode (`start_selection`): navigation keys
         // extend the mark, Enter copies, Escape cancels; any other key
         // exits and falls through to normal handling.
         if pressed && self.keysel.is_some() && self.keysel_key(key) {
-            self.suppress_pending_text = true;
+            self.suppress_key_text = true;
             return true;
         }
         let mode = *self.session.terminal.term.lock().mode();
@@ -2304,7 +2302,7 @@ impl TermSurface {
                         if trig.unconsumed && !trig.all && !trig.global {
                             fired_unconsumed = true;
                         } else {
-                            self.suppress_pending_text = true;
+                            self.suppress_key_text = true;
                             return true;
                         }
                     }
@@ -2320,7 +2318,7 @@ impl TermSurface {
                 && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
             {
                 self.do_action(action);
-                self.suppress_pending_text = true;
+                self.suppress_key_text = true;
                 return true;
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
@@ -3869,17 +3867,6 @@ impl SceneContent for TermSurface {
                 }
             }
         }
-        // `pending_text` pairs a TextInput with the Key press that
-        // follows it. Anything else arriving first means the pair broke
-        // (a dropped event) — flush rather than strand the text.
-        let pairs_with_key = matches!(
-            event,
-            SurfaceInputEvent::TextInput(_) | SurfaceInputEvent::Key { pressed: true, .. }
-        );
-        let mut flushed = false;
-        if !pairs_with_key && let Some(t) = self.pending_text.take() {
-            flushed = self.on_text(&t);
-        }
         // A frame is only requested when the handler changed what the
         // scene draws. Keystrokes that just write bytes to the PTY need
         // no invalidation — the echoed output repaints through the wake
@@ -3924,28 +3911,24 @@ impl SceneContent for TermSurface {
                         "[key] pressed={pressed} key={key:?} code={code:?} mods={modifiers:?}"
                     );
                 }
-                // The press pairs with the staged TextInput: when an
-                // action consumes it, the text is dropped instead of
-                // reaching the PTY.
-                let paired = if *pressed { self.pending_text.take() } else { None };
-                self.suppress_pending_text = false;
-                let mut r = self.on_key(*pressed, key, *code, *modifiers);
-                if let Some(t) = paired
-                    && !self.suppress_pending_text
-                {
-                    r = self.on_text(&t) || r;
+                // hydrolysis delivers the press before its text
+                // (keydown → beforeinput): a press an action consumed
+                // suppresses the TextInput that follows it.
+                if *pressed {
+                    self.suppress_key_text = false;
                 }
-                r
+                self.on_key(*pressed, key, *code, *modifiers)
             }
             SurfaceInputEvent::TextInput(text) => {
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
                     eprintln!("[text] {text:?}");
                 }
-                // hydrolysis emits TextInput BEFORE the Key press it
-                // belongs to — stage it; the Key's verdict decides
-                // whether it lands (consumed actions drop it).
-                self.pending_text = Some(text.to_string());
-                false
+                if self.suppress_key_text {
+                    self.suppress_key_text = false;
+                    false
+                } else {
+                    self.on_text(text.as_str())
+                }
             }
             SurfaceInputEvent::CompositionStart => {
                 if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
@@ -3978,7 +3961,7 @@ impl SceneContent for TermSurface {
                 true
             }
         };
-        if (needs_frame || flushed)
+        if needs_frame
             && let Some(invalidator) = &self.invalidator
         {
             invalidator();
