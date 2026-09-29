@@ -109,6 +109,31 @@ pub enum QuickTermPosition {
     Center,
 }
 
+/// `quick-terminal-screen` — the monitor the drop-down resolves
+/// against (Ghostty `quick-terminal-screen`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuickTerminalScreen {
+    /// The app's focused window's monitor (`main`).
+    #[default]
+    Main,
+    /// The monitor under the pointer (`mouse`).
+    Mouse,
+    /// The primary monitor (`macos-menu-bar`).
+    MacosMenuBar,
+}
+
+/// `quick-terminal-keyboard-interactivity` — the drop-down's focus
+/// policy (Ghostty `quick-terminal-keyboard-interactivity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickTerminalKeyboardInteractivity {
+    /// The window never takes keyboard focus (`none`).
+    None,
+    /// Showing does not focus; a click does (`on-demand`).
+    OnDemand,
+    /// Showing focuses the window (`exclusive`).
+    Exclusive,
+}
+
 /// `quick-terminal-size` — one axis extent of the drop-down window:
 /// a percentage of the screen (`50%`) or pixels (`300px`). A bare
 /// number is a config error (Ghostty `quick-terminal-size`).
@@ -280,6 +305,55 @@ pub struct KeybindTrigger {
     /// named table and only matches while that table is active.
     /// `None` is the default table.
     pub table: Option<String>,
+    /// Ghostty trigger sequence (`a>b>c=action`): empty for a plain
+    /// trigger; ≥2 steps for a sequence. Steps carry their own
+    /// modifier mask and may be `physical:` or `catch_all`.
+    pub seq: Vec<SeqStep>,
+}
+
+/// One step of a `>` trigger sequence (Ghostty `Trigger`):
+/// `shift+a`, `ctrl+physical:b`, `catch_all`, `ctrl+catch_all`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqStep {
+    /// Canonical modifier part — the `mods_prefix` form (`"ctrl+alt"`,
+    /// `""` when none).
+    pub mods: String,
+    /// Canonical key name (`"a"`, `"escape"`, `"catch_all"`).
+    pub key: String,
+    /// `physical:` step — `key` is the normalized name, `code` the
+    /// winit position to compare.
+    pub code: Option<Code>,
+    /// `catch_all` step — matches any key not otherwise bound (with
+    /// the step's modifiers when `mods` is non-empty).
+    pub catch_all: bool,
+}
+
+/// A resolved key press for sequence matching / replay (the surface's
+/// `key`/`code`/`modifiers` triple).
+#[derive(Debug, Clone)]
+pub struct SeqPress {
+    /// The layout-translated key.
+    pub key: Key,
+    /// The physical key position.
+    pub code: Code,
+    /// The modifiers held with the press.
+    pub mods: Modifiers,
+}
+
+/// Result of probing a pending trigger sequence (Ghostty `a>b`
+/// semantics: a bind whose trigger is a prefix of a longer bound
+/// sequence is shadowed — it stays pending, never fires).
+#[derive(Debug)]
+pub enum SeqProbe {
+    /// `presses` exactly equals a bound sequence (and no longer bound
+    /// sequence extends it). Carries the trigger, action and the
+    /// matched table's name like `lookup_keybind_tabled`.
+    Fire(KeybindTrigger, Option<TermAction>, Option<String>),
+    /// `presses` is a proper prefix of at least one bound sequence —
+    /// keep collecting.
+    Continue,
+    /// No bound sequence starts with `presses`.
+    Miss,
 }
 
 /// Fully-resolved settings — defaults plus file overrides.
@@ -352,6 +426,19 @@ pub struct AppConfig {
     pub quick_terminal_autohide: bool,
     /// `quick-terminal-position` — drop-down dock edge (top default).
     pub quick_terminal_position: QuickTermPosition,
+    /// `quick-terminal-screen` — which display the drop-down docks on
+    /// (Ghostty): `main` = the screen of this app's focused window,
+    /// `mouse` = the screen under the pointer, `macos-menu-bar` = the
+    /// primary screen (macOS: the one carrying the menu bar).
+    /// Backed by `Window::placement`'s monitor selector
+    /// (water-rs/waterui#1302); off macOS `macos-menu-bar` is `primary`.
+    pub quick_terminal_screen: QuickTerminalScreen,
+    /// `quick-terminal-keyboard-interactivity` — how the drop-down
+    /// takes keyboard focus (Ghostty): `none` never takes focus,
+    /// `on-demand` takes it on click, `exclusive` grabs it on show.
+    /// Ghostty's default is platform-dependent: `none` on Linux
+    /// (there is no OS-level grab), `on-demand` on macOS.
+    pub quick_terminal_keyboard_interactivity: QuickTerminalKeyboardInteractivity,
     /// `quick-terminal-size = <primary>[,<secondary>]` — primary axis
     /// (height for top/bottom, width for left/right, orientation for
     /// center); secondary axis is maximized for edge-docked positions
@@ -939,6 +1026,15 @@ impl Default for AppConfig {
                 title: true,
             },
             quick_terminal_position: QuickTermPosition::Top,
+            quick_terminal_screen: QuickTerminalScreen::Main,
+            // Ghostty defaults `quick-terminal-keyboard-interactivity`
+            // to `none` off macOS (no OS-level exclusive grab exists
+            // outside it) and `on-demand` on macOS.
+            quick_terminal_keyboard_interactivity: if cfg!(target_os = "macos") {
+                QuickTerminalKeyboardInteractivity::OnDemand
+            } else {
+                QuickTerminalKeyboardInteractivity::None
+            },
             quick_terminal_size: None,
             quick_terminal_animation_duration: 0.2,
             clipboard_trim: true,
@@ -1231,6 +1327,7 @@ confirm-close-surface = true  # ask before closing a running program (true|false
 # selection-word-chars = ,│`|:\"' ()[]{}<>\t   # double-click word separators
 # open-link-with = firefox --new-window {}   # {} = the URL (default xdg-open)
 # quick-terminal-position = top   # top | bottom | left | right | center
+# quick-terminal-screen = main    # main | mouse | macos-menu-bar (macos-menu-bar = main off macOS)
 # quick-terminal-size = 45%       # N% or Npx[, second axis] — primary axis
 #                                  # is height for top/bottom, width for
 #                                  # left/right; edge docks maximize the rest
@@ -1295,6 +1392,91 @@ impl AppConfig {
             .map(|(t, a)| (t.clone(), a.clone()))
     }
 
+    /// Ghostty `catch_all` fallback — a bind whose key is `catch_all`
+    /// fires only when the exact press is otherwise unbound. Lookup
+    /// order (Ghostty `Binding.zig` doc on `keybind`): the exact
+    /// press first (the caller's plain lookup), then `catch_all` with
+    /// the press's modifiers, then bare `catch_all`. Searched
+    /// innermost table → outermost → default.
+    pub fn lookup_catch_all(
+        &self,
+        mods: Modifiers,
+        tables: &[String],
+    ) -> Option<(KeybindTrigger, Option<TermAction>, Option<String>)> {
+        let mods_part = mods_prefix(mods);
+        let scopes = tables
+            .iter()
+            .rev()
+            .map(|t| Some(t.as_str()))
+            .chain(std::iter::once(None));
+        let hit = |scope: Option<&str>, want: &str| {
+            self.keybinds
+                .iter()
+                .rev()
+                .find(|(t, _)| {
+                    t.table.as_deref() == scope
+                        && t.seq.is_empty()
+                        && match t.physical_code {
+                            // `physical:` never pairs with catch_all.
+                            Some(_) => false,
+                            None => t.chord == want,
+                        }
+                })
+                .map(|(t, a)| (t.clone(), a.clone(), scope.map(str::to_string)))
+        };
+        if !mods_part.is_empty() {
+            let modded = format!("{mods_part}+catch_all");
+            for scope in scopes.clone() {
+                if let Some(found) = hit(scope, &modded) {
+                    return Some(found);
+                }
+            }
+        }
+        for scope in scopes {
+            if let Some(found) = hit(scope, "catch_all") {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Probe a pending `>` trigger sequence against the bind table.
+    /// `presses` is the already-collected prefix plus the current
+    /// press. Active key tables are searched innermost-first, then the
+    /// default map — matching `lookup_keybind_tabled` scope order.
+    /// Within a scope a longer bound sequence shadows an exact match:
+    /// the prefix waits (Ghostty "the sequence will override the
+    /// previous binding").
+    pub fn seq_probe(&self, presses: &[SeqPress], tables: &[String]) -> SeqProbe {
+        let scopes = tables
+            .iter()
+            .rev()
+            .map(|t| Some(t.as_str()))
+            .chain(std::iter::once(None));
+        for scope in scopes {
+            let mut extended = false;
+            let mut exact = None;
+            for (t, a) in self.keybinds.iter().rev() {
+                if t.table.as_deref() != scope || t.seq.is_empty() {
+                    continue;
+                }
+                if t.seq.len() > presses.len() && seq_steps_match(&t.seq[..presses.len()], presses)
+                {
+                    extended = true;
+                } else if t.seq.len() == presses.len() && seq_steps_match(&t.seq, presses) {
+                    exact = Some((t.clone(), a.clone()));
+                }
+            }
+            if extended {
+                return SeqProbe::Continue;
+            }
+            if let Some((t, a)) = exact {
+                return SeqProbe::Fire(t, a, scope.map(str::to_string));
+            }
+        }
+        SeqProbe::Miss
+    }
+
     /// Lookup with active key tables (Ghostty `key_table`). The stack is
     /// searched innermost-last → outermost; the first table with an
     /// entry for the key wins (an `unbind` there also shadows the outer
@@ -1316,6 +1498,7 @@ impl AppConfig {
                 .rev()
                 .find(|(t, _)| {
                     t.table.as_deref() == table
+                        && t.seq.is_empty()
                         && match t.physical_code {
                             Some(pc) => pc == code && chord_mods(&t.chord) == mods_part,
                             None => chord.as_deref() == Some(t.chord.as_str()),
@@ -1328,8 +1511,12 @@ impl AppConfig {
                 return Some((found.0, found.1, Some(name.clone())));
             }
         }
-        self.lookup_keybind(key, code, mods)
-            .map(|(t, a)| (t, a, None))
+        if let Some((t, a)) = self.lookup_keybind(key, code, mods) {
+            return Some((t, a, None));
+        }
+        // `catch_all` (Ghostty): the key matched nothing — consult
+        // `<mods>+catch_all`, then bare `catch_all`.
+        self.lookup_catch_all(mods, tables)
     }
 
     /// Parse config text → (config, errors). Unknown keys and bad values
@@ -1841,6 +2028,35 @@ impl AppConfig {
                     "center" => cfg.quick_terminal_position = QuickTermPosition::Center,
                     _ => errors.push(format!(
                         "line {}: bad quick-terminal-position {value:?}",
+                        n + 1
+                    )),
+                },
+                "quick-terminal-screen" => match value {
+                    "main" => cfg.quick_terminal_screen = QuickTerminalScreen::Main,
+                    "mouse" => cfg.quick_terminal_screen = QuickTerminalScreen::Mouse,
+                    "macos-menu-bar" => {
+                        cfg.quick_terminal_screen = QuickTerminalScreen::MacosMenuBar;
+                    }
+                    _ => errors.push(format!(
+                        "line {}: bad quick-terminal-screen {value:?}",
+                        n + 1
+                    )),
+                },
+                "quick-terminal-keyboard-interactivity" => match value {
+                    "none" => {
+                        cfg.quick_terminal_keyboard_interactivity =
+                            QuickTerminalKeyboardInteractivity::None;
+                    }
+                    "on-demand" => {
+                        cfg.quick_terminal_keyboard_interactivity =
+                            QuickTerminalKeyboardInteractivity::OnDemand;
+                    }
+                    "exclusive" => {
+                        cfg.quick_terminal_keyboard_interactivity =
+                            QuickTerminalKeyboardInteractivity::Exclusive;
+                    }
+                    _ => errors.push(format!(
+                        "line {}: bad quick-terminal-keyboard-interactivity {value:?}",
                         n + 1
                     )),
                 },
@@ -2611,9 +2827,33 @@ impl AppConfig {
                         // entry wholesale, flags included.
                         Ok((trig, action)) => {
                             cfg.keybinds.retain(|(t, _)| {
-                                t.chord != trig.chord || t.table != trig.table
+                                if t.table != trig.table {
+                                    return true;
+                                }
+                                if t.chord == trig.chord {
+                                    return false;
+                                }
+                                // Ghostty: a non-sequence binding for a
+                                // sequence's first step unbinds the whole
+                                // sequence ("the entire previously bound
+                                // sequence will be unbound"). The reverse
+                                // direction shadows at lookup, not here.
+                                if trig.seq.is_empty()
+                                    && !t.seq.is_empty()
+                                    && seq_step_chord(&t.seq[0]) == trig.chord
+                                {
+                                    return false;
+                                }
+                                true
                             });
-                            cfg.keybinds.push((trig, action));
+                            // A sequence `unbind` removes the matching
+                            // sequence outright — unlike a plain unbind
+                            // there is no "bound to nothing" entry to
+                            // keep (a stored None seq bind would still
+                            // Fire on its trigger).
+                            if trig.seq.is_empty() || action.is_some() {
+                                cfg.keybinds.push((trig, action));
+                            }
                         }
                         Err(e) => errors.push(format!("line {}: {e}", n + 1)),
                     }
@@ -3238,14 +3478,38 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
         *flag = true;
         rest = tail;
     }
-    // `physical:` keeps the modifier prefix for compare and resolves the
-    // key name to its physical `Code` (US-layout position) — `physical:e`
-    // fires on the E-position key whatever the layout maps there.
-    let (chord, physical_code) = if physical {
-        let (mods, name, code) = parse_physical_chord(rest)?;
-        (format!("{mods}physical:{name}"), Some(code))
+    // Ghostty trigger sequences: `a>b>c` — each `>`-separated step is
+    // its own trigger (modifiers, `physical:`, `catch_all` allowed per
+    // step). The press of the first step enters a pending state; the
+    // action fires once the whole sequence is typed.
+    let steps: Vec<&str> = rest.split('>').collect();
+    let (chord, physical_code, seq) = if steps.len() > 1 {
+        if physical {
+            return Err(format!(
+                "keybind {raw:?}: `physical:` is per-step inside a `>` sequence"
+            ));
+        }
+        if global {
+            return Err(format!(
+                "keybind {raw:?}: `global:` cannot grab a `>` sequence \
+                 (the grab covers one key only)"
+            ));
+        }
+        let seq: Result<Vec<SeqStep>, String> = steps.iter().map(|s| parse_seq_step(s)).collect();
+        let seq = seq?;
+        let display = seq.iter().map(seq_step_chord).collect::<Vec<_>>().join(">");
+        (display, None, seq)
     } else {
-        (normalize_chord(rest)?, None)
+        // `physical:` keeps the modifier prefix for compare and resolves the
+        // key name to its physical `Code` (US-layout position) — `physical:e`
+        // fires on the E-position key whatever the layout maps there.
+        let (chord, physical_code) = if physical {
+            let (mods, name, code) = parse_physical_chord(rest)?;
+            (format!("{mods}physical:{name}"), Some(code))
+        } else {
+            (normalize_chord(rest)?, None)
+        };
+        (chord, physical_code, Vec::new())
     };
     let chord = KeybindTrigger {
         chord,
@@ -3255,6 +3519,7 @@ fn parse_keybind(value: &str) -> Result<(KeybindTrigger, Option<TermAction>), St
         performable,
         physical_code,
         table,
+        seq,
     };
     let action_raw = action.trim();
     let lower = action_raw.to_ascii_lowercase();
@@ -3417,6 +3682,75 @@ fn split_sequence(inner: &str) -> Vec<&str> {
 
 /// Parse `ctrl+shift+arrowup` / `alt+f4` / `super+v` into the canonical
 /// `ctrl+alt+shift+super+key` string.
+/// A `>` sequence step: `physical:mods+key` or `mods+key`, where the
+/// key may be `catch_all`. Flags (`global:`/`all:`/…) are trigger
+/// prefixes, not step syntax — they are parsed before the split.
+fn parse_seq_step(raw: &str) -> Result<SeqStep, String> {
+    let step = raw.trim().to_ascii_lowercase();
+    if step.is_empty() {
+        return Err("empty step in `>` keybind sequence".to_string());
+    }
+    let (physical, rest) = match step.strip_prefix("physical:") {
+        Some(tail) => (true, tail),
+        None => (false, step.as_str()),
+    };
+    if physical {
+        let (mods, name, code) = parse_physical_chord(rest)?;
+        return Ok(SeqStep {
+            mods: mods.trim_end_matches('+').to_string(),
+            key: name,
+            code: Some(code),
+            catch_all: false,
+        });
+    }
+    let chord = normalize_chord(rest)?;
+    let (mods, key) = match chord.rsplit_once('+') {
+        Some((m, k)) => (m.to_string(), k.to_string()),
+        None => (String::new(), chord),
+    };
+    Ok(SeqStep {
+        mods,
+        catch_all: key == "catch_all",
+        key,
+        code: None,
+    })
+}
+
+/// `press` matches `step`: modifiers must equal the step's mask
+/// (`ctrl+catch_all` needs ctrl held; bare `catch_all` takes any
+/// mods); `physical:` compares the key position; otherwise the
+/// layout-translated key name.
+fn seq_step_matches(step: &SeqStep, press: &SeqPress) -> bool {
+    if step.catch_all {
+        return step.mods.is_empty() || mods_prefix(press.mods) == step.mods;
+    }
+    if mods_prefix(press.mods) != step.mods {
+        return false;
+    }
+    match step.code {
+        Some(code) => press.code == code,
+        None => key_name_of(&press.key) == Some(step.key.clone()),
+    }
+}
+
+/// All `steps` match `presses` pairwise (same length required by the
+/// caller for an exact hit; callers may pass a step slice prefix).
+fn seq_steps_match(steps: &[SeqStep], presses: &[SeqPress]) -> bool {
+    steps
+        .iter()
+        .zip(presses)
+        .all(|(s, p)| seq_step_matches(s, p))
+}
+
+/// The canonical `mods+key` form of a sequence step — used for the
+/// trigger's display string and the prefix-shadowing compare at parse.
+fn seq_step_chord(step: &SeqStep) -> String {
+    match step.mods.is_empty() {
+        true => step.key.clone(),
+        false => format!("{}+{}", step.mods, step.key),
+    }
+}
+
 fn normalize_chord(chord: &str) -> Result<String, String> {
     let mut mods = [false; 4]; // ctrl, alt, shift, super
     let mut key = None;
@@ -3604,7 +3938,9 @@ fn canonical_key_name(name: &str) -> Result<String, String> {
         "space",
     ];
     let n = name.to_ascii_lowercase();
-    if n.len() == 1 || NAMES.contains(&n.as_str()) {
+    // Ghostty `catch_all` — a pseudo-key matching any otherwise
+    // unbound press.
+    if n == "catch_all" || n.len() == 1 || NAMES.contains(&n.as_str()) {
         return Ok(n);
     }
     if let Some(digits) = n.strip_prefix('f')
@@ -3698,6 +4034,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         }
         "deactivate_key_table" => TermAction::DeactivateKeyTable,
         "deactivate_all_key_tables" => TermAction::DeactivateAllKeyTables,
+        "end_key_sequence" => TermAction::EndKeySequence,
         "undo" => TermAction::Undo,
         "redo" => TermAction::Redo,
         "toggle_mark" => TermAction::ToggleMark,
@@ -3737,6 +4074,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "toggle_quick_terminal" => TermAction::ToggleQuickTerminal,
         "last_tab" => TermAction::LastTab,
         "close_window" => TermAction::CloseWindow,
+        "close_all_windows" => TermAction::CloseAllWindows,
         "close_all_tabs" => TermAction::CloseAllTabs,
         "close_other_tabs" => TermAction::CloseOtherTabs,
         "toggle_tab_bar" => TermAction::ToggleTabBar,
@@ -3952,13 +4290,18 @@ fn chord_of(key: &Key, mods: Modifiers) -> Option<String> {
     if mods.contains(Modifiers::META) {
         out.push_str("super+");
     }
-    let key_name = match key {
+    let key_name = key_name_of(key)?;
+    out.push_str(&key_name);
+    Some(out)
+}
+
+/// The canonical key name part of `chord_of` (no modifier prefix).
+fn key_name_of(key: &Key) -> Option<String> {
+    Some(match key {
         Key::Character(c) if c.as_str() == " " => "space".to_string(),
         Key::Character(c) => c.to_ascii_lowercase(),
         Key::Named(named) => named_key_name(*named)?,
-    };
-    out.push_str(&key_name);
-    Some(out)
+    })
 }
 
 fn named_key_name(key: NamedKey) -> Option<String> {
@@ -5735,5 +6078,152 @@ mod key_table_tests {
         assert!(!cfg.font_shaping_break);
         let (_, errs) = AppConfig::parse("font-shaping-break = true\n");
         assert_eq!(errs.len(), 1);
+    }
+
+    /// `SeqPress` construction for sequence probes: a character key
+    /// with modifiers and a plausible `Code`.
+    fn sp(ch: char, code: Code, mods: Modifiers) -> SeqPress {
+        SeqPress {
+            key: Key::Character(ch.to_string()),
+            code,
+            mods,
+        }
+    }
+
+    #[test]
+    fn parses_r65_keys() {
+        // `>` trigger sequences (Ghostty `Binding.zig:413`): `a>b`
+        // binds a two-step sequence; the trigger chord renders as
+        // `a>b` and carries `seq` steps.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+a>n=new_tab\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let (trig, action) = &cfg.keybinds[0];
+        assert_eq!(trig.chord, "ctrl+a>n");
+        assert_eq!(trig.seq.len(), 2);
+        assert_eq!(trig.seq[0].mods, "ctrl");
+        assert_eq!(trig.seq[0].key, "a");
+        assert_eq!(trig.seq[1].key, "n");
+        assert!(matches!(action, Some(TermAction::NewTab)));
+
+        // A probe matching only the prefix waits; the full sequence
+        // fires; a divergent press misses.
+        assert!(matches!(
+            cfg.seq_probe(&[sp('a', Code::KeyA, Modifiers::CONTROL)], &[]),
+            SeqProbe::Continue
+        ));
+        let probe = cfg.seq_probe(
+            &[
+                sp('a', Code::KeyA, Modifiers::CONTROL),
+                sp('n', Code::KeyN, Modifiers::empty()),
+            ],
+            &[],
+        );
+        assert!(matches!(probe, SeqProbe::Fire(..)));
+        assert!(matches!(
+            cfg.seq_probe(
+                &[
+                    sp('a', Code::KeyA, Modifiers::CONTROL),
+                    sp('x', Code::KeyX, Modifiers::empty()),
+                ],
+                &[]
+            ),
+            SeqProbe::Miss
+        ));
+
+        // Shadow rule: `ctrl+a>n` bound → a plain `ctrl+a` does
+        // nothing (the prefix is captured); rebinding `ctrl+a` plain
+        // unbinds the whole sequence.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+a>n=new_tab\nkeybind = ctrl+a=ignore\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.keybinds.iter().all(|(t, _)| t.seq.is_empty()));
+
+        // Three-step sequences and per-step `physical:`.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+a>physical:b>c=text:s\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let (trig, _) = &cfg.keybinds[0];
+        assert_eq!(trig.seq.len(), 3);
+        assert!(trig.seq[1].code.is_some());
+        // physical step matches by `code`, not layout key name.
+        let probe = cfg.seq_probe(
+            &[
+                sp('a', Code::KeyA, Modifiers::CONTROL),
+                sp('b', Code::KeyB, Modifiers::empty()),
+                sp('c', Code::KeyC, Modifiers::empty()),
+            ],
+            &[],
+        );
+        assert!(matches!(probe, SeqProbe::Fire(..)));
+
+        // `physical:`/`global:` flag on a `>` trigger errors loudly.
+        let (_, errs) = AppConfig::parse("keybind = physical:ctrl+a>b=ignore\n");
+        assert_eq!(errs.len(), 1);
+        let (_, errs) = AppConfig::parse("keybind = global:ctrl+a>b=ignore\n");
+        assert_eq!(errs.len(), 1);
+
+        // `catch_all` in a sequence: `ctrl+w>catch_all=ignore` swallows
+        // any second press (Ghostty `catch_all` key name).
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+w>catch_all=ignore\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let probe = cfg.seq_probe(
+            &[
+                sp('w', Code::KeyW, Modifiers::CONTROL),
+                sp('z', Code::KeyZ, Modifiers::SHIFT),
+            ],
+            &[],
+        );
+        match probe {
+            SeqProbe::Fire(_, action, _) => {
+                assert!(matches!(action, Some(TermAction::Ignore)))
+            }
+            _ => panic!("catch_all seq should fire: {probe:?}"),
+        }
+
+        // Plain `catch_all` binds: mods-qualified wins over bare.
+        let (cfg, errs) = AppConfig::parse(
+            "keybind = catch_all=new_tab\nkeybind = shift+catch_all=close_window\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        let hit = cfg.lookup_catch_all(Modifiers::SHIFT, &[]);
+        assert!(matches!(hit, Some((_, Some(TermAction::CloseWindow), _))));
+        let hit = cfg.lookup_catch_all(Modifiers::CONTROL, &[]);
+        assert!(matches!(hit, Some((_, Some(TermAction::NewTab), _))));
+
+        // `end_key_sequence` action parses (Ghostty
+        // `ctrl+w>escape=end_key_sequence` ends a sequence, forwarding
+        // the prior keys).
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+w>escape=end_key_sequence\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(
+            cfg.keybinds[0].1,
+            Some(TermAction::EndKeySequence)
+        ));
+
+        // `close_all_windows` (deprecated upstream: "no effect … use
+        // all:close_window", Ghostty binding.zig) parses and is
+        // implemented as the cross-window sweep; `all:close_window`
+        // also parses.
+        let (cfg, errs) = AppConfig::parse("keybind = ctrl+alt+w=close_all_windows\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(
+            cfg.keybinds[0].1,
+            Some(TermAction::CloseAllWindows)
+        ));
+        let (cfg, errs) = AppConfig::parse("keybind = all:ctrl+alt+w=close_window\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let (trig, _) = &cfg.keybinds[0];
+        assert!(trig.all);
+        assert!(matches!(trig.chord.as_str(), "ctrl+alt+w"));
+
+        // A sequence `unbind` removes the sequence — it is not kept as
+        // a None-action bind.
+        let (cfg, errs) =
+            AppConfig::parse("keybind = ctrl+a>n=new_tab\nkeybind = ctrl+a>n=unbind\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.keybinds.iter().all(|(t, _)| t.seq.is_empty()));
+        // …and `ctrl+a` is free again.
+        assert!(matches!(
+            cfg.seq_probe(&[sp('a', Code::KeyA, Modifiers::CONTROL)], &[]),
+            SeqProbe::Miss
+        ));
     }
 }

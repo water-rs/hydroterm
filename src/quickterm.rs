@@ -32,17 +32,6 @@ fn keysym_to_keycode(conn: &RustConnection, keysym: u32) -> Option<Keycode> {
     None
 }
 
-/// Screen size of the connection's default screen (used to size the
-/// drop-down window: full width, 45% height, docked at y = 0).
-pub fn screen_size() -> Option<(f64, f64)> {
-    let (conn, screen) = RustConnection::connect(None).ok()?;
-    let root = conn.setup().roots.get(screen)?;
-    Some((
-        f64::from(root.width_in_pixels),
-        f64::from(root.height_in_pixels),
-    ))
-}
-
 /// Canonical keybind key name → X11 keysym, for `global:` chords. Covers
 /// the whole `canonical_key_name` set: single chars, F1–F24, and the
 /// named navigation keys.

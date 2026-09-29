@@ -108,7 +108,7 @@ fn cli_action(name: &str, config_path: Option<&std::path::Path>) -> ! {
 pub fn app(env: Environment) -> App {
     let mut env = env;
     let (config_path, command) = cli();
-    let state = app::AppState::new(config_path, command);
+    let state = app::AppState::new(config_path, command, app::Instance::new());
     // water-rs/cli#188: the app gives the runtime its color scheme through
     // the Environment — a `Computed` driven by `window-theme`, so a config
     // reload flips the chrome scheme without a restart. Requires hydrolysis

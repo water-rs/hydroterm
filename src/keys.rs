@@ -570,6 +570,11 @@ pub enum TermAction {
     /// Close every tab except the selected one (Ghostty
     /// `close_other_tabs`), `confirm-close` prompts where configured.
     CloseOtherTabs,
+    /// Ghostty `close_all_windows` — deprecated upstream ("no effect";
+    /// the supported path is `all:close_window`). Bound by name and
+    /// implemented as the same every-window sweep `all:close_window`
+    /// performs.
+    CloseAllWindows,
     /// Show/hide the tab strip on demand, overriding `tab-bar-min-tabs`
     /// until the next config reload (kitty `toggle_tab_bar`).
     ToggleTabBar,
@@ -829,6 +834,10 @@ pub enum TermAction {
     DeactivateKeyTable,
     /// Ghostty `deactivate_all_key_tables` — clear the whole stack.
     DeactivateAllKeyTables,
+    /// Ghostty `end_key_sequence` — inside a `>` sequence, flush only
+    /// the already-typed prefix keys to the program and exit the
+    /// sequence (the completing key itself is consumed by the bind).
+    EndKeySequence,
     /// Ghostty `crash` / `crash:<cause>` — crash the process on purpose
     /// (the reference uses it to exercise crash reporting).
     Crash,

@@ -12,8 +12,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
@@ -37,7 +35,7 @@ use waterui_graphics::{Code, Key, Modifiers, NamedKey};
 use waterui_text::FontCollection;
 
 use crate::app::{AppState, Session};
-use crate::config::MouseShiftCapture;
+use crate::config::{MouseShiftCapture, SeqPress, SeqProbe};
 use crate::fonts::TermFonts;
 use crate::keys::{FileSink, TermAction, action_chord, key_release_bytes, key_to_bytes, tab_chord};
 use crate::mouse::{self, CellPos, MouseAction};
@@ -638,6 +636,16 @@ pub struct TermSurface {
     /// — `None` brush means the file failed to read/decode; the path is
     /// still cached so a bad path is not re-read every frame.
     bg_img: RefCell<BgImageCache>,
+
+    /// `HYDROTERM_INPUT_STATS` read once at construction — gates the
+    /// per-frame input/draw breakdown below.
+    input_stats: bool,
+    /// `SurfaceInputEvent` deliveries since the last `build_scene`.
+    stat_events: u64,
+    /// Key-press deliveries since the last `build_scene`.
+    stat_keys: u64,
+    /// Timestamp of the previous key delivery — inter-key gap basis.
+    last_key_at: Option<Instant>,
 }
 
 /// `background-image` decode cache: (config path, decoded brush + pixel dims).
@@ -756,6 +764,10 @@ impl TermSurface {
             hover_link: Vec::new(),
             hover_cursor: binding(CursorStyle::IBeam),
             bg_img: RefCell::new((None, None)),
+            input_stats: std::env::var_os("HYDROTERM_INPUT_STATS").is_some(),
+            stat_events: 0,
+            stat_keys: 0,
+            last_key_at: None,
         }
     }
 
@@ -1184,6 +1196,13 @@ impl TermSurface {
                     self.do_action_all(a);
                 }
             }
+            // `all:close_window` (and the deprecated
+            // `close_all_windows`): the reference applies close_window
+            // to every surface — every window holding one closes. The
+            // sweep covers every AppState window, not just this one.
+            TermAction::CloseWindow | TermAction::CloseAllWindows => {
+                self.app.close_all_windows();
+            }
             _ => self.do_action(action),
         }
     }
@@ -1211,6 +1230,7 @@ impl TermSurface {
             TermAction::ToggleQuickTerminal => self.app.toggle_quick(),
             TermAction::LastTab => self.app.select_last_tab(),
             TermAction::CloseWindow => self.app.close_window(),
+            TermAction::CloseAllWindows => self.app.close_all_windows(),
             TermAction::CloseAllTabs => self.app.close_all_tabs(),
             TermAction::CloseOtherTabs => self.app.close_other_tabs(),
             TermAction::ToggleTabBar => self.app.toggle_tab_bar(),
@@ -1653,6 +1673,12 @@ impl TermSurface {
             }
             TermAction::DeactivateAllKeyTables => {
                 self.session.key_tables.borrow_mut().clear();
+            }
+            TermAction::EndKeySequence => {
+                // Bound as a plain trigger or inside a `sequence:` list
+                // there is no pending `>` prefix to flush — the pending
+                // path handles the real case before dispatch reaches
+                // here.
             }
             TermAction::SetSurfaceTitle(title) => {
                 self.app
@@ -2614,6 +2640,20 @@ impl TermSurface {
                 .iter()
                 .map(|(n, _)| n.clone())
                 .collect();
+            // `>` trigger sequences (Ghostty leader keys): the presses
+            // collected so far plus this one form the probe candidate.
+            // A bound sequence shadows a plain bind on its prefix chord
+            // — the press is captured and waits (`seq_probe` Continue).
+            let mut cand = self.session.pending_seq.borrow().clone();
+            cand.push(SeqPress {
+                key: key.clone(),
+                code,
+                mods,
+            });
+            let probe = self.app.config(|c| c.seq_probe(&cand, &table_names));
+            if !matches!(probe, SeqProbe::Miss) || cand.len() > 1 {
+                return self.seq_resolve(probe, cand, mode);
+            }
             match self
                 .app
                 .config(|c| c.lookup_keybind_tabled(key, code, mods, &table_names))
@@ -2682,6 +2722,10 @@ impl TermSurface {
                 return self.snap_to_bottom_if_scrolled();
             }
             false
+        } else if !self.session.pending_seq.borrow().is_empty() {
+            // A `>` sequence is collecting — a mid-sequence release
+            // produces no bytes.
+            true
         } else if let Some(bytes) = key_release_bytes(key, mods, mode) {
             if !self.session.terminal.proxy.kam_locked() && !self.session.readonly.get() {
                 self.write(bytes);
@@ -2690,6 +2734,115 @@ impl TermSurface {
             false
         } else {
             false
+        }
+    }
+
+    /// Resolve a `>` sequence probe (Ghostty leader keys). `cand` is the
+    /// pending presses plus the current press. Continue keeps
+    /// collecting; Fire runs the bound action (`end_key_sequence`
+    /// flushes only the prior prefix — the completing press is the
+    /// bind's own, and `unconsumed:`/`performable:` miss semantics
+    /// flush every press); a broken sequence encodes every captured
+    /// press to the program unless a `catch_all` bind ignores the
+    /// breaking key.
+    fn seq_resolve(&mut self, probe: SeqProbe, cand: Vec<SeqPress>, mode: TermMode) -> bool {
+        match probe {
+            SeqProbe::Continue => {
+                *self.session.pending_seq.borrow_mut() = cand;
+                self.suppress_key_text = true;
+                true
+            }
+            SeqProbe::Miss => self.seq_flush(cand, mode),
+            SeqProbe::Fire(trig, action, hit_table) => {
+                self.session.pending_seq.borrow_mut().clear();
+                let action = match action {
+                    Some(a) => a,
+                    // A sequence `unbind` deletes the bind at parse — a
+                    // None action reaching here is defensive.
+                    None => return self.seq_flush(cand, mode),
+                };
+                if matches!(action, TermAction::EndKeySequence) {
+                    self.write_seq_presses(&cand[..cand.len().saturating_sub(1)], mode);
+                    self.suppress_key_text = true;
+                    return true;
+                }
+                if trig.performable && !self.action_performable(&action) {
+                    // Unperformable mid-sequence: the bind does not
+                    // fire; the whole typed prefix flushes through.
+                    return self.seq_flush_raw(cand, mode);
+                }
+                if trig.unconsumed && !trig.all && !trig.global {
+                    self.write_seq_presses(&cand, mode);
+                }
+                if trig.all {
+                    self.do_action_all(action);
+                } else {
+                    self.do_action(action);
+                }
+                if let Some(name) = hit_table {
+                    let pos = self
+                        .session
+                        .key_tables
+                        .borrow()
+                        .iter()
+                        .rposition(|(n, once)| *once && *n == name);
+                    if let Some(pos) = pos {
+                        self.session.key_tables.borrow_mut().remove(pos);
+                    }
+                }
+                self.suppress_key_text = true;
+                true
+            }
+        }
+    }
+
+    /// Broken sequence (Ghostty): encode every captured press to the
+    /// program as if no keybind existed — unless a `catch_all` bind
+    /// ignoring the breaking key drops the sequence silently.
+    fn seq_flush(&mut self, cand: Vec<SeqPress>, mode: TermMode) -> bool {
+        let tables: Vec<String> = self
+            .session
+            .key_tables
+            .borrow()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let ignored = cand.last().is_some_and(|p| {
+            matches!(
+                self.app.config(|c| c.lookup_catch_all(p.mods, &tables)),
+                Some((_, Some(TermAction::Ignore), _))
+            )
+        });
+        self.session.pending_seq.borrow_mut().clear();
+        if ignored {
+            self.suppress_key_text = true;
+            return true;
+        }
+        self.seq_flush_raw(cand, mode)
+    }
+
+    /// Encode every press in `cand` and write it to the PTY.
+    fn seq_flush_raw(&mut self, cand: Vec<SeqPress>, mode: TermMode) -> bool {
+        self.write_seq_presses(&cand, mode);
+        self.clear_selection_on_input();
+        self.hide_cursor_on_typing();
+        self.suppress_key_text = true;
+        let _ = self.snap_to_bottom_if_scrolled();
+        true
+    }
+
+    /// Encode a slice of captured presses through the normal key
+    /// encoder and write each to the PTY. A plain `Key::Character`
+    /// whose text would normally arrive on the following TextInput
+    /// event writes its own bytes — that TextInput is suppressed while
+    /// the sequence resolves.
+    fn write_seq_presses(&mut self, presses: &[SeqPress], mode: TermMode) {
+        for p in presses {
+            if let Some(bytes) = key_to_bytes(&p.key, p.code, p.mods, mode) {
+                self.write(bytes);
+            } else if let Key::Character(text) = &p.key {
+                self.write(text.as_bytes().to_vec());
+            }
         }
     }
 
@@ -4085,23 +4238,6 @@ impl Drop for TermSurface {
     }
 }
 
-/// Input-throughput instrumentation, enabled by `HYDROTERM_INPUT_STATS=1`.
-/// Counts `SurfaceInputEvent` deliveries and `Key` deliveries between
-/// consecutive `build_scene` calls, per-key inter-arrival gaps, and draw
-/// duration — the three numbers needed to attribute event-thread stalls
-/// to the app or to the framework's redraw scheduling.
-pub(crate) fn input_stats() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| std::env::var_os("HYDROTERM_INPUT_STATS").is_some())
-}
-
-/// Events delivered since the last draw (any `SurfaceInputEvent`).
-static STAT_EVENTS: AtomicU64 = AtomicU64::new(0);
-/// Key presses delivered since the last draw.
-static STAT_KEYS: AtomicU64 = AtomicU64::new(0);
-/// Timestamp of the previous key delivery, for inter-key gaps.
-static LAST_KEY_AT: Mutex<Option<Instant>> = Mutex::new(None);
-
 impl SceneContent for TermSurface {
     fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
         let draw_start = Instant::now();
@@ -4175,11 +4311,17 @@ impl SceneContent for TermSurface {
 
         self.build(scene, width, height);
 
-        if input_stats() {
-            let keys = STAT_KEYS.swap(0, Ordering::Relaxed);
-            let events = STAT_EVENTS.swap(0, Ordering::Relaxed);
+        if self.input_stats {
+            let keys = std::mem::take(&mut self.stat_keys);
+            let events = std::mem::take(&mut self.stat_events);
             let ms = draw_start.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("istats draw keys={keys} events={events} draw_ms={ms:.1}");
+            tracing::debug!(
+                target: "hydroterm::stats",
+                keys,
+                events,
+                draw_ms = ms,
+                "istats draw"
+            );
         }
 
         cursor_blinking || bell_live || resize_live || self.search.is_some()
@@ -4254,14 +4396,20 @@ impl SceneContent for TermSurface {
         if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
             eprintln!("[input s{} @{self:p}] {event:?}", self.session.id);
         }
-        if input_stats() {
-            STAT_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if self.input_stats {
+            self.stat_events += 1;
             if let SurfaceInputEvent::Key { pressed: true, .. } = event {
-                let n = STAT_KEYS.fetch_add(1, Ordering::Relaxed) + 1;
+                self.stat_keys += 1;
+                let n = self.stat_keys;
                 let now = Instant::now();
-                if let Some(prev) = LAST_KEY_AT.lock().unwrap().replace(now) {
+                if let Some(prev) = self.last_key_at.replace(now) {
                     let gap = (now - prev).as_secs_f64() * 1000.0;
-                    eprintln!("istats key #{n} gap_ms={gap:.1}");
+                    tracing::debug!(
+                        target: "hydroterm::stats",
+                        key = n,
+                        gap_ms = gap,
+                        "istats key"
+                    );
                 }
             }
         }

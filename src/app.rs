@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::term::Config;
+use crate::config::SeqProbe;
+use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
 use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
@@ -32,7 +33,9 @@ use waterui::theme::ColorScheme;
 use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForeground, Surface};
 use waterui::widget::condition::when;
 use waterui::window::WindowPresentation;
-use waterui::window::{Window, WindowState, WindowStyle, conditional_window};
+use waterui::window::{
+    Activation, Monitor, MonitorSelector, Window, WindowState, WindowStyle, conditional_window,
+};
 use waterui_core::id::SelfId;
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_core::resolve::Resolvable;
@@ -117,6 +120,9 @@ pub struct Session {
     /// not the `TermSurface`, because a layout write (`sizes`, `zoomed`,
     /// `tree`) rebuilds the pane view — the stack must survive that.
     pub key_tables: RefCell<Vec<(String, bool)>>,
+    /// Pending `>` trigger sequence (Ghostty leader keys): presses
+    /// collected so far. Session-owned — pending state is per-surface.
+    pub pending_seq: RefCell<Vec<crate::config::SeqPress>>,
     /// `toggle_mouse_reporting` — while set, pointer input is captured
     /// locally instead of producing DEC mouse reports. Session-owned for
     /// the same rebuild-survival reason as `key_tables`.
@@ -341,6 +347,7 @@ impl Session {
             progress: Binding::default(),
             kitty: Rc::new(RefCell::new(crate::kitty::KittyStore::default())),
             key_tables: RefCell::new(Vec::new()),
+            pending_seq: RefCell::new(Vec::new()),
             mouse_reporting_off: Cell::new(false),
             readonly: Cell::new(false),
             pending_actions: Rc::new(RefCell::new(Vec::new())),
@@ -653,10 +660,12 @@ pub struct PaneTab {
 /// stop-flag)` — the flag tells its X11 grab thread to release.
 type GlobalGrab = (String, TermAction, std::sync::Arc<AtomicBool>);
 
-/// Everything tabs and surfaces share.
-#[derive(Clone)]
-#[state]
-pub struct AppState {
+/// Everything tabs and surfaces share, behind one `Rc` — every
+/// `AppState` clone of a window points at the same `AppShared`, and the
+/// `Instance` registry holds only a `Weak` to it, so a window's registry
+/// entry dies with its last `AppState` clone and is pruned on the next
+/// sweep.
+pub struct AppShared {
     /// Session list — panes index into it.
     sessions: Rc<RefCell<Vec<Rc<Session>>>>,
     /// Tabs in display order; `selected` holds the active tab's id.
@@ -747,6 +756,10 @@ pub struct AppState {
     /// can slide it in/out on open/close (`None` when never opened or
     /// already unmounted).
     quick_frame: Rc<RefCell<Option<Binding<Rect>>>>,
+    /// The monitor the drop-down was placed on (resolved at mount by
+    /// `Window::placement`, water-rs/waterui#1302) — `close_quick`
+    /// slides the window back off that screen's edge.
+    quick_monitor: Rc<RefCell<Option<Monitor>>>,
     /// Presentation helper for the quick window (retained `presented` flag).
     quick_presentation: WindowPresentation,
     /// Lazily-created session set for the quick window — kept alive across
@@ -770,31 +783,88 @@ pub struct AppState {
     /// True after the first `spawn_session` — `command` is consumed as
     /// initial-surface-only and never re-applied by a hot reload.
     initial_spawn: Rc<std::cell::Cell<bool>>,
-    is_quick: bool,
+    /// True for the drop-down's own AppState (set once right after
+    /// construction): it neither hosts a quick window itself nor spawns
+    /// a second key grab.
+    is_quick: std::cell::Cell<bool>,
     /// Weak handles to live terminals so the theme monitor thread can
     /// request frames (dirty is only read inside `poll_config`).
     theme_wakes: Arc<Mutex<Vec<std::sync::Weak<Terminal>>>>,
     next_id: Arc<AtomicU64>,
+    /// The process's window registry — shared by every `AppState` so
+    /// `close_all_windows`, `hide_all_windows` and the quit-delay cancel
+    /// reach every window of the instance.
+    instance: Rc<Instance>,
+}
+
+/// Cloneable handle to one window's state — clones share the
+/// `Rc<AppShared>`. The handle is what `.state(&app)` injection and
+/// the registry's sweep targets pass around.
+#[derive(Clone)]
+#[state]
+pub struct AppState {
+    shared: Rc<AppShared>,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = AppShared;
+    fn deref(&self) -> &AppShared {
+        &self.shared
+    }
 }
 
 // `.state(&app)` injection rows read the state back through a plain
 // `AppState` extractor parameter.
 
-thread_local! {
-    /// Every window's `WindowState` binding — each `AppState` registers
-    /// on construction. `hide_all_windows` walks this list; bindings of
-    /// closed windows linger harmlessly (setting Minimized on a dead
-    /// window's state is a no-op).
-    static WINDOW_STATES: RefCell<Vec<Binding<WindowState>>> =
-        const { RefCell::new(Vec::new()) };
+/// One hydroterm process's shared window registry — created once where
+/// the app starts (`AppState::new`) and cloned into every `AppState`
+/// through `Rc`: the main window, spawned windows, torn-off windows and
+/// the drop-down all share the one `Instance`.
+pub struct Instance {
+    /// Every live window — `Weak`s to the `AppShared` of the main
+    /// window, spawned windows, torn-off windows and the drop-down.
+    /// The registry holds no strong reference: when a window's last
+    /// `AppState` clone drops, its entry fails to upgrade and is pruned
+    /// on the next sweep. `close_all_windows` calls `close_window` on
+    /// each upgraded handle; `hide_all_windows` minimizes each entry's
+    /// `window_state` binding.
+    windows: RefCell<Vec<std::rc::Weak<AppShared>>>,
+    /// `quit-after-last-window-closed-delay` armed flag — the timer
+    /// thread exits the process at the deadline unless a new surface
+    /// sets it first. Instance-wide (not per-`AppState`): the quit
+    /// applies to the whole process, so a surface spawned in any
+    /// window — including a drop-down — cancels it. The `RefCell` is
+    /// UI-thread-only; only the `Arc<AtomicBool>` crosses to the timer
+    /// thread.
+    quit_cancel: RefCell<Option<Arc<AtomicBool>>>,
 }
 
-/// `quit-after-last-window-closed-delay` armed flag — the timer thread
-/// exits the process at the deadline unless a new surface sets it first.
-/// Process-global (not per-`AppState`): the quit applies to the whole
-/// process, so a surface spawned in any window — including a drop-down —
-/// cancels it.
-static QUIT_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+impl Instance {
+    /// The empty registry — the app's first `AppState` creates it.
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            windows: RefCell::new(Vec::new()),
+            quit_cancel: RefCell::new(None),
+        })
+    }
+
+    /// Entries whose `Weak` still upgrades — windows with a live
+    /// `AppState`.
+    #[cfg(test)]
+    fn live_entries(&self) -> usize {
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|w| w.upgrade().is_some())
+            .count()
+    }
+
+    /// Raw registry length including un-pruned dead entries.
+    #[cfg(test)]
+    fn entries_len(&self) -> usize {
+        self.windows.borrow().len()
+    }
+}
 
 /// Extractor key for a pane's session — a local newtype because the
 /// orphan rule won't let `Extractor` (foreign) be implemented for
@@ -836,17 +906,23 @@ impl AppState {
     // and are consumed in `render`), so the `Arc`s only need UI confinement,
     // not Send+Sync — `Binding` is not Send+Sync by design.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new(config_path: Option<std::path::PathBuf>, command: Option<Vec<String>>) -> Self {
-        Self::new_inner(config_path, command, true)
+    pub fn new(
+        config_path: Option<std::path::PathBuf>,
+        command: Option<Vec<String>>,
+        instance: Rc<Instance>,
+    ) -> Self {
+        Self::new_inner(config_path, command, true, instance)
     }
 
     /// `spawn_initial` = whether the state opens a first tab — a
     /// `detach_tab_to_window` state arrives with its moved tab and must
-    /// not.
+    /// not. `instance` is the process's shared window registry — every
+    /// `AppState` clones the same `Rc`.
     fn new_inner(
         config_path: Option<std::path::PathBuf>,
         command: Option<Vec<String>>,
         spawn_initial: bool,
+        instance: Rc<Instance>,
     ) -> Self {
         let mut watcher = ConfigWatcher::new(config_path);
         if command.is_some() {
@@ -871,69 +947,73 @@ impl AppState {
         );
         let quick_binding = Binding::container(WindowState::Closed);
         let state = Self {
-            sessions: Rc::new(RefCell::new(Vec::new())),
-            tabs: NamiList::new(),
-            session_tab: Arc::new(Mutex::new(HashMap::new())),
-            selected: Binding::u64(0),
-            tab_count: Binding::usize(0),
-            tab_bar_min: Binding::usize(watcher.config.tab_bar_min_tabs),
-            tab_bar_forced: Binding::default(),
-            last_tab_id: Rc::new(std::cell::Cell::new(0)),
-            focus_owner: Binding::default(),
-            window_title: binding({
-                let base = watcher
-                    .config
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "hydroterm".into());
-                match &watcher.config.window_subtitle {
-                    Some(s) => Str::from(format!("{base} — {s}")),
-                    None => Str::from(base.to_string()),
-                }
+            shared: Rc::new(AppShared {
+                sessions: Rc::new(RefCell::new(Vec::new())),
+                tabs: NamiList::new(),
+                session_tab: Arc::new(Mutex::new(HashMap::new())),
+                selected: Binding::u64(0),
+                tab_count: Binding::usize(0),
+                tab_bar_min: Binding::usize(watcher.config.tab_bar_min_tabs),
+                tab_bar_forced: Binding::default(),
+                last_tab_id: Rc::new(std::cell::Cell::new(0)),
+                focus_owner: Binding::default(),
+                window_title: binding({
+                    let base = watcher
+                        .config
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "hydroterm".into());
+                    match &watcher.config.window_subtitle {
+                        Some(s) => Str::from(format!("{base} — {s}")),
+                        None => Str::from(base.to_string()),
+                    }
+                }),
+                window_state: binding(WindowState::Normal),
+                titlebar_bg: Binding::container(watcher.config.titlebar_background),
+                titlebar_fg: Binding::container(watcher.config.titlebar_foreground),
+                window_frame: Rc::new(RefCell::new(None)),
+                window_scheme: Binding::container(crate::theme::scheme_for(
+                    &watcher.config.window_theme,
+                    &watcher.config.resolve_theme().background,
+                )),
+                title_font_family: Binding::container(
+                    watcher
+                        .config
+                        .window_title_font_family
+                        .clone()
+                        .map(Str::from),
+                ),
+                cfg: Rc::new(RefCell::new(watcher)),
+                palette: Rc::new(RefCell::new(palette)),
+                env: Rc::new(std::cell::OnceCell::new()),
+                palette_open: Binding::bool(false),
+                palette_query: binding(Str::from("")),
+                palette_field_focus: Binding::default(),
+                palette_sel: Binding::container(Some(0)),
+                palette_scroll: ScrollController::new(0),
+                settings_open: Binding::bool(false),
+                set_font: Binding::i32(13),
+                set_theme: Binding::usize(0),
+                set_blink: Binding::bool(true),
+                theme_dirty: Arc::new(AtomicBool::new(false)),
+                quick_state: quick_binding.clone(),
+                quick_frame: Rc::new(RefCell::new(None)),
+                quick_monitor: Rc::new(RefCell::new(None)),
+                quick_presentation: WindowPresentation::new(&quick_binding),
+                quick_app: Rc::new(RefCell::new(None)),
+                global_grabs: Rc::new(RefCell::new(Vec::new())),
+                applied_quick_geo: Rc::new(RefCell::new(applied_quick_geo)),
+                quick_listener_started: Rc::new(AtomicBool::new(false)),
+                quick_task: Rc::new(RefCell::new(None)),
+                quick_unavailable: Rc::new(RefCell::new(false)),
+                closed_stack: Rc::new(RefCell::new(Vec::new())),
+                last_restored: Rc::new(RefCell::new(None)),
+                initial_spawn: Rc::new(std::cell::Cell::new(false)),
+                is_quick: std::cell::Cell::new(false),
+                theme_wakes: Arc::new(Mutex::new(Vec::new())),
+                next_id: Arc::new(AtomicU64::new(0)),
+                instance,
             }),
-            window_state: binding(WindowState::Normal),
-            titlebar_bg: Binding::container(watcher.config.titlebar_background),
-            titlebar_fg: Binding::container(watcher.config.titlebar_foreground),
-            window_frame: Rc::new(RefCell::new(None)),
-            window_scheme: Binding::container(crate::theme::scheme_for(
-                &watcher.config.window_theme,
-                &watcher.config.resolve_theme().background,
-            )),
-            title_font_family: Binding::container(
-                watcher
-                    .config
-                    .window_title_font_family
-                    .clone()
-                    .map(Str::from),
-            ),
-            cfg: Rc::new(RefCell::new(watcher)),
-            palette: Rc::new(RefCell::new(palette)),
-            env: Rc::new(std::cell::OnceCell::new()),
-            palette_open: Binding::bool(false),
-            palette_query: binding(Str::from("")),
-            palette_field_focus: Binding::default(),
-            palette_sel: Binding::container(Some(0)),
-            palette_scroll: ScrollController::new(0),
-            settings_open: Binding::bool(false),
-            set_font: Binding::i32(13),
-            set_theme: Binding::usize(0),
-            set_blink: Binding::bool(true),
-            theme_dirty: Arc::new(AtomicBool::new(false)),
-            quick_state: quick_binding.clone(),
-            quick_frame: Rc::new(RefCell::new(None)),
-            quick_presentation: WindowPresentation::new(&quick_binding),
-            quick_app: Rc::new(RefCell::new(None)),
-            global_grabs: Rc::new(RefCell::new(Vec::new())),
-            applied_quick_geo: Rc::new(RefCell::new(applied_quick_geo)),
-            quick_listener_started: Rc::new(AtomicBool::new(false)),
-            quick_task: Rc::new(RefCell::new(None)),
-            quick_unavailable: Rc::new(RefCell::new(false)),
-            closed_stack: Rc::new(RefCell::new(Vec::new())),
-            last_restored: Rc::new(RefCell::new(None)),
-            initial_spawn: Rc::new(std::cell::Cell::new(false)),
-            is_quick: false,
-            theme_wakes: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(AtomicU64::new(0)),
         };
         if spawn_initial {
             state.open_first_tab();
@@ -974,21 +1054,51 @@ impl AppState {
                 }
             });
         }
-        // `hide_all_windows` — every AppState (main window + each
-        // spawned/torn-off window) registers its window-state binding
-        // here; the action minimizes them all. The drop-down keeps its
-        // own Closed/Normal toggle contract and is not registered.
-        WINDOW_STATES.with(|w| w.borrow_mut().push(state.window_state.clone()));
+        // `hide_all_windows` minimizes every live window; the drop-down
+        // keeps its own Closed/Normal toggle contract.
+        // `all:close_window` / `close_all_windows` reach every window
+        // through the shared `Instance`: the registry holds only a `Weak`
+        // to this window's `AppShared`, so the entry dies when the
+        // window's last `AppState` clone drops and is pruned on the next
+        // sweep.
+        state
+            .instance
+            .windows
+            .borrow_mut()
+            .push(Rc::downgrade(&state.shared));
         state
     }
 
     /// `hide_all_windows` — minimize every registered window.
     pub fn hide_all_windows(&self) {
-        WINDOW_STATES.with(|w| {
-            for s in w.borrow().iter() {
-                s.set(WindowState::Minimized);
-            }
-        });
+        for shared in self
+            .instance
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            shared.window_state.set(WindowState::Minimized);
+        }
+    }
+
+    /// `all:close_window` / `close_all_windows` (Ghostty): close every
+    /// window of the instance — each one's `close_window` closes its
+    /// tabs with `confirm-close` prompts where configured. Dead
+    /// registry entries prune as they are met.
+    pub fn close_all_windows(&self) {
+        let sweep: Vec<AppState> = {
+            let mut windows = self.instance.windows.borrow_mut();
+            windows.retain(|w| w.upgrade().is_some());
+            windows
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .map(|shared| AppState { shared })
+                .collect()
+        };
+        for app in sweep {
+            app.close_window();
+        }
     }
 
     /// Register a live surface's frame-wake for the theme monitor.
@@ -1271,15 +1381,24 @@ impl AppState {
         if let Some(app) = self.quick_app.borrow().as_ref() {
             return app.clone();
         }
-        let mut app = AppState::new(Some(self.cfg.borrow().path.clone()), None);
-        app.is_quick = true;
+        let mut app = AppState::new(
+            Some(self.cfg.borrow().path.clone()),
+            None,
+            self.instance.clone(),
+        );
+        app.is_quick.set(true);
         // Share the host's `quick_state`: `quick-terminal-autohide` on a
         // drop-down surface writes it and the `conditional_window` reads
-        // it — a private binding would leave the window visible.
-        app.quick_state = self.quick_state.clone();
-        // The frame binding too: `animate_quick_close` on a drop-down
-        // surface slides the host-owned window out.
-        app.quick_frame = self.quick_frame.clone();
+        // it — a private binding would leave the window visible. The
+        // `Rc<AppShared>` is still unique here (registry holds Weak), so
+        // `Rc::get_mut` can swap the two bindings the host owns.
+        {
+            let shared = Rc::get_mut(&mut app.shared).expect("fresh AppState is unique");
+            shared.quick_state = self.quick_state.clone();
+            // The frame binding too: `animate_quick_close` on a drop-down
+            // surface slides the host-owned window out.
+            shared.quick_frame = self.quick_frame.clone();
+        }
         let app = Rc::new(app);
         *self.quick_app.borrow_mut() = Some(app.clone());
         app
@@ -1288,12 +1407,12 @@ impl AppState {
     /// True for the drop-down window's own AppState — its surfaces check
     /// this for `quick-terminal-autohide` on Focus(false).
     pub fn is_quick_app(&self) -> bool {
-        self.is_quick
+        self.is_quick.get()
     }
 
     /// Flip the drop-down window open/closed (the X11 hotkey calls this).
     pub fn toggle_quick(&self) {
-        if self.is_quick {
+        if self.is_quick.get() {
             // The drop-down's own view should not host another quick window.
             return;
         }
@@ -1309,7 +1428,7 @@ impl AppState {
     /// The grab thread forwards F12 presses over a channel; this drains it
     /// via `spawn_local` so the `WindowState` flip happens on the UI thread.
     pub fn start_quick_listener(&self) {
-        if self.is_quick || self.quick_listener_started.swap(true, Ordering::SeqCst) {
+        if self.is_quick.get() || self.quick_listener_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let (tx, rx) = async_channel::unbounded::<()>();
@@ -1369,28 +1488,53 @@ impl AppState {
         } else {
             w
         };
-        // `quick-terminal-position` — dock geometry on the primary
-        // screen (top/bottom: full width × 45% height; left/right:
-        // 40% width × full height; center: 70%×70% centered). The initial
-        // frame is requested up front — position applied while the X11
-        // window is still invisible is currently dropped by the WM
-        // (hydrolysis#105), so the drop-down may land wherever the window
-        // manager places it until that fix lands. No timed re-emit: racing
-        // the WM is forbidden workaround, not a fix.
-        if let Some((sw, sh)) = crate::quickterm::screen_size() {
+        // `quick-terminal-screen` (water-rs/waterui#1302): the backend
+        // resolves the selector at mount and runs `place` against the
+        // resolved monitor — `main` → the focused window's monitor,
+        // `mouse` → the pointer's, `macos-menu-bar` → the primary.
+        let selector = match self.config(|c| c.quick_terminal_screen) {
+            crate::config::QuickTerminalScreen::Main => MonitorSelector::Focused,
+            crate::config::QuickTerminalScreen::Mouse => MonitorSelector::Pointer,
+            crate::config::QuickTerminalScreen::MacosMenuBar => MonitorSelector::Primary,
+        };
+        // `quick-terminal-keyboard-interactivity` — the drop-down's
+        // focus policy maps onto `Activation` (same mount-time API).
+        let w = w.activation(
+            match self.config(|c| c.quick_terminal_keyboard_interactivity) {
+                crate::config::QuickTerminalKeyboardInteractivity::None => Activation::Never,
+                crate::config::QuickTerminalKeyboardInteractivity::OnDemand => Activation::OnClick,
+                crate::config::QuickTerminalKeyboardInteractivity::Exclusive => Activation::OnShow,
+            },
+        );
+        // `quick-terminal-position`/`size` — the dock rect computed
+        // inside `place` from the resolved monitor's `visible_frame`
+        // (top/bottom: full width × 45% height; left/right: 40% width
+        // × full height; center: 70%×70% centered). The resolved
+        // monitor is captured into `quick_monitor` so the close
+        // animation slides back off the same screen.
+        let shell = self.clone();
+        let frame_binding = w.frame.clone();
+        w.placement(selector, move |monitor| {
             use crate::config::{QuickTermPosition as P, QuickTermSize as S};
+            *shell.quick_monitor.borrow_mut() = Some(monitor.clone());
+            let frame = monitor.visible_frame;
+            let (fx, fy) = (f64::from(frame.origin().x), f64::from(frame.origin().y));
+            let (sw, sh) = (
+                f64::from(frame.size().width),
+                f64::from(frame.size().height),
+            );
             // `quick-terminal-size = <primary>[,<secondary>]` — the
             // primary axis is height for top/bottom, width for
             // left/right, and follows the monitor orientation for
             // center; the secondary axis is maximized for edge-docked
             // positions unless a second size is given (Ghostty).
-            let size = self.config(|c| c.quick_terminal_size);
+            let size = shell.config(|c| c.quick_terminal_size);
             let axis = |v: Option<S>, full: f64| match v {
                 Some(S::Percent(p)) => full * p / 100.0,
                 Some(S::Px(px)) => px,
                 None => full,
             };
-            let pos = self.config(|c| c.quick_terminal_position);
+            let pos = shell.config(|c| c.quick_terminal_position);
             let (x, y, w_px, h_px) = match pos {
                 P::Top => {
                     let h = size.map_or(sh * 0.45, |(a, _)| axis(Some(a), sh));
@@ -1428,24 +1572,23 @@ impl AppState {
                 }
             };
             let dock = Rect::new(
-                Point::new(x as f32, y as f32),
+                Point::new((fx + x) as f32, (fy + y) as f32),
                 Size::new(w_px as f32, h_px as f32),
             );
-            w.frame.set(dock);
-            *self.quick_frame.borrow_mut() = Some(w.frame.clone());
+            *shell.quick_frame.borrow_mut() = Some(frame_binding.clone());
             // `quick-terminal-animation-duration`: edge-docked positions
             // slide in from their dock edge; `center` mounts instantly
             // (there is no edge to slide from — Ghostty animates center
             // with a fade, which has no frame equivalent).
-            let secs = self.config(|c| c.quick_terminal_animation_duration);
+            let secs = shell.config(|c| c.quick_terminal_animation_duration);
             if secs > 0.0
-                && let Some(off) = dock_offscreen(pos, dock, sw as f32, sh as f32)
+                && let Some(off) = dock_offscreen(pos, dock, monitor.frame)
             {
-                w.frame.set(off);
-                animate_frame(&w.frame, off, dock, secs, None);
+                frame_binding.set(off);
+                animate_frame(&frame_binding, off, dock, secs, None);
             }
-        }
-        w
+            dock
+        })
     }
 
     /// `quick-terminal-animation-duration` close path: slide the
@@ -1461,8 +1604,11 @@ impl AppState {
         let secs = self.config(|c| c.quick_terminal_animation_duration);
         let cur = frame.snapshot();
         let pos = self.config(|c| c.quick_terminal_position);
-        let off = crate::quickterm::screen_size()
-            .and_then(|(sw, sh)| dock_offscreen(pos, cur, sw as f32, sh as f32));
+        let off = self
+            .quick_monitor
+            .borrow()
+            .as_ref()
+            .and_then(|monitor| dock_offscreen(pos, cur, monitor.frame));
         match off.filter(|_| secs > 0.0) {
             Some(off) => {
                 let state = self.quick_state.clone();
@@ -1517,7 +1663,12 @@ impl AppState {
         // `window-inherit-working-directory` seeds `working-directory` —
         // inheriting post-construction is too late, the session already
         // spawned.
-        let state = AppState::new_inner(Some(self.cfg.borrow().path.clone()), None, false);
+        let state = AppState::new_inner(
+            Some(self.cfg.borrow().path.clone()),
+            None,
+            false,
+            self.instance.clone(),
+        );
         if self.config(|c| c.inherit_working_directory)
             && let Some(cwd) = self
                 .focused_session()
@@ -1604,7 +1755,12 @@ impl AppState {
         // collide with the adopted ids.
         // The moved tab arrives whole — `new_inner(.., false)` skips the
         // initial spawn (which would also re-run `initial-command`).
-        let state = AppState::new_inner(Some(self.cfg.borrow().path.clone()), None, false);
+        let state = AppState::new_inner(
+            Some(self.cfg.borrow().path.clone()),
+            None,
+            false,
+            self.instance.clone(),
+        );
         {
             let mut sessions = self.sessions.borrow_mut();
             let mut map = state.session_tab.lock().unwrap();
@@ -1706,6 +1862,22 @@ impl AppState {
             .iter()
             .map(|(n, _)| n.clone())
             .collect();
+        // `>` trigger sequences run over focused overlays too — the
+        // same probe the surface input path uses, minus PTY encoding:
+        // a broken sequence's bytes are the surface's job, so a Miss
+        // here forwards to the focused surface's own input path (the
+        // overlay no longer holds the key by then only when the caller
+        // bubbles it — treats as Ignored).
+        let mut cand = session.pending_seq.borrow().clone();
+        cand.push(crate::config::SeqPress {
+            key: press.key.clone(),
+            code: press.code,
+            mods: press.modifiers,
+        });
+        let probe = self.config(|c| c.seq_probe(&cand, &tables));
+        if !matches!(probe, SeqProbe::Miss) || cand.len() > 1 {
+            return self.seq_resolve_overlay(session, probe, cand);
+        }
         let hit = self
             .config(|c| c.lookup_keybind_tabled(&press.key, press.code, press.modifiers, &tables));
         match hit {
@@ -1715,6 +1887,94 @@ impl AppState {
                 KeyHandling::Handled
             }
             _ => KeyHandling::Ignored,
+        }
+    }
+
+    /// `>` sequence resolution for the overlay dispatch path: Continue
+    /// stores the presses; Fire queues the action on the session
+    /// (`end_key_sequence` flushes the prior prefix to the PTY
+    /// directly); a broken sequence encodes the captured presses into
+    /// the program, matching the surface's own `seq_flush`.
+    fn seq_resolve_overlay(
+        &self,
+        session: std::rc::Rc<Session>,
+        probe: crate::config::SeqProbe,
+        cand: Vec<crate::config::SeqPress>,
+    ) -> KeyHandling {
+        use crate::config::SeqProbe as P;
+        match probe {
+            P::Continue => {
+                *session.pending_seq.borrow_mut() = cand;
+                KeyHandling::Handled
+            }
+            P::Fire(_, action, hit_table) => {
+                session.pending_seq.borrow_mut().clear();
+                let Some(action) = action else {
+                    return self.seq_flush_overlay(&session, &cand);
+                };
+                if matches!(action, TermAction::EndKeySequence) {
+                    let mode = *session.terminal.term.lock().mode();
+                    for p in &cand[..cand.len().saturating_sub(1)] {
+                        Self::write_seq_press(&session, p, mode);
+                    }
+                    return KeyHandling::Handled;
+                }
+                session.pending_actions.borrow_mut().push(action);
+                session.terminal.proxy.request_frame();
+                if let Some(name) = hit_table {
+                    let pos = session
+                        .key_tables
+                        .borrow()
+                        .iter()
+                        .rposition(|(n, once)| *once && *n == name);
+                    if let Some(pos) = pos {
+                        session.key_tables.borrow_mut().remove(pos);
+                    }
+                }
+                KeyHandling::Handled
+            }
+            P::Miss => self.seq_flush_overlay(&session, &cand),
+        }
+    }
+
+    /// Broken sequence over an overlay: `catch_all = ignore` drops it
+    /// silently; otherwise the captured presses encode to the PTY.
+    fn seq_flush_overlay(
+        &self,
+        session: &std::rc::Rc<Session>,
+        cand: &[crate::config::SeqPress],
+    ) -> KeyHandling {
+        let tables: Vec<String> = session
+            .key_tables
+            .borrow()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let ignored = cand.last().is_some_and(|p| {
+            matches!(
+                self.config(|c| c.lookup_catch_all(p.mods, &tables)),
+                Some((_, Some(TermAction::Ignore), _))
+            )
+        });
+        session.pending_seq.borrow_mut().clear();
+        if ignored {
+            return KeyHandling::Handled;
+        }
+        let mode = *session.terminal.term.lock().mode();
+        for p in cand {
+            Self::write_seq_press(session, p, mode);
+        }
+        KeyHandling::Handled
+    }
+
+    /// Encode one captured sequence press to the PTY; a plain
+    /// `Key::Character` writes its own text bytes (the TextInput that
+    /// would carry them is suppressed while the sequence resolves).
+    fn write_seq_press(session: &Session, p: &crate::config::SeqPress, mode: TermMode) {
+        if let Some(b) = crate::keys::key_to_bytes(&p.key, p.code, p.mods, mode) {
+            session.terminal.write(b);
+        } else if let Key::Character(text) = &p.key {
+            session.terminal.write(text.as_bytes().to_vec());
         }
     }
 
@@ -1780,7 +2040,7 @@ impl AppState {
     ) -> Rc<Session> {
         // A surface arriving inside `quit-after-last-window-closed-delay`
         // cancels the pending quit (covers tabs, splits, undo restores).
-        if let Some(cancel) = QUIT_CANCEL.lock().unwrap().take() {
+        if let Some(cancel) = self.instance.quit_cancel.borrow_mut().take() {
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let id = self.alloc_id();
@@ -2423,12 +2683,12 @@ impl AppState {
         // (new tab, undo restore, a quick-terminal window spawning)
         // cancels it (checked on the flag at spawn_session).
         if self.tabs.is_empty()
-            && !self.is_quick
+            && !self.is_quick.get()
             && self.config(|c| c.quit_after_last_window_closed)
         {
             match self.config(|c| c.quit_after_last_window_closed_delay) {
                 Some(delay) => {
-                    let mut armed = QUIT_CANCEL.lock().unwrap();
+                    let mut armed = self.instance.quit_cancel.borrow_mut();
                     if armed.is_none() {
                         let cancel = Arc::new(AtomicBool::new(false));
                         *armed = Some(cancel.clone());
@@ -3410,17 +3670,20 @@ fn restore_node(node: &ClosedNode, sessions: &[Rc<Session>]) -> SplitNode {
 fn dock_offscreen(
     pos: crate::config::QuickTermPosition,
     dock: Rect,
-    sw: f32,
-    sh: f32,
+    monitor_frame: Rect,
 ) -> Option<Rect> {
     use crate::config::QuickTermPosition as P;
     let o = dock.origin();
     let s = dock.size();
+    // Off-screen means past the resolved monitor's edge — with several
+    // monitors the visible edge is that monitor's own frame, not (0, 0).
+    let fo = monitor_frame.origin();
+    let fs = monitor_frame.size();
     let off = match pos {
-        P::Top => Point::new(o.x, -s.height),
-        P::Bottom => Point::new(o.x, sh),
-        P::Left => Point::new(-s.width, o.y),
-        P::Right => Point::new(sw, o.y),
+        P::Top => Point::new(o.x, fo.y - s.height),
+        P::Bottom => Point::new(o.x, fo.y + fs.height),
+        P::Left => Point::new(fo.x - s.width, o.y),
+        P::Right => Point::new(fo.x + fs.width, o.y),
         P::Center => return None,
     };
     Some(Rect::new(off, *s))
@@ -4482,8 +4745,44 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SplitDir, SplitNode, auto_split_dir};
+    use super::{AppState, Instance, SplitDir, SplitNode, WindowState, auto_split_dir};
     use nami::Signal;
+
+    /// The window registry holds no strong reference: dropping a
+    /// window's last `AppState` clone kills its entry, which the next
+    /// sweep prunes — `hide_all_windows`/`close_all_windows` then reach
+    /// only the live windows.
+    #[test]
+    fn window_registry_prunes_dropped_windows() {
+        let instance = Instance::new();
+        let live = AppState::new_inner(None, None, false, instance.clone());
+        let dead = AppState::new_inner(None, None, false, instance.clone());
+        // Keep only the dead window's state binding — the window's last
+        // `AppState` clone still drops.
+        let dead_state = dead.window_state.clone();
+        assert_eq!(instance.live_entries(), 2);
+        drop(dead);
+        assert_eq!(
+            instance.live_entries(),
+            1,
+            "the dropped window's entry must die with its last AppState clone"
+        );
+        live.hide_all_windows();
+        assert!(matches!(
+            live.window_state.snapshot(),
+            WindowState::Minimized
+        ));
+        assert!(
+            matches!(dead_state.snapshot(), WindowState::Normal),
+            "hide_all_windows reached a dropped window"
+        );
+        live.close_all_windows();
+        assert_eq!(
+            instance.entries_len(),
+            1,
+            "a dead registry entry must be pruned on the next sweep"
+        );
+    }
 
     #[test]
     fn auto_split_picks_by_aspect() {

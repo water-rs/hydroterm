@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -831,6 +831,20 @@ pub struct TapReader {
     file: std::fs::File,
     scanner: OscScanner,
     scratch: Vec<u8>,
+    /// `HYDROTERM_INPUT_STATS` read once at spawn — enables the
+    /// per-second reader-stage breakdown (`report_stats`).
+    input_stats: bool,
+    /// Nanoseconds spent feeding scanner bytes (`stage` inner call).
+    stat_feed_ns: u64,
+    /// Nanoseconds spent in `scanner.take` on the parser thread.
+    stat_take_ns: u64,
+    /// Nanoseconds spent in the PTY `read` syscall (`stage` outer call).
+    stat_read_ns: u64,
+    /// PTY bytes read since the last report.
+    stat_bytes: u64,
+    /// Time of the previous per-second report; the dump is skipped when
+    /// a report went out inside the last second.
+    stat_last_report: Option<Instant>,
 }
 
 impl TapPty {
@@ -842,6 +856,12 @@ impl TapPty {
             file: pty.file().try_clone().expect("dup pty fd"),
             scanner: OscScanner::new(),
             scratch: vec![0; 65536],
+            input_stats: std::env::var_os("HYDROTERM_INPUT_STATS").is_some(),
+            stat_feed_ns: 0,
+            stat_take_ns: 0,
+            stat_read_ns: 0,
+            stat_bytes: 0,
+            stat_last_report: None,
         };
         Self { inner: pty, reader }
     }
@@ -854,9 +874,41 @@ impl TapReader {
         if got > 0 {
             let t = Instant::now();
             self.scanner.feed(&self.scratch[..got]);
-            stat_add(&STAT_FEED_NS, t.elapsed().as_nanos() as u64);
+            self.stat_feed_ns += t.elapsed().as_nanos() as u64;
         }
         Ok(got)
+    }
+
+    /// With `HYDROTERM_INPUT_STATS`, emit the reader-stage breakdown
+    /// once per second while bytes flow — the split between scanning
+    /// and the syscall.
+    fn report_stats(&mut self) {
+        if !self.input_stats {
+            return;
+        }
+        if self
+            .stat_last_report
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        if self.stat_last_report.replace(Instant::now()).is_none() {
+            return;
+        }
+        let (feed, take, rd, by) = (
+            std::mem::take(&mut self.stat_feed_ns),
+            std::mem::take(&mut self.stat_take_ns),
+            std::mem::take(&mut self.stat_read_ns),
+            std::mem::take(&mut self.stat_bytes),
+        );
+        tracing::debug!(
+            target: "hydroterm::stats",
+            bytes = by,
+            feed_ms = feed as f64 / 1e6,
+            take_ms = take as f64 / 1e6,
+            read_ms = rd as f64 / 1e6,
+            "rstats reader-stage breakdown"
+        );
     }
 }
 
@@ -875,53 +927,6 @@ impl Read for TapReader {
             }
         }
     }
-}
-
-static STAT_FEED_NS: AtomicU64 = AtomicU64::new(0);
-static STAT_TAKE_NS: AtomicU64 = AtomicU64::new(0);
-static STAT_READ_NS: AtomicU64 = AtomicU64::new(0);
-static STAT_BYTES: AtomicU64 = AtomicU64::new(0);
-static STAT_LAST: AtomicU64 = AtomicU64::new(0);
-
-fn stat_add(slot: &AtomicU64, v: u64) {
-    slot.fetch_add(v, Ordering::Relaxed);
-}
-
-/// With `HYDROTERM_INPUT_STATS`, dump the reader-stage breakdown once per
-/// second while bytes flow — the split between scanning and the syscall.
-fn report_reader_stats() {
-    if !crate::surface::input_stats() {
-        return;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let prev = STAT_LAST.load(Ordering::Relaxed);
-    if prev != 0 && now - prev < 1000 {
-        return;
-    }
-    if STAT_LAST
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    if prev == 0 {
-        return;
-    }
-    let (feed, take, rd, by) = (
-        STAT_FEED_NS.swap(0, Ordering::Relaxed),
-        STAT_TAKE_NS.swap(0, Ordering::Relaxed),
-        STAT_READ_NS.swap(0, Ordering::Relaxed),
-        STAT_BYTES.swap(0, Ordering::Relaxed),
-    );
-    eprintln!(
-        "rstats bytes={by} feed_ms={:.1} take_ms={:.1} read_ms={:.1}",
-        feed as f64 / 1e6,
-        take as f64 / 1e6,
-        rd as f64 / 1e6
-    );
 }
 
 impl EventedReadWrite for TapPty {
@@ -1725,7 +1730,7 @@ impl IoLoop {
 
                 let t = Instant::now();
                 let (n, events) = self.pty.reader().scanner.take(seg);
-                stat_add(&STAT_TAKE_NS, t.elapsed().as_nanos() as u64);
+                self.pty.reader().stat_take_ns += t.elapsed().as_nanos() as u64;
                 if n == 0 && events.is_empty() {
                     break;
                 }
@@ -1779,9 +1784,10 @@ impl IoLoop {
             match self.pty.reader().stage() {
                 Ok(0) => break 'fill,
                 Ok(got) => {
-                    stat_add(&STAT_READ_NS, t.elapsed().as_nanos() as u64);
-                    stat_add(&STAT_BYTES, got as u64);
-                    report_reader_stats();
+                    let reader = self.pty.reader();
+                    reader.stat_read_ns += t.elapsed().as_nanos() as u64;
+                    reader.stat_bytes += got as u64;
+                    reader.report_stats();
                     continue 'fill;
                 }
                 Err(err) => match err.kind() {

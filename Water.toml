@@ -66,7 +66,7 @@ version = "=0.3.1"
 
 [framework.packages.hydrolysis]
 git = "https://github.com/water-rs/hydrolysis"
-rev = "0b9c0948bfb2c511c4f6dc5ef97f8c3c57828d6a"
+rev = "6164ea6d7a26495847cebe15acdb2d88d8d920ee"
 
 [framework.packages.hydrolysis-m3]
 git = "https://github.com/water-rs/hydrolysis-m3"
