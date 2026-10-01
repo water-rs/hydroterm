@@ -606,7 +606,8 @@ impl Terminal {
             }
             if std::env::var_os("HYDRO_SNIFF").is_some() {
                 eprintln!(
-                    "[resize] shell={:?} -> {cols}x{lines} redraw={:?} cursor={:?}",
+                    "[{}] [resize] shell={:?} -> {cols}x{lines} redraw={:?} cursor={:?}",
+                    sniff_ms(),
                     self.shell_pid.lock().unwrap(),
                     *self.shell_redraw.lock().unwrap(),
                     term.grid().cursor.point
@@ -629,7 +630,8 @@ impl Terminal {
                     );
                 }
                 eprintln!(
-                    "[postreflow] shell={:?} row0=|{}|",
+                    "[{}] [postreflow] shell={:?} row0=|{}|",
+                    sniff_ms(),
                     self.shell_pid.lock().unwrap(),
                     s.trim_end()
                 );
@@ -671,6 +673,15 @@ impl Terminal {
         let mut p: ansi::Processor = ansi::Processor::new();
         p.advance(&mut *term, bytes);
     }
+}
+
+/// Millis-since-epoch for SNIFF log timestamps — correlates the resize,
+/// clear, ioctl, and byte-segment lines across the two threads.
+pub(crate) fn sniff_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
 /// Does any cell on `line` still carry [`PROMPT_MARK`]? A rewrite or erase
@@ -731,7 +742,10 @@ fn clear_prompt_for_redraw<T: EventListener>(
     let sniff = std::env::var_os("HYDRO_SNIFF").is_some();
     let clear_rows = |grid: &mut Term<T>, start: i32, end: i32| {
         if sniff {
-            eprintln!("[clear] rows {start}..{end} cursor={cursor}");
+            eprintln!(
+                "[{}] [clear] rows {start}..{end} cursor={cursor}",
+                sniff_ms()
+            );
         }
         // Sever the wrap join into the region so reflow cannot merge the
         // stale row above it back into the cleared rows, then blank the
@@ -886,19 +900,68 @@ fn zsh_integration_dir() -> Option<String> {
 }
 
 /// Zsh `ZDOTDIR/.zshrc`: sources the user's real zshrc, then hooks
-/// `precmd`/`preexec` for OSC 133 marks + OSC 7 cwd. `B` is injected at
-/// the head of PS1; zsh's $HOST is the short hostname.
+/// `precmd`/`preexec` for OSC 133 marks + OSC 7 cwd.
+///
+/// Prompt marks are embedded in PS1/PS2 (`%{ %}` zero-width escapes),
+/// the reference zsh integration's approach (ghostty's
+/// src/shell-integration/zsh/ghostty-integration:124-161): every zle
+/// redisplay — reset-prompt, and the SIGWINCH repaint after a resize —
+/// re-emits the `133;A` mark at the prompt's first cell and the `133;B`
+/// mark at its end, so the terminal's prompt-region tracking survives
+/// the repaint (precmd-emitted marks are never re-emitted and their
+/// recorded row goes stale on the next reflow). `cl=line` matches the
+/// reference's mark (ghostty-integration:124). Multi-line prompt
+/// continuations get `133;P;k=s` (:172-175) and PS2 `k=s` too (:177-178).
+/// A `133;P;k=i`+`B` fallback at zle-line-init covers a PS1 rewritten
+/// after precmd (:269-281). zsh's $HOST is the short hostname.
+///
+/// `redraw=last` — not the reference's bare `133;A`: the reference
+/// relies on zsh repainting the prompt on every SIGWINCH, but zsh's
+/// WINCH repaint is deferred/coalesced (SIGWINCH is blocked while zle
+/// is outside its inner poll — zsh Src/Zle/zle_main.c `winch_unblock()`
+/// brackets only `poll()` — so pending WINCHes collapse and the handler
+/// reads current-not-signaled size; a repaint per resize is never
+/// guaranteed). That is the same deferred-repaint class as bash, for
+/// which `redraw=last` exists (semantic_prompt.zig:303-322: `.last`
+/// "because Bash only redraws the last line"). Declaring `last` clears
+/// at most the displaced cursor row — the prompt region survives a
+/// resize even when the repaint lands late or waits for the next
+/// keystroke, and the eventual repaint still redraws the full prompt.
 const ZSH_INTEGRATION: &str = r#"# hydroterm shell integration (auto-generated)
 [ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
 [ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc"
+__hydro_markA=$'%{\e]133;A;cl=line;redraw=last\a%}'
+__hydro_markS=$'%{\e]133;P;k=s\a%}'
+__hydro_markB=$'%{\e]133;B\a%}'
 __hydro_precmd() {
-  local s=$?
-  printf '\e]133;D;%s\e\\\e]7;file://%s%s\e\\\e]133;A\e\\' "$s" "$HOST" "$PWD"
+  builtin local s=$?
+  builtin printf '\e]133;D;%s\e\\\e]7;file://%s%s\e\\' "$s" "$HOST" "$PWD"
+  if [[ -o prompt_percent ]]; then
+    # Start each cycle from the pre-mark PS1 so a theme's edits stick.
+    if [[ -n ${__hydro_marked_ps1+x} && $PS1 == $__hydro_marked_ps1 ]]; then
+      PS1=$__hydro_saved_ps1
+      PS2=$__hydro_saved_ps2
+    fi
+    __hydro_saved_ps1=$PS1
+    __hydro_saved_ps2=$PS2
+    # A trailing bare % would fuse with the mark's %{ into an escape.
+    [[ $PS1 == *[^%]% || $PS1 == % ]] && PS1=$PS1%
+    PS1=${__hydro_markA}${PS1}${__hydro_markB}
+    [[ $PS1 == *$'\n'* ]] && PS1=${PS1//$'\n'/$'\n'$__hydro_markS}
+    [[ $PS2 == *[^%]% || $PS2 == % ]] && PS2=$PS2%
+    PS2=${__hydro_markS}${PS2}${__hydro_markB}
+    __hydro_marked_ps1=$PS1
+  else
+    builtin printf '\e]133;A;cl=line;redraw=last\a'
+  fi
 }
-__hydro_preexec() { printf '\e]133;C\e\\' }
+__hydro_preexec() { builtin printf '\e]133;C\e\\' }
 precmd_functions+=(__hydro_precmd)
 preexec_functions+=(__hydro_preexec)
-PS1=$'%{\e]133;B\e\\%}'$PS1
+functions[zle-line-init]="
+  if [[ \$PS1 != *$'%{\\e]133;A'* ]]; then builtin printf '\e]133;P;k=i\a\e]133;B\a'; fi
+"${functions[zle-line-init]-}
+zle -N zle-line-init 2>/dev/null
 "#;
 
 /// Fish `-C` init command: `fish_postexec`/`fish_preexec` events carry
@@ -1077,8 +1140,12 @@ impl OnResize for TapPty {
                 libc::ioctl(self.inner.file().as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
             }
             eprintln!(
-                "[ioctl] pty winsize {}x{} -> {}x{}",
-                ws.ws_row, ws.ws_col, window_size.num_lines, window_size.num_cols
+                "[{}] [ioctl] pty winsize {}x{} -> {}x{}",
+                sniff_ms(),
+                ws.ws_row,
+                ws.ws_col,
+                window_size.num_lines,
+                window_size.num_cols
             );
         }
         self.inner.on_resize(window_size);
@@ -1128,6 +1195,9 @@ impl Marks {
                     marks.push(abs);
                 }
             }
+            // A continuation/secondary prompt line is prompt content but
+            // never the region's start row — flag the row, don't record.
+            TapEvent::PromptSecondary => *self.sem.lock().unwrap() = SemKind::Prompt,
             TapEvent::PromptEnd => *self.sem.lock().unwrap() = SemKind::Input,
             TapEvent::CommandStart => {
                 *self.sem.lock().unwrap() = SemKind::Output;
@@ -1870,6 +1940,11 @@ impl IoLoop {
                         .append(true)
                         .open(format!("/tmp/sniff-{:?}.bin", std::thread::current().id()))
                         .unwrap();
+                    let ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    let _ = f.write_all(format!("<<MS:{ms}>>").as_bytes());
                     let _ = f.write_all(&seg[..n]);
                     let _ = f.write_all(b"\n---SNIFF-SEG---\n");
                 }
@@ -2246,7 +2321,19 @@ mod tests {
 
     #[test]
     fn zsh_prompt_marks_are_zero_width() {
-        assert!(ZSH_INTEGRATION.contains("PS1=$'%{\\e]133;B\\e\\\\%}'"));
+        // The reference zsh integration embeds its marks in PS1 so every
+        // zle redisplay — reset-prompt, the SIGWINCH repaint — re-emits
+        // them (ghostty-integration:124-161): A at the head, B at the
+        // tail, continuations via `133;P;k=s`. `redraw=last` declares
+        // zsh's deferred WINCH repaint honestly (same class as bash's
+        // `redraw=last`): only the displaced cursor row may be cleared.
+        assert!(ZSH_INTEGRATION.contains(r#"$'%{\e]133;A;cl=line;redraw=last\a%}'"#));
+        assert!(ZSH_INTEGRATION.contains("${__hydro_markA}${PS1}${__hydro_markB}"));
+        assert!(ZSH_INTEGRATION.contains(r#"$'%{\e]133;P;k=s\a%}'"#));
+        assert!(ZSH_INTEGRATION.contains(r#"$'%{\e]133;B\a%}'"#));
+        // A repainted prompt re-marks via `133;P;k=i` when PS1 was
+        // rewritten after precmd (ghostty-integration:269-281).
+        assert!(ZSH_INTEGRATION.contains("133;P;k=i"));
     }
 
     // -- semantic marks ------------------------------------------------------

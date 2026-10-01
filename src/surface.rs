@@ -2166,7 +2166,9 @@ impl TermSurface {
                 TermEvent::Tap(tap) => match tap {
                     // Marks + the redraw mode are recorded on the reader
                     // thread where the cursor still sits at the mark.
-                    TapEvent::PromptStart | TapEvent::ShellRedraw(_) => {}
+                    TapEvent::PromptStart
+                    | TapEvent::PromptSecondary
+                    | TapEvent::ShellRedraw(_) => {}
                     TapEvent::Cwd(path) => {
                         *self.session.cwd.lock().unwrap() = Some(path);
                     }
@@ -4351,7 +4353,8 @@ impl SceneContent for TermSurface {
                 rows.push_str(&format!("|{}|", s.trim_end()));
             }
             eprintln!(
-                "[grid] s{} off={} hist={} cur={:?} rows={rows}",
+                "[{}] [grid] s{} off={} hist={} cur={:?} rows={rows}",
+                crate::terminal::sniff_ms(),
                 self.session.id,
                 g.display_offset(),
                 g.history_size(),

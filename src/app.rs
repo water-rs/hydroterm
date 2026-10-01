@@ -1072,6 +1072,14 @@ impl AppState {
         let for_declared = quick_host.is_none();
         let closed_launch = for_declared && spawn_initial && !watcher.config.initial_window;
         let spawn_initial = spawn_initial && (!for_declared || watcher.config.initial_window);
+        // A declared window born `Normal` is shown — record it up front:
+        // `on_window_state_change` only marks `any_window_shown` on a
+        // transition, which a born-shown window never makes, so without
+        // this a first `Closed` would read as "never shown" and skip the
+        // `quit-after-last-window-closed` tail entirely.
+        if !closed_launch && for_declared {
+            instance.any_window_shown.set(true);
+        }
         let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
@@ -1643,6 +1651,12 @@ impl AppState {
         match self.quick_state.snapshot() {
             WindowState::Closed => {
                 self.quick_state.set(WindowState::Normal);
+                // A drop-down whose last shell exited closes like any
+                // window — the reopen must respawn a session then.
+                let app = self.quick_app();
+                if app.tabs.is_empty() {
+                    app.open_first_tab();
+                }
                 // `conditional_window` presents the drop-down only while
                 // a live declared window hosts it (`initial-window =
                 // false`, or the last real window closed under a
@@ -2929,17 +2943,17 @@ impl AppState {
                 }
             }
         }
-        // `quit-after-last-window-closed` (default on, Ghostty/Linux):
-        // the last tab is gone, so is every session — exit. With
-        // `quit-after-last-window-closed-delay` the exit waits out the
-        // delay on a timer thread; a new surface anywhere in the process
-        // (new tab, undo restore, a quick-terminal window spawning)
-        // cancels it (checked on the flag at spawn_session).
-        if self.tabs.is_empty()
-            && !self.is_quick.get()
-            && self.config(|c| c.quit_after_last_window_closed)
-        {
-            self.exit_or_delay();
+        // The shared window-close: every path that empties a window
+        // (close_surface → close_pane, close_tab, close_window, the
+        // last shell exiting) ends here. The window has no content left,
+        // so it is `Closed` — the runner reaps `Closed` windows under
+        // both policies, and `on_window_state_change` applies
+        // `quit-after-last-window-closed` (+`-delay`) the same way the
+        // OS close button does: exit only once every window is closed,
+        // otherwise stay resident. An empty drop-down closes too —
+        // `quick-terminal` revives it.
+        if self.tabs.is_empty() {
+            self.window_state.set(WindowState::Closed);
         }
     }
 
@@ -5002,9 +5016,12 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Instance, SplitDir, SplitNode, WindowState, auto_split_dir, quit_delay_expired,
+        AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
+        quit_delay_expired,
     };
-    use nami::Signal;
+    use nami::collection::Collection;
+    use nami::{Binding, Signal};
+    use waterui::Str;
 
     /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
     /// first arm wins, a new surface cancels by taking the slot and
@@ -5029,6 +5046,39 @@ mod tests {
         assert!(
             instance.quit_cancel.borrow().is_none(),
             "cancelling consumes the armed slot"
+        );
+    }
+
+    /// The shared window-close: every path that empties a window ends at
+    /// `close_tab`'s tail, which writes `window_state = Closed` — the
+    /// runner reaps `Closed` windows under both last-window policies, so
+    /// the last tab going away must always reap its window (the zombie
+    /// under `StayResident`). The phantom one-leaf tab exercises the tail
+    /// without spawning a PTY (`kill_session` no-ops on unknown ids).
+    #[test]
+    fn last_tab_close_closes_window() {
+        let instance = Instance::new();
+        let app = AppState::new_inner(None, None, false, instance, None);
+        assert_eq!(app.window_state.snapshot(), WindowState::Normal);
+        app.session_tab.lock().unwrap().insert(1, 1);
+        app.tabs.push(PaneTab {
+            id: 1,
+            title: binding(Str::from("")),
+            tree: binding(SplitNode::Leaf(1)),
+            focused: Binding::u64(1),
+            zoomed: Binding::default(),
+            activity: Binding::bool(false),
+            title_override: Binding::default(),
+            badge: Binding::bool(false),
+        });
+        app.tab_count.set(1);
+        app.selected.set(1);
+        app.close_tab(1);
+        assert!(app.tabs.is_empty());
+        assert_eq!(
+            app.window_state.snapshot(),
+            WindowState::Closed,
+            "emptying the window must close it — under StayResident too"
         );
     }
 

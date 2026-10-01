@@ -34,10 +34,15 @@ pub enum ShellRedraw {
 /// Events extracted from the raw byte stream.
 #[derive(Debug, Clone)]
 pub enum TapEvent {
-    /// OSC 133 ; A — prompt start.
-    PromptStart,
     /// OSC 133 ; A ; … ; redraw=X — repaint mode announced at the mark.
     ShellRedraw(ShellRedraw),
+    /// OSC 133 ; A — prompt start. Also produced by `133;P;k=i`
+    /// (kitty initial-prompt mark): shell integrations emit it when
+    /// the prompt was already drawn without an `A`.
+    PromptStart,
+    /// OSC 133 ; P ; k=s — continuation/secondary prompt line. Prompt
+    /// content, but not the prompt's start row.
+    PromptSecondary,
     /// OSC 133 ; B — prompt end / command start.
     PromptEnd,
     /// OSC 133 ; C — command output start (pre-execution).
@@ -282,6 +287,14 @@ impl OscScanner {
                         tap(TapEvent::ShellRedraw(r), &mut self.events);
                     }
                 }
+                // `133;P;k=` — prompt-kind marks (kitty): `i` initial
+                // prompt, `s` secondary/continuation. The reference
+                // treats both as prompt semantic content
+                // (Terminal.zig:2115-2119 `cursorSetSemanticContent`).
+                b"P" => match params.get(2).copied().unwrap_or(b"") {
+                    b"k=i" => tap(TapEvent::PromptStart, &mut self.events),
+                    _ => tap(TapEvent::PromptSecondary, &mut self.events),
+                },
                 b"B" => tap(TapEvent::PromptEnd, &mut self.events),
                 b"C" => tap(TapEvent::CommandStart, &mut self.events),
                 // `133;D;{code}` — also `133;D` alone.
