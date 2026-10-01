@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Cdebuginfo=0
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # git + libssl-dev + pkg-config: the cargo-dylint driver build script
+        # clones and checks out rust-clippy. libfontconfig-dev: the
+        # yeslogic-fontconfig-sys build script needs fontconfig.pc.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git libssl-dev pkg-config libgbm-dev libfontconfig-dev
+
+      - name: Install the pinned lint toolchain
+        # dtolnay/rust-toolchain sets `rustup default` on each install, so the
+        # LAST toolchain installed wins. Install nightly first: stable must be
+        # the default for fmt/clippy/test; the lint library selects its own
+        # nightly via its rust-toolchain.toml.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-28
+          components: llvm-tools-preview, rustc-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Install dylint driver
+        # Neither tool is in install-action's native manifests; both install
+        # through its cargo-binstall fallback, which fetches the signed
+        # release tarballs instead of compiling from source.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dylint@6.0.4,dylint-link@6.0.4
+
+      - name: Dylint
+        run: cargo dylint --all

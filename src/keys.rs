@@ -25,7 +25,9 @@ pub fn key_to_bytes(key: &Key, code: Code, mods: Modifiers, mode: TermMode) -> O
         return None;
     }
 
-    let Key::Character(text) = key else { return None };
+    let Key::Character(text) = key else {
+        return None;
+    };
     let ch = text.chars().next()?;
 
     // Ctrl+letter → C0 control codes; this is also the terminal-action lane
@@ -77,11 +79,15 @@ pub fn key_release_bytes(key: &Key, mods: Modifiers, mode: TermMode) -> Option<V
     if !mode.contains(TermMode::REPORT_EVENT_TYPES) {
         return None;
     }
-    if let Key::Character(text) = key && let Some(ch) = text.chars().next() {
+    if let Key::Character(text) = key
+        && let Some(ch) = text.chars().next()
+    {
         let m = kitty_mod(mods);
         return Some(format!("\x1b[{};{m}:3u", ch as u32).into_bytes());
     }
-    if let Key::Named(named) = key && let Some(num) = kitty_named_number(*named) {
+    if let Key::Named(named) = key
+        && let Some(num) = kitty_named_number(*named)
+    {
         let m = kitty_mod(mods);
         return Some(format!("\x1b[{num};{m}:3u").into_bytes());
     }
@@ -112,7 +118,13 @@ fn kitty_mod(mods: Modifiers) -> u8 {
 fn csi_mod(n: u8, mods: Modifiers, fin: char) -> Vec<u8> {
     let m = xterm_mod(mods);
     if m == 1 {
-        format!("\x1b[{n}{fin}").into_bytes()
+        // Both params at their default → omit them entirely: `\e[D`,
+        // not `\e[1D` (readline binds only the param-less form).
+        if n == 1 {
+            format!("\x1b[{fin}").into_bytes()
+        } else {
+            format!("\x1b[{n}{fin}").into_bytes()
+        }
     } else {
         format!("\x1b[{n};{m}{fin}").into_bytes()
     }
@@ -140,22 +152,46 @@ fn named_key_bytes(
     let num = |n: u8| -> Vec<u8> { csi_mod(n, mods, '~') };
     Some(match named {
         ArrowUp => {
-            if app { ss3(mods, 'A') } else { csi_mod(1, mods, 'A') }
+            if app {
+                ss3(mods, 'A')
+            } else {
+                csi_mod(1, mods, 'A')
+            }
         }
         ArrowDown => {
-            if app { ss3(mods, 'B') } else { csi_mod(1, mods, 'B') }
+            if app {
+                ss3(mods, 'B')
+            } else {
+                csi_mod(1, mods, 'B')
+            }
         }
         ArrowRight => {
-            if app { ss3(mods, 'C') } else { csi_mod(1, mods, 'C') }
+            if app {
+                ss3(mods, 'C')
+            } else {
+                csi_mod(1, mods, 'C')
+            }
         }
         ArrowLeft => {
-            if app { ss3(mods, 'D') } else { csi_mod(1, mods, 'D') }
+            if app {
+                ss3(mods, 'D')
+            } else {
+                csi_mod(1, mods, 'D')
+            }
         }
         Home => {
-            if app { ss3(mods, 'H') } else { csi_mod(1, mods, 'H') }
+            if app {
+                ss3(mods, 'H')
+            } else {
+                csi_mod(1, mods, 'H')
+            }
         }
         End => {
-            if app { ss3(mods, 'F') } else { csi_mod(1, mods, 'F') }
+            if app {
+                ss3(mods, 'F')
+            } else {
+                csi_mod(1, mods, 'F')
+            }
         }
         PageUp => num(5),
         PageDown => num(6),
@@ -290,28 +326,186 @@ fn kitty_csi_u(codepoint: u32, mods: Modifiers, release: bool) -> Vec<u8> {
 /// Returns the action name so the caller can run it instead of writing to
 /// the PTY.
 pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
+    // F11 alone toggles fullscreen (GNOME Terminal / VTE convention).
+    if matches!(key, Key::Named(NamedKey::F11)) && mods.is_empty() {
+        return Some(TermAction::Fullscreen);
+    }
+    // Shift-only PageUp/PageDown scroll one page — the xterm/alacritty
+    // convention (Ctrl+Shift+PageUp/Down stays bound to tab cycling).
+    if mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::CONTROL)
+        && !mods.contains(Modifiers::ALT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::PageUp => Some(TermAction::ScrollPageUp),
+                NamedKey::PageDown => Some(TermAction::ScrollPageDown),
+                // Shift+Up/Down scroll one line — xterm/kitty convention.
+                NamedKey::ArrowUp => Some(TermAction::ScrollPageLines(-1)),
+                NamedKey::ArrowDown => Some(TermAction::ScrollPageLines(1)),
+                // Shift+Insert pastes — the xterm/VTE convention.
+                NamedKey::Insert => Some(TermAction::Paste),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
+    // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
+    // PageUp/PageDown in the same chord are Ghostty's goto_split
+    // previous/next.
+    if mods.contains(Modifiers::CONTROL)
+        && mods.contains(Modifiers::ALT)
+        && mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::ArrowLeft => Some(TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false,
+                }),
+                NamedKey::ArrowRight => Some(TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: true,
+                }),
+                NamedKey::ArrowUp => Some(TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: false,
+                }),
+                NamedKey::ArrowDown => Some(TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: true,
+                }),
+                NamedKey::PageUp => Some(TermAction::FocusPrevPane),
+                NamedKey::PageDown => Some(TermAction::FocusNextPane),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // Ctrl+Alt+1..9: jump straight to the nth split. (Plain
+    // Ctrl+Alt+Arrow was the directional-focus chord until r23 — KDE and
+    // GNOME both grab it globally for workspace switching, so the app
+    // never sees it; directional focus now sits on Ghostty's own Linux
+    // default, Ctrl+Shift+Alt+Arrow.)
+    if mods.contains(Modifiers::CONTROL)
+        && mods.contains(Modifiers::ALT)
+        && !mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(_) = key {
+            return None;
+        }
+        if let Key::Character(text) = key {
+            return match text.as_str() {
+                "1" => Some(TermAction::GotoSplit(0)),
+                "2" => Some(TermAction::GotoSplit(1)),
+                "3" => Some(TermAction::GotoSplit(2)),
+                "4" => Some(TermAction::GotoSplit(3)),
+                "5" => Some(TermAction::GotoSplit(4)),
+                "6" => Some(TermAction::GotoSplit(5)),
+                "7" => Some(TermAction::GotoSplit(6)),
+                "8" => Some(TermAction::GotoSplit(7)),
+                "9" => Some(TermAction::GotoSplit(8)),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // Alt+Shift+Arrow: move the divider beside the focused pane — the
+    // keyboard half of split resizing (pointer half is the divider drag
+    // handle). Ctrl+Alt+Shift+Arrow was the chord until r23 but GNOME
+    // grabs it globally (move window to workspace); no common desktop
+    // binds Alt+Shift+Arrow.
+    if mods.contains(Modifiers::ALT)
+        && mods.contains(Modifiers::SHIFT)
+        && !mods.contains(Modifiers::CONTROL)
+        && !mods.contains(Modifiers::META)
+    {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::ArrowLeft => Some(TermAction::ResizePane {
+                    horizontal: true,
+                    forward: false,
+                    px: 48,
+                }),
+                NamedKey::ArrowRight => Some(TermAction::ResizePane {
+                    horizontal: true,
+                    forward: true,
+                    px: 48,
+                }),
+                NamedKey::ArrowUp => Some(TermAction::ResizePane {
+                    horizontal: false,
+                    forward: false,
+                    px: 48,
+                }),
+                NamedKey::ArrowDown => Some(TermAction::ResizePane {
+                    horizontal: false,
+                    forward: true,
+                    px: 48,
+                }),
+                _ => None,
+            };
+        }
+        return None;
+    }
     if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
         return None;
     }
-    let Key::Character(text) = key else { return None };
+    if let Key::Named(named) = key {
+        return Some(match named {
+            NamedKey::ArrowUp => TermAction::JumpToPrompt(-1),
+            NamedKey::ArrowDown => TermAction::JumpToPrompt(1),
+            // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
+            // convention) — plain Ctrl+PageUp/Down cycles them.
+            NamedKey::PageUp => TermAction::MoveTab(-1),
+            NamedKey::PageDown => TermAction::MoveTab(1),
+            NamedKey::Home => TermAction::ScrollToTop,
+            NamedKey::End => TermAction::ScrollToBottom,
+            // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
+            // convention) — same action as Ctrl+Shift+Z.
+            NamedKey::Enter => TermAction::PaneZoom,
+            _ => return None,
+        });
+    }
+    let Key::Character(text) = key else {
+        return None;
+    };
     Some(match text.to_ascii_lowercase().as_str() {
         "c" => TermAction::Copy,
         "v" => TermAction::Paste,
         "t" => TermAction::NewTab,
         "w" => TermAction::CloseTab,
-        "n" => TermAction::NewTab,
-        "+" | "=" => TermAction::FontBigger,
-        "-" | "_" => TermAction::FontSmaller,
+        "n" => TermAction::NewWindow,
+        "a" => TermAction::SelectAll,
+        "e" => TermAction::SplitRight,
+        "d" => TermAction::SplitDown,
+        "z" => TermAction::PaneZoom,
+        "]" | "}" => TermAction::FocusNextPane,
+        "[" | "{" => TermAction::FocusPrevPane,
+        "+" | "=" => TermAction::IncreaseFontSize(1),
+        "-" | "_" => TermAction::DecreaseFontSize(1),
         "0" | ")" => TermAction::FontReset,
         "k" => TermAction::ClearScrollback,
+        "o" => TermAction::CopyLastOutput,
+        "u" => TermAction::UrlHints,
+        "g" => TermAction::OpenScrollbackEditor,
         "f" => TermAction::Search,
+        "p" => TermAction::Palette,
+        "," | "<" => TermAction::ReloadConfig,
+        "l" => TermAction::ClearScreen,
         _ => return None,
     })
 }
 
-/// Ctrl (no shift) digits select tabs 1-8; Ctrl+Tab / Ctrl+Shift+Tab cycle.
+/// Ctrl (no shift) digits select tabs 1-8; Alt+digits select tabs 1-9;
+/// Ctrl+Tab / Ctrl+Shift+Tab cycle.
 pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
-    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
+    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT)
+        || mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::CONTROL)
+    {
         let digit = match code {
             Code::Digit1 => Some(1),
             Code::Digit2 => Some(2),
@@ -321,11 +515,14 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
             Code::Digit6 => Some(6),
             Code::Digit7 => Some(7),
             Code::Digit8 => Some(8),
+            Code::Digit9 if mods.contains(Modifiers::ALT) => Some(9),
             _ => None,
         };
         if let Some(n) = digit {
             return Some(TermAction::SelectTab(n));
         }
+    }
+    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
         if matches!(key, Key::Named(NamedKey::Tab)) {
             return Some(TermAction::NextTab);
         }
@@ -345,19 +542,357 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
 }
 
 /// Actions the app performs rather than forwarding as bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TermAction {
     Copy,
     Paste,
     NewTab,
+    /// Ghostty `close_tab` — close the whole tab (every split in it).
     CloseTab,
+    /// Ghostty `close_surface` — close only the focused pane; a sole
+    /// pane takes its tab with it.
+    CloseSurface,
+    /// Open a whole new OS window (its own tabs and sessions).
+    NewWindow,
+    /// Flip the drop-down quick terminal open/closed (Ghostty
+    /// `toggle_quick_terminal`; works as a window-local keybind and as
+    /// the `global:` hotkey target).
+    ToggleQuickTerminal,
+    /// Jump back to the previously-selected tab (kitty `goto_tab -1`,
+    /// tmux `last-window`).
+    LastTab,
+    /// Close every tab in this window (Ghostty `close_window`), with
+    /// `confirm-close` prompts where configured.
+    CloseWindow,
+    /// Close every tab in this window (Ghostty `close_all_tabs`) —
+    /// same effect as `close_window`, kept as the reference's name.
+    CloseAllTabs,
+    /// Close every tab except the selected one (Ghostty
+    /// `close_other_tabs`), `confirm-close` prompts where configured.
+    CloseOtherTabs,
+    /// Ghostty `close_all_windows` — deprecated upstream ("no effect";
+    /// the supported path is `all:close_window`). Bound by name and
+    /// implemented as the same every-window sweep `all:close_window`
+    /// performs.
+    CloseAllWindows,
+    /// Show/hide the tab strip on demand, overriding `tab-bar-min-tabs`
+    /// until the next config reload (kitty `toggle_tab_bar`).
+    ToggleTabBar,
     NextTab,
     PrevTab,
     SelectTab(usize),
-    FontBigger,
-    FontSmaller,
+    /// Ghostty `reset_font_size` — restore the configured `font-size`.
     FontReset,
+    /// Ghostty `increase_font_size:pt` / `decrease_font_size:pt` —
+    /// parameterized zoom steps (whole points).
+    IncreaseFontSize(i32),
+    DecreaseFontSize(i32),
+    /// Ghostty `set_font_size:pt` — absolute font size (fractional).
+    SetFontSize(f32),
     ClearScrollback,
+    /// Ghostty `clear_screen` — erase the display AND the scrollback,
+    /// cursor home (no mode reset).
+    ClearScreen,
+    /// Ghostty `reset` — RIS: reset modes + erase everything.
+    Reset,
     Search,
+    /// Ghostty `jump_to_prompt:N` — scroll the viewport N prompt marks
+    /// (negative = previous).
+    JumpToPrompt(i32),
+    /// Select the whole viewport.
+    SelectAll,
+    /// Keyboard selection mode (Ghostty `start_selection`): anchor a
+    /// selection at the cursor, arrows/Home/End/PageUp/PageDown move its
+    /// end, Enter copies, Escape cancels; any other key exits.
+    StartSelection,
+    /// Scroll the viewport to the top of scrollback / the bottom.
+    ScrollToTop,
+    ScrollToBottom,
+    /// Scroll one page up/down through scrollback (Shift+PageUp/Down).
+    ScrollPageUp,
+    ScrollPageDown,
+    /// Ghostty `scroll_page_lines:N` — scroll N lines through
+    /// scrollback (negative = up; Shift+Up/Down defaults use ±1).
+    ScrollPageLines(i32),
+    /// Ghostty `move_tab:N` — move the current tab N slots
+    /// (negative = left; Ctrl+Shift+PageUp/Down defaults use ±1).
+    MoveTab(i32),
+    /// Focus the neighboring pane in a direction (Ctrl+Alt+Arrow).
+    FocusPaneDir {
+        /// Left/right (Row splits) when true, up/down (Column) when false.
+        horizontal: bool,
+        /// Right/down when true, left/up when false.
+        forward: bool,
+    },
+    /// Move the divider beside the focused pane in a direction
+    /// (Ctrl+Alt+Shift+Arrow / `keybind = resize_split:dir[,px]`) —
+    /// keyboard split resize; `px` is the step in points.
+    ResizePane {
+        /// Left/right (Row splits) when true, up/down (Column) when false.
+        horizontal: bool,
+        /// Right/down when true, left/up when false.
+        forward: bool,
+        /// Main-axis points to move the divider by.
+        px: i32,
+    },
+    /// URL hint mode: number the visible links, type digits + Enter to
+    /// open one without the mouse.
+    UrlHints,
+    /// Paste-protection confirm: write the stashed clipboard text.
+    /// Cancel is Escape on the surface, not an action — the snackbar
+    /// has a single action slot.
+    PasteConfirm,
+    /// `confirm-close`: the user approved closing a pane/tab that has a
+    /// program running in the foreground.
+    CloseConfirm,
+    /// Drag-and-drop: paste the dropped item's path (shell-quoted).
+    DropText(String),
+    /// Copy the output of the last finished (or running) command — the
+    /// rows between its OSC 133 `C` and `D` marks.
+    CopyLastOutput,
+    /// Context-menu \"Open Link\" — the URL the secondary press landed on
+    /// travels with the action so the opener need not re-resolve the
+    /// pointer cell.
+    OpenUrl(String),
+    /// Dump the scrollback + screen to a temp file and open it in
+    /// `$VISUAL`/`$EDITOR` inside a new tab (kitty/WezTerm style).
+    OpenScrollbackEditor,
+    /// `write_screen_file` / `write_scrollback_file` /
+    /// `write_selection_file` / `write_last_output_file` (Ghostty
+    /// actions, `:action` parameter): dump the visible viewport / full
+    /// scrollback+screen / current selection / last command output to a
+    /// temp file, then `open` it in `$VISUAL`/`$EDITOR` in a new tab,
+    /// `copy` the path to the clipboard, or `paste` the path to the pty.
+    WriteScreenFile(FileSink),
+    WriteScrollbackFile(FileSink),
+    WriteSelectionFile(FileSink),
+    WriteLastOutputFile(FileSink),
+    /// Ghostty `open_config` — open the live config file in
+    /// `$VISUAL`/`$EDITOR` in a new tab.
+    OpenConfig,
+    /// Ghostty `scroll_to_selection` — scroll the viewport so the
+    /// selection's start is the top row.
+    ScrollToSelection,
+    /// Ghostty `clear_selection` — drop the current selection.
+    ClearSelection,
+    /// Ghostty `navigate_search:next|previous` — step the search match
+    /// cursor forward / back.
+    NavigateSearch(i32),
+    /// Shut down all sessions and exit.
+    Quit,
+    /// Split the focused pane (new pane takes half its slot); Left/Up
+    /// insert the new pane ahead of the target like Ghostty's
+    /// `new_split:left`/`up`.
+    SplitRight,
+    /// Ghostty `new_split:auto` — pick Row/Column by the pane's
+    /// aspect ratio (wider than tall → right, else down).
+    SplitAuto,
+    SplitDown,
+    SplitLeft,
+    SplitUp,
+    /// Toggle: the focused pane fills the whole tab (tmux zoom).
+    PaneZoom,
+    /// Focus the nth pane in the tab (Ghostty `goto_split`,
+    /// Ctrl+Alt+1..9 — Ctrl+Alt+Arrows already do directional focus).
+    GotoSplit(usize),
+    /// Re-read the config file and live-apply it (Ctrl+Shift+,).
+    ReloadConfig,
+    /// `clipboard-read = ask`: the program's OSC 52 read was approved
+    /// by the Allow action or Enter.
+    ClipboardReadConfirm,
+    /// The OSC 52 read was refused — replies with an empty payload and
+    /// drops the request (Ghostty's Deny button / Escape).
+    ClipboardReadDeny,
+    /// Cycle pane focus within the tab.
+    FocusNextPane,
+    FocusPrevPane,
+    /// Toggle borderless fullscreen.
+    Fullscreen,
+    /// Ghostty `toggle_maximize` — maximize/restore the window.
+    ToggleMaximize,
+    /// Ghostty `toggle_window_float_on_top` — always-on-top
+    /// stacking level.
+    ToggleWindowFloatOnTop,
+    /// Reset every split in the tab to equal shares
+    /// (Ghostty `equalize_splits`, tmux `select-layout -E`).
+    EqualizeSplits,
+    /// Open the command palette.
+    Palette,
+    /// Open the settings page.
+    Settings,
+    /// Ghostty `keybind = chord=text:"…"` — write literal bytes to the
+    /// focused pane as if typed.
+    TypeText(String),
+    /// Ghostty `keybind = chord=esc:"…"` — write `\e` + payload.
+    EscSeq(String),
+    /// Ghostty `keybind = chord=csi:"…"` — write `\e[` + payload.
+    CsiSeq(String),
+    /// Ghostty `paste_from_selection` — paste the PRIMARY selection
+    /// (the clipboard `paste` covers `paste_from_clipboard`).
+    PasteFromSelection,
+    /// Ghostty `scroll_to_fraction` — jump the viewport to a fraction
+    /// of the scrollback (0.0 = bottom / latest, 1.0 = top / oldest).
+    ScrollToFraction(f64),
+    /// Ghostty `scroll_to_row` — jump the viewport N rows back into
+    /// scrollback (0 = bottom / latest screen row).
+    ScrollToRow(usize),
+    /// Ghostty `prompt_surface_title` — interactive rename of the
+    /// focused session's title (until the next OSC 0/1/2 override).
+    PromptTitle,
+    /// Ghostty `prompt_tab_title` — interactive rename of the owning
+    /// tab; a tab title persists across pane-focus changes.
+    PromptTabTitle,
+    /// Ghostty `set_surface_title:text` — set the session title
+    /// directly (empty resets to the running program's title).
+    SetSurfaceTitle(String),
+    /// Ghostty `set_tab_title:text` — set a title on the owning tab
+    /// that survives pane-focus changes; empty removes it.
+    SetTabTitle(String),
+    /// Ghostty `inspector` / `inspector:toggle` — overlay chip reporting
+    /// the attributes of the cell under the terminal cursor.
+    Inspector,
+    /// `inspector:show` / `inspector:hide`.
+    InspectorSet(bool),
+    /// Ghostty `ignore` — consume the chord and do nothing (bytes do
+    /// NOT reach the pty; `unbind` lets them through).
+    Ignore,
+    /// Ghostty `copy_url_to_clipboard` — copy the URL under the mouse
+    /// cursor (OSC 8 hyperlink or detected) to the clipboard.
+    CopyUrlToClipboard,
+    /// Ghostty `copy_title_to_clipboard` — copy the focused session's
+    /// title to the clipboard.
+    CopyTitleToClipboard,
+    /// Ghostty `toggle_mouse_visibility` — hide/show the pointer
+    /// cursor; unlike `mouse-hide-while-typing` the hidden state
+    /// survives pointer motion until toggled back.
+    ToggleMouseVisibility,
+    /// Ghostty `adjust_selection:dir` — move the active end of the
+    /// keyboard selection; with no selection active it starts one at
+    /// the cursor cell; `escape` clears the selection.
+    AdjustSelection(AdjustSel),
+    /// Ghostty `start_search` — open the search bar.
+    StartSearch,
+    /// Ghostty `end_search` — close the search bar and drop the query.
+    EndSearch,
+    /// Ghostty `search_selection` — open search seeded with the
+    /// current selection text.
+    SearchSelection,
+    /// Ghostty `search:text` — set the search query (empty cancels).
+    SearchFor(String),
+    /// Ghostty `scroll_page_fractional:f` — scroll a fraction of the
+    /// page (negative = up).
+    ScrollPageFractional(f64),
+    /// Ghostty `keybind = chord=sequence:a,b` — run every action in
+    /// order on one chord press.
+    Sequence(Vec<TermAction>),
+    /// Ghostty `undo` — reopen the most recently closed tab with its
+    /// scrollback restored (cell-faithful: the grid is serialized with
+    /// its SGR attributes and replayed into the new surface before the
+    /// shell's first prompt).
+    Undo,
+    /// Ghostty `redo` — re-close the surface `undo` just restored,
+    /// pushing it back onto the undo stack so undo can restore again.
+    /// Only fires while the restored tab still exists.
+    Redo,
+    /// Ghostty `toggle_mark` — mark/unmark the line the cursor sits on;
+    /// `jump_to_mark` scrolls back to it. Invisible like the reference.
+    ToggleMark,
+    /// Ghostty `jump_to_mark:previous|next` — scroll the viewport to
+    /// the nearest toggled mark (-1 / +1).
+    JumpToMark(i32),
+    /// Ghostty `cursor_key:<key>` — emit the escape sequence a physical
+    /// cursor keypress would produce, honoring the terminal's DECCKM
+    /// application-cursor mode.
+    CursorKey(CursorKeyDir),
+    /// Ghostty `hide_all_windows` — minimize every window of this
+    /// instance (main, spawned, torn-off).
+    HideAllWindows,
+    /// Ghostty `move_tab_to_new_window` — detach the focused tab (with
+    /// its live sessions) into a new OS window.
+    MoveTabToNewWindow,
+    /// Ghostty `prompt_window_title` — interactive rename of the window
+    /// title (until the next title change).
+    PromptWindowTitle,
+    /// Ghostty `set_window_title:text` — set the window title directly.
+    SetWindowTitle(String),
+    /// Ghostty `toggle_mouse_reporting` — stop forwarding pointer events
+    /// to the program; the app recaptures them (selection, scroll,
+    /// context menu) until toggled again. Per-surface.
+    ToggleMouseReporting,
+    /// Ghostty `toggle_readonly` — the surface stops accepting input
+    /// (key bytes, committed text, pastes, `text:`/`csi:`/`esc:`
+    /// payloads) until toggled again; protocol replies and keybinds
+    /// still work. Per-surface.
+    ToggleReadonly,
+    /// Ghostty `cancel` — dismiss the open transient (hints, keyboard
+    /// selection, prompts, paste-confirm, search, palette).
+    Cancel,
+    /// Ghostty `open_url` — open the link under the pointer.
+    OpenUrlUnderCursor,
+    /// Ghostty `activate_key_table:name` — push a modal keybind layer;
+    /// stays until `deactivate_key_table` (or all-clear).
+    ActivateKeyTable(String),
+    /// Ghostty `activate_key_table_once:name` — like
+    /// `activate_key_table` but auto-pops when any binding fires.
+    ActivateKeyTableOnce(String),
+    /// Ghostty `deactivate_key_table` — pop the innermost key table.
+    DeactivateKeyTable,
+    /// Ghostty `deactivate_all_key_tables` — clear the whole stack.
+    DeactivateAllKeyTables,
+    /// Ghostty `end_key_sequence` — inside a `>` sequence, flush only
+    /// the already-typed prefix keys to the program and exit the
+    /// sequence (the completing key itself is consumed by the bind).
+    EndKeySequence,
+    /// Ghostty `crash` / `crash:<cause>` — crash the process on purpose
+    /// (the reference uses it to exercise crash reporting).
+    Crash,
 }
 
+/// Ghostty `cursor_key:<key>` key set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKeyDir {
+    /// Arrow keys — `\e[A`…`\e[D`, or SS3 `\eOA`…`\eOD` under DECCKM.
+    Up,
+    Down,
+    Right,
+    Left,
+    /// `\e[H` / `\eOH` under DECCKM.
+    Home,
+    /// `\e[F` / `\eOF` under DECCKM.
+    End,
+    /// `\e[5~` (same sequence in both modes).
+    PageUp,
+    /// `\e[6~` (same sequence in both modes).
+    PageDown,
+}
+
+/// Ghostty `adjust_selection:dir` direction set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustSel {
+    /// One cell left / right.
+    Left,
+    Right,
+    /// One row up / down.
+    Up,
+    Down,
+    /// Line start / end.
+    Home,
+    End,
+    /// One viewport up / down.
+    PageUp,
+    PageDown,
+    /// Clear the selection and leave keyboard selection.
+    Escape,
+}
+
+/// Ghostty's `:action` suffix for `write_*_file` — what to do with the
+/// written temp file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSink {
+    /// Open it in `$VISUAL`/`$EDITOR` inside a new tab (default).
+    Open,
+    /// Copy the file path to the clipboard.
+    Copy,
+    /// Paste the file path into the terminal.
+    Paste,
+}
