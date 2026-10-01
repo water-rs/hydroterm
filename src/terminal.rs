@@ -342,8 +342,9 @@ impl EventListener for EventProxy {
 pub struct Terminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     // IoSender wraps mpsc::Sender, which is !Sync — keep it behind a Mutex
-    // so Terminal stays Send+Sync.
-    io: Mutex<IoSender>,
+    // so Terminal stays Send+Sync. `None` until `ensure_started` spawns
+    // the PTY at the surface's real size.
+    io: Mutex<Option<IoSender>>,
     pub proxy: EventProxy,
     /// Absolute grid rows of OSC 133 prompt-start marks
     /// (`history_size + screen line`, recorded on the reader thread at the
@@ -360,17 +361,26 @@ pub struct Terminal {
     /// the reference terminal (a shell repaints its prompt until it says
     /// otherwise).
     shell_redraw: Arc<Mutex<ShellRedraw>>,
+    /// The cursor's live semantic kind — the reference terminal's
+    /// `cursor.semantic_content`, set on the reader thread at each OSC
+    /// 133 mark's stream position. `clear_prompt_for_redraw` gates on it.
+    sem: Arc<Mutex<SemKind>>,
     /// `133;C` timestamp — the surface compares it to
     /// `notify-on-command-finish-after` when `133;D` arrives.
     pub command_started_at: Arc<Mutex<Option<std::time::Instant>>>,
     pub events: Mutex<Receiver<TermEvent>>,
+    /// PTY spawn retained while the surface's real grid size is unknown —
+    /// `ensure_started` consumes it. `None` once the child exists.
+    pending_spawn: Mutex<Option<tty::Options>>,
+    /// Input bytes written before the PTY exists — flushed at attach.
+    pending_input: Mutex<Vec<u8>>,
     /// Duplicated master fd — `tcgetpgrp` answers the slave's foreground
     /// pgroup without taking the reader's term lock.
-    pty_file: std::fs::File,
+    pty_file: Mutex<Option<std::fs::File>>,
     /// PID of the spawned child == its process group (the shell is the
     /// foreground job when nothing else runs).
-    shell_pid: i32,
-    _join: std::thread::JoinHandle<(IoLoop, IoState)>,
+    shell_pid: Mutex<Option<i32>>,
+    join: Mutex<Option<std::thread::JoinHandle<(IoLoop, IoState)>>>,
 }
 
 /// Process-side inputs to [`Terminal::spawn`] — everything the child
@@ -394,15 +404,12 @@ pub struct SpawnOpts<'a> {
 }
 
 impl Terminal {
-    /// Spawn a shell on a PTY and start parsing. `shell` overrides the
-    /// auto-injected shell integration (used by `shell =` config and `-e`).
-    pub fn spawn(
-        config: Config,
-        cols: usize,
-        lines: usize,
-        cell_px: (u16, u16),
-        opts: SpawnOpts<'_>,
-    ) -> io::Result<Self> {
+    /// Build the terminal state without a child process: the grid, event
+    /// plumbing and semantic-mark recorders, with the PTY `Options`
+    /// retained in `pending_spawn` until `ensure_started` gives a real
+    /// grid size. `shell` overrides the auto-injected shell integration
+    /// (used by `shell =` config and `-e`).
+    fn new_unspawned(config: Config, cols: usize, lines: usize, opts: SpawnOpts<'_>) -> Self {
         let (proxy, events_rx) = EventProxy::new();
         let term = Term::new(config, &TermSize { cols, lines }, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -433,11 +440,89 @@ impl Terminal {
             drain_on_exit: true,
             env,
         };
+        Self {
+            term,
+            io: Mutex::new(None),
+            proxy,
+            prompt_marks: Arc::default(),
+            last_output: Arc::default(),
+            shell_redraw: Arc::new(Mutex::new(ShellRedraw::True)),
+            sem: Arc::new(Mutex::new(SemKind::Output)),
+            command_started_at: Arc::default(),
+            events: Mutex::new(events_rx),
+            pending_spawn: Mutex::new(Some(options)),
+            pending_input: Mutex::new(Vec::new()),
+            pty_file: Mutex::new(None),
+            shell_pid: Mutex::new(None),
+            join: Mutex::new(None),
+        }
+    }
+
+    /// Spawn a shell on a PTY and start parsing, at an explicitly given
+    /// grid size — the caller already knows the surface's real dims
+    /// (split/tab spawn). For a launch-size-unknown session use
+    /// [`Terminal::deferred`] so the child is born at the laid-out size.
+    pub fn spawn(
+        config: Config,
+        cols: usize,
+        lines: usize,
+        cell_px: (u16, u16),
+        opts: SpawnOpts<'_>,
+    ) -> io::Result<Self> {
+        let this = Self::new_unspawned(config, cols, lines, opts);
+        this.attach(cols as u16, lines as u16, cell_px)?;
+        Ok(this)
+    }
+
+    /// A terminal whose child spawns on the first real layout instead of
+    /// now — the shell is born at the surface's true winsize, so launch
+    /// involves no resize (and no launch-time SIGWINCH prompt-clear at
+    /// all). `cols`/`lines` seed the empty grid it renders until then.
+    pub fn deferred(config: Config, opts: SpawnOpts<'_>) -> Self {
+        Self::new_unspawned(config, 120, 32, opts)
+    }
+
+    /// Spawn the retained PTY at the given grid size when this terminal
+    /// is still deferred; a no-op once the child exists. Returns true
+    /// when this call attached. The grid is resized before the child is
+    /// born, so its first output lands on the real dims.
+    pub fn ensure_started(&self, cols: u16, lines: u16, cell_px: (u16, u16)) -> bool {
+        if self.pending_spawn.lock().unwrap().is_none() {
+            return false;
+        }
+        {
+            let mut term = self.term.lock();
+            term.resize(TermSize {
+                cols: cols as usize,
+                lines: lines as usize,
+            });
+        }
+        match self.attach(cols, lines, cell_px) {
+            Ok(()) => true,
+            Err(e) => {
+                // Spawn failure is unrecoverable — surface it loudly in
+                // the (empty) grid rather than dying mid-layout.
+                tracing::error!("pty spawn failed: {e}");
+                self.inject_output(format!("\r\npty spawn failed: {e}\r\n").as_bytes());
+                true
+            }
+        }
+    }
+
+    /// Spawn the child on a new PTY and start the I/O loop at the given
+    /// grid size — the shared tail of `spawn` and `ensure_started`.
+    fn attach(&self, cols: u16, lines: u16, cell_px: (u16, u16)) -> io::Result<()> {
+        let options = self
+            .pending_spawn
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| io::Error::other("pty already spawned"))?;
         let pty = tty::new(
             &options,
             WindowSize {
-                num_lines: lines as u16,
-                num_cols: cols as u16,
+                num_lines: lines,
+                num_cols: cols,
                 cell_width: cell_px.0,
                 cell_height: cell_px.1,
             },
@@ -446,43 +531,28 @@ impl Terminal {
         // Grab a duplicated master fd + the child's pid before the Pty
         // moves into the tap wrapper — `confirm-close` later asks
         // `tcgetpgrp(master) != shell pgroup`.
-        let pty_file = pty.file().try_clone()?;
-        let shell_pid = pty.child().id() as i32;
-        let prompt_marks: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
-        let last_output: Arc<Mutex<OutputSpan>> = Arc::default();
-        let shell_redraw = Arc::new(Mutex::new(ShellRedraw::True));
-        let command_started_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+        *self.pty_file.lock().unwrap() = Some(pty.file().try_clone()?);
+        *self.shell_pid.lock().unwrap() = Some(pty.child().id() as i32);
         let marks = Marks {
-            sem: SemKind::Output,
-            prompt_marks: prompt_marks.clone(),
-            last_output: last_output.clone(),
-            redraw: shell_redraw.clone(),
-            command_started_at: command_started_at.clone(),
-            sink: proxy.inner.events.clone(),
+            sem: self.sem.clone(),
+            prompt_marks: self.prompt_marks.clone(),
+            last_output: self.last_output.clone(),
+            redraw: self.shell_redraw.clone(),
+            command_started_at: self.command_started_at.clone(),
+            sink: self.proxy.inner.events.clone(),
         };
         let pty = TapPty::new(pty);
-
-        // `drain_on_exit` is a loop parameter, not an Options one: drain
-        // the PTY's last bytes on child exit so the final output isn't
-        // lost — `wait-after-command` (and any exit) shows the complete
-        // last frame.
-        let (io_loop, io) = IoLoop::new(term.clone(), proxy.clone(), pty, true, marks)?;
-        proxy.inner.notifier.set(IoNotifier(io.clone())).ok();
-        let join = io_loop.spawn();
-
-        Ok(Self {
-            term,
-            io: Mutex::new(io),
-            proxy,
-            prompt_marks,
-            last_output,
-            shell_redraw,
-            command_started_at,
-            events: Mutex::new(events_rx),
-            pty_file,
-            shell_pid,
-            _join: join,
-        })
+        let (io_loop, io) = IoLoop::new(self.term.clone(), self.proxy.clone(), pty, true, marks)?;
+        self.proxy.inner.notifier.set(IoNotifier(io.clone())).ok();
+        *self.join.lock().unwrap() = Some(io_loop.spawn());
+        // Flush any input written before the child existed (keys typed
+        // in the first frame), then publish the sender.
+        let pending = std::mem::take(&mut *self.pending_input.lock().unwrap());
+        if !pending.is_empty() {
+            let _ = io.send(Msg::Input(pending.into()));
+        }
+        *self.io.lock().unwrap() = Some(io);
+        Ok(())
     }
 
     /// The program holding the PTY's foreground process group, or `None`
@@ -490,9 +560,12 @@ impl Terminal {
     /// `confirm-close` gates on this: a running program wants an OK first.
     pub fn foreground_program(&self) -> Option<String> {
         use std::os::unix::io::AsRawFd;
+        let pty_file = self.pty_file.lock().unwrap();
+        let file = pty_file.as_ref()?;
+        let shell_pid = (*self.shell_pid.lock().unwrap())?;
         // SAFETY: tcgetpgrp on a live pty master fd is a plain query.
-        let pgid = unsafe { libc::tcgetpgrp(self.pty_file.as_raw_fd()) };
-        if pgid <= 0 || pgid == self.shell_pid {
+        let pgid = unsafe { libc::tcgetpgrp(file.as_raw_fd()) };
+        if pgid <= 0 || pgid == shell_pid {
             return None;
         }
         std::fs::read_to_string(format!("/proc/{pgid}/comm"))
@@ -502,9 +575,16 @@ impl Terminal {
             .or_else(|| Some(format!("process {pgid}")))
     }
 
-    /// Write user input bytes to the PTY.
+    /// Write user input bytes to the PTY. Before the deferred spawn
+    /// attaches (the first frame), bytes queue and flush at attach —
+    /// nothing typed in the first frame is lost.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.io.lock().unwrap().send(Msg::Input(bytes.into()));
+        let bytes = bytes.into();
+        if let Some(io) = self.io.lock().unwrap().as_ref() {
+            let _ = io.send(Msg::Input(bytes));
+        } else {
+            self.pending_input.lock().unwrap().extend_from_slice(&bytes);
+        }
     }
 
     /// Tell the PTY the grid resized. A same-size call is a full no-op —
@@ -512,6 +592,11 @@ impl Terminal {
     /// ours must too: clearing the prompt row without a real pty resize
     /// produces no SIGWINCH repaint to refill it.
     pub fn resize(&self, cols: u16, lines: u16, cell_px: (u16, u16)) {
+        // A deferred terminal is born at these dims instead of resizing —
+        // the child sees only the real winsize, never a placeholder.
+        if self.ensure_started(cols, lines, cell_px) {
+            return;
+        }
         {
             let mut term = self.term.lock();
             if term.grid().columns() == cols as usize
@@ -521,8 +606,8 @@ impl Terminal {
             }
             if std::env::var_os("HYDRO_SNIFF").is_some() {
                 eprintln!(
-                    "[resize] shell={} -> {cols}x{lines} redraw={:?} cursor={:?}",
-                    self.shell_pid,
+                    "[resize] shell={:?} -> {cols}x{lines} redraw={:?} cursor={:?}",
+                    self.shell_pid.lock().unwrap(),
                     *self.shell_redraw.lock().unwrap(),
                     term.grid().cursor.point
                 );
@@ -544,19 +629,23 @@ impl Terminal {
                     );
                 }
                 eprintln!(
-                    "[postreflow] shell={} row0=|{}|",
-                    self.shell_pid,
+                    "[postreflow] shell={:?} row0=|{}|",
+                    self.shell_pid.lock().unwrap(),
                     s.trim_end()
                 );
             }
             clear_prompt_for_redraw(
                 &mut term,
-                &self.last_output,
+                &self.sem,
+                &self.prompt_marks,
                 *self.shell_redraw.lock().unwrap(),
                 pre_prompt_text,
             );
         }
-        let _ = self.io.lock().unwrap().send(Msg::Resize(WindowSize {
+        let Some(io) = self.io.lock().unwrap().as_ref().cloned() else {
+            return;
+        };
+        let _ = io.send(Msg::Resize(WindowSize {
             num_lines: lines,
             num_cols: cols,
             cell_width: cell_px.0,
@@ -566,7 +655,9 @@ impl Terminal {
 
     /// Ask the event loop to quit (kills the child).
     pub fn shutdown(&self) {
-        let _ = self.io.lock().unwrap().send(Msg::Shutdown);
+        if let Some(io) = self.io.lock().unwrap().as_ref() {
+            let _ = io.send(Msg::Shutdown);
+        }
     }
 
     /// Feed bytes through a fresh parser into the grid as if the program
@@ -591,39 +682,42 @@ pub(crate) fn row_has_mark(grid: &Grid<Cell>, cols: usize, line: i32) -> bool {
 
 /// Clear the prompt region after a resize-reflow so the shell's SIGWINCH
 /// repaint lands on clean rows — the reference terminal's
-/// `clearPromptForRedraw`, driven by [`PROMPT_MARK`] cell flags set when
-/// the OSC 133 marks arrived:
+/// `clearPromptForRedraw` (src/terminal/Screen.zig:2235):
 ///
 /// * `redraw` (`133;A;redraw=`) says how much the shell repaints:
 ///   `False` clears nothing; `Last` (bash) clears only the cursor's row —
 ///   and only when the reflow changed what that row shows, since bash's
 ///   WINCH repaint is deferred to the next input event (clearing an
 ///   undisturbed row would blank the live prompt until a keypress);
-///   `True` (the default) clears from the prompt's first row to the page
-///   end.
-/// * A `C` mark awaiting its `D` means a command is still running — the
-///   cursor sits in its output, not a prompt — so nothing is cleared
-///   (the reference's `semantic_content != .output` check).
-/// * With no flagged rows at all nothing is cleared either — matching
-///   the reference for unintegrated shells.
+///   `True` clears from the prompt's start row to the page end.
+/// * The redraw default is `True`: the reference's
+///   `shell_redraws_prompt` flag starts `.true` (src/terminal/
+///   Terminal.zig:105) and a bare `133;A` never changes it (only a
+///   parsed `redraw=` does — Terminal.zig:2126), so a prompt without
+///   `redraw=` is a repainting prompt (semantic_prompt.zig:308-322:
+///   `.true` "is the default value").
+/// * The clear only runs when the cursor is not on command output — the
+///   reference's `semantic_content != .output` gate (Screen.zig:2248).
+///   Our `SemKind` mirrors it exactly: `Output` from `133;C` through the
+///   next `133;A`, so a cursor in output (running or between `D` and
+///   the next prompt) skips the clear, and an unintegrated shell —
+///   `sem` starts `Output` — never clears either.
 ///
-/// The prompt region is exactly the contiguous tagged rows ending at the
-/// cursor's row — the reader stamps `PROMPT_MARK` on every row the cursor
-/// touches while the semantic state is prompt or input, so no text matching
-/// or row guessing is needed. Stale generations reflow orphaned with their
-/// marks still join the contiguous block and are cleared with it. Cells are
-/// blanked, never erased, and the WRAPLINE join into the cleared region is
-/// severed so the next reflow cannot splice stale rows back in.
+/// The cleared region is the reference's `.true` shape: the prompt's
+/// start row (the last `133;A` at or before the cursor — the
+/// `promptIterator(.left_up)` walk) down to the page end, so unmarked
+/// input rows and gaps between the mark and the cursor can't shrink it.
+/// Cells are blanked, never erased, and the WRAPLINE join into the
+/// cleared region is severed so the next reflow cannot splice stale
+/// rows back in.
 fn clear_prompt_for_redraw<T: EventListener>(
     term: &mut Term<T>,
-    output: &Mutex<OutputSpan>,
+    sem: &Mutex<SemKind>,
+    prompt_marks: &Mutex<Vec<i64>>,
     redraw: ShellRedraw,
     pre_prompt_text: String,
 ) {
-    if redraw == ShellRedraw::False {
-        return;
-    }
-    if matches!(*output.lock().unwrap(), Some((_, None))) {
+    if redraw == ShellRedraw::False || *sem.lock().unwrap() == SemKind::Output {
         return;
     }
     let grid = term.grid_mut();
@@ -668,15 +762,19 @@ fn clear_prompt_for_redraw<T: EventListener>(
             }
         }
         ShellRedraw::True => {
-            // The region ends at the cursor's row; nothing tagged above
-            // an unmarked cursor row is this prompt's.
-            if !row_has_mark(grid, cols, cursor) {
+            // The prompt's start is the last `133;A` row at or before
+            // the cursor — the reference's `promptIterator(.left_up)`
+            // walk; unmarked input rows under the cursor don't stop it.
+            let history = grid.history_size() as i64;
+            let cursor_abs = history + i64::from(cursor);
+            let marks = prompt_marks.lock().unwrap();
+            let Some(&start_abs) = marks.iter().rev().find(|&&m| m <= cursor_abs) else {
                 return;
-            }
-            let mut start = cursor;
-            while start > 0 && row_has_mark(grid, cols, start - 1) {
-                start -= 1;
-            }
+            };
+            drop(marks);
+            // An `A` scrolled into scrollback clamps to row 0: every
+            // visible row is inside the prompt region it began.
+            let start = (start_abs - history).clamp(0, i64::from(cursor)) as i32;
             let end = grid.screen_lines() as i32;
             tracing::debug!(cursor, start, "resize prompt clear");
             clear_rows(term, start, end);
@@ -991,8 +1089,8 @@ impl OnResize for TapPty {
 
 /// What the cursor is currently writing — the semantic state an OSC 133
 /// mark sets at its exact position in the stream (the reference terminal's
-/// `semantic_prompt` on the cursor).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// `cursor.semantic_content`; resize-time clearing reads the shared copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SemKind {
     /// Ordinary command output — rows are never tagged.
     Output,
@@ -1006,7 +1104,7 @@ enum SemKind {
 /// shared recorders the rest of the app reads (`prompt_marks`,
 /// `last_output`, `redraw`).
 struct Marks {
-    sem: SemKind,
+    sem: Arc<Mutex<SemKind>>,
     prompt_marks: Arc<std::sync::Mutex<Vec<i64>>>,
     last_output: Arc<Mutex<OutputSpan>>,
     redraw: Arc<Mutex<ShellRedraw>>,
@@ -1024,15 +1122,15 @@ impl Marks {
         let abs = term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0);
         match ev {
             TapEvent::PromptStart => {
-                self.sem = SemKind::Prompt;
+                *self.sem.lock().unwrap() = SemKind::Prompt;
                 let mut marks = self.prompt_marks.lock().unwrap();
                 if marks.last() != Some(&abs) {
                     marks.push(abs);
                 }
             }
-            TapEvent::PromptEnd => self.sem = SemKind::Input,
+            TapEvent::PromptEnd => *self.sem.lock().unwrap() = SemKind::Input,
             TapEvent::CommandStart => {
-                self.sem = SemKind::Output;
+                *self.sem.lock().unwrap() = SemKind::Output;
                 *self.last_output.lock().unwrap() = Some((abs, None));
                 *self.command_started_at.lock().unwrap() = Some(std::time::Instant::now());
             }
@@ -1069,8 +1167,10 @@ impl<T: EventListener> ansi::Handler for MarkingTerm<'_, T> {
     fn input(&mut self, c: char) {
         let before = self.term.grid().cursor.point;
         self.term.input(c);
-        if !matches!(self.marks.sem, SemKind::Prompt | SemKind::Input)
-            || self.term.mode().contains(TermMode::ALT_SCREEN)
+        if !matches!(
+            *self.marks.sem.lock().unwrap(),
+            SemKind::Prompt | SemKind::Input
+        ) || self.term.mode().contains(TermMode::ALT_SCREEN)
         {
             return;
         }
@@ -2162,7 +2262,7 @@ mod tests {
         let mut term = Term::new(Config::default(), &Sz(24, 80), VoidListener);
         let (sink, _rx) = mpsc::channel();
         let mut marks = Marks {
-            sem: SemKind::Output,
+            sem: Arc::new(Mutex::new(SemKind::Output)),
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
@@ -2212,7 +2312,7 @@ mod tests {
         let mut term = Term::new(Config::default(), &Sz(4, 8), VoidListener);
         let (sink, _rx) = mpsc::channel();
         let mut marks = Marks {
-            sem: SemKind::Output,
+            sem: Arc::new(Mutex::new(SemKind::Output)),
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
@@ -2297,7 +2397,7 @@ mod tests {
         let mut term = Term::new(Config::default(), &Sz(15, 44), VoidListener);
         let (sink, _rx) = mpsc::channel();
         let mut marks = Marks {
-            sem: SemKind::Output,
+            sem: Arc::new(Mutex::new(SemKind::Output)),
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
@@ -2368,7 +2468,13 @@ mod tests {
         for l in (-hs)..0 {
             eprintln!("  scroll {l}: {:?}", text_of(&term, l));
         }
-        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
+        clear_prompt_for_redraw(
+            &mut term,
+            marks.sem.as_ref(),
+            &marks.prompt_marks,
+            ShellRedraw::Last,
+            pre,
+        );
 
         let mut rows = Vec::new();
         let hs = term.grid().history_size() as i32;
@@ -2401,7 +2507,7 @@ mod tests {
         let mut term = Term::new(Config::default(), &Sz(15, 44), VoidListener);
         let (sink, _rx) = mpsc::channel();
         let mut marks = Marks {
-            sem: SemKind::Output,
+            sem: Arc::new(Mutex::new(SemKind::Output)),
             prompt_marks: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_output: Arc::new(Mutex::new(None)),
             redraw: Arc::new(Mutex::new(ShellRedraw::True)),
@@ -2463,7 +2569,13 @@ mod tests {
             cols: 20,
             lines: 15,
         });
-        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
+        clear_prompt_for_redraw(
+            &mut term,
+            marks.sem.as_ref(),
+            &marks.prompt_marks,
+            ShellRedraw::Last,
+            pre,
+        );
         assert_eq!(
             text_of(&term, 14),
             "bash-5.3#",
@@ -2486,7 +2598,13 @@ mod tests {
             cols: 16,
             lines: 15,
         });
-        clear_prompt_for_redraw(&mut term, &marks.last_output, ShellRedraw::Last, pre);
+        clear_prompt_for_redraw(
+            &mut term,
+            marks.sem.as_ref(),
+            &marks.prompt_marks,
+            ShellRedraw::Last,
+            pre,
+        );
         assert_eq!(
             text_of(&term, 14),
             "",

@@ -294,24 +294,25 @@ impl Session {
                 .map(|s| Shell::new(s.clone(), Vec::<String>::new()))
         };
         // Born at the pane's expected grid size when the caller knows it
-        // (split/tab spawn) — otherwise a reasonable initial grid that the
-        // surface resizes on its first frame.
-        let (cols, lines, cell_px) = initial_size.unwrap_or((120, 32, (9, 18)));
-        let terminal = Terminal::spawn(
-            config.clone(),
-            cols,
-            lines,
-            cell_px,
-            crate::terminal::SpawnOpts {
-                cwd,
-                shell,
-                term_name: &cfg.term,
-                env_extra: &cfg.env,
-                shell_integration: cfg.shell_integration,
-                shell_features: cfg.shell_features,
-            },
-        )
-        .expect("failed to spawn PTY — is a shell available?");
+        // (split/tab spawn). When it doesn't (the launch surface) the
+        // child is deferred to the first real layout — the shell is born
+        // at the surface's true winsize, so launch involves no resize and
+        // no launch-time SIGWINCH prompt-clear at all.
+        let spawn_opts = crate::terminal::SpawnOpts {
+            cwd,
+            shell,
+            term_name: &cfg.term,
+            env_extra: &cfg.env,
+            shell_integration: cfg.shell_integration,
+            shell_features: cfg.shell_features,
+        };
+        let terminal = match initial_size {
+            Some((cols, lines, cell_px)) => {
+                Terminal::spawn(config.clone(), cols, lines, cell_px, spawn_opts)
+                    .expect("failed to spawn PTY — is a shell available?")
+            }
+            None => Terminal::deferred(config.clone(), spawn_opts),
+        };
         // `enquiry-response` — configured DA answer, live-updated on reload.
         terminal
             .proxy
@@ -853,16 +854,22 @@ pub struct Instance {
     /// UI-executor timer task exits the process at the deadline unless
     /// a new surface sets it first. Instance-wide (not per-`AppState`): the quit
     /// applies to the whole process, so a surface spawned in any
-    /// window — including a drop-down — cancels it. The `RefCell` is
-    /// UI-thread-only; the flag inside is what the UI-executor timer
-    /// task checks when its delay lands.
-    quit_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// window — including a drop-down — cancels it. `Rc<Cell<bool>>`:
+    /// the flag only ever moves between this `RefCell` and the
+    /// `spawn_local` timer task on the UI thread, never across
+    /// threads — the `!Send` type statically proves the confinement.
+    quit_cancel: RefCell<Option<Rc<Cell<bool>>>>,
     /// Whether any window has ever reached a non-`Closed` state.
     /// Under `initial-window = false` the launch mount starts (and
     /// stays) `Closed`, and `quit-after-last-window-closed` must not
     /// fire before the first real window exists — the window-state
     /// watcher only evaluates the quit once a window was shown.
     any_window_shown: std::cell::Cell<bool>,
+    /// The window whose pane last held embedded focus — the menu-bar's
+    /// dispatch target for window-scoped commands (New Tab, Close,
+    /// Copy/Paste). Marked by surfaces on `on_focus`.
+    #[cfg(target_os = "macos")]
+    frontmost: RefCell<Option<std::rc::Weak<AppShared>>>,
 }
 
 impl Instance {
@@ -872,7 +879,49 @@ impl Instance {
             windows: RefCell::new(Vec::new()),
             quit_cancel: RefCell::new(None),
             any_window_shown: std::cell::Cell::new(false),
+            #[cfg(target_os = "macos")]
+            frontmost: RefCell::new(None),
         })
+    }
+
+    /// Mark `shared`'s window as the menu dispatch target.
+    #[cfg(target_os = "macos")]
+    fn mark_frontmost(&self, shared: &Rc<AppShared>) {
+        *self.frontmost.borrow_mut() = Some(Rc::downgrade(shared));
+    }
+
+    /// The frontmost window's `AppState` — the last focus-marked entry
+    /// that still upgrades, else the first live entry (a freshly
+    /// spawned window before its first focus event).
+    #[cfg(target_os = "macos")]
+    fn frontmost_state(&self) -> Option<AppState> {
+        self.frontmost
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .or_else(|| {
+                self.windows
+                    .borrow()
+                    .iter()
+                    .find_map(std::rc::Weak::upgrade)
+            })
+            .map(|shared| AppState { shared })
+    }
+
+    /// Dispatch a menu-bar command: the frontmost live window takes
+    /// window-scoped actions; windowless, they land on `root`'s
+    /// app-level path — a New Tab with no window opens one (the macOS
+    /// convention), Close/Copy/Paste no-op until a window exists.
+    #[cfg(target_os = "macos")]
+    fn menu_dispatch(&self, action: TermAction, root: &AppState) {
+        if let Some(state) = self.frontmost_state() {
+            state.run_palette_action(action);
+        } else {
+            match action {
+                TermAction::NewTab => root.new_window(),
+                _ => root.run_palette_action(action),
+            }
+        }
     }
 
     /// Entries whose `Weak` still upgrades — windows with a live
@@ -895,12 +944,12 @@ impl Instance {
     /// Arms the quit-delay timer if none is armed and returns the flag
     /// the UI-executor task checks on expiry; `None` while a delay is
     /// already running (first arm wins — the delay does not re-arm).
-    fn arm_quit_delay(&self) -> Option<Arc<AtomicBool>> {
+    fn arm_quit_delay(&self) -> Option<Rc<Cell<bool>>> {
         let mut slot = self.quit_cancel.borrow_mut();
         if slot.is_some() {
             return None;
         }
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Rc::new(Cell::new(false));
         *slot = Some(cancel.clone());
         Some(cancel)
     }
@@ -909,15 +958,15 @@ impl Instance {
     /// surface arriving inside the delay window.
     fn cancel_quit_delay(&self) {
         if let Some(cancel) = self.quit_cancel.borrow_mut().take() {
-            cancel.store(true, Ordering::SeqCst);
+            cancel.set(true);
         }
     }
 }
 
 /// The armed quit-delay's decision when its timer lands: quit unless a
 /// surface spawned during the delay cancelled the arm.
-fn quit_delay_expired(cancel: &AtomicBool) -> bool {
-    !cancel.load(Ordering::SeqCst)
+fn quit_delay_expired(cancel: &Cell<bool>) -> bool {
+    !cancel.get()
 }
 
 /// Extractor key for a pane's session — a local newtype because the
@@ -955,6 +1004,21 @@ impl Resolvable for TitleFont {
 }
 
 impl AppState {
+    /// Record this window as the menu-bar dispatch target — the
+    /// surface's focus handler calls it when the pane takes embedded
+    /// focus (which is what window activation drives).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mark_frontmost(&self) {
+        self.instance.mark_frontmost(&self.shared);
+    }
+
+    /// Menu-bar command entry — `Instance` routes it to the frontmost
+    /// live window or, windowless, this state's own app-level path.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn menu_dispatch(&self, action: TermAction) {
+        self.instance.menu_dispatch(action, self);
+    }
+
     /// Create with one running session.
     // Sessions never leave the UI thread (PTY events arrive through a channel
     // and are consumed in `render`), so the `Arc`s only need UI confinement,
@@ -1534,7 +1598,7 @@ impl AppState {
                 if let Some(cancel) = self.instance.arm_quit_delay() {
                     spawn_local(async move {
                         sleep(std::time::Duration::from_secs_f64(delay)).await;
-                        if quit_delay_expired(&cancel) {
+                        if quit_delay_expired(cancel.as_ref()) {
                             std::process::exit(0);
                         }
                     })
@@ -4954,12 +5018,12 @@ mod tests {
             "a second arm while one is running is a no-op"
         );
         assert!(
-            quit_delay_expired(&cancel),
+            quit_delay_expired(cancel.as_ref()),
             "an armed, uncancelled delay quits at expiry"
         );
         instance.cancel_quit_delay();
         assert!(
-            !quit_delay_expired(&cancel),
+            !quit_delay_expired(cancel.as_ref()),
             "a surface spawned inside the delay must cancel the exit"
         );
         assert!(

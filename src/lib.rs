@@ -191,7 +191,68 @@ pub fn app(env: Environment) -> App {
     } else {
         LastWindowPolicy::Quit
     };
-    App::new_with_windows([window], env).on_last_window_closed(policy)
+    let app = App::new_with_windows([window], env).on_last_window_closed(policy);
+    // macOS menu bar: App (Quit), File (New Window/Tab/Close), Edit
+    // (Copy/Paste), View (Toggle Quick Terminal) — each wired to the same
+    // TermAction as its keybind. `NSApp.mainMenu` survives the windowless
+    // StayResident state, so New Window and Toggle Quick Terminal stay
+    // reachable with zero windows (the F12 grab is X11-only). Not armed
+    // elsewhere: no menu surface exists on Linux/Windows here, and these
+    // chords are super — arming them on the shortcut registry would
+    // shadow the window manager's own super bindings.
+    #[cfg(target_os = "macos")]
+    let app = app.menu_bar(menus(&state));
+    app
+}
+
+/// The macOS menu bar — `App::menu_bar` resolves once; hydrolysis arms
+/// each command's shortcut on the app-scoped registry and renders the
+/// menus on `NSApp.mainMenu`. Dispatch mirrors the keybinds: the
+/// frontmost window (the pane last focused) takes window-scoped
+/// commands, the root state takes app-level ones — `menu_dispatch`
+/// makes New Window / Toggle Quick Terminal / Quit work with zero
+/// windows.
+#[cfg(target_os = "macos")]
+fn menus(state: &app::AppState) -> Vec<Menu> {
+    use crate::keys::TermAction;
+    let cmd = |label: &'static str, key: &'static str, action: TermAction| {
+        label
+            .command()
+            .action(move |State(root): State<app::AppState>| {
+                root.menu_dispatch(action.clone());
+            })
+            .shortcut(Shortcut::new(key).command())
+            .state(state)
+    };
+    vec![
+        Menu::new("hydroterm", cmd("Quit hydroterm", "q", TermAction::Quit)),
+        Menu::new(
+            "File",
+            (
+                cmd("New Window", "n", TermAction::NewWindow),
+                cmd("New Tab", "t", TermAction::NewTab),
+                // ⌘W is `close_surface` in the Ghostty Darwin table —
+                // a sole surface takes its tab (and window) with it.
+                cmd("Close", "w", TermAction::CloseSurface),
+            ),
+        ),
+        Menu::new(
+            "Edit",
+            (
+                cmd("Copy", "c", TermAction::Copy),
+                cmd("Paste", "v", TermAction::Paste),
+            ),
+        ),
+        Menu::new(
+            "View",
+            "Toggle Quick Terminal"
+                .command()
+                .action(move |State(root): State<app::AppState>| {
+                    root.menu_dispatch(TermAction::ToggleQuickTerminal);
+                })
+                .state(state),
+        ),
+    ]
 }
 
 /// The M3 style for `run()`/`water run`: `window-theme = ghostty` seeds

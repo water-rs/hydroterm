@@ -1,5 +1,4 @@
 [package]
-type = "app"
 name = "hydroterm"
 bundle_identifier = "dev.lexoliu.hydroterm"
 
