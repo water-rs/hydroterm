@@ -25,7 +25,7 @@ use nami::{Binding, Signal, binding};
 use waterui::cursor::CursorStyle;
 use waterui::snackbar::Snackbar;
 use waterui::task::spawn_local;
-use waterui::window::WindowState;
+use waterui::window::{UserAttention, WindowState};
 use waterui_core::Str;
 use waterui_core::layout::{Rect as UiRect, Size as UiSize};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
@@ -604,8 +604,10 @@ pub struct TermSurface {
     keysel: Option<(Point, Point)>,
     clipboard: Option<waterkit_clipboard::Clipboard>,
     /// X11 pointer-hide for `mouse-hide-while-typing` (None off-X11).
+    #[cfg(not(target_os = "android"))]
     cursor_hider: Option<crate::xcursor::CursorHider>,
     /// Set when the hider was attempted — avoid reconnecting per frame.
+    #[cfg(not(target_os = "android"))]
     cursor_hider_tried: bool,
     /// `toggle_mouse_visibility` manual hide state — survives pointer
     /// motion until toggled off (Ghostty).
@@ -622,6 +624,7 @@ pub struct TermSurface {
     /// Linux PRIMARY selection (X11, or Wayland data-control where the
     /// compositor offers it) — waterkit-clipboard's `PrimarySelection`;
     /// claims on copy-on-select, middle-click reads it.
+    #[cfg(target_os = "linux")]
     primary: Option<waterkit_clipboard::PrimarySelection>,
     /// Last pointer position in surface-local coords — re-evaluates the
     /// Ctrl+hover link affordance when the modifier chord changes.
@@ -754,11 +757,14 @@ impl TermSurface {
             hints: None,
             keysel: None,
             clipboard: waterkit_clipboard::Clipboard::new().ok(),
+            #[cfg(not(target_os = "android"))]
             cursor_hider: None,
+            #[cfg(not(target_os = "android"))]
             cursor_hider_tried: false,
             pointer_hidden: false,
             suppress_key_text: false,
             last_output_gen: Cell::new(0),
+            #[cfg(target_os = "linux")]
             primary: waterkit_clipboard::PrimarySelection::new().ok(),
             pointer_at: (0.0, 0.0),
             hover_link: Vec::new(),
@@ -913,6 +919,7 @@ impl TermSurface {
     }
 
     /// Current PRIMARY contents, `None` when unowned or unsupported.
+    #[cfg(target_os = "linux")]
     fn primary_text(&self) -> Option<String> {
         self.primary
             .as_ref()
@@ -1045,10 +1052,13 @@ impl TermSurface {
         if let Some(text) = text {
             let text = self.trimmed_copy(text);
             if std::env::var_os("HYDROTERM_DEBUG_INPUT").is_some() {
+                #[cfg(target_os = "linux")]
+                let has_primary = self.primary.is_some();
+                #[cfg(not(target_os = "linux"))]
+                let has_primary = false;
                 eprintln!(
-                    "[copy_sel] mode={mode:?} text={text:?} clip={} primary={}",
+                    "[copy_sel] mode={mode:?} text={text:?} clip={} primary={has_primary}",
                     self.clipboard.is_some(),
-                    self.primary.is_some()
                 );
             }
             if matches!(mode, CoS::Both)
@@ -1059,6 +1069,7 @@ impl TermSurface {
             }
             // PRIMARY tracks the last selection — a middle click
             // anywhere pastes what was last selected.
+            #[cfg(target_os = "linux")]
             if matches!(mode, CoS::Primary | CoS::Both)
                 && let Some(primary) = self.primary.as_mut()
             {
@@ -1490,6 +1501,8 @@ impl TermSurface {
             TermAction::FocusNextPane => self.app.cycle_pane(1),
             TermAction::FocusPrevPane => self.app.cycle_pane(-1),
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
+            TermAction::ToggleMaximize => self.app.toggle_maximize(),
+            TermAction::ToggleWindowFloatOnTop => self.app.toggle_window_float_on_top(),
             TermAction::Palette => self.app.toggle_palette(),
             TermAction::Settings => self.app.toggle_settings(),
             // `text:`/`esc:`/`csi:` payloads — literal bytes on the pty,
@@ -1516,15 +1529,18 @@ impl TermSurface {
                 }
             }
             TermAction::PasteFromSelection => {
-                let bracketed = self
-                    .session
-                    .terminal
-                    .term
-                    .lock()
-                    .mode()
-                    .contains(TermMode::BRACKETED_PASTE);
-                if let Some(t) = self.primary_text() {
-                    self.paste_text(&t, bracketed);
+                #[cfg(target_os = "linux")]
+                {
+                    let bracketed = self
+                        .session
+                        .terminal
+                        .term
+                        .lock()
+                        .mode()
+                        .contains(TermMode::BRACKETED_PASTE);
+                    if let Some(t) = self.primary_text() {
+                        self.paste_text(&t, bracketed);
+                    }
                 }
             }
             // Ghostty counts the target down from the scrollback top
@@ -1724,10 +1740,14 @@ impl TermSurface {
                 // Ghostty `toggle_mouse_visibility` — manual hide/show
                 // that survives pointer motion until toggled back.
                 self.pointer_hidden = !self.pointer_hidden;
-                if !self.cursor_hider_tried {
-                    self.cursor_hider_tried = true;
-                    self.cursor_hider = crate::xcursor::CursorHider::new();
+                #[cfg(not(target_os = "android"))]
+                {
+                    if !self.cursor_hider_tried {
+                        self.cursor_hider_tried = true;
+                        self.cursor_hider = crate::xcursor::CursorHider::new();
+                    }
                 }
+                #[cfg(not(target_os = "android"))]
                 if let Some(h) = &mut self.cursor_hider {
                     if self.pointer_hidden {
                         h.hide();
@@ -2076,6 +2096,11 @@ impl TermSurface {
                     }
                     if attention {
                         self.app.tab_badge(self.session.id, true);
+                        // Ghostty's `attention` also raises the WM
+                        // urgency hint — `Window::attention` reaches
+                        // `request_user_attention` (runner clears it
+                        // on focus). WATERUI_FEEDBACK #51, now wired.
+                        self.app.attention.set(Some(UserAttention::Informational));
                     }
                     // `bell-features` `border` — a ring around the pane
                     // until it's re-focused or receives input (Ghostty).
@@ -2188,6 +2213,7 @@ impl TermSurface {
                                 if self.app.config(|c| c.bell_attention) {
                                     *self.session.notify_badge.lock().unwrap() = true;
                                     self.app.tab_badge(self.session.id, true);
+                                    self.app.attention.set(Some(UserAttention::Informational));
                                 }
                                 if self.app.config(|c| c.bell_border) {
                                     self.bell_border = true;
@@ -2219,6 +2245,7 @@ impl TermSurface {
                         if self.app.config(|c| c.bell_attention) {
                             *self.session.notify_badge.lock().unwrap() = true;
                             self.app.tab_badge(self.session.id, true);
+                            self.app.attention.set(Some(UserAttention::Informational));
                         }
                         if self.app.config(|c| c.bell_border) {
                             self.bell_border = true;
@@ -2343,6 +2370,10 @@ impl TermSurface {
     fn sync_size(&mut self, width: f32, height: f32) {
         let m = self.fonts.metrics;
         self.session.cell_px.set((m.cell_w, m.cell_h));
+        // `window-step-resize` — the window's resize-increments hint
+        // tracks the laid-out cell (last writer wins; surfaces in a
+        // window share font config).
+        self.app.cell_size.set(UiSize::new(m.cell_w, m.cell_h));
         // `window-padding-x`/`window-padding-y` live inside the surface's
         // own frame (with the internal `PADDING` margin) so the scene's
         // `window-padding-color` extension can paint them contiguously.
@@ -3066,7 +3097,10 @@ impl TermSurface {
             }
             // Paste reads each clipboard synchronously.
             TermAction::Paste => !self.clipboard_text().is_empty(),
+            #[cfg(target_os = "linux")]
             TermAction::PasteFromSelection => self.primary_text().is_some(),
+            #[cfg(not(target_os = "linux"))]
+            TermAction::PasteFromSelection => false,
             // Scroll actions need scrollback to move through.
             TermAction::ScrollPageUp
             | TermAction::ScrollPageDown
@@ -3092,12 +3126,15 @@ impl TermSurface {
         if !self.app.config(|c| c.mouse_hide_typing) {
             return;
         }
-        if !self.cursor_hider_tried {
-            self.cursor_hider_tried = true;
-            self.cursor_hider = crate::xcursor::CursorHider::new();
-        }
-        if let Some(h) = &mut self.cursor_hider {
-            h.hide();
+        #[cfg(not(target_os = "android"))]
+        {
+            if !self.cursor_hider_tried {
+                self.cursor_hider_tried = true;
+                self.cursor_hider = crate::xcursor::CursorHider::new();
+            }
+            if let Some(h) = &mut self.cursor_hider {
+                h.hide();
+            }
         }
     }
 
@@ -3501,15 +3538,19 @@ impl TermSurface {
                                 crate::config::CopyOnSelect::Both
                             ) {
                                 self.paste_clipboard();
-                            } else if let Some(text) = self.primary_text() {
-                                let bracketed = self
-                                    .session
-                                    .terminal
-                                    .term
-                                    .lock()
-                                    .mode()
-                                    .contains(TermMode::BRACKETED_PASTE);
-                                self.paste_text(&text, bracketed);
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                if let Some(text) = self.primary_text() {
+                                    let bracketed = self
+                                        .session
+                                        .terminal
+                                        .term
+                                        .lock()
+                                        .mode()
+                                        .contains(TermMode::BRACKETED_PASTE);
+                                    self.paste_text(&text, bracketed);
+                                }
                             }
                         }
                         // `clipboard-paste` — the standard clipboard.
@@ -4434,6 +4475,7 @@ impl SceneContent for TermSurface {
             SurfaceInputEvent::PointerMove { position } => {
                 // `toggle_mouse_visibility` keeps the pointer hidden
                 // across motion until the action toggles it back.
+                #[cfg(not(target_os = "android"))]
                 if !self.pointer_hidden
                     && let Some(h) = &mut self.cursor_hider
                 {
@@ -4447,6 +4489,7 @@ impl SceneContent for TermSurface {
                 button,
                 position,
             } => {
+                #[cfg(not(target_os = "android"))]
                 if !self.pointer_hidden
                     && let Some(h) = &mut self.cursor_hider
                 {

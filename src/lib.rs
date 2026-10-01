@@ -27,15 +27,16 @@ mod scene;
 mod surface;
 mod terminal;
 mod theme;
+#[cfg(not(target_os = "android"))]
 mod xcursor;
 
 use crate::app::AppState;
 use waterui::Plugin;
-use waterui::app::App;
+use waterui::app::{App, LastWindowPolicy};
 use waterui::prelude::*;
 use waterui::theme::Theme;
 use waterui::window::Window;
-use waterui::window::WindowState::Fullscreen;
+use waterui::window::WindowState::{Fullscreen, Maximized};
 use waterui::window::WindowStyle::{Borderless, Titled};
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...] [+ACTION]`
@@ -133,7 +134,21 @@ pub fn app(env: Environment) -> App {
     } else {
         Borderless
     })
+    // `toggle_window_float_on_top` flips the shared binding; the
+    // runner diffs `level` each pump (`Window::level`).
+    .level(state.window_level.clone())
     .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+    let mut window = window;
+    // `bell-features = attention` writes `Some(UserAttention)` here;
+    // the runner maps it to the WM's demands-attention hint and
+    // clears it on focus.
+    window.attention = state.attention.clone();
+    // `window-step-resize` (Ghostty default on): the WM sees
+    // cell-sized resize increments, so interactive resizes snap to
+    // the grid (`Window::resize_increments`).
+    if state.config(|c| c.window_step_resize) {
+        window = window.resize_increments(state.cell_size.clone());
+    }
     // `class =` — X11 WM_CLASS / Wayland app_id (water-rs/waterui#1291).
     let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
         window.app_id(Str::from(cls))
@@ -158,7 +173,25 @@ pub fn app(env: Environment) -> App {
     if state.config(|c| c.window_fullscreen) {
         state.window_state.set(Fullscreen);
     }
-    App::new_with_windows([window], env)
+    // `maximize` — launch the first window maximized (Ghostty).
+    if state.config(|c| c.maximize && c.initial_window) {
+        state.window_state.set(Maximized);
+    }
+    // `LastWindowPolicy`: the runner's default `Quit` ends the event
+    // loop when the last window closes — correct only when
+    // `quit-after-last-window-closed` applies with no delay. A
+    // `false` config, a delay (our timer exits the process itself),
+    // or a zero-window launch (`initial-window = false` must not
+    // quit at mount) all need `StayResident`.
+    let policy = if !state.config(|c| c.initial_window)
+        || !state.config(|c| c.quit_after_last_window_closed)
+        || state.config(|c| c.quit_after_last_window_closed_delay.is_some())
+    {
+        LastWindowPolicy::StayResident
+    } else {
+        LastWindowPolicy::Quit
+    };
+    App::new_with_windows([window], env).on_last_window_closed(policy)
 }
 
 /// The M3 style for `run()`/`water run`: `window-theme = ghostty` seeds
@@ -193,6 +226,19 @@ pub fn material_style() -> hydrolysis_m3::Material3 {
 /// The `hydroterm` binary's entry: identical to the generated backend's
 /// `main` — `app(env)` carries the `window-theme` scheme in the
 /// environment; `material_style()` picks the seed on both paths.
+#[cfg(not(target_os = "android"))]
 pub fn run() {
     hydrolysis::run(app(Environment::new()), material_style());
+}
+
+/// The Android entry: the APK host loads this library and registers the
+/// app factory; hydrolysis drives it from `android_main`.
+#[cfg(target_os = "android")]
+pub fn run() {
+    hydrolysis::android::register_app(|| {
+        (
+            app(Environment::new()),
+            std::rc::Rc::new(material_style()) as std::rc::Rc<dyn hydrolysis::Style>,
+        )
+    });
 }

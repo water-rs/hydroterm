@@ -708,6 +708,11 @@ pub enum TermAction {
     FocusPrevPane,
     /// Toggle borderless fullscreen.
     Fullscreen,
+    /// Ghostty `toggle_maximize` — maximize/restore the window.
+    ToggleMaximize,
+    /// Ghostty `toggle_window_float_on_top` — always-on-top
+    /// stacking level.
+    ToggleWindowFloatOnTop,
     /// Reset every split in the tab to equal shares
     /// (Ghostty `equalize_splits`, tmux `select-layout -E`).
     EqualizeSplits,

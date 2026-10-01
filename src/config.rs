@@ -690,6 +690,17 @@ pub struct AppConfig {
     pub window_save_state: bool,
     /// Launch every window fullscreen (Ghostty `fullscreen`).
     pub window_fullscreen: bool,
+    /// Launch the first window maximized (Ghostty `maximize`).
+    pub maximize: bool,
+    /// Launch the process without its window — it stays resident and
+    /// opens windows on demand (Ghostty `initial-window`, default
+    /// true). With `false` the declared window mounts `Closed`, the
+    /// runner reaps it, and `StayResident` keeps the process alive.
+    pub initial_window: bool,
+    /// Report cell-sized resize increments to the WM so interactive
+    /// resizes snap to the grid (Ghostty `window-step-resize`, default
+    /// true).
+    pub window_step_resize: bool,
     /// Keep the surface open after a `command`/`-e` child exits
     /// (Ghostty `wait-after-command`, default false). Interactive
     /// shells always close their tab on exit.
@@ -1107,6 +1118,9 @@ impl Default for AppConfig {
             selection_invert: false,
             window_save_state: false,
             window_fullscreen: false,
+            maximize: false,
+            initial_window: true,
+            window_step_resize: true,
             wait_after_command: false,
             abnormal_command_exit_runtime: 250,
             desktop_notifications: true,
@@ -1707,23 +1721,22 @@ impl AppConfig {
                     }
                 }
                 "initial-window" => {
-                    // Ghostty launches the process with no window and
-                    // stays resident — WaterUI cannot keep a process
-                    // alive with zero windows (App::new_with_windows
-                    // panics on empty; the runner exits when none
-                    // remain). `true` (the default) is accepted; `false`
-                    // fails loudly naming the gap.
-                    match value.trim() {
-                        "true" => {}
-                        "false" => errors.push(format!(
-                            "line {}: initial-window = false is not supported yet: WaterUI cannot keep a process alive with zero windows, see WATERUI_FEEDBACK #76 / water-rs/waterui#1315",
-                            n + 1
-                        )),
-                        _ => errors.push(format!(
-                            "line {}: bad initial-window {value:?}",
-                            n + 1
-                        )),
-                    }
+                    // Ghostty `initial-window = false` launches the
+                    // process resident without a window. Supported
+                    // since waterui's `LastWindowPolicy` +
+                    // `WindowState::Closed` mount (water-rs/waterui#1315
+                    // landed): the declared window mounts unmapped, the
+                    // runner reaps it, and `StayResident` keeps the
+                    // process alive — the mount pump still captures the
+                    // runner `env` and arms the hotkey, so windows open
+                    // on demand.
+                    cfg.initial_window = bool_value(value, n, &mut errors);
+                }
+                "maximize" => {
+                    cfg.maximize = bool_value(value, n, &mut errors);
+                }
+                "window-step-resize" => {
+                    cfg.window_step_resize = bool_value(value, n, &mut errors);
                 }
                 "background-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
@@ -3295,6 +3308,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "adjust_selection:<left|right|up|down|home|end|page_up|page_down|escape>",
     "quit",
     "toggle_fullscreen",
+    "toggle_maximize",
+    "toggle_window_float_on_top",
     "toggle_command_palette",
     "settings",
     "new_split:<right|down|left|up|auto>",
@@ -4181,6 +4196,8 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "quit" => TermAction::Quit,
         "equalize_splits" => TermAction::EqualizeSplits,
         "toggle_fullscreen" => TermAction::Fullscreen,
+        "toggle_maximize" => TermAction::ToggleMaximize,
+        "toggle_window_float_on_top" => TermAction::ToggleWindowFloatOnTop,
         "toggle_command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
         // Ghostty `write_*_file[:open|copy|paste]` — the suffix names
@@ -6042,16 +6059,19 @@ mod key_table_tests {
         assert_eq!(cfg.keybinds.len(), 1);
 
         // `scrollback-compression = false` is our behavior (accepted);
-        // `true` errors loudly. `initial-window = true` accepted;
-        // `false` errors naming the zero-window residency gap.
+        // `true` errors loudly. `initial-window` parses as a bool —
+        // `false` launches windowless-resident (waterui#1315 landed).
         let (_, errs) = AppConfig::parse("scrollback-compression = false\ninitial-window = true\n");
         assert!(errs.is_empty(), "{errs:?}");
         let (_, errs) = AppConfig::parse("scrollback-compression = true\n");
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("kept uncompressed"));
-        let (_, errs) = AppConfig::parse("initial-window = false\n");
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("zero windows"));
+        let (cfg, errs) = AppConfig::parse("initial-window = false\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!cfg.initial_window);
+        let (cfg, errs) = AppConfig::parse("maximize = true\nwindow-step-resize = false\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.maximize && !cfg.window_step_resize);
         let (_, errs) = AppConfig::parse("initial-window = maybe\n");
         assert_eq!(errs.len(), 1);
     }

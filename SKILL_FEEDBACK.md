@@ -427,3 +427,52 @@ patched in-repo.
   exits 1 while `xdotool windowfocus <wid>` raises+fine. If `type`/
   `key` lands nothing on a real `search`-found window under Xvfb,
   focus it with `windowfocus` first.
+
+## r-next — waterui `9dfe6be` / hydrolysis `06f0b2f`
+
+- **Zero-window / resident apps are undocumented in the skill.**
+  `references/navigation.md` "Windows" documents `App::new_with_windows`,
+  `.level(..)`, `.resize_increments(..)`, `WindowState::Maximized`,
+  `request_attention`, and `conditional_window` — all accurate. It does
+  NOT mention `App::on_last_window_closed(LastWindowPolicy)`,
+  `LastWindowPolicy::{Quit, StayResident}`, or that a declared window
+  may start `WindowState::Closed` (the mount pump builds its view once,
+  then the runner reaps it — the only way to arm app-level state with
+  no visible window). Needed for `initial-window = false` / Dock- and
+  tray-resident apps.
+- **`Window::show(env)` is the path when no live view hosts a
+  presenter.** The skill shows `conditional_window` for on-demand
+  windows, but the presentation node lives inside one window's view —
+  when that window is destroyed the presenter is gone and flipping the
+  `WindowState` binding mounts nothing. `Window::show(&env)` through
+  the env captured at `body()` (a `std::cell::OnceCell<Environment>`
+  retained on app state) mounts through `WindowManager` independent of
+  any live view — required for hotkey-resurrected drop-downs and
+  `new_window` after the last window closes. Not in the skill.
+- **`window.attention` (pub field, signal-driven) vs
+  `WindowHandle::request_attention`.** The skill lists only the
+  imperative handle call. The reactive `Window::attention` field takes
+  `Binding<Option<UserAttention>>` — set it once at window
+  construction and the runner diffs it into `request_user_attention`
+  every pump (verified: BEL → `WM_HINTS` urgency bit under KWin, cleared
+  on focus). Both forms work; the field form fits signal-driven bell
+  features.
+- **Dead-window dispatch is an app-side hazard, not a framework
+  error.** `spawn_local` tasks and X11 passive-grab drain loops
+  captured at mount keep running after their window closes (the winit
+  runner's local executor is process-level — verified). Anything
+  dispatching through a closed window's view (per-window action queues,
+  `conditional_window` hosts, focused-session lookups) silently
+  dead-ends; env/`WindowManager`/`Window::show` keep working. App code
+  must gate on its own `window_state` binding, and liveness must be
+  checked against the state binding — not the registry `Weak`, which
+  stays upgradable while any task holds a clone.
+- **`Option<V>` in view tuples works** (`(cond.then(|| view), other)`)
+  — used to suppress the drop-down's own `conditional_window` host via
+  `(!state.is_quick_app()).then(...)` — the skill covers `if`/`Option`
+  in `view` bodies but not inside tuple children of a composite.
+- **Repin through `water channel dev` works end-to-end now** —
+  `GITHUB_TOKEN=$(gh auth token) water channel dev` rewrote
+  Water.toml/Water.lock to waterui `9dfe6be` + hydrolysis `06f0b2f`
+  plus every other water-rs dev head in one pass; the earlier
+  resolved-graph hand-merge recipe is no longer needed for dev pins.

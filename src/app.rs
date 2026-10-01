@@ -34,7 +34,8 @@ use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForegro
 use waterui::widget::condition::when;
 use waterui::window::WindowPresentation;
 use waterui::window::{
-    Activation, Monitor, MonitorSelector, Window, WindowState, WindowStyle, conditional_window,
+    Activation, Monitor, MonitorSelector, UserAttention, Window, WindowLevel, WindowState,
+    WindowStyle, conditional_window,
 };
 use waterui_core::id::SelfId;
 use waterui_core::layout::{Point, Rect, Size};
@@ -709,6 +710,20 @@ pub struct AppShared {
     /// Window state binding — normal/minimized/fullscreen/closed.
     /// Owned by us so keybinds can toggle fullscreen.
     pub window_state: Binding<WindowState>,
+    /// Stacking level — `toggle_window_float_on_top` flips it between
+    /// `Normal` and `AlwaysOnTop`; the runner applies it through
+    /// `set_window_level` (waterui `Window::level`, #1315 wave).
+    pub window_level: Binding<WindowLevel>,
+    /// Pending user-attention request — `bell-features = attention`
+    /// sets `Some(Informational)`; the runner maps it to the WM's
+    /// demands-attention hint and clears it on focus (closes the WM
+    /// half of WATERUI_FEEDBACK #51).
+    pub attention: Binding<Option<UserAttention>>,
+    /// Current cell size in points — the first surface to lay out
+    /// writes it; `window-step-resize` feeds it to the WM's
+    /// resize-increments hint so interactive resizes snap to cells
+    /// (the other half of WATERUI_FEEDBACK #51).
+    pub cell_size: Binding<Size>,
     /// The main window's `frame` binding (hydrolysis writes live geometry
     /// back on Moved/Resize) — captured in `main` so the save-state poller
     /// can persist it.
@@ -816,6 +831,11 @@ impl std::ops::Deref for AppState {
 // `.state(&app)` injection rows read the state back through a plain
 // `AppState` extractor parameter.
 
+/// Bindings the drop-down inherits from its host window: the shared
+/// `quick_state` `conditional_window` reads, and the `quick_frame`
+/// cell the close slide animates through.
+type QuickHost = (Binding<WindowState>, Rc<RefCell<Option<Binding<Rect>>>>);
+
 /// One hydroterm process's shared window registry — created once where
 /// the app starts (`AppState::new`) and cloned into every `AppState`
 /// through `Rc`: the main window, spawned windows, torn-off windows and
@@ -829,14 +849,20 @@ pub struct Instance {
     /// each upgraded handle; `hide_all_windows` minimizes each entry's
     /// `window_state` binding.
     windows: RefCell<Vec<std::rc::Weak<AppShared>>>,
-    /// `quit-after-last-window-closed-delay` armed flag — the timer
-    /// thread exits the process at the deadline unless a new surface
-    /// sets it first. Instance-wide (not per-`AppState`): the quit
+    /// `quit-after-last-window-closed-delay` armed flag — the
+    /// UI-executor timer task exits the process at the deadline unless
+    /// a new surface sets it first. Instance-wide (not per-`AppState`): the quit
     /// applies to the whole process, so a surface spawned in any
     /// window — including a drop-down — cancels it. The `RefCell` is
-    /// UI-thread-only; only the `Arc<AtomicBool>` crosses to the timer
-    /// thread.
+    /// UI-thread-only; the flag inside is what the UI-executor timer
+    /// task checks when its delay lands.
     quit_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// Whether any window has ever reached a non-`Closed` state.
+    /// Under `initial-window = false` the launch mount starts (and
+    /// stays) `Closed`, and `quit-after-last-window-closed` must not
+    /// fire before the first real window exists — the window-state
+    /// watcher only evaluates the quit once a window was shown.
+    any_window_shown: std::cell::Cell<bool>,
 }
 
 impl Instance {
@@ -845,6 +871,7 @@ impl Instance {
         Rc::new(Self {
             windows: RefCell::new(Vec::new()),
             quit_cancel: RefCell::new(None),
+            any_window_shown: std::cell::Cell::new(false),
         })
     }
 
@@ -864,6 +891,33 @@ impl Instance {
     fn entries_len(&self) -> usize {
         self.windows.borrow().len()
     }
+
+    /// Arms the quit-delay timer if none is armed and returns the flag
+    /// the UI-executor task checks on expiry; `None` while a delay is
+    /// already running (first arm wins — the delay does not re-arm).
+    fn arm_quit_delay(&self) -> Option<Arc<AtomicBool>> {
+        let mut slot = self.quit_cancel.borrow_mut();
+        if slot.is_some() {
+            return None;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *slot = Some(cancel.clone());
+        Some(cancel)
+    }
+
+    /// Cancels an armed quit delay: `spawn_session` calls it for any
+    /// surface arriving inside the delay window.
+    fn cancel_quit_delay(&self) {
+        if let Some(cancel) = self.quit_cancel.borrow_mut().take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The armed quit-delay's decision when its timer lands: quit unless a
+/// surface spawned during the delay cancelled the arm.
+fn quit_delay_expired(cancel: &AtomicBool) -> bool {
+    !cancel.load(Ordering::SeqCst)
 }
 
 /// Extractor key for a pane's session — a local newtype because the
@@ -911,18 +965,24 @@ impl AppState {
         command: Option<Vec<String>>,
         instance: Rc<Instance>,
     ) -> Self {
-        Self::new_inner(config_path, command, true, instance)
+        Self::new_inner(config_path, command, true, instance, None)
     }
 
     /// `spawn_initial` = whether the state opens a first tab — a
     /// `detach_tab_to_window` state arrives with its moved tab and must
     /// not. `instance` is the process's shared window registry — every
-    /// `AppState` clones the same `Rc`.
+    /// `AppState` clones the same `Rc`. `quick_host` hands the
+    /// drop-down the host's shared bindings: autohide writes and the
+    /// host's `conditional_window` read one `quick_state`, and the
+    /// close slide animates through one `quick_frame` — carried in at
+    /// construction because the registry's `Weak` rules out a later
+    /// `Rc::get_mut` swap.
     fn new_inner(
         config_path: Option<std::path::PathBuf>,
         command: Option<Vec<String>>,
         spawn_initial: bool,
         instance: Rc<Instance>,
+        quick_host: Option<QuickHost>,
     ) -> Self {
         let mut watcher = ConfigWatcher::new(config_path);
         if command.is_some() {
@@ -932,8 +992,22 @@ impl AppState {
             watcher.config.initial_command = command;
         }
         for e in &watcher.errors {
-            eprintln!("hydroterm config: {e}");
+            tracing::error!("hydroterm config: {e}");
         }
+        // `initial-window = false` launches the process without its
+        // first window: the declared window mounts with its state
+        // `Closed`, the runner reaps it before it shows, and
+        // `LastWindowPolicy::StayResident` keeps the process alive.
+        // The mount pump still builds the view once — that is what
+        // captures the runner `env` `Window::show` needs and arms the
+        // global hotkey, so windows still open on demand. Only the
+        // main window can start closed (spawned windows always show).
+        // The `initial-window` gate applies to the declared launch
+        // window only — the drop-down (quick_host set) always spawns
+        // its session, whatever the first window did.
+        let for_declared = quick_host.is_none();
+        let closed_launch = for_declared && spawn_initial && !watcher.config.initial_window;
+        let spawn_initial = spawn_initial && (!for_declared || watcher.config.initial_window);
         let palette = Palette::for_config(&watcher.config);
         #[cfg(target_os = "linux")]
         let theme_is_auto = matches!(watcher.config.theme, crate::config::ThemeRef::Auto)
@@ -945,7 +1019,13 @@ impl AppState {
             watcher.config.quick_terminal_position,
             watcher.config.quick_terminal_size,
         );
-        let quick_binding = Binding::container(WindowState::Closed);
+        let (quick_binding, quick_frame) = match quick_host {
+            Some((q, f)) => (q, f),
+            None => (
+                Binding::container(WindowState::Closed),
+                Rc::new(RefCell::new(None)),
+            ),
+        };
         let state = Self {
             shared: Rc::new(AppShared {
                 sessions: Rc::new(RefCell::new(Vec::new())),
@@ -968,7 +1048,14 @@ impl AppState {
                         None => Str::from(base.to_string()),
                     }
                 }),
-                window_state: binding(WindowState::Normal),
+                window_state: binding(if closed_launch {
+                    WindowState::Closed
+                } else {
+                    WindowState::Normal
+                }),
+                window_level: binding(WindowLevel::Normal),
+                attention: Binding::default(),
+                cell_size: binding(Size::new(9.0, 18.0)),
                 titlebar_bg: Binding::container(watcher.config.titlebar_background),
                 titlebar_fg: Binding::container(watcher.config.titlebar_foreground),
                 window_frame: Rc::new(RefCell::new(None)),
@@ -997,7 +1084,7 @@ impl AppState {
                 set_blink: Binding::bool(true),
                 theme_dirty: Arc::new(AtomicBool::new(false)),
                 quick_state: quick_binding.clone(),
-                quick_frame: Rc::new(RefCell::new(None)),
+                quick_frame,
                 quick_monitor: Rc::new(RefCell::new(None)),
                 quick_presentation: WindowPresentation::new(&quick_binding),
                 quick_app: Rc::new(RefCell::new(None)),
@@ -1133,7 +1220,7 @@ impl AppState {
             (w.config.clone(), w.errors.clone())
         };
         for e in &errors {
-            eprintln!("hydroterm config: {e}");
+            tracing::error!("hydroterm config: {e}");
         }
         self.apply_config(&config);
         self.reload_toast(&config);
@@ -1225,7 +1312,7 @@ impl AppState {
             (w.config.clone(), w.errors.clone())
         };
         for e in &errors {
-            eprintln!("hydroterm config: {e}");
+            tracing::error!("hydroterm config: {e}");
         }
         self.apply_config(&config);
         self.reload_toast(&config);
@@ -1375,30 +1462,103 @@ impl AppState {
         self.window_state.set(next);
     }
 
+    /// `toggle_maximize` — flip between `Maximized` and `Normal` on
+    /// the same state binding fullscreen uses (waterui
+    /// `WindowState::Maximized`, landed in the #1315 wave).
+    pub fn toggle_maximize(&self) {
+        let next = match self.window_state.snapshot() {
+            WindowState::Maximized => WindowState::Normal,
+            _ => WindowState::Maximized,
+        };
+        self.window_state.set(next);
+    }
+
+    /// `toggle_window_float_on_top` — flip the stacking level between
+    /// `AlwaysOnTop` and `Normal` (waterui `Window::level`, same wave).
+    pub fn toggle_window_float_on_top(&self) {
+        let next = match self.window_level.snapshot() {
+            WindowLevel::AlwaysOnTop => WindowLevel::Normal,
+            _ => WindowLevel::AlwaysOnTop,
+        };
+        self.window_level.set(next);
+    }
+
+    /// Every registered window is `Closed` (or already gone).
+    /// `is_quick` entries never block the quit: hiding the drop-down
+    /// is not a window close in the `quit-after-last-window-closed`
+    /// sense (mirrors the `!is_quick` guard on the tab path).
+    fn all_windows_closed(&self) -> bool {
+        self.instance
+            .windows
+            .borrow()
+            .iter()
+            .all(|w| match w.upgrade() {
+                Some(s) => s.is_quick.get() || s.window_state.snapshot() == WindowState::Closed,
+                None => true,
+            })
+    }
+
+    /// Window-state write-back (`Window::state` is our binding — the
+    /// runner writes `Closed` into it on `CloseRequested`, and our own
+    /// actions write it too). Under `LastWindowPolicy::StayResident`
+    /// — `initial-window = false`, `quit-after-last-window-closed =
+    /// false` or the delay form — the runner never ends the loop, so
+    /// the `quit-after-last-window-closed` semantics live here: once
+    /// a real window was shown, every window closed applies the same
+    /// exit the tab-close path does (delay timer or immediate).
+    fn on_window_state_change(&self) {
+        if self.is_quick.get() {
+            return;
+        }
+        if self.window_state.snapshot() != WindowState::Closed {
+            self.instance.any_window_shown.set(true);
+            return;
+        }
+        if !self.instance.any_window_shown.get()
+            || !self.config(|c| c.quit_after_last_window_closed)
+            || !self.all_windows_closed()
+        {
+            return;
+        }
+        self.exit_or_delay();
+    }
+
+    /// `quit-after-last-window-closed` tail, shared by the tab-close
+    /// and the window-close paths: with
+    /// `quit-after-last-window-closed-delay` the exit waits out the
+    /// timer (a new surface anywhere cancels it at `spawn_session`),
+    /// otherwise the process quits now.
+    fn exit_or_delay(&self) {
+        match self.config(|c| c.quit_after_last_window_closed_delay) {
+            Some(delay) => {
+                if let Some(cancel) = self.instance.arm_quit_delay() {
+                    spawn_local(async move {
+                        sleep(std::time::Duration::from_secs_f64(delay)).await;
+                        if quit_delay_expired(&cancel) {
+                            std::process::exit(0);
+                        }
+                    })
+                    .detach();
+                }
+            }
+            None => self.quit(),
+        }
+    }
+
     /// The drop-down's own session set — created once, kept across
     /// show/hide cycles so the shell + scrollback persist.
     fn quick_app(&self) -> Rc<AppState> {
         if let Some(app) = self.quick_app.borrow().as_ref() {
             return app.clone();
         }
-        let mut app = AppState::new(
+        let app = AppState::new_inner(
             Some(self.cfg.borrow().path.clone()),
             None,
+            true,
             self.instance.clone(),
+            Some((self.quick_state.clone(), self.quick_frame.clone())),
         );
         app.is_quick.set(true);
-        // Share the host's `quick_state`: `quick-terminal-autohide` on a
-        // drop-down surface writes it and the `conditional_window` reads
-        // it — a private binding would leave the window visible. The
-        // `Rc<AppShared>` is still unique here (registry holds Weak), so
-        // `Rc::get_mut` can swap the two bindings the host owns.
-        {
-            let shared = Rc::get_mut(&mut app.shared).expect("fresh AppState is unique");
-            shared.quick_state = self.quick_state.clone();
-            // The frame binding too: `animate_quick_close` on a drop-down
-            // surface slides the host-owned window out.
-            shared.quick_frame = self.quick_frame.clone();
-        }
         let app = Rc::new(app);
         *self.quick_app.borrow_mut() = Some(app.clone());
         app
@@ -1417,7 +1577,20 @@ impl AppState {
             return;
         }
         match self.quick_state.snapshot() {
-            WindowState::Closed => self.quick_state.set(WindowState::Normal),
+            WindowState::Closed => {
+                self.quick_state.set(WindowState::Normal);
+                // `conditional_window` presents the drop-down only while
+                // a live declared window hosts it (`initial-window =
+                // false`, or the last real window closed under a
+                // resident policy, leaves no host). With no live host
+                // `Window::show` through the captured runner `env`
+                // mounts the drop-down directly instead.
+                if self.window_state.snapshot() == WindowState::Closed
+                    && let Some(env) = self.env.get()
+                {
+                    self.quick_window(&self.quick_state).show(env);
+                }
+            }
             // Closing runs the `quick-terminal-animation-duration`
             // slide-out before unmapping.
             _ => self.close_quick(),
@@ -1468,12 +1641,16 @@ impl AppState {
 
     /// Build the quick terminal's borderless top-docked window (mounted by
     /// `conditional_window` when `quick_state` leaves `Closed`).
-    fn quick_window(&self, state: Binding<WindowState>) -> Window {
+    fn quick_window(&self, state: &Binding<WindowState>) -> Window {
         let app = self.quick_app();
         let title = app.window_title.clone();
-        let w = Window::new(title, state, move || app_root((*app).clone()))
+        let level = app.window_level.clone();
+        let attention = app.attention.clone();
+        let mut w = Window::new(title, state.clone(), move || app_root((*app).clone()))
             .style(WindowStyle::Borderless)
-            .resizable(false);
+            .resizable(false)
+            .level(level);
+        w.attention = attention;
         // `class =` — the quick-terminal window shares the app's
         // desktop identity too (water-rs/waterui#1291).
         let w = if let Some(cls) = self.config(|c| c.app_class.clone()) {
@@ -1668,6 +1845,7 @@ impl AppState {
             None,
             false,
             self.instance.clone(),
+            None,
         );
         if self.config(|c| c.inherit_working_directory)
             && let Some(cwd) = self
@@ -1691,7 +1869,19 @@ impl AppState {
         } else {
             WindowStyle::Borderless
         })
+        // `toggle_window_float_on_top` state lives on the shared
+        // binding — the runner diffs `level` on every pump.
+        .level(state.window_level.clone())
         .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        let mut window = window;
+        // `bell-features = attention` writes here; the runner turns it
+        // into the WM urgency hint and clears it on focus.
+        window.attention = state.attention.clone();
+        // `window-step-resize` — cell-sized `WM_NORMAL_HINTS`
+        // increments (default on like Ghostty).
+        if state.config(|c| c.window_step_resize) {
+            window = window.resize_increments(state.cell_size.clone());
+        }
         // `class =` — WM_CLASS/app_id on spawned windows too.
         let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
             window.app_id(Str::from(cls))
@@ -1760,6 +1950,7 @@ impl AppState {
             None,
             false,
             self.instance.clone(),
+            None,
         );
         {
             let mut sessions = self.sessions.borrow_mut();
@@ -2040,9 +2231,7 @@ impl AppState {
     ) -> Rc<Session> {
         // A surface arriving inside `quit-after-last-window-closed-delay`
         // cancels the pending quit (covers tabs, splits, undo restores).
-        if let Some(cancel) = self.instance.quit_cancel.borrow_mut().take() {
-            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.instance.cancel_quit_delay();
         let id = self.alloc_id();
         let mut cfg = self.cfg.borrow().config.clone();
         // First surface: `initial-command` (`-e`) wins over `command`.
@@ -2686,25 +2875,7 @@ impl AppState {
             && !self.is_quick.get()
             && self.config(|c| c.quit_after_last_window_closed)
         {
-            match self.config(|c| c.quit_after_last_window_closed_delay) {
-                Some(delay) => {
-                    let mut armed = self.instance.quit_cancel.borrow_mut();
-                    if armed.is_none() {
-                        let cancel = Arc::new(AtomicBool::new(false));
-                        *armed = Some(cancel.clone());
-                        std::thread::Builder::new()
-                            .name("quit-delay".into())
-                            .spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(delay));
-                                if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                                    std::process::exit(0);
-                                }
-                            })
-                            .ok();
-                    }
-                }
-                None => self.quit(),
-            }
+            self.exit_or_delay();
         }
     }
 
@@ -3964,15 +4135,17 @@ pub fn tabs_view(state: AppState) -> impl View {
 
     // X11 global hotkey → quick terminal (F12). The listener spawns once
     // per process; `conditional_window` mounts the drop-down whenever
-    // `quick_state` leaves Closed.
+    // `quick_state` leaves Closed. Only non-drop-down windows host it —
+    // a drop-down's root would open its own copy recursively (its
+    // `quick_presentation` is the shared binding, already presented).
     state.start_quick_listener();
-    let quick = {
+    let quick = (!state.is_quick_app()).then(|| {
         let app = state.clone();
         conditional_window(&state.quick_presentation, move |win_state| {
-            app.quick_window(win_state)
+            app.quick_window(&win_state)
         })
         .anyview()
-    };
+    });
 
     zstack((
         vstack((strip_bar, content)).spacing(0.0).leading(),
@@ -3983,6 +4156,15 @@ pub fn tabs_view(state: AppState) -> impl View {
     // Keys a focused modal control did not consume bubble here — bind
     // them (Ghostty fires keybinds over overlays; `cancel` relies on it).
     .on_key_press(|Use(press): Use<KeyPress>, app: AppState| app.dispatch_bind_press(&press))
+    // `Window::state` write-back — the runner writes `Closed` on
+    // `CloseRequested`; under `StayResident` the
+    // `quit-after-last-window-closed` semantics run app-side
+    // (`on_window_state_change`), and the first non-`Closed` state
+    // marks that a real window was shown for `initial-window = false`.
+    .on_change(&state.window_state, {
+        let app = state.clone();
+        move |_: WindowState| app.on_window_state_change()
+    })
     // Tab switch → grant embedded focus to that tab's remembered pane;
     // also track the previously-selected tab for `last_tab`.
     .on_change(&state.selected, {
@@ -4515,7 +4697,15 @@ impl AppState {
     pub fn run_palette_action(&self, action: TermAction) {
         self.palette_open.set(false);
         self.palette_field_focus.set(None);
-        if let Some(session) = self.focused_session() {
+        // The session path only works while this AppState owns a live
+        // window — `pending_actions` is drained by the surface's event
+        // handling, which dies with the window. Once the window is gone
+        // (resident drop-down launcher, `initial-window = false`), an
+        // action must fall through to the app-level match or it is
+        // queued on a dead surface and never runs.
+        if self.window_state.snapshot() != WindowState::Closed
+            && let Some(session) = self.focused_session()
+        {
             session.pending_actions.borrow_mut().push(action);
             session.terminal.proxy.request_frame();
             return;
@@ -4532,6 +4722,8 @@ impl AppState {
             TermAction::NextTab => self.cycle_tab(1),
             TermAction::PrevTab => self.cycle_tab(-1),
             TermAction::Fullscreen => self.toggle_fullscreen(),
+            TermAction::ToggleMaximize => self.toggle_maximize(),
+            TermAction::ToggleWindowFloatOnTop => self.toggle_window_float_on_top(),
             TermAction::Quit => self.quit(),
             _ => {}
         }
@@ -4745,8 +4937,36 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, Instance, SplitDir, SplitNode, WindowState, auto_split_dir};
+    use super::{
+        AppState, Instance, SplitDir, SplitNode, WindowState, auto_split_dir, quit_delay_expired,
+    };
     use nami::Signal;
+
+    /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
+    /// first arm wins, a new surface cancels by taking the slot and
+    /// setting the flag, and the timer's expiry check honours the flag.
+    #[test]
+    fn quit_delay_cancel_blocks_exit() {
+        let instance = Instance::new();
+        let cancel = instance.arm_quit_delay().expect("first arm wins");
+        assert!(
+            instance.arm_quit_delay().is_none(),
+            "a second arm while one is running is a no-op"
+        );
+        assert!(
+            quit_delay_expired(&cancel),
+            "an armed, uncancelled delay quits at expiry"
+        );
+        instance.cancel_quit_delay();
+        assert!(
+            !quit_delay_expired(&cancel),
+            "a surface spawned inside the delay must cancel the exit"
+        );
+        assert!(
+            instance.quit_cancel.borrow().is_none(),
+            "cancelling consumes the armed slot"
+        );
+    }
 
     /// The window registry holds no strong reference: dropping a
     /// window's last `AppState` clone kills its entry, which the next
@@ -4755,8 +4975,8 @@ mod tests {
     #[test]
     fn window_registry_prunes_dropped_windows() {
         let instance = Instance::new();
-        let live = AppState::new_inner(None, None, false, instance.clone());
-        let dead = AppState::new_inner(None, None, false, instance.clone());
+        let live = AppState::new_inner(None, None, false, instance.clone(), None);
+        let dead = AppState::new_inner(None, None, false, instance.clone(), None);
         // Keep only the dead window's state binding — the window's last
         // `AppState` clone still drops.
         let dead_state = dead.window_state.clone();

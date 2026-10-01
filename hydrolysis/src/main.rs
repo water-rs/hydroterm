@@ -66,5 +66,5 @@ fn main() {
 fn main() {
     let env = waterui::configure_environment!(waterui::env::Environment::new());
     let app = hydroterm::app(env);
-    hydrolysis::run(app, hydroterm::material_style());
+    hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }
