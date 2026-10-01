@@ -342,7 +342,7 @@ impl KittyStore {
                             Some((raw[..(w * h * 4) as usize].to_vec(), w, h))
                         } else {
                             let mut out = Vec::with_capacity((w * h * 3) as usize);
-                            for px in raw[..(w * h * 3) as usize].chunks_exact(3) {
+                            for px in raw[..(w * h * 3) as usize].as_chunks::<3>().0 {
                                 out.extend_from_slice(px);
                                 out.push(255);
                             }
@@ -428,11 +428,15 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let rgba = match color_type {
         png::ColorType::Rgba => buf.to_vec(),
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
