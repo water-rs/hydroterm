@@ -5,6 +5,7 @@
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+use waterui_graphics::cherenkov::{self, Srgb, WorkingColor};
 
 /// A resolved color pair for one cell.
 #[derive(Debug, Clone, Copy)]
@@ -270,24 +271,26 @@ impl Palette {
     }
 }
 
-/// Convert a terminal `Rgb` to a peniko color.
-pub fn peniko(rgb: Rgb) -> peniko::Color {
-    peniko::Color::new([
+/// Convert a terminal `Rgb` to a working color.
+pub fn working(rgb: Rgb) -> WorkingColor {
+    cherenkov::Color::<Srgb>::new([
         rgb.r as f32 / 255.0,
         rgb.g as f32 / 255.0,
         rgb.b as f32 / 255.0,
         1.0,
     ])
+    .to_working()
 }
 
 /// Convert with alpha.
-pub fn peniko_alpha(rgb: Rgb, a: f32) -> peniko::Color {
-    peniko::Color::new([
+pub fn working_alpha(rgb: Rgb, a: f32) -> WorkingColor {
+    cherenkov::Color::<Srgb>::new([
         rgb.r as f32 / 255.0,
         rgb.g as f32 / 255.0,
         rgb.b as f32 / 255.0,
         a,
     ])
+    .to_working()
 }
 
 // ---------------------------------------------------------------------------

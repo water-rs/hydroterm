@@ -13,9 +13,11 @@
 //! placements), `t=t` shared memory, `t=o` file-descriptor passing,
 //! `a=f` frame animation, `C=`/`o=`/`H=`/`V=`/relative extents.
 
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
-use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use waterui_graphics::Registered;
+use waterui_graphics::cherenkov::{Image, ImageData, Rgba8};
 
 /// One decoded `G...;payload` command.
 pub struct KittyCmd {
@@ -98,7 +100,10 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
 /// A placed image: absolute buffer row + column at transmit time.
 pub struct KittyImage {
     pub id: u32,
-    pub brush: peniko::ImageBrush,
+    /// RGBA pixel data, registered with the scene engine on first draw.
+    pub data: ImageData<Rgba8>,
+    /// Engine-side registration, filled by the first recording that draws it.
+    pub registered: OnceCell<Registered<Image<Rgba8>>>,
     /// Absolute line index (same convention as prompt marks).
     pub line: i64,
     pub col: usize,
@@ -372,20 +377,15 @@ impl KittyStore {
     /// One placement — `id`/`p=` replace any existing placement of the
     /// same pair; `c`/`r`/`z` size and layer it.
     fn push_image(&mut self, cmd: &KittyCmd, line: i64, col: usize, px: Vec<u8>, w: u32, h: u32) {
-        let image = ImageData {
-            data: Blob::new(std::sync::Arc::new(px)),
-            format: ImageFormat::Rgba8,
-            alpha_type: ImageAlphaType::Alpha,
-            width: w,
-            height: h,
-        };
+        let data = ImageData::<Rgba8>::new(w, h, px).expect("kitty image buffer length");
         let id = cmd.id();
         let placement = cmd.num('p').unwrap_or(0);
         self.images
             .retain(|img| !(img.id == id && img.placement == placement));
         self.images.push(KittyImage {
             id,
-            brush: peniko::ImageBrush::new(image),
+            data,
+            registered: OnceCell::new(),
             line,
             col,
             cols: cmd.num('c').unwrap_or(0),
@@ -406,7 +406,7 @@ impl KittyStore {
 /// `EXPAND | ALPHA | STRIP_16` normalizes palette and low-depth sources,
 /// but the `png` crate keeps 8-bit grayscale sources as Gray/LA — those
 /// are expanded to Rgba8 by hand so the caller can always assume a
-/// 4-bytes-per-pixel buffer (vello `ImageData` is declared Rgba8; a
+/// 4-bytes-per-pixel buffer (`ImageData<Rgba8>` is declared Rgba8; a
 /// shorter buffer aborts inside wgpu's `write_texture` validation).
 pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));

@@ -5,7 +5,10 @@
 //! The family's `parley::FontContext` is the host's own — installed into the
 //! environment at startup and shared through `FontCollection` — so a pane
 //! never enumerates system fonts for itself, and the shaped glyph runs hand
-//! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
+//! back parley font data the scene registers as Cherenkov fonts by blob id.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use parley::fontique::Synthesis;
 use parley::setting::Tag;
@@ -14,6 +17,9 @@ use parley::{
     Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle, FontWeight, Layout,
     LayoutContext, StyleProperty, style::GenericFamily,
 };
+use waterui_graphics::Registered;
+use waterui_graphics::cherenkov::{Font, FontId, FontSource};
+use waterui_graphics::resources::RecordingResources;
 use waterui_text::FontCollection;
 
 /// Parse one `font-feature` entry: `-tag` disables, `+tag`/`tag`/`tag=N`
@@ -104,6 +110,9 @@ pub struct TermFonts {
     /// (`wght=700,wdth=85`); each applies only to its own run and does
     /// not inherit.
     variations: [Option<Vec<FontVariation>>; 4],
+    /// Engine-side font registrations keyed by the parley blob id; an
+    /// entry registers on first use and names itself each frame after.
+    font_regs: HashMap<u64, Registered<Font>>,
     pub metrics: CellMetrics,
 }
 
@@ -197,10 +206,36 @@ impl TermFonts {
             style_italic: None,
             style_bold_italic: None,
             variations: [None, None, None, None],
+            font_regs: HashMap::new(),
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
         fonts
+    }
+
+    /// Register `fd`'s face with the scene engine on first use and name its
+    /// `FontId` in this recording. Keyed by the parley blob id — the same
+    /// face reused across runs registers once. `None` when the engine
+    /// rejects the font (the run is skipped, as before).
+    pub fn font_id(
+        &mut self,
+        resources: &mut RecordingResources<'_>,
+        fd: &parley::FontData,
+    ) -> Option<FontId> {
+        let key = fd.data.id();
+        if let std::collections::hash_map::Entry::Vacant(e) = self.font_regs.entry(key) {
+            let source = FontSource::bytes(Arc::<[u8]>::from(fd.data.data())).with_index(fd.index);
+            match resources.font(source) {
+                Ok(registered) => {
+                    e.insert(registered);
+                }
+                Err(err) => {
+                    tracing::debug!(%err, "scene engine rejected terminal font");
+                    return None;
+                }
+            }
+        }
+        Some(resources.name(self.font_regs.get(&key)?))
     }
 
     /// Set `font-codepoint-map` — each entry's family resolved like
