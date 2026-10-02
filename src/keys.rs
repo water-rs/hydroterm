@@ -330,215 +330,395 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
     if matches!(key, Key::Named(NamedKey::F11)) && mods.is_empty() {
         return Some(TermAction::Fullscreen);
     }
-    // Shift-only PageUp/PageDown scroll one page — the xterm/alacritty
-    // convention (Ctrl+Shift+PageUp/Down stays bound to tab cycling).
-    if mods.contains(Modifiers::SHIFT)
-        && !mods.contains(Modifiers::CONTROL)
-        && !mods.contains(Modifiers::ALT)
-        && !mods.contains(Modifiers::META)
+    #[cfg(target_os = "macos")]
     {
-        if let Key::Named(named) = key {
-            return match named {
-                NamedKey::PageUp => Some(TermAction::ScrollPageUp),
-                NamedKey::PageDown => Some(TermAction::ScrollPageDown),
-                // Shift+Up/Down scroll one line — xterm/kitty convention.
-                NamedKey::ArrowUp => Some(TermAction::ScrollPageLines(-1)),
-                NamedKey::ArrowDown => Some(TermAction::ScrollPageLines(1)),
-                // Shift+Insert pastes — the xterm/VTE convention.
-                NamedKey::Insert => Some(TermAction::Paste),
-                _ => None,
-            };
+        if let Some(action) = macos_action_chord(key, mods) {
+            return Some(action);
+        }
+        // An unbound Cmd+key is consumed silently — a terminal never
+        // sends super-modified chords to the pty (bound or not, they
+        // must never reach `key_to_bytes`).
+        if mods.contains(Modifiers::META) {
+            return Some(TermAction::Ignore);
         }
         return None;
     }
-    // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
-    // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
-    // PageUp/PageDown in the same chord are Ghostty's goto_split
-    // previous/next.
-    if mods.contains(Modifiers::CONTROL)
-        && mods.contains(Modifiers::ALT)
-        && mods.contains(Modifiers::SHIFT)
-        && !mods.contains(Modifiers::META)
+    #[cfg(not(target_os = "macos"))]
     {
-        if let Key::Named(named) = key {
-            return match named {
-                NamedKey::ArrowLeft => Some(TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: false,
-                }),
-                NamedKey::ArrowRight => Some(TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: true,
-                }),
-                NamedKey::ArrowUp => Some(TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: false,
-                }),
-                NamedKey::ArrowDown => Some(TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: true,
-                }),
-                NamedKey::PageUp => Some(TermAction::FocusPrevPane),
-                NamedKey::PageDown => Some(TermAction::FocusNextPane),
-                _ => None,
-            };
-        }
-        return None;
-    }
-    // Ctrl+Alt+1..9: jump straight to the nth split. (Plain
-    // Ctrl+Alt+Arrow was the directional-focus chord until r23 — KDE and
-    // GNOME both grab it globally for workspace switching, so the app
-    // never sees it; directional focus now sits on Ghostty's own Linux
-    // default, Ctrl+Shift+Alt+Arrow.)
-    if mods.contains(Modifiers::CONTROL)
-        && mods.contains(Modifiers::ALT)
-        && !mods.contains(Modifiers::SHIFT)
-        && !mods.contains(Modifiers::META)
-    {
-        if let Key::Named(_) = key {
+        // Shift-only PageUp/PageDown scroll one page — the xterm/alacritty
+        // convention (Ctrl+Shift+PageUp/Down stays bound to tab cycling).
+        if mods.contains(Modifiers::SHIFT)
+            && !mods.contains(Modifiers::CONTROL)
+            && !mods.contains(Modifiers::ALT)
+            && !mods.contains(Modifiers::META)
+        {
+            if let Key::Named(named) = key {
+                return match named {
+                    NamedKey::PageUp => Some(TermAction::ScrollPageUp),
+                    NamedKey::PageDown => Some(TermAction::ScrollPageDown),
+                    // Shift+Up/Down scroll one line — xterm/kitty convention.
+                    NamedKey::ArrowUp => Some(TermAction::ScrollPageLines(-1)),
+                    NamedKey::ArrowDown => Some(TermAction::ScrollPageLines(1)),
+                    // Shift+Insert pastes — the xterm/VTE convention.
+                    NamedKey::Insert => Some(TermAction::Paste),
+                    _ => None,
+                };
+            }
             return None;
         }
-        if let Key::Character(text) = key {
-            return match text.as_str() {
-                "1" => Some(TermAction::GotoSplit(0)),
-                "2" => Some(TermAction::GotoSplit(1)),
-                "3" => Some(TermAction::GotoSplit(2)),
-                "4" => Some(TermAction::GotoSplit(3)),
-                "5" => Some(TermAction::GotoSplit(4)),
-                "6" => Some(TermAction::GotoSplit(5)),
-                "7" => Some(TermAction::GotoSplit(6)),
-                "8" => Some(TermAction::GotoSplit(7)),
-                "9" => Some(TermAction::GotoSplit(8)),
-                _ => None,
-            };
+        // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
+        // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
+        // PageUp/PageDown in the same chord are Ghostty's goto_split
+        // previous/next.
+        if mods.contains(Modifiers::CONTROL)
+            && mods.contains(Modifiers::ALT)
+            && mods.contains(Modifiers::SHIFT)
+            && !mods.contains(Modifiers::META)
+        {
+            if let Key::Named(named) = key {
+                return match named {
+                    NamedKey::ArrowLeft => Some(TermAction::FocusPaneDir {
+                        horizontal: true,
+                        forward: false,
+                    }),
+                    NamedKey::ArrowRight => Some(TermAction::FocusPaneDir {
+                        horizontal: true,
+                        forward: true,
+                    }),
+                    NamedKey::ArrowUp => Some(TermAction::FocusPaneDir {
+                        horizontal: false,
+                        forward: false,
+                    }),
+                    NamedKey::ArrowDown => Some(TermAction::FocusPaneDir {
+                        horizontal: false,
+                        forward: true,
+                    }),
+                    NamedKey::PageUp => Some(TermAction::FocusPrevPane),
+                    NamedKey::PageDown => Some(TermAction::FocusNextPane),
+                    _ => None,
+                };
+            }
+            return None;
         }
-        return None;
-    }
-    // Alt+Shift+Arrow: move the divider beside the focused pane — the
-    // keyboard half of split resizing (pointer half is the divider drag
-    // handle). Ctrl+Alt+Shift+Arrow was the chord until r23 but GNOME
-    // grabs it globally (move window to workspace); no common desktop
-    // binds Alt+Shift+Arrow.
-    if mods.contains(Modifiers::ALT)
-        && mods.contains(Modifiers::SHIFT)
-        && !mods.contains(Modifiers::CONTROL)
-        && !mods.contains(Modifiers::META)
-    {
+        // Ctrl+Alt+1..9: jump straight to the nth split. (Plain
+        // Ctrl+Alt+Arrow was the directional-focus chord until r23 — KDE and
+        // GNOME both grab it globally for workspace switching, so the app
+        // never sees it; directional focus now sits on Ghostty's own Linux
+        // default, Ctrl+Shift+Alt+Arrow.)
+        if mods.contains(Modifiers::CONTROL)
+            && mods.contains(Modifiers::ALT)
+            && !mods.contains(Modifiers::SHIFT)
+            && !mods.contains(Modifiers::META)
+        {
+            if let Key::Named(_) = key {
+                return None;
+            }
+            if let Key::Character(text) = key {
+                return match text.as_str() {
+                    "1" => Some(TermAction::GotoSplit(0)),
+                    "2" => Some(TermAction::GotoSplit(1)),
+                    "3" => Some(TermAction::GotoSplit(2)),
+                    "4" => Some(TermAction::GotoSplit(3)),
+                    "5" => Some(TermAction::GotoSplit(4)),
+                    "6" => Some(TermAction::GotoSplit(5)),
+                    "7" => Some(TermAction::GotoSplit(6)),
+                    "8" => Some(TermAction::GotoSplit(7)),
+                    "9" => Some(TermAction::GotoSplit(8)),
+                    _ => None,
+                };
+            }
+            return None;
+        }
+        // Alt+Shift+Arrow: move the divider beside the focused pane — the
+        // keyboard half of split resizing (pointer half is the divider drag
+        // handle). Ctrl+Alt+Shift+Arrow was the chord until r23 but GNOME
+        // grabs it globally (move window to workspace); no common desktop
+        // binds Alt+Shift+Arrow.
+        if mods.contains(Modifiers::ALT)
+            && mods.contains(Modifiers::SHIFT)
+            && !mods.contains(Modifiers::CONTROL)
+            && !mods.contains(Modifiers::META)
+        {
+            if let Key::Named(named) = key {
+                return match named {
+                    NamedKey::ArrowLeft => Some(TermAction::ResizePane {
+                        horizontal: true,
+                        forward: false,
+                        px: 48,
+                    }),
+                    NamedKey::ArrowRight => Some(TermAction::ResizePane {
+                        horizontal: true,
+                        forward: true,
+                        px: 48,
+                    }),
+                    NamedKey::ArrowUp => Some(TermAction::ResizePane {
+                        horizontal: false,
+                        forward: false,
+                        px: 48,
+                    }),
+                    NamedKey::ArrowDown => Some(TermAction::ResizePane {
+                        horizontal: false,
+                        forward: true,
+                        px: 48,
+                    }),
+                    _ => None,
+                };
+            }
+            return None;
+        }
+        if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
+            return None;
+        }
         if let Key::Named(named) = key {
-            return match named {
-                NamedKey::ArrowLeft => Some(TermAction::ResizePane {
-                    horizontal: true,
-                    forward: false,
-                    px: 48,
-                }),
-                NamedKey::ArrowRight => Some(TermAction::ResizePane {
-                    horizontal: true,
-                    forward: true,
-                    px: 48,
-                }),
-                NamedKey::ArrowUp => Some(TermAction::ResizePane {
-                    horizontal: false,
-                    forward: false,
-                    px: 48,
-                }),
-                NamedKey::ArrowDown => Some(TermAction::ResizePane {
-                    horizontal: false,
-                    forward: true,
-                    px: 48,
-                }),
-                _ => None,
-            };
+            return Some(match named {
+                NamedKey::ArrowUp => TermAction::JumpToPrompt(-1),
+                NamedKey::ArrowDown => TermAction::JumpToPrompt(1),
+                // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
+                // convention) — plain Ctrl+PageUp/Down cycles them.
+                NamedKey::PageUp => TermAction::MoveTab(-1),
+                NamedKey::PageDown => TermAction::MoveTab(1),
+                NamedKey::Home => TermAction::ScrollToTop,
+                NamedKey::End => TermAction::ScrollToBottom,
+                // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
+                // convention) — same action as Ctrl+Shift+Z.
+                NamedKey::Enter => TermAction::PaneZoom,
+                _ => return None,
+            });
         }
-        return None;
+        let Key::Character(text) = key else {
+            return None;
+        };
+        Some(match text.to_ascii_lowercase().as_str() {
+            "c" => TermAction::Copy,
+            "v" => TermAction::Paste,
+            "t" => TermAction::NewTab,
+            "w" => TermAction::CloseTab,
+            "n" => TermAction::NewWindow,
+            "a" => TermAction::SelectAll,
+            "e" => TermAction::SplitRight,
+            "d" => TermAction::SplitDown,
+            "z" => TermAction::PaneZoom,
+            "]" | "}" => TermAction::FocusNextPane,
+            "[" | "{" => TermAction::FocusPrevPane,
+            "+" | "=" => TermAction::IncreaseFontSize(1),
+            "-" | "_" => TermAction::DecreaseFontSize(1),
+            "0" | ")" => TermAction::FontReset,
+            "k" => TermAction::ClearScrollback,
+            "o" => TermAction::CopyLastOutput,
+            "u" => TermAction::UrlHints,
+            "g" => TermAction::OpenScrollbackEditor,
+            "f" => TermAction::Search,
+            "p" => TermAction::Palette,
+            "," | "<" => TermAction::ReloadConfig,
+            "l" => TermAction::ClearScreen,
+            _ => return None,
+        })
     }
-    if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
-        return None;
-    }
+}
+
+/// macOS terminal-action chords — the reference terminal's Darwin default
+/// keybind table (ghostty `src/config/Config.zig` `Keybinds.init`, the
+/// `isDarwin()` block at :7074 plus the shared binds whose modifier is
+/// `ctrlOrSuper` → super: :6603 `,`, :6647 c/v, :6674 =/+/-/0, :6690 j,
+/// :6983 digits, :6710 expand-selection, :6751 ctrl+tab cycling, and the
+/// natural-editing text/esc binds at :7330). Cmd+key never produces pty
+/// bytes: a matched chord runs its action and an unmatched super chord is
+/// consumed upstream via [`TermAction::Ignore`].
+#[cfg(target_os = "macos")]
+fn macos_action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
+    const S: Modifiers = Modifiers::META;
+    const C: Modifiers = Modifiers::CONTROL;
+    const A: Modifiers = Modifiers::ALT;
+    const H: Modifiers = Modifiers::SHIFT;
     if let Key::Named(named) = key {
         return Some(match named {
-            NamedKey::ArrowUp => TermAction::JumpToPrompt(-1),
-            NamedKey::ArrowDown => TermAction::JumpToPrompt(1),
-            // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
-            // convention) — plain Ctrl+PageUp/Down cycles them.
-            NamedKey::PageUp => TermAction::MoveTab(-1),
-            NamedKey::PageDown => TermAction::MoveTab(1),
-            NamedKey::Home => TermAction::ScrollToTop,
-            NamedKey::End => TermAction::ScrollToBottom,
-            // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
-            // convention) — same action as Ctrl+Shift+Z.
-            NamedKey::Enter => TermAction::PaneZoom,
+            // `end_search` — a no-op (and non-consuming) without an open
+            // search, so bare Escape still reaches vim (the surface's
+            // performable gate drops it to bytes then).
+            NamedKey::Escape if mods.is_empty() => TermAction::EndSearch,
+            NamedKey::Tab if mods == C | H => TermAction::PrevTab,
+            NamedKey::Tab if mods == C => TermAction::NextTab,
+            // Expand selection — the shared shift-only binds.
+            NamedKey::ArrowLeft if mods == H => TermAction::AdjustSelection(AdjustSel::Left),
+            NamedKey::ArrowRight if mods == H => TermAction::AdjustSelection(AdjustSel::Right),
+            NamedKey::ArrowUp if mods == H => TermAction::AdjustSelection(AdjustSel::Up),
+            NamedKey::ArrowDown if mods == H => TermAction::AdjustSelection(AdjustSel::Down),
+            NamedKey::PageUp if mods == H => TermAction::AdjustSelection(AdjustSel::PageUp),
+            NamedKey::PageDown if mods == H => TermAction::AdjustSelection(AdjustSel::PageDown),
+            NamedKey::Home if mods == H => TermAction::AdjustSelection(AdjustSel::Home),
+            NamedKey::End if mods == H => TermAction::AdjustSelection(AdjustSel::End),
+            // Mac viewport scrolling.
+            NamedKey::Home if mods == S => TermAction::ScrollToTop,
+            NamedKey::End if mods == S => TermAction::ScrollToBottom,
+            NamedKey::PageUp if mods == S => TermAction::ScrollPageUp,
+            NamedKey::PageDown if mods == S => TermAction::ScrollPageDown,
+            // Semantic prompts: super+shift+arrows (Ghostty) and
+            // super+arrows (Terminal.app) both jump.
+            NamedKey::ArrowUp if mods == S || mods == S | H => TermAction::JumpToPrompt(-1),
+            NamedKey::ArrowDown if mods == S || mods == S | H => TermAction::JumpToPrompt(1),
+            // Split navigation: super+alt+arrows goto, super+ctrl+arrows
+            // resize (Ghostty's 10-unit step ≈ our 48px chord step).
+            NamedKey::ArrowLeft if mods == S | A => TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: false,
+            },
+            NamedKey::ArrowRight if mods == S | A => TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: true,
+            },
+            NamedKey::ArrowUp if mods == S | A => TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: false,
+            },
+            NamedKey::ArrowDown if mods == S | A => TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: true,
+            },
+            NamedKey::ArrowLeft if mods == S | C => TermAction::ResizePane {
+                horizontal: true,
+                forward: false,
+                px: 48,
+            },
+            NamedKey::ArrowRight if mods == S | C => TermAction::ResizePane {
+                horizontal: true,
+                forward: true,
+                px: 48,
+            },
+            NamedKey::ArrowUp if mods == S | C => TermAction::ResizePane {
+                horizontal: false,
+                forward: false,
+                px: 48,
+            },
+            NamedKey::ArrowDown if mods == S | C => TermAction::ResizePane {
+                horizontal: false,
+                forward: true,
+                px: 48,
+            },
+            // Natural text editing — forces legacy encoding (the text:
+            // action emits raw bytes, matching the reference).
+            NamedKey::ArrowRight if mods == S => TermAction::TypeText("\x05".into()),
+            NamedKey::ArrowLeft if mods == S => TermAction::TypeText("\x01".into()),
+            NamedKey::Backspace if mods == S => TermAction::TypeText("\x15".into()),
+            NamedKey::ArrowLeft if mods == A => TermAction::EscSeq("b".into()),
+            NamedKey::ArrowRight if mods == A => TermAction::EscSeq("f".into()),
             _ => return None,
         });
     }
     let Key::Character(text) = key else {
         return None;
     };
-    Some(match text.to_ascii_lowercase().as_str() {
-        "c" => TermAction::Copy,
-        "v" => TermAction::Paste,
-        "t" => TermAction::NewTab,
-        "w" => TermAction::CloseTab,
-        "n" => TermAction::NewWindow,
-        "a" => TermAction::SelectAll,
-        "e" => TermAction::SplitRight,
-        "d" => TermAction::SplitDown,
-        "z" => TermAction::PaneZoom,
-        "]" | "}" => TermAction::FocusNextPane,
-        "[" | "{" => TermAction::FocusPrevPane,
-        "+" | "=" => TermAction::IncreaseFontSize(1),
-        "-" | "_" => TermAction::DecreaseFontSize(1),
-        "0" | ")" => TermAction::FontReset,
-        "k" => TermAction::ClearScrollback,
-        "o" => TermAction::CopyLastOutput,
-        "u" => TermAction::UrlHints,
-        "g" => TermAction::OpenScrollbackEditor,
-        "f" => TermAction::Search,
-        "p" => TermAction::Palette,
-        "," | "<" => TermAction::ReloadConfig,
-        "l" => TermAction::ClearScreen,
-        _ => return None,
+    let t = text.as_str();
+    Some(match t {
+        "," if mods == S | H => TermAction::ReloadConfig,
+        "," if mods == S => TermAction::OpenConfig,
+        "c" if mods == S => TermAction::Copy,
+        "v" if mods == S => TermAction::Paste,
+        "=" | "+" if mods == S => TermAction::IncreaseFontSize(1),
+        "-" if mods == S => TermAction::DecreaseFontSize(1),
+        "0" if mods == S => TermAction::FontReset,
+        // write_screen_file: copy (ctrl+shift+super) / paste (shift+super)
+        // / open (shift+alt+super) — the `ctrlOrSuper` shared binds.
+        "j" if mods == S | C | H => TermAction::WriteScreenFile(FileSink::Copy),
+        "j" if mods == S | H => TermAction::WriteScreenFile(FileSink::Paste),
+        "j" if mods == S | H | A => TermAction::WriteScreenFile(FileSink::Open),
+        "j" if mods == S => TermAction::ScrollToSelection,
+        "q" if mods == S => TermAction::Quit,
+        "k" if mods == S => TermAction::ClearScreen,
+        "a" if mods == S => TermAction::SelectAll,
+        "t" if mods == S | H => TermAction::Undo,
+        "z" if mods == S => TermAction::Undo,
+        "z" if mods == S | H => TermAction::Redo,
+        // Mac windowing.
+        "n" if mods == S => TermAction::NewWindow,
+        "w" if mods == S | H | A => TermAction::CloseAllWindows,
+        "w" if mods == S | H => TermAction::CloseWindow,
+        "w" if mods == S | A => TermAction::CloseTab,
+        "w" if mods == S => TermAction::CloseSurface,
+        "t" if mods == S => TermAction::NewTab,
+        "{" if mods == S | H => TermAction::PrevTab,
+        "}" if mods == S | H => TermAction::NextTab,
+        "d" if mods == S => TermAction::SplitRight,
+        "d" if mods == S | H => TermAction::SplitDown,
+        "[" if mods == S => TermAction::FocusPrevPane,
+        "]" if mods == S => TermAction::FocusNextPane,
+        "=" if mods == S | C => TermAction::EqualizeSplits,
+        "f" if mods == S => TermAction::StartSearch,
+        "e" if mods == S => TermAction::SearchSelection,
+        "f" if mods == S | H => TermAction::EndSearch,
+        "g" if mods == S => TermAction::NavigateSearch(1),
+        "g" if mods == S | H => TermAction::NavigateSearch(-1),
+        "i" if mods == S | A => TermAction::Inspector,
+        "f" if mods == S | C => TermAction::Fullscreen,
+        "v" if mods == S | H => TermAction::PasteFromSelection,
+        _ => {
+            // Cmd+digit selects tabs 1-8; Cmd+9 the last tab (unicode
+            // chars only — physical-digit binds cover AZERTY upstream
+            // but macOS keyboard layouts produce the digit as text).
+            if mods == S {
+                match t {
+                    "9" => TermAction::LastTab,
+                    _ if t.len() == 1 && matches!(t.as_bytes()[0], b'1'..=b'8') => {
+                        TermAction::SelectTab((t.as_bytes()[0] - b'0') as usize)
+                    }
+                    _ => return None,
+                }
+            } else {
+                return None;
+            }
+        }
     })
 }
 
 /// Ctrl (no shift) digits select tabs 1-8; Alt+digits select tabs 1-9;
 /// Ctrl+Tab / Ctrl+Shift+Tab cycle.
 pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
-    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT)
-        || mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::CONTROL)
+    // macOS covers tab cycling in its own table (`macos_action_chord`);
+    // binding ctrl/alt+digit here would shadow the shell's word-jump
+    // input, which the Darwin defaults deliberately leave unbound.
+    #[cfg(target_os = "macos")]
     {
-        let digit = match code {
-            Code::Digit1 => Some(1),
-            Code::Digit2 => Some(2),
-            Code::Digit3 => Some(3),
-            Code::Digit4 => Some(4),
-            Code::Digit5 => Some(5),
-            Code::Digit6 => Some(6),
-            Code::Digit7 => Some(7),
-            Code::Digit8 => Some(8),
-            Code::Digit9 if mods.contains(Modifiers::ALT) => Some(9),
-            _ => None,
-        };
-        if let Some(n) = digit {
-            return Some(TermAction::SelectTab(n));
-        }
+        let _ = (key, code, mods);
+        return None;
     }
-    if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
-        if matches!(key, Key::Named(NamedKey::Tab)) {
-            return Some(TermAction::NextTab);
+    #[cfg(not(target_os = "macos"))]
+    {
+        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT)
+            || mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::CONTROL)
+        {
+            let digit = match code {
+                Code::Digit1 => Some(1),
+                Code::Digit2 => Some(2),
+                Code::Digit3 => Some(3),
+                Code::Digit4 => Some(4),
+                Code::Digit5 => Some(5),
+                Code::Digit6 => Some(6),
+                Code::Digit7 => Some(7),
+                Code::Digit8 => Some(8),
+                Code::Digit9 if mods.contains(Modifiers::ALT) => Some(9),
+                _ => None,
+            };
+            if let Some(n) = digit {
+                return Some(TermAction::SelectTab(n));
+            }
         }
-        if matches!(key, Key::Named(NamedKey::PageDown)) {
-            return Some(TermAction::NextTab);
+        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
+            if matches!(key, Key::Named(NamedKey::Tab)) {
+                return Some(TermAction::NextTab);
+            }
+            if matches!(key, Key::Named(NamedKey::PageDown)) {
+                return Some(TermAction::NextTab);
+            }
+            if matches!(key, Key::Named(NamedKey::PageUp)) {
+                return Some(TermAction::PrevTab);
+            }
         }
-        if matches!(key, Key::Named(NamedKey::PageUp)) {
+        if mods.contains(Modifiers::CONTROL | Modifiers::SHIFT)
+            && matches!(key, Key::Named(NamedKey::Tab))
+        {
             return Some(TermAction::PrevTab);
         }
+        None
     }
-    if mods.contains(Modifiers::CONTROL | Modifiers::SHIFT)
-        && matches!(key, Key::Named(NamedKey::Tab))
-    {
-        return Some(TermAction::PrevTab);
-    }
-    None
 }
 
 /// Actions the app performs rather than forwarding as bytes.

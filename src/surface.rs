@@ -2166,7 +2166,9 @@ impl TermSurface {
                 TermEvent::Tap(tap) => match tap {
                     // Marks + the redraw mode are recorded on the reader
                     // thread where the cursor still sits at the mark.
-                    TapEvent::PromptStart | TapEvent::ShellRedraw(_) => {}
+                    TapEvent::PromptStart
+                    | TapEvent::PromptSecondary
+                    | TapEvent::ShellRedraw(_) => {}
                     TapEvent::Cwd(path) => {
                         *self.session.cwd.lock().unwrap() = Some(path);
                     }
@@ -2399,27 +2401,35 @@ impl TermSurface {
             self.pad_x = pad_x;
             self.pad_y = pad_y;
         }
-        if cols > 2 && lines > 1 && (cols != self.cols || lines != self.lines) {
-            self.cols = cols;
-            self.lines = lines;
+        if cols > 2 && lines > 1 {
+            // A deferred session spawns its PTY here, at the laid-out
+            // grid size — the shell is born at the real winsize, so the
+            // launch surface never resizes (and never prompt-clears).
             self.session
                 .terminal
-                .resize(cols, lines, (m.cell_w as u16, m.cell_h as u16));
-            // `resize-overlay`: show the new grid size for a beat after
-            // the last change — the Instant decays inside build_scene,
-            // same pattern as the bell flash. `after-first` skips this
-            // surface's very first resize (its initial layout).
-            self.resize_count += 1;
-            let show = match self.app.config(|c| c.resize_overlay) {
-                crate::config::ResizeOverlay::Always => true,
-                crate::config::ResizeOverlay::AfterFirst => self.resize_count > 1,
-                crate::config::ResizeOverlay::Never => false,
-            };
-            if show {
-                self.resize_at = Some(Instant::now());
+                .ensure_started(cols, lines, (m.cell_w as u16, m.cell_h as u16));
+            if cols != self.cols || lines != self.lines {
+                self.cols = cols;
+                self.lines = lines;
                 self.session
-                    .resize_label
-                    .set(Some(Str::from(format!("{cols}\u{00d7}{lines}"))));
+                    .terminal
+                    .resize(cols, lines, (m.cell_w as u16, m.cell_h as u16));
+                // `resize-overlay`: show the new grid size for a beat after
+                // the last change — the Instant decays inside build_scene,
+                // same pattern as the bell flash. `after-first` skips this
+                // surface's very first resize (its initial layout).
+                self.resize_count += 1;
+                let show = match self.app.config(|c| c.resize_overlay) {
+                    crate::config::ResizeOverlay::Always => true,
+                    crate::config::ResizeOverlay::AfterFirst => self.resize_count > 1,
+                    crate::config::ResizeOverlay::Never => false,
+                };
+                if show {
+                    self.resize_at = Some(Instant::now());
+                    self.session
+                        .resize_label
+                        .set(Some(Str::from(format!("{cols}\u{00d7}{lines}"))));
+                }
             }
         }
     }
@@ -2433,6 +2443,13 @@ impl TermSurface {
 
     fn on_focus(&mut self, gained: bool) {
         self.focused = gained;
+        // Last-focused pane ⇒ its window is the menu-bar's dispatch
+        // target (frontmost approximation: focus moves with clicks and
+        // window activation).
+        #[cfg(target_os = "macos")]
+        if gained {
+            self.app.mark_frontmost();
+        }
         if !gained {
             self.held_mod_codes.clear();
         }
@@ -2734,9 +2751,25 @@ impl TermSurface {
                 && !self.app.config(|c| c.keybinds_cleared)
                 && let Some(action) = action_chord(key, mods).or_else(|| tab_chord(key, code, mods))
             {
-                self.do_action(action);
-                self.suppress_key_text = true;
-                return true;
+                // The builtin table obeys the same performable rule as
+                // configured binds on macOS: an action that can't perform
+                // (bare Escape with no open search) falls through to
+                // literal bytes — except under super, where an
+                // unperformable Cmd+key is consumed like an unbound one.
+                #[cfg(target_os = "macos")]
+                if !self.action_performable(&action) && !mods.contains(Modifiers::META) {
+                    // fall through
+                } else {
+                    self.do_action(action);
+                    self.suppress_key_text = true;
+                    return true;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.do_action(action);
+                    self.suppress_key_text = true;
+                    return true;
+                }
             }
             if let Some(bytes) = key_to_bytes(key, code, mods, mode) {
                 // ANSI KAM (`CSI 2 h`, gated by `vt-kam-allowed`):
@@ -4320,7 +4353,8 @@ impl SceneContent for TermSurface {
                 rows.push_str(&format!("|{}|", s.trim_end()));
             }
             eprintln!(
-                "[grid] s{} off={} hist={} cur={:?} rows={rows}",
+                "[{}] [grid] s{} off={} hist={} cur={:?} rows={rows}",
+                crate::terminal::sniff_ms(),
                 self.session.id,
                 g.display_offset(),
                 g.history_size(),
