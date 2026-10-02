@@ -829,9 +829,7 @@ fn draw_text_run(
                 continue;
             }
 
-            let Some(font) = ctx.fonts.font_id(resources, run.font()) else {
-                continue;
-            };
+            let font = ctx.fonts.font_id(resources, run.font());
             let synthesis = crate::fonts::RunStyle::from(run.synthesis());
             let mut transform = Affine::translate((0.0, baseline_y as f64));
             if ctx.font_synthetic_italic
@@ -1092,9 +1090,7 @@ fn draw_preedit(
             let (start, end) = runs[idx];
             idx += 1;
             let run = gr.run();
-            let Some(font) = ctx.fonts.font_id(resources, run.font()) else {
-                continue;
-            };
+            let font = ctx.fonts.font_id(resources, run.font());
             let out = GlyphRun {
                 font,
                 size: run.font_size(),
@@ -1156,9 +1152,7 @@ fn draw_chip_text(
             let (start, end) = runs[idx];
             idx += 1;
             let run = gr.run();
-            let Some(font) = ctx.fonts.font_id(resources, run.font()) else {
-                continue;
-            };
+            let font = ctx.fonts.font_id(resources, run.font());
             let out = GlyphRun {
                 font,
                 size: run.font_size(),

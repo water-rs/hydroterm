@@ -809,11 +809,18 @@ impl TermSurface {
             let loaded = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| crate::kitty::decode_png(&bytes))
-                .and_then(|(px, iw, ih)| {
-                    ImageData::<Rgba8>::new(iw, ih, px)
-                        .ok()
-                        .and_then(|data| resources.image(data).ok())
-                        .map(|reg| (reg, iw, ih))
+                .map(|(px, iw, ih)| {
+                    // Past the decode boundary: a well-formed buffer of
+                    // decoded pixels always makes `ImageData`, and a
+                    // well-formed `ImageData` always registers — both
+                    // failures are internal invariants, not user input.
+                    let data = ImageData::<Rgba8>::new(iw, ih, px).unwrap_or_else(|e| {
+                        panic!("decoded PNG {iw}x{ih} cannot form image data: {e:?}")
+                    });
+                    let reg = resources.image(data).unwrap_or_else(|e| {
+                        panic!("scene engine rejected decoded PNG {iw}x{ih}: {e:?}")
+                    });
+                    (reg, iw, ih)
                 });
             *cache = (Some(path), loaded);
         }
@@ -4292,16 +4299,26 @@ impl TermSurface {
             let registered = match img.registered.get() {
                 Some(reg) => reg.clone(),
                 None => {
-                    let Ok(data) = ImageData::<Rgba8>::new(
+                    // The stored buffer was validated when the image was
+                    // accepted — reconstruction and engine registration
+                    // are internal invariants, not input.
+                    let data = ImageData::<Rgba8>::new(
                         img.data.width,
                         img.data.height,
                         img.data.data.clone(),
-                    ) else {
-                        return;
-                    };
-                    let Ok(reg) = resources.image(data) else {
-                        return;
-                    };
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "kitty image {}x{} cannot form image data: {e:?}",
+                            img.data.width, img.data.height
+                        )
+                    });
+                    let reg = resources.image(data).unwrap_or_else(|e| {
+                        panic!(
+                            "scene engine rejected kitty image {}x{}: {e:?}",
+                            img.data.width, img.data.height
+                        )
+                    });
                     let _ = img.registered.set(reg.clone());
                     reg
                 }

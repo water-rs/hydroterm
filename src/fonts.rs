@@ -5,7 +5,8 @@
 //! The family's `parley::FontContext` is the host's own — installed into the
 //! environment at startup and shared through `FontCollection` — so a pane
 //! never enumerates system fonts for itself, and the shaped glyph runs hand
-//! back parley font data the scene registers as Cherenkov fonts by blob id.
+//! back parley font data the scene registers as Cherenkov fonts by face
+//! identity (blob id plus collection index).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +37,14 @@ pub fn parse_font_feature(spec: &str) -> Option<FontFeature> {
         None => (body.trim(), value),
     };
     Some(FontFeature::new(Tag::parse(tag_s)?, value))
+}
+
+/// Face identity for engine registration: the font blob's id plus the
+/// face's index inside it. Faces sharing one file — a `.ttc` collection —
+/// carry the same blob id and are only told apart by the index, so the
+/// pair is the registration key and the `FontSource` fed to the engine.
+fn font_key(fd: &parley::FontData) -> (u64, u32) {
+    (fd.data.id(), fd.index)
 }
 
 /// Families asked for first, in preference order. Everything they cannot
@@ -110,9 +119,11 @@ pub struct TermFonts {
     /// (`wght=700,wdth=85`); each applies only to its own run and does
     /// not inherit.
     variations: [Option<Vec<FontVariation>>; 4],
-    /// Engine-side font registrations keyed by the parley blob id; an
-    /// entry registers on first use and names itself each frame after.
-    font_regs: HashMap<u64, Registered<Font>>,
+    /// Engine-side font registrations keyed by face identity — the blob
+    /// id AND the collection index, since faces in one font file (a
+    /// `.ttc`) share the blob. An entry registers on first use and names
+    /// itself each frame after.
+    font_regs: HashMap<(u64, u32), Registered<Font>>,
     pub metrics: CellMetrics,
 }
 
@@ -214,15 +225,15 @@ impl TermFonts {
     }
 
     /// Register `fd`'s face with the scene engine on first use and name its
-    /// `FontId` in this recording. Keyed by the parley blob id — the same
-    /// face reused across runs registers once. `None` when the engine
-    /// rejects the font (the run is skipped, as before).
+    /// `FontId` in this recording. Registering a valid parley face is an
+    /// internal invariant: the engine rejecting it panics with the face's
+    /// identity rather than silently dropping the shaped run.
     pub fn font_id(
         &mut self,
         resources: &mut RecordingResources<'_>,
         fd: &parley::FontData,
-    ) -> Option<FontId> {
-        let key = fd.data.id();
+    ) -> FontId {
+        let key = font_key(fd);
         if let std::collections::hash_map::Entry::Vacant(e) = self.font_regs.entry(key) {
             let source = FontSource::bytes(Arc::<[u8]>::from(fd.data.data())).with_index(fd.index);
             match resources.font(source) {
@@ -230,12 +241,11 @@ impl TermFonts {
                     e.insert(registered);
                 }
                 Err(err) => {
-                    tracing::debug!(%err, "scene engine rejected terminal font");
-                    return None;
+                    panic!("scene engine rejected font face {key:?}: {err}");
                 }
             }
         }
-        Some(resources.name(self.font_regs.get(&key)?))
+        resources.name(self.font_regs.get(&key).expect("face registered above"))
     }
 
     /// Set `font-codepoint-map` — each entry's family resolved like
@@ -673,5 +683,62 @@ mod tests {
                 "family ZWJ cluster did not resolve to Noto Color Emoji"
             );
         }
+    }
+
+    /// Faces inside one TrueType collection share a blob id and are told
+    /// apart only by their index inside the file — `font_key` must keep
+    /// that index or a second face draws with the first face's tables.
+    /// Observed on a real installed `.ttc`; skipped when the host has none.
+    #[test]
+    fn ttc_faces_share_blob_id_but_have_distinct_face_keys() {
+        use parley::fontique::{Collection, CollectionOptions, SourceCache, SourceKind};
+        let Some(ttc) = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+        ]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists()) else {
+            eprintln!("skipping: no .ttc installed on this host");
+            return;
+        };
+        let mut collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: true,
+        });
+        let mut cache = SourceCache::default();
+        let mut faces = Vec::new();
+        let names: Vec<String> = collection.family_names().map(str::to_string).collect();
+        for name in names {
+            let Some(family) = collection
+                .family_id(&name)
+                .and_then(|id| collection.family(id))
+            else {
+                continue;
+            };
+            for info in family.fonts() {
+                let in_ttc = matches!(&info.source().kind, SourceKind::Path(p) if **p == ttc);
+                if in_ttc {
+                    let blob = info.load(Some(&mut cache)).expect("collection face loads");
+                    let fd = parley::FontData::new(blob, info.index());
+                    faces.push((name.clone(), fd.data.id(), font_key(&fd)));
+                }
+            }
+        }
+        assert!(faces.len() > 1, "{ttc:?} exposed only {faces:?}");
+        let blob_id = faces[0].1;
+        assert!(
+            faces.iter().all(|(_, id, _)| *id == blob_id),
+            "faces of one TTC share a blob id: {faces:?}"
+        );
+        let keys: std::collections::HashSet<(u64, u32)> =
+            faces.iter().map(|(_, _, key)| *key).collect();
+        assert_eq!(
+            keys.len(),
+            faces.len(),
+            "font_key aliases TTC faces: {faces:?}"
+        );
     }
 }
