@@ -3888,7 +3888,7 @@ dependencies = [
 [[package]]
 name = "hydrolysis"
 version = "0.3.1"
-source = "git+https://github.com/water-rs/hydrolysis?rev=ecf84009952be5ed630f05115e12096d78416490#ecf84009952be5ed630f05115e12096d78416490"
+source = "git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097#01172c0513a5e83c5fa472d4917f4caf259ac097"
 dependencies = [
  "accesskit 0.25.1",
  "android_logger",
@@ -3942,11 +3942,67 @@ dependencies = [
 ]
 
 [[package]]
-name = "hydrolysis-android-test-app"
-version = "0.0.0"
+name = "hydrolysis"
+version = "0.3.1"
 source = "git+https://github.com/water-rs/hydrolysis?rev=ecf84009952be5ed630f05115e12096d78416490#ecf84009952be5ed630f05115e12096d78416490"
 dependencies = [
- "hydrolysis",
+ "accesskit 0.25.0",
+ "android_logger",
+ "async-task",
+ "cfg_aliases",
+ "cherenkov",
+ "cherenkov-gpu",
+ "executor-core",
+ "icu_properties",
+ "jni 0.21.1",
+ "js-sys 0.3.105",
+ "keyboard-types",
+ "kurbo",
+ "libc",
+ "log",
+ "lru 0.18.5",
+ "nami",
+ "native-executor",
+ "ndk",
+ "parley",
+ "peniko",
+ "png",
+ "pollster 1.0.1",
+ "raw-window-handle",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "skrifa",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "waterkit-clipboard",
+ "waterui",
+ "waterui-assets",
+ "waterui-backend-core",
+ "waterui-controls",
+ "waterui-core",
+ "waterui-form",
+ "waterui-graphics",
+ "waterui-icon",
+ "waterui-inspector-protocol",
+ "waterui-layout",
+ "waterui-locale",
+ "waterui-map",
+ "waterui-shape",
+ "waterui-text",
+ "waterui-url",
+ "waterui-webview",
+ "wgpu",
+]
+
+[[package]]
+name = "hydrolysis-android-test-app"
+version = "0.0.0"
+source = "git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097#01172c0513a5e83c5fa472d4917f4caf259ac097"
+dependencies = [
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "hydrolysis-m3 0.3.1 (git+https://github.com/water-rs/hydrolysis-m3?rev=355c69066d2dd10c0f5153953f4316eb3ede45ee)",
  "jni 0.21.1",
  "waterui",
@@ -3960,7 +4016,7 @@ version = "0.3.1"
 source = "git+https://github.com/water-rs/hydrolysis-m3?rev=c16c410866c4694ada6cf110b83f946e0f30a079#c16c410866c4694ada6cf110b83f946e0f30a079"
 dependencies = [
  "cherenkov",
- "hydrolysis",
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "material-color-utils",
  "num-traits",
  "waterui",
@@ -3977,7 +4033,7 @@ version = "0.3.1"
 source = "git+https://github.com/water-rs/hydrolysis-m3?rev=355c69066d2dd10c0f5153953f4316eb3ede45ee#355c69066d2dd10c0f5153953f4316eb3ede45ee"
 dependencies = [
  "cherenkov",
- "hydrolysis",
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "material-color-utils",
  "num-traits",
  "waterui",
@@ -7880,7 +7936,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "reply-example"
 version = "0.1.0"
 dependencies = [
- "hydrolysis",
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "hydrolysis-m3 0.3.1 (git+https://github.com/water-rs/hydrolysis-m3?rev=c16c410866c4694ada6cf110b83f946e0f30a079)",
  "waterui",
  "waterui-icons-material-icon",
@@ -8604,7 +8660,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 name = "skill_snippets"
 version = "0.1.0"
 dependencies = [
- "hydrolysis",
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "hydrolysis-m3 0.3.1 (git+https://github.com/water-rs/hydrolysis-m3?rev=c16c410866c4694ada6cf110b83f946e0f30a079)",
  "jiff",
  "serde",
@@ -11528,7 +11584,7 @@ dependencies = [
  "async-io",
  "bitflags 2.13.2",
  "executor-core",
- "hydrolysis",
+ "hydrolysis 0.3.1 (git+https://github.com/water-rs/hydrolysis?rev=01172c0513a5e83c5fa472d4917f4caf259ac097)",
  "hydrolysis-m3 0.3.1 (git+https://github.com/water-rs/hydrolysis-m3?rev=c16c410866c4694ada6cf110b83f946e0f30a079)",
  "image",
  "kurbo",
