@@ -2231,6 +2231,8 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
+ "base64 0.22.1",
+ "cfg_aliases",
  "hydrolysis",
  "hydrolysis-m3",
  "keyboard-types",
@@ -2243,6 +2245,7 @@ dependencies = [
  "polling",
  "pollster 1.0.1",
  "regex",
+ "rustix 1.1.5",
  "tracing",
  "waterkit-clipboard",
  "waterkit-notification",
