@@ -209,7 +209,7 @@ impl KittyStore {
                         None => return (cmd.id(), "EINVAL:crop".to_string()),
                     }
                 }
-                _ => clone_image_data(&stored.data),
+                _ => stored.data.clone(),
             }
         };
         self.push_image(cmd, line, col, data);
@@ -274,7 +274,7 @@ impl KittyStore {
             .and_then(|stored| self.store_checked(cmd.id(), stored, limit))
         {
             Ok(()) => {
-                let data = clone_image_data(&self.data[&cmd.id()].data);
+                let data = self.data[&cmd.id()].data.clone();
                 self.push_image(cmd, line, col, data);
                 (cmd.id(), "OK".to_string())
             }
@@ -449,21 +449,6 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     };
     debug_assert_eq!(rgba.len(), w * h * 4);
     Some((rgba, info.width, info.height))
-}
-
-/// `ImageData` has no `Clone` at this pin (its format marker is private),
-/// so clone by field: the texel `Arc` shares the buffer. `new` cannot
-/// fail here — dimensions and length were validated when `img` entered
-/// the store.
-pub(crate) fn clone_image_data(img: &ImageData<Rgba8>) -> ImageData<Rgba8> {
-    let out = ImageData::<Rgba8>::new(img.width, img.height, img.data.clone())
-        .expect("stored image data re-validates")
-        .color_space(img.color_space);
-    if img.premultiplied {
-        out.premultiplied()
-    } else {
-        out
-    }
 }
 
 /// Slice an RGBA8 image to `(x, y, cw, ch)`; bounds-checked. Index

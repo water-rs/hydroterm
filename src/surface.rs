@@ -4302,7 +4302,7 @@ impl TermSurface {
                     // The stored `ImageData` was validated at the transmit
                     // boundary; registration fails only with `Lost`.
                     let reg = resources
-                        .image(crate::kitty::clone_image_data(&img.data))
+                        .image(img.data.clone())
                         .unwrap_or_else(|e| {
                             panic!(
                                 "scene engine rejected kitty image {}x{}: {e:?}",
