@@ -17,7 +17,8 @@ use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 use waterui_graphics::Registered;
-use waterui_graphics::cherenkov::{Image, ImageData, Rgba8};
+use waterui_graphics::cherenkov::ImageId;
+use waterui_graphics::{ImageData, Rgba8};
 
 /// One decoded `G...;payload` command.
 pub struct KittyCmd {
@@ -97,13 +98,25 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Share an `ImageData`'s `Arc` buffer into a new `ImageData` — the type
+/// is not `Clone`, so re-wrap through `new` (cheap: it only re-checks the
+/// length, and the stored pixels were already validated at the transmit
+/// boundary). Used where the protocol places or registers the same pixels.
+pub(crate) fn share_image_data(d: &ImageData<Rgba8>) -> ImageData<Rgba8> {
+    let mut out = ImageData::new(d.width, d.height, d.data.clone())
+        .expect("stored image data is well-formed");
+    out.color_space = d.color_space;
+    out.premultiplied = d.premultiplied;
+    out
+}
+
 /// A placed image: absolute buffer row + column at transmit time.
 pub struct KittyImage {
     pub id: u32,
     /// RGBA pixel data, registered with the scene engine on first draw.
     pub data: ImageData<Rgba8>,
     /// Engine-side registration, filled by the first recording that draws it.
-    pub registered: OnceCell<Registered<Image<Rgba8>>>,
+    pub registered: OnceCell<Registered<ImageId>>,
     /// Absolute line index (same convention as prompt marks).
     pub line: i64,
     pub col: usize,
@@ -209,7 +222,7 @@ impl KittyStore {
                         None => return (cmd.id(), "EINVAL:crop".to_string()),
                     }
                 }
-                _ => stored.data.clone(),
+                _ => share_image_data(&stored.data),
             }
         };
         self.push_image(cmd, line, col, data);
@@ -274,7 +287,7 @@ impl KittyStore {
             .and_then(|stored| self.store_checked(cmd.id(), stored, limit))
         {
             Ok(()) => {
-                let data = self.data[&cmd.id()].data.clone();
+                let data = share_image_data(&self.data[&cmd.id()].data);
                 self.push_image(cmd, line, col, data);
                 (cmd.id(), "OK".to_string())
             }

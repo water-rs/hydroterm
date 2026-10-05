@@ -30,11 +30,12 @@ use waterui::window::{UserAttention, WindowState};
 use waterui_core::Str;
 use waterui_core::layout::{Rect as UiRect, Size as UiSize};
 use waterui_graphics::cherenkov::kurbo;
-use waterui_graphics::cherenkov::{Draw, Extend, Image, ImageData, Recorder, Rgba8, Sampling};
+use waterui_graphics::cherenkov::{Draw, Extend, ImageId, Recorder, Sampling};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::resources::RecordingResources;
 use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
 use waterui_graphics::{Code, Key, Modifiers, NamedKey, Registered};
+use waterui_graphics::{ImageData, Rgba8};
 use waterui_text::FontCollection;
 
 use crate::app::{AppState, Session};
@@ -657,7 +658,7 @@ pub struct TermSurface {
 /// `background-image` decode cache: (config path, registered image + pixel dims).
 type BgImageCache = (
     Option<std::path::PathBuf>,
-    Option<(Registered<Image<Rgba8>>, u32, u32)>,
+    Option<(Registered<ImageId>, u32, u32)>,
 );
 
 /// The semantic `Modifiers` bit a physical modifier `Code` contributes
@@ -4302,7 +4303,7 @@ impl TermSurface {
                     // The stored `ImageData` was validated at the transmit
                     // boundary; registration fails only with `Lost`.
                     let reg = resources
-                        .image(img.data.clone())
+                        .image(crate::kitty::share_image_data(&img.data))
                         .unwrap_or_else(|e| {
                             panic!(
                                 "scene engine rejected kitty image {}x{}: {e:?}",
@@ -4349,6 +4350,18 @@ impl Drop for TermSurface {
 }
 
 impl SceneContent for TermSurface {
+    /// Cached `Registered` handles are generation-bound to the previous
+    /// engine: drop them so the next recording re-registers fonts and
+    /// images into the new registry. The semantic inputs (font faces,
+    /// stored `ImageData`, the background-image path) are kept.
+    fn rebuild_for_engine(&mut self) {
+        self.fonts.clear_registrations();
+        self.bg_img.borrow_mut().1 = None;
+        for img in self.session.kitty.borrow_mut().images.iter_mut() {
+            let _ = img.registered.take();
+        }
+    }
+
     fn build_scene(
         &mut self,
         recorder: &mut Recorder,

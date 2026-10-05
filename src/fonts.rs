@@ -18,8 +18,9 @@ use parley::{
     Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle, FontWeight, Layout,
     LayoutContext, StyleProperty, style::GenericFamily,
 };
+use waterui_graphics::FontSource;
 use waterui_graphics::Registered;
-use waterui_graphics::cherenkov::{Font, FontId, FontSource};
+use waterui_graphics::cherenkov::FontId;
 use waterui_graphics::resources::RecordingResources;
 use waterui_text::FontCollection;
 
@@ -123,7 +124,7 @@ pub struct TermFonts {
     /// id AND the collection index, since faces in one font file (a
     /// `.ttc`) share the blob. An entry registers on first use and names
     /// itself each frame after.
-    font_regs: HashMap<(u64, u32), Registered<Font>>,
+    font_regs: HashMap<(u64, u32), Registered<FontId>>,
     pub metrics: CellMetrics,
 }
 
@@ -246,6 +247,13 @@ impl TermFonts {
             }
         }
         resources.name(self.font_regs.get(&key).expect("face registered above"))
+    }
+
+    /// Drop every engine-side registration: the handles are bound to the
+    /// previous engine generation, and the next `font_id` re-registers
+    /// lazily. Called by `SceneContent::rebuild_for_engine`.
+    pub fn clear_registrations(&mut self) {
+        self.font_regs.clear();
     }
 
     /// Set `font-codepoint-map` — each entry's family resolved like
