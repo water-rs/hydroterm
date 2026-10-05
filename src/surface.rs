@@ -4299,26 +4299,16 @@ impl TermSurface {
             let registered = match img.registered.get() {
                 Some(reg) => reg.clone(),
                 None => {
-                    // The stored buffer was validated when the image was
-                    // accepted — reconstruction and engine registration
-                    // are internal invariants, not input.
-                    let data = ImageData::<Rgba8>::new(
-                        img.data.width,
-                        img.data.height,
-                        img.data.data.clone(),
-                    )
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "kitty image {}x{} cannot form image data: {e:?}",
-                            img.data.width, img.data.height
-                        )
-                    });
-                    let reg = resources.image(data).unwrap_or_else(|e| {
-                        panic!(
-                            "scene engine rejected kitty image {}x{}: {e:?}",
-                            img.data.width, img.data.height
-                        )
-                    });
+                    // The stored `ImageData` was validated at the transmit
+                    // boundary; registration fails only with `Lost`.
+                    let reg = resources
+                        .image(crate::kitty::clone_image_data(&img.data))
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "scene engine rejected kitty image {}x{}: {e:?}",
+                                img.data.width, img.data.height
+                            )
+                        });
                     let _ = img.registered.set(reg.clone());
                     reg
                 }
