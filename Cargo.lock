@@ -1992,6 +1992,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "cfg_aliases",
+ "cherenkov",
  "hydrolysis",
  "hydrolysis-m3",
  "keyboard-types",

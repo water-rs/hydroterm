@@ -33,6 +33,7 @@ rustix = { version = "1.1.5", features = ["shm", "fs"] }
 
 [dev-dependencies]
 base64 = "0.22.1"
+cherenkov = { version = "0.0.0", features = ["testing"] }
 
 [build-dependencies]
 cfg_aliases = "0.2.2"

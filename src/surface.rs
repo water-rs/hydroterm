@@ -4356,7 +4356,7 @@ impl SceneContent for TermSurface {
     /// stored `ImageData`, the background-image path) are kept.
     fn rebuild_for_engine(&mut self) {
         self.fonts.clear_registrations();
-        self.bg_img.borrow_mut().1 = None;
+        *self.bg_img.borrow_mut() = (None, None);
         for img in self.session.kitty.borrow_mut().images.iter_mut() {
             let _ = img.registered.take();
         }
@@ -5149,5 +5149,64 @@ mod tests {
         assert_eq!(cursor_click_seq(3), b"\x1b[C\x1b[C\x1b[C".to_vec());
         assert_eq!(cursor_click_seq(-2), b"\x1b[D\x1b[D".to_vec());
         assert!(cursor_click_seq(0).is_empty());
+    }
+
+    /// `rebuild_for_engine` must re-register the background image: after the
+    /// engine swap the cached `Registered<ImageId>` is dead, and the loader
+    /// only decodes when the cached path is cleared too. With a stale
+    /// `(Some(path), None)` cache the loader returns `None` on every frame.
+    #[test]
+    fn rebuild_for_engine_re_registers_background_image() {
+        use crate::app::Instance;
+        use std::collections::HashSet;
+        use std::sync::mpsc::channel;
+        use waterui_graphics::cherenkov::Engine;
+        use waterui_graphics::cherenkov::testing::{Null, NullConfig};
+        use waterui_graphics::resources::SceneResources;
+
+        // A 2x2 RGBA PNG (opaque pixels), valid for `crate::kitty::decode_png`.
+        const TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00r\xb6\r$\x00\x00\x00\x15IDATx\x9cc\xf8\xef\xd0\xf0\x1f\x84\x19\x1a\xfe;\xfc\x07a\x00a\xcc\n\xf9\xaf\xad\xee\xea\x00\x00\x00\x00IEND\xaeB`\x82";
+
+        // `AppState::new` spawns the first tab's session with a deferred
+        // terminal — no PTY is forked in the test.
+        let app = AppState::new(None, None, Instance::new());
+        let session = app
+            .focused_session()
+            .expect("AppState::new spawns the first tab's session");
+
+        let png =
+            std::env::temp_dir().join(format!("hydroterm-bg-test-{}.png", std::process::id()));
+        std::fs::write(&png, TEST_PNG).expect("write the PNG fixture");
+        app.cfg.borrow_mut().config.background_image = Some(png.clone());
+
+        let mut surface = TermSurface::new(
+            session,
+            app,
+            Rc::new(RefCell::new(Palette::default())),
+            FontCollection::new(parley::FontContext::new()),
+        );
+        let (events, _probe) = channel();
+        let engine = Rc::new(
+            Engine::<Null>::new(NullConfig {
+                events,
+                reject: HashSet::new(),
+            })
+            .expect("the null engine failed to start"),
+        );
+        let resources = SceneResources::with_shaders(engine.clone(), engine);
+
+        // First recording: decode + register.
+        let mut rec = resources.recording();
+        assert!(surface.bg_image_draw(&mut rec, 100.0, 100.0).is_some());
+        drop(rec);
+
+        // Engine swap: the next recording must decode and register again.
+        surface.rebuild_for_engine();
+        let mut rec = resources.recording();
+        assert!(surface.bg_image_draw(&mut rec, 100.0, 100.0).is_some());
+        drop(rec);
+        assert!(surface.bg_img.borrow().1.is_some());
+
+        let _ = std::fs::remove_file(&png);
     }
 }
