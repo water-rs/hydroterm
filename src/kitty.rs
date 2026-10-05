@@ -784,7 +784,7 @@ mod tests {
         let cmd = parse(raw.as_bytes()).unwrap();
         let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "OK");
-        assert_eq!(s.images[0].data.data[..], px[..]);
+        assert_eq!(s.images[0].data.data()[..], px[..]);
     }
 
     /// An `O`/`S` outside the mapped object is EINVAL at the input
