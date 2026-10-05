@@ -653,13 +653,18 @@ mod tests {
     fn shm_medium() {
         use rustix::{fs::Mode, shm};
         use std::io::Write;
+        // Darwin's PSHMNAMLEN is 31 bytes including the leading `/`: a
+        // short prefix plus hex pid and a per-process counter fits on
+        // every platform.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
-            "/hydroterm-test-{}-{}",
+            "/ht-{:x}-{:x}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            name.len() <= 31,
+            "shm name {name:?} must fit PSHMNAMLEN (31 bytes)"
         );
         let fd = shm::open(
             &name,
