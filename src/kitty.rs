@@ -471,14 +471,7 @@ fn crop_rgba(
 /// already validated (`/`-leading, no `..`) at the decode boundary.
 /// `rustix::shm` only exists where shm_open does, which excludes
 /// Windows and a few embedded targets.
-#[cfg(not(any(
-    windows,
-    target_os = "android",
-    target_os = "espidf",
-    target_os = "horizon",
-    target_os = "vita",
-    target_os = "wasi"
-)))]
+#[cfg(kitty_shm)]
 fn shm_read(name: &str) -> Result<Vec<u8>, String> {
     use rustix::{fs::Mode, shm};
     let fd =
@@ -492,14 +485,7 @@ fn shm_read(name: &str) -> Result<Vec<u8>, String> {
     Ok(raw)
 }
 
-#[cfg(any(
-    windows,
-    target_os = "android",
-    target_os = "espidf",
-    target_os = "horizon",
-    target_os = "vita",
-    target_os = "wasi"
-))]
+#[cfg(not(kitty_shm))]
 fn shm_read(_name: &str) -> Result<Vec<u8>, String> {
     Err("EINVAL:unsupported medium".to_string())
 }
@@ -662,14 +648,7 @@ mod tests {
         assert_eq!(s.images[0].placement, 5);
     }
 
-    #[cfg(not(any(
-        windows,
-        target_os = "android",
-        target_os = "espidf",
-        target_os = "horizon",
-        target_os = "vita",
-        target_os = "wasi"
-    )))]
+    #[cfg(kitty_shm)]
     #[test]
     fn shm_medium() {
         use rustix::{fs::Mode, shm};
@@ -690,7 +669,11 @@ mod tests {
         .unwrap();
         std::fs::File::from(fd).write_all(b"pixels").unwrap();
         let mut s = KittyStore::default();
-        let raw = format!("Ga=T,f=32,s=1,v=1,t=s;{}", b64_encode(name.as_bytes()));
+        use base64::Engine as _;
+        let raw = format!(
+            "Ga=T,f=32,s=1,v=1,t=s;{}",
+            base64::engine::general_purpose::STANDARD.encode(name.as_bytes())
+        );
         let cmd = parse(raw.as_bytes()).unwrap();
         let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "OK"); // "pixels" is ≥4 bytes → f=32 1x1
@@ -700,14 +683,7 @@ mod tests {
         assert_eq!(err, rustix::io::Errno::NOENT);
     }
 
-    #[cfg(any(
-        windows,
-        target_os = "android",
-        target_os = "espidf",
-        target_os = "horizon",
-        target_os = "vita",
-        target_os = "wasi"
-    ))]
+    #[cfg(not(kitty_shm))]
     #[test]
     fn shm_medium() {
         let mut s = KittyStore::default();
@@ -715,39 +691,5 @@ mod tests {
         let cmd = parse(&raw).unwrap();
         let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "EINVAL:unsupported medium");
-    }
-
-    /// RFC 4648 encoder mirroring `b64_decode` — test payloads build
-    /// their `<keys>;<b64>` command strings through it.
-    #[cfg(not(any(
-        windows,
-        target_os = "android",
-        target_os = "espidf",
-        target_os = "horizon",
-        target_os = "vita",
-        target_os = "wasi"
-    )))]
-    fn b64_encode(data: &[u8]) -> String {
-        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for c in data.chunks(3) {
-            let b0 = u32::from(c[0]);
-            let b1 = u32::from(c.get(1).copied().unwrap_or(0));
-            let b2 = u32::from(c.get(2).copied().unwrap_or(0));
-            let n = (b0 << 16) | (b1 << 8) | b2;
-            out.push(T[((n >> 18) & 63) as usize] as char);
-            out.push(T[((n >> 12) & 63) as usize] as char);
-            out.push(if c.len() > 1 {
-                T[((n >> 6) & 63) as usize] as char
-            } else {
-                '='
-            });
-            out.push(if c.len() > 2 {
-                T[(n & 63) as usize] as char
-            } else {
-                '='
-            });
-        }
-        out
     }
 }
