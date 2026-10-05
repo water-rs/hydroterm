@@ -218,7 +218,7 @@ fn menus(state: &app::AppState) -> Vec<Menu> {
     let cmd = |label: &'static str, shortcut: Shortcut, action: TermAction| {
         label
             .command()
-            .action(move |State(root): State<app::AppState>| {
+            .action(move |root: app::AppState| {
                 root.menu_dispatch(action.clone());
             })
             .shortcut(shortcut)
@@ -263,7 +263,7 @@ fn menus(state: &app::AppState) -> Vec<Menu> {
             (
                 "Toggle Quick Terminal"
                     .command()
-                    .action(move |State(root): State<app::AppState>| {
+                    .action(move |root: app::AppState| {
                         root.menu_dispatch(TermAction::ToggleQuickTerminal);
                     })
                     .state(state),
