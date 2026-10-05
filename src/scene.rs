@@ -21,6 +21,8 @@ use crate::config::CellColor;
 use crate::fonts::TermFonts;
 use crate::palette::{Palette, working, working_alpha};
 use crate::terminal::EventProxy;
+use waterui_graphics::cherenkov::Sampling;
+use waterui_graphics::cherenkov::kurbo::Cap::Butt;
 
 /// Padding around the text area, in logical units (scaled to px at draw).
 pub const PADDING: f32 = 6.0;
@@ -542,7 +544,7 @@ pub fn draw_term(
             transform: bg.transform,
             extend_x: bg.extend,
             extend_y: bg.extend,
-            sampling: waterui_graphics::cherenkov::Sampling::default(),
+            sampling: Sampling::default(),
         };
         if bg.opacity < 1.0 {
             recorder.group(Group::new().opacity(bg.opacity), |r| {
@@ -932,8 +934,8 @@ fn draw_decorations(
         recorder.stroke(
             p,
             Stroke::new(stroke_w)
-                .with_start_cap(waterui_graphics::cherenkov::kurbo::Cap::Butt)
-                .with_end_cap(waterui_graphics::cherenkov::kurbo::Cap::Butt),
+                .with_start_cap(Butt)
+                .with_end_cap(Butt),
             paint,
         );
     }
