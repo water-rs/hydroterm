@@ -14,17 +14,17 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
 use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
 use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
-use nami::collection::{Collection, List as NamiList};
-use nami::impl_constant;
-use nami::zip::zip;
-use nami::{Binding, Signal, binding};
 use waterui::Identifiable;
 use waterui::Url;
 use waterui::accessibility::{AccessibilityRole, AccessibilityState};
+use waterui::app::Quit;
 use waterui::drag_drop::{Files, Transferable};
 use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
+use waterui::reactive::collection::{Collection, List as NamiList};
+use waterui::reactive::impl_constant;
+use waterui::reactive::zip::zip;
 use waterui::shape::{FixedRoundedRectangle, ShapeExt};
 use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::state;
@@ -37,6 +37,7 @@ use waterui::window::{
     Activation, Monitor, MonitorSelector, UserAttention, Window, WindowLevel, WindowState,
     WindowStyle, conditional_window,
 };
+use waterui::{Binding, Signal, binding};
 use waterui_core::id::SelfId;
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_core::resolve::Resolvable;
@@ -630,7 +631,7 @@ impl SplitNode {
 
 /// A tab: one layout tree of panes plus a focused pane.
 /// `Clone` shares the bindings (Rc-backed state), so a cloned item from
-/// `nami::collection::List` reads and writes the same tab state.
+/// `waterui::reactive::collection::List` reads and writes the same tab state.
 #[derive(Clone, Identifiable)]
 pub struct PaneTab {
     #[id]
@@ -1604,10 +1605,11 @@ impl AppState {
         match self.config(|c| c.quit_after_last_window_closed_delay) {
             Some(delay) => {
                 if let Some(cancel) = self.instance.arm_quit_delay() {
+                    let state = self.clone();
                     spawn_local(async move {
                         sleep(std::time::Duration::from_secs_f64(delay)).await;
                         if quit_delay_expired(cancel.as_ref()) {
-                            std::process::exit(0);
+                            state.quit();
                         }
                     })
                     .detach();
@@ -2079,12 +2081,26 @@ impl AppState {
         window.show(env);
     }
 
-    /// Shut every session down and exit the process.
+    /// Ask the framework to terminate. `Quit::request` files a
+    /// cancellable termination, which lands in the app's `on_terminate`
+    /// hook, so every quit path — the keybind, the palette action, a
+    /// platform gesture, the last-window policy, the quit-delay timer —
+    /// runs the same shutdown.
     pub fn quit(&self) {
+        self.env
+            .get()
+            .expect("the application environment is cached before any quit path can run")
+            .get::<Quit>()
+            .expect("the runner installs the Quit service in the application environment")
+            .request();
+    }
+
+    /// Shut every session down — the `on_terminate` hook's body, run
+    /// once by the runner before it tears the runtime down.
+    pub fn shutdown_sessions(&self) {
         for s in self.sessions.borrow().iter() {
             s.terminal.shutdown();
         }
-        std::process::exit(0);
     }
 
     /// Look up one session.
@@ -5019,9 +5035,9 @@ mod tests {
         AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
         quit_delay_expired,
     };
-    use nami::collection::Collection;
-    use nami::{Binding, Signal};
     use waterui::Str;
+    use waterui::reactive::collection::Collection;
+    use waterui::{Binding, Signal};
 
     /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
     /// first arm wins, a new surface cancels by taking the slot and
