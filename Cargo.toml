@@ -7,12 +7,12 @@ license = "MIT OR Apache-2.0"
 description = "A modern GPU terminal emulator built on WaterUI's hydrolysis backend"
 
 [dependencies]
-waterui = { version = "0.5.2", default-features = false, features = ["gpu", "snackbar"] }
+waterui = { default-features = false, features = ["gpu", "snackbar"] , git = "https://github.com/water-rs/waterui", rev = "3b3d31a7b4444d0246f3604377bb6d92b9b29d07" }
 waterui-graphics = { version = "0.5.1", default-features = false }
-waterui-core = "0.5.1"
+waterui-core = { git = "https://github.com/water-rs/waterui", rev = "3b3d31a7b4444d0246f3604377bb6d92b9b29d07" }
 waterui-text = { version = "0.5.1", features = ["font-collection"] }
 hydrolysis = { version = "0.3.1", features = ["winit"] }
-hydrolysis-m3 = "0.3.1"
+hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "cc8be840d96be39dc6f23aeace7310801d7a5f35" }
 nami = "=0.11.1"
 alacritty_terminal = "0.26.0"
 waterkit-clipboard = "0.1.4"
