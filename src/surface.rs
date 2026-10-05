@@ -30,7 +30,7 @@ use waterui::window::{UserAttention, WindowState};
 use waterui_core::Str;
 use waterui_core::layout::{Rect as UiRect, Size as UiSize};
 use waterui_graphics::cherenkov::kurbo;
-use waterui_graphics::cherenkov::{Draw, Extend, ImageId, Recorder, Sampling};
+use waterui_graphics::cherenkov::{Draw, Extend, ImageId, Recorder, ResourceError, Sampling};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
 use waterui_graphics::resources::RecordingResources;
 use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
@@ -810,18 +810,29 @@ impl TermSurface {
             let loaded = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| crate::kitty::decode_png(&bytes))
-                .map(|(px, iw, ih)| {
-                    // Past the decode boundary: a well-formed buffer of
-                    // decoded pixels always makes `ImageData`, and a
-                    // well-formed `ImageData` always registers — both
-                    // failures are internal invariants, not user input.
+                .and_then(|(px, iw, ih)| {
+                    // Past the decode boundary a well-formed buffer always
+                    // makes `ImageData`; registration fails only with `Lost`.
+                    // `TooLarge` is user input: it surfaces as a config error
+                    // and the frame draws no background image.
                     let data = ImageData::<Rgba8>::new(iw, ih, px).unwrap_or_else(|e| {
                         panic!("decoded PNG {iw}x{ih} cannot form image data: {e:?}")
                     });
-                    let reg = resources.image(data).unwrap_or_else(|e| {
-                        panic!("scene engine rejected decoded PNG {iw}x{ih}: {e:?}")
-                    });
-                    (reg, iw, ih)
+                    match resources.image(data) {
+                        Ok(reg) => Some((reg, iw, ih)),
+                        Err(ResourceError::TooLarge {
+                            width,
+                            height,
+                            limits,
+                        }) => {
+                            tracing::error!(
+                                "hydroterm config: background-image {} is {width}x{height}, exceeding the image limits ({limits})",
+                                path.display()
+                            );
+                            None
+                        }
+                        Err(e) => panic!("scene engine rejected decoded PNG {iw}x{ih}: {e:?}"),
+                    }
                 });
             *cache = (Some(path), loaded);
         }
@@ -4273,6 +4284,9 @@ impl TermSurface {
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
         let (pad, pad_y) = (self.pad_x, self.pad_y);
+        // Placement ids the engine rejected as oversized — dropped from the
+        // kitty store once the draw pass releases its borrow.
+        let dropped = RefCell::new(Vec::<u32>::new());
         let draw_img = |recorder: &mut Recorder,
                         resources: &mut RecordingResources<'_>,
                         img: &crate::kitty::KittyImage| {
@@ -4301,17 +4315,32 @@ impl TermSurface {
                 Some(reg) => reg.clone(),
                 None => {
                     // The stored `ImageData` was validated at the transmit
-                    // boundary; registration fails only with `Lost`.
-                    let reg = resources
-                        .image(crate::kitty::share_image_data(&img.data))
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "scene engine rejected kitty image {}x{}: {e:?}",
-                                img.data.width, img.data.height
-                            )
-                        });
-                    let _ = img.registered.set(reg.clone());
-                    reg
+                    // boundary; registration fails only with `Lost` (a panic)
+                    // or `TooLarge` — the latter is program input, so the
+                    // placement is dropped after this draw pass.
+                    match resources.image(img.data.clone()) {
+                        Ok(reg) => {
+                            let _ = img.registered.set(reg.clone());
+                            reg
+                        }
+                        Err(ResourceError::TooLarge {
+                            width,
+                            height,
+                            limits,
+                        }) => {
+                            tracing::warn!(
+                                "kitty image {} {width}x{height} exceeds the image limits ({limits}); dropping the placement",
+                                img.id
+                            );
+                            dropped.borrow_mut().push(img.id);
+                            return;
+                        }
+                        Err(e) => panic!(
+                            "scene engine rejected kitty image {}x{}: {e:?}",
+                            img.data.width(),
+                            img.data.height()
+                        ),
+                    }
                 }
             };
             let id = resources.name(&registered);
@@ -4330,6 +4359,15 @@ impl TermSurface {
         });
         for img in images.images.iter().filter(|i| i.z >= 0) {
             draw_img(recorder, resources, img);
+        }
+        let dropped = dropped.take();
+        if !dropped.is_empty() {
+            drop(images);
+            self.session
+                .kitty
+                .borrow_mut()
+                .images
+                .retain(|i| !dropped.contains(&i.id));
         }
     }
 }
@@ -5190,6 +5228,7 @@ mod tests {
             Engine::<Null>::new(NullConfig {
                 events,
                 reject: HashSet::new(),
+                image_limits: waterui_graphics::cherenkov::ImageLimits::UNLIMITED,
             })
             .expect("the null engine failed to start"),
         );
@@ -5208,5 +5247,159 @@ mod tests {
         assert!(surface.bg_img.borrow().1.is_some());
 
         let _ = std::fs::remove_file(&png);
+    }
+
+    /// Test scaffolding for the `TooLarge` paths: a Null engine configured
+    /// with small `image_limits` plus a scoped fmt subscriber capturing
+    /// tracing output.
+    struct LimitedFixtures {
+        app: AppState,
+        session: Rc<crate::app::Session>,
+        resources: waterui_graphics::resources::SceneResources,
+        logs: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    /// 4x4/16-texel limits: an 8x8 image overflows both bounds; 2x2 passes.
+    fn limited_fixtures() -> LimitedFixtures {
+        use crate::app::Instance;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex, mpsc::channel};
+        use waterui_graphics::cherenkov::testing::{Null, NullConfig};
+        use waterui_graphics::cherenkov::{Engine, ImageLimits};
+        use waterui_graphics::resources::SceneResources;
+
+        struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let app = AppState::new(None, None, Instance::new());
+        let session = app
+            .focused_session()
+            .expect("AppState::new spawns the first tab's session");
+        let (events, _probe) = channel();
+        let limits = ImageLimits {
+            max_dimension: 4,
+            max_texels: 16,
+        };
+        let engine = Rc::new(
+            Engine::<Null>::new(NullConfig {
+                events,
+                reject: HashSet::new(),
+                image_limits: limits,
+            })
+            .expect("the null engine failed to start"),
+        );
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let sink = logs.clone();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || LogSink(sink.clone()))
+                .with_ansi(false)
+                .without_time()
+                .finish(),
+        );
+        LimitedFixtures {
+            app,
+            session,
+            resources: SceneResources::with_shaders(engine.clone(), engine),
+            logs,
+            _guard: guard,
+        }
+    }
+
+    /// An oversized `background-image` is user input, not an invariant: the
+    /// frame draws no background and the rejection surfaces through the same
+    /// `hydroterm config:` error channel config parse errors use.
+    #[test]
+    fn bg_image_too_large_surfaces_config_error() {
+        // An 8x8 RGBA PNG (red pixels), oversized under 4px/16-texel limits.
+        const BIG_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x08\x00\x00\x00\x08\x08\x06\x00\x00\x00\xc4\x0f\xbe\x8b\x00\x00\x00\x12IDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x1ff\x18\x19\n\x00\xc2\xd7\x7f\x81/q\xe0\x01\x00\x00\x00\x00IEND\xaeB`\x82";
+
+        let fx = limited_fixtures();
+        let png = std::env::temp_dir().join(format!("hydroterm-bg-big-{}.png", std::process::id()));
+        std::fs::write(&png, BIG_PNG).expect("write the PNG fixture");
+        fx.app.cfg.borrow_mut().config.background_image = Some(png.clone());
+
+        let surface = TermSurface::new(
+            fx.session,
+            fx.app,
+            Rc::new(RefCell::new(Palette::default())),
+            FontCollection::new(parley::FontContext::new()),
+        );
+        let mut rec = fx.resources.recording();
+        assert!(surface.bg_image_draw(&mut rec, 100.0, 100.0).is_none());
+        drop(rec);
+
+        // The cache keeps the path with no registration: later frames draw
+        // nothing rather than re-attempting or panicking.
+        let cache = surface.bg_img.borrow();
+        assert!(cache.0.is_some() && cache.1.is_none());
+        drop(cache);
+        let logs = fx.logs.lock().unwrap();
+        let text = String::from_utf8_lossy(&logs);
+        assert!(
+            text.contains("hydroterm config: background-image")
+                && text.contains("8x8")
+                && text.contains("exceeding the image limits"),
+            "config error missing from the log: {text}"
+        );
+        let _ = std::fs::remove_file(&png);
+    }
+
+    /// An oversized kitty image is program input: `build_scene` drops the
+    /// placement from the store and logs one warning instead of panicking.
+    #[test]
+    fn kitty_image_too_large_drops_placement() {
+        use std::cell::OnceCell;
+        use waterui_graphics::ImageData;
+        use waterui_graphics::cherenkov::{Content, LayoutSize};
+
+        let fx = limited_fixtures();
+        let data = ImageData::<waterui_graphics::Rgba8>::new(8, 8, vec![0u8; 256])
+            .expect("well-formed image data");
+        fx.session
+            .kitty
+            .borrow_mut()
+            .images
+            .push(crate::kitty::KittyImage {
+                id: 7,
+                data,
+                registered: OnceCell::new(),
+                line: 0,
+                col: 0,
+                cols: 0,
+                rows: 0,
+                z: 1,
+                placement: 0,
+                px_w: 8,
+                px_h: 8,
+            });
+
+        let mut surface = TermSurface::new(
+            fx.session.clone(),
+            fx.app,
+            Rc::new(RefCell::new(Palette::default())),
+            FontCollection::new(parley::FontContext::new()),
+        );
+        let _content = Content::record(&LayoutSize::new(), |recorder| {
+            let mut res = fx.resources.recording();
+            surface.build_scene(recorder, &mut res, 800.0, 600.0);
+        });
+
+        assert!(fx.session.kitty.borrow().images.is_empty());
+        let logs = fx.logs.lock().unwrap();
+        let text = String::from_utf8_lossy(&logs);
+        assert!(
+            text.contains("kitty image 7 8x8 exceeds the image limits"),
+            "warn missing from the log: {text}"
+        );
     }
 }
