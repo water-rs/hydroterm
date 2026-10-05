@@ -310,8 +310,9 @@ impl KittyStore {
                     Err(e) => return Err(format!("ENOENT:{e}")),
                 }
             }
-            // `t=s`: payload is the base64 of a POSIX shm name (leading `/`);
-            // on Linux it maps onto /dev/shm.<name>.
+            // `t=s`: payload is the base64 of a POSIX shm name (leading `/`).
+            // A shm object is not a filesystem file — it must be opened with
+            // shm_open and unlinked once read.
             "s" => {
                 let Some(name) = b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
@@ -321,10 +322,7 @@ impl KittyStore {
                 if name.contains("..") || !name.starts_with('/') {
                     return Err("EINVAL:shm name".to_string());
                 }
-                match std::fs::read(format!("/dev/shm{name}")) {
-                    Ok(raw) => raw,
-                    Err(e) => return Err(format!("ENOENT:{e}")),
-                }
+                shm_read(name)?
             }
             _ => return Err("EINVAL:unsupported medium".to_string()),
         };
@@ -465,6 +463,45 @@ fn crop_rgba(
         out.extend_from_slice(&px[s..s + (cw * 4) as usize]);
     }
     Some((out, cw, ch))
+}
+
+/// `t=s` payload read: `shm_open` the transmitted name read-only, take
+/// its bytes, then `shm_unlink` as the protocol requires — the object
+/// dies with the read even when the read itself fails. The name was
+/// already validated (`/`-leading, no `..`) at the decode boundary.
+/// `rustix::shm` only exists where shm_open does, which excludes
+/// Windows and a few embedded targets.
+#[cfg(not(any(
+    windows,
+    target_os = "android",
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "wasi"
+)))]
+fn shm_read(name: &str) -> Result<Vec<u8>, String> {
+    use rustix::{fs::Mode, shm};
+    let fd =
+        shm::open(name, shm::OFlags::RDONLY, Mode::empty()).map_err(|e| format!("ENOENT:{e}"))?;
+    let mut file = std::fs::File::from(fd);
+    let mut raw = Vec::new();
+    let read = std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("ENOENT:{e}"));
+    let unlink = shm::unlink(name).map_err(|e| format!("ENOENT:{e}"));
+    read?;
+    unlink?;
+    Ok(raw)
+}
+
+#[cfg(any(
+    windows,
+    target_os = "android",
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "wasi"
+))]
+fn shm_read(_name: &str) -> Result<Vec<u8>, String> {
+    Err("EINVAL:unsupported medium".to_string())
 }
 
 #[cfg(test)]
@@ -625,22 +662,92 @@ mod tests {
         assert_eq!(s.images[0].placement, 5);
     }
 
+    #[cfg(not(any(
+        windows,
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "wasi"
+    )))]
     #[test]
     fn shm_medium() {
-        std::fs::write("/dev/shm/hydroterm-test-shm", b"pixels").unwrap();
+        use rustix::{fs::Mode, shm};
+        use std::io::Write;
+        let name = format!(
+            "/hydroterm-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let fd = shm::open(
+            &name,
+            shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        std::fs::File::from(fd).write_all(b"pixels").unwrap();
         let mut s = KittyStore::default();
-        // t=s with a PNG payload would decode; use bad bytes → EINVAL:decode
-        // proves the shm read path returned data rather than ENOENT.
-        let name = crate::kitty::b64_decode("L2h5ZHJvdGVybS10ZXN0LXNobQ==").unwrap();
-        assert_eq!(name, b"/hydroterm-test-shm");
-        let raw = b"Ga=T,f=32,s=1,v=1,t=s;"
-            .to_vec()
-            .into_iter()
-            .chain(b"L2h5ZHJvdGVybS10ZXN0LXNobQ==".iter().copied())
-            .collect::<Vec<_>>();
-        let cmd = parse(&raw).unwrap();
+        let raw = format!("Ga=T,f=32,s=1,v=1,t=s;{}", b64_encode(name.as_bytes()));
+        let cmd = parse(raw.as_bytes()).unwrap();
         let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "OK"); // "pixels" is ≥4 bytes → f=32 1x1
-        std::fs::remove_file("/dev/shm/hydroterm-test-shm").unwrap();
+        assert_eq!(s.images.len(), 1);
+        // The decode path unlinked the object after reading it.
+        let err = shm::open(&name, shm::OFlags::RDONLY, Mode::empty()).unwrap_err();
+        assert_eq!(err, rustix::io::Errno::NOENT);
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "wasi"
+    ))]
+    #[test]
+    fn shm_medium() {
+        let mut s = KittyStore::default();
+        let raw = b"Ga=T,f=32,s=1,v=1,t=s;L25hbWU=".to_vec();
+        let cmd = parse(&raw).unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert_eq!(status.as_str(), "EINVAL:unsupported medium");
+    }
+
+    /// RFC 4648 encoder mirroring `b64_decode` — test payloads build
+    /// their `<keys>;<b64>` command strings through it.
+    #[cfg(not(any(
+        windows,
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "wasi"
+    )))]
+    fn b64_encode(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for c in data.chunks(3) {
+            let b0 = u32::from(c[0]);
+            let b1 = u32::from(c.get(1).copied().unwrap_or(0));
+            let b2 = u32::from(c.get(2).copied().unwrap_or(0));
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(if c.len() > 1 {
+                T[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                T[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
     }
 }

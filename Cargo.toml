@@ -31,6 +31,7 @@ png = "0.17"
 regex = "1.11"
 tracing = "0.1"
 polling = "3.8.0"
+rustix = { version = "1.1.5", features = ["shm", "fs"] }
 
 [features]
 # The `water` CLI's dev loop links the app as a dylib against a shared

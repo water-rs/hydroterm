@@ -2243,6 +2243,7 @@ dependencies = [
  "polling",
  "pollster 1.0.1",
  "regex",
+ "rustix 1.1.5",
  "tracing",
  "waterkit-clipboard",
  "waterkit-notification",
