@@ -341,7 +341,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         if mods.contains(Modifiers::META) {
             return Some(TermAction::Ignore);
         }
-        return None;
+        None
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -650,6 +650,7 @@ fn macos_action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
         "i" if mods == S | A => TermAction::Inspector,
         "f" if mods == S | C => TermAction::Fullscreen,
         "v" if mods == S | H => TermAction::PasteFromSelection,
+        "p" if mods == S | H => TermAction::Palette,
         _ => {
             // Cmd+digit selects tabs 1-8; Cmd+9 the last tab (unicode
             // chars only — physical-digit binds cover AZERTY upstream
@@ -678,7 +679,7 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
     #[cfg(target_os = "macos")]
     {
         let _ = (key, code, mods);
-        return None;
+        None
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1075,4 +1076,31 @@ pub enum FileSink {
     Copy,
     /// Paste the file path into the terminal.
     Paste,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_shift_p_is_palette() {
+        assert_eq!(
+            action_chord(
+                &Key::Character("p".into()),
+                Modifiers::META | Modifiers::SHIFT
+            ),
+            Some(TermAction::Palette)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_p_falls_through() {
+        assert_eq!(
+            action_chord(
+                &Key::Character("p".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            None
+        );
+    }
 }

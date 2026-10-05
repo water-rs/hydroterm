@@ -215,42 +215,64 @@ pub fn app(env: Environment) -> App {
 #[cfg(target_os = "macos")]
 fn menus(state: &app::AppState) -> Vec<Menu> {
     use crate::keys::TermAction;
-    let cmd = |label: &'static str, key: &'static str, action: TermAction| {
+    let cmd = |label: &'static str, shortcut: Shortcut, action: TermAction| {
         label
             .command()
             .action(move |State(root): State<app::AppState>| {
                 root.menu_dispatch(action.clone());
             })
-            .shortcut(Shortcut::new(key).command())
+            .shortcut(shortcut)
             .state(state)
     };
     vec![
-        Menu::new("hydroterm", cmd("Quit hydroterm", "q", TermAction::Quit)),
+        Menu::new(
+            "hydroterm",
+            cmd(
+                "Quit hydroterm",
+                Shortcut::new("q").command(),
+                TermAction::Quit,
+            ),
+        ),
         Menu::new(
             "File",
             (
-                cmd("New Window", "n", TermAction::NewWindow),
-                cmd("New Tab", "t", TermAction::NewTab),
+                cmd(
+                    "New Window",
+                    Shortcut::new("n").command(),
+                    TermAction::NewWindow,
+                ),
+                cmd("New Tab", Shortcut::new("t").command(), TermAction::NewTab),
                 // ⌘W is `close_surface` in the Ghostty Darwin table —
                 // a sole surface takes its tab (and window) with it.
-                cmd("Close", "w", TermAction::CloseSurface),
+                cmd(
+                    "Close",
+                    Shortcut::new("w").command(),
+                    TermAction::CloseSurface,
+                ),
             ),
         ),
         Menu::new(
             "Edit",
             (
-                cmd("Copy", "c", TermAction::Copy),
-                cmd("Paste", "v", TermAction::Paste),
+                cmd("Copy", Shortcut::new("c").command(), TermAction::Copy),
+                cmd("Paste", Shortcut::new("v").command(), TermAction::Paste),
             ),
         ),
         Menu::new(
             "View",
-            "Toggle Quick Terminal"
-                .command()
-                .action(move |State(root): State<app::AppState>| {
-                    root.menu_dispatch(TermAction::ToggleQuickTerminal);
-                })
-                .state(state),
+            (
+                "Toggle Quick Terminal"
+                    .command()
+                    .action(move |State(root): State<app::AppState>| {
+                        root.menu_dispatch(TermAction::ToggleQuickTerminal);
+                    })
+                    .state(state),
+                cmd(
+                    "Command Palette",
+                    Shortcut::new("p").command().shift(),
+                    TermAction::Palette,
+                ),
+            ),
         ),
     ]
 }
