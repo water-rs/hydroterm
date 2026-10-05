@@ -191,17 +191,33 @@ pub fn app(env: Environment) -> App {
     } else {
         LastWindowPolicy::Quit
     };
-    let app = App::new_with_windows([window], env).on_last_window_closed(policy);
-    // macOS menu bar: App (Quit), File (New Window/Tab/Close), Edit
-    // (Copy/Paste), View (Toggle Quick Terminal) — each wired to the same
-    // TermAction as its keybind. `NSApp.mainMenu` survives the windowless
-    // StayResident state, so New Window and Toggle Quick Terminal stay
-    // reachable with zero windows (the F12 grab is X11-only). Not armed
-    // elsewhere: no menu surface exists on Linux/Windows here, and these
-    // chords are super — arming them on the shortcut registry would
-    // shadow the window manager's own super bindings.
+    let app = App::new_with_windows([window], env)
+        .on_last_window_closed(policy)
+        // `.state(&state)` makes `AppState` extractable in every
+        // application-scoped handler — the menu commands and the
+        // termination hook below both take it as a bare parameter.
+        .state(&state)
+        // `on_terminate` runs once before the runner tears down, from
+        // every quit path (⌘Q, the menu, a platform gesture, the
+        // last-window policy): the sessions shut down inside the
+        // framework's termination machine instead of a `process::exit`.
+        .on_terminate(|state: app::AppState| async move {
+            state.shutdown_sessions();
+        });
+    // macOS menu bar: File (New Window/Tab/Close), Edit (Copy/Paste),
+    // View (Toggle Quick Terminal) — each wired to the same TermAction
+    // as its keybind. No Quit entry: the framework's standard app menu
+    // carries the one `Quit hydroterm` item, routed through
+    // `Quit::request` into the hook above (a hand-declared ⌘Q command
+    // is rejected by the menu validator). `NSApp.mainMenu` survives
+    // the windowless StayResident state, so New Window and Toggle Quick
+    // Terminal stay reachable with zero windows (the F12 grab is
+    // X11-only). Not armed elsewhere: no menu surface exists on
+    // Linux/Windows here, and these chords are super — arming them on
+    // the shortcut registry would shadow the window manager's own
+    // super bindings.
     #[cfg(target_os = "macos")]
-    let app = app.menu_bar(menus(&state));
+    let app = app.menu_bar(menus());
     app
 }
 
@@ -211,9 +227,9 @@ pub fn app(env: Environment) -> App {
 /// frontmost window (the pane last focused) takes window-scoped
 /// commands, the root state takes app-level ones — `menu_dispatch`
 /// makes New Window / Toggle Quick Terminal / Quit work with zero
-/// windows.
+/// windows. The handlers take `AppState` from `App::state(&state)`.
 #[cfg(target_os = "macos")]
-fn menus(state: &app::AppState) -> Vec<Menu> {
+fn menus() -> Vec<Menu> {
     use crate::keys::TermAction;
     let cmd = |label: &'static str, shortcut: Shortcut, action: TermAction| {
         label
@@ -222,17 +238,8 @@ fn menus(state: &app::AppState) -> Vec<Menu> {
                 root.menu_dispatch(action.clone());
             })
             .shortcut(shortcut)
-            .state(state)
     };
     vec![
-        Menu::new(
-            "hydroterm",
-            cmd(
-                "Quit hydroterm",
-                Shortcut::new("q").command(),
-                TermAction::Quit,
-            ),
-        ),
         Menu::new(
             "File",
             (
@@ -265,8 +272,7 @@ fn menus(state: &app::AppState) -> Vec<Menu> {
                     .command()
                     .action(move |root: app::AppState| {
                         root.menu_dispatch(TermAction::ToggleQuickTerminal);
-                    })
-                    .state(state),
+                    }),
                 cmd(
                     "Command Palette",
                     Shortcut::new("p").command().shift(),

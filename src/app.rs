@@ -17,6 +17,7 @@ use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
 use waterui::Identifiable;
 use waterui::Url;
 use waterui::accessibility::{AccessibilityRole, AccessibilityState};
+use waterui::app::Quit;
 use waterui::drag_drop::{Files, Transferable};
 use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::layout::frame::Frame;
@@ -1604,10 +1605,11 @@ impl AppState {
         match self.config(|c| c.quit_after_last_window_closed_delay) {
             Some(delay) => {
                 if let Some(cancel) = self.instance.arm_quit_delay() {
+                    let state = self.clone();
                     spawn_local(async move {
                         sleep(std::time::Duration::from_secs_f64(delay)).await;
                         if quit_delay_expired(cancel.as_ref()) {
-                            std::process::exit(0);
+                            state.quit();
                         }
                     })
                     .detach();
@@ -2079,12 +2081,25 @@ impl AppState {
         window.show(env);
     }
 
-    /// Shut every session down and exit the process.
+    /// Ask the framework to terminate. `Quit::request` files a
+    /// cancellable termination, which lands in the app's `on_terminate`
+    /// hook, so every quit path — the keybind, the palette action, a
+    /// platform gesture, the last-window policy, the quit-delay timer —
+    /// runs the same shutdown.
     pub fn quit(&self) {
+        if let Some(env) = self.env.get()
+            && let Some(quit) = env.get::<Quit>()
+        {
+            quit.request();
+        }
+    }
+
+    /// Shut every session down — the `on_terminate` hook's body, run
+    /// once by the runner before it tears the runtime down.
+    pub fn shutdown_sessions(&self) {
         for s in self.sessions.borrow().iter() {
             s.terminal.shutdown();
         }
-        std::process::exit(0);
     }
 
     /// Look up one session.
