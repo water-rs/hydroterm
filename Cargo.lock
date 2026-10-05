@@ -870,7 +870,7 @@ source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee
 dependencies = [
  "color",
  "kurbo",
- "nami-core 0.4.0",
+ "nami-core",
  "rustc-hash 2.1.3",
  "serde",
  "thiserror 2.0.21",
@@ -1920,7 +1920,7 @@ dependencies = [
  "libc",
  "lru",
  "muda",
- "nami 0.12.0",
+ "nami",
  "native-executor",
  "ndk",
  "ndk-context",
@@ -1996,7 +1996,6 @@ dependencies = [
  "hydrolysis-m3",
  "keyboard-types",
  "libc",
- "nami 0.11.2",
  "parley",
  "png 0.17.16",
  "polling",
@@ -3015,24 +3014,6 @@ dependencies = [
 
 [[package]]
 name = "nami"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66f346970519dd65bc7c1dcf49696edcf43eb9916f3bb00f2b8841c44de6d35"
-dependencies = [
- "async-channel",
- "async-io",
- "executor-core",
- "futures-core",
- "gloo-timers 0.4.0",
- "log",
- "nami-core 0.3.3",
- "nami-derive 0.3.1",
- "num-traits",
- "pin-project-lite",
-]
-
-[[package]]
-name = "nami"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2682abc0f1ffae7dcea58fea6792290d2279193f0a521ea06c5043cffbefe13"
@@ -3043,17 +3024,11 @@ dependencies = [
  "futures-core",
  "gloo-timers 0.4.0",
  "log",
- "nami-core 0.4.0",
- "nami-derive 0.4.0",
+ "nami-core",
+ "nami-derive",
  "num-traits",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "nami-core"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a70d1da3e07e48053148d4e32d49274c9249ab710ec26e9f10570e175a647ec"
 
 [[package]]
 name = "nami-core"
@@ -3062,17 +3037,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8998544a5a89948c3e5f0e18ae340f9ed09a165ead95108f7fbffcdb6a1e43cf"
 dependencies = [
  "kurbo",
-]
-
-[[package]]
-name = "nami-derive"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b76f4c97f6726b9589ca160480b114b8ee6cf4bfbe839253f426c1b778fc5fe"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
 ]
 
 [[package]]
@@ -4870,7 +4834,7 @@ name = "suiteki"
 version = "0.1.1"
 source = "git+https://github.com/water-rs/suiteki?rev=7cf17bdba0e978d388a096b1916daebdc17253b4#7cf17bdba0e978d388a096b1916daebdc17253b4"
 dependencies = [
- "nami-core 0.4.0",
+ "nami-core",
  "serde",
 ]
 
@@ -5622,7 +5586,7 @@ source = "git+https://github.com/water-rs/waterkit?rev=24ff906aaaaeccfee9b014760
 dependencies = [
  "executor-core",
  "jiff",
- "nami 0.12.0",
+ "nami",
  "thiserror 2.0.21",
  "uuid",
 ]
@@ -5767,7 +5731,7 @@ version = "0.5.2"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
  "kurbo",
- "nami 0.12.0",
+ "nami",
  "num-traits",
  "tracing",
  "waterui",
@@ -5786,7 +5750,7 @@ version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
  "executor-core",
- "nami 0.12.0",
+ "nami",
  "waterui-core",
  "waterui-icon",
  "waterui-layout",
@@ -5803,7 +5767,7 @@ dependencies = [
  "anyhow",
  "bitflags 2.13.2",
  "keyboard-types",
- "nami 0.12.0",
+ "nami",
  "num-traits",
  "smallvec",
  "suiteki",
@@ -5825,7 +5789,7 @@ source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee
 dependencies = [
  "getrandom 0.4.3",
  "jiff",
- "nami 0.12.0",
+ "nami",
  "tracing",
  "waterkit-dialog",
  "waterui-controls",
@@ -5856,7 +5820,7 @@ dependencies = [
  "image",
  "keyboard-types",
  "mp4parse",
- "nami 0.12.0",
+ "nami",
  "pastey",
  "pollster 1.0.1",
  "shaderloom",
@@ -5916,7 +5880,7 @@ dependencies = [
  "cpu-time",
  "executor-core",
  "futures",
- "nami 0.12.0",
+ "nami",
  "native-executor",
  "pastey",
  "robius-open",
@@ -5948,7 +5912,7 @@ name = "waterui-layout"
 version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
- "nami 0.12.0",
+ "nami",
  "num-traits",
  "smallvec",
  "waterui-core",
@@ -5970,7 +5934,7 @@ dependencies = [
  "icu_provider",
  "icu_time",
  "jiff",
- "nami 0.12.0",
+ "nami",
  "num-traits",
  "serde",
  "suiteki",
@@ -6000,7 +5964,7 @@ name = "waterui-map"
 version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
- "nami 0.12.0",
+ "nami",
  "suiteki",
  "waterkit-location",
  "waterui-core",
@@ -6032,7 +5996,7 @@ name = "waterui-navigation"
 version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
- "nami 0.12.0",
+ "nami",
  "waterui-controls",
  "waterui-core",
  "waterui-graphics",
@@ -6047,7 +6011,7 @@ version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
  "executor-core",
- "nami 0.12.0",
+ "nami",
  "native-executor",
  "num-traits",
  "waterui-core",
@@ -6074,7 +6038,7 @@ name = "waterui-text"
 version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
- "nami 0.12.0",
+ "nami",
  "parley",
  "smallvec",
  "suiteki",
@@ -6095,7 +6059,7 @@ version = "0.5.1"
 source = "git+https://github.com/water-rs/waterui?rev=50f5ae37187fb7106a66986aee4dd418458c6638#50f5ae37187fb7106a66986aee4dd418458c6638"
 dependencies = [
  "base64 0.23.1",
- "nami-core 0.4.0",
+ "nami-core",
  "suiteki",
 ]
 
