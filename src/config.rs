@@ -1219,27 +1219,42 @@ const TEMPLATE: &str = "\
 font-size = 13
 font-family = monospace
 scrollback = 10000
-window-padding-x = 0       # blank margin around the grid, in points
+# blank margin around the grid, in points
+window-padding-x = 0
 window-padding-y = 0
-window-padding-balance = false  # center the grid when it doesn't fill the frame
-middle-click-action = primary-paste  # middle click pastes the PRIMARY selection
-right-click-action = context-menu  # context-menu | copy | paste | ignore
-font-thicken = false       # overdraw glyph runs to darken strokes
+# center the grid when it doesn't fill the frame
+window-padding-balance = false
+# middle click pastes the PRIMARY selection
+middle-click-action = primary-paste
+# context-menu | copy | paste | ignore
+right-click-action = context-menu
+# overdraw glyph runs to darken strokes
+font-thicken = false
 # window-title-font-family = DejaVu Sans   # tab-chip label font (the reference's titlebar font key)
 # font-family-bold = DejaVu Sans Mono   # per-style family overrides
 # font-family-italic = DejaVu Sans Mono
 # font-family-bold-italic = DejaVu Sans Mono
-term = xterm-256color      # $TERM value advertised to programs
-clipboard-write = allow    # allow | deny — OSC 52 clipboard writes by programs
-clipboard-read = ask       # allow | ask | deny — OSC 52 clipboard reads by programs
-mouse-shift-capture = false # false | true | always | never — whether Shift reaches a mouse-reporting program
-cursor-invert-fg-bg = true # block cursor swaps the cell's fg/bg
-bold-color = bright        # bright | #rrggbb — bold-text color (unset = no override)
-faint-opacity = 0.5        # faint (SGR 2) text opacity, 0.0-1.0
+# $TERM value advertised to programs
+term = xterm-256color
+# allow | deny — OSC 52 clipboard writes by programs
+clipboard-write = allow
+# allow | ask | deny — OSC 52 clipboard reads by programs
+clipboard-read = ask
+# false | true | always | never — whether Shift reaches a mouse-reporting program
+mouse-shift-capture = false
+# block cursor swaps the cell's fg/bg
+cursor-invert-fg-bg = true
+# bright | #rrggbb — bold-text color (unset = no override)
+bold-color = bright
+# faint (SGR 2) text opacity, 0.0-1.0
+faint-opacity = 0.5
 # font-shaping-break = cursor  # cursor|no-cursor — break ligatures under the cursor (default on)
-selection-clear-on-typing = true  # typing drops the selection highlight
-unfocused-split-opacity = 1.0   # dim non-focused panes (0.0-1.0)
-resize-overlay = after-first   # never | always | after-first — cols x rows chip while resizing
+# typing drops the selection highlight
+selection-clear-on-typing = true
+# dim non-focused panes (0.0-1.0)
+unfocused-split-opacity = 1.0
+# never | always | after-first — cols x rows chip while resizing
+resize-overlay = after-first
 # resize-overlay-position = center   # center | top-left | top-center | top-right | bottom-left | bottom-center | bottom-right
 # resize-overlay-duration = 750ms    # compound units: 1h30m, 45s, 250ms
 focus-follows-mouse = false
@@ -1260,19 +1275,27 @@ focus-follows-mouse = false
 # theme = light:solarized-light,dark:solarized-dark
 theme = hydroterm-dark
 
-cursor-style = block        # block | beam | underline | hollow
+# block | beam | underline | hollow
+cursor-style = block
 cursor-style-blink = true
-copy-on-select = both       # both | clipboard | primary | false
-shell-integration = detect  # detect | none | bash | zsh | fish
+# both | clipboard | primary | false
+copy-on-select = both
+# detect | none | bash | zsh | fish
+shell-integration = detect
 # bell-features = attention,title   # bell channels; reference default — add `system`/`audio`/`border` to enable more
 # bell-audio-path = ~/bell.wav      # sound for the `audio` bell channel (rel. to config dir)
 # bell-audio-volume = 0.5           # 0.0..1.0 — maps to the player's own flag
-notify-on-command-finish = no   # no | unfocused | always — raise 🔔 when a command ends
-notify-on-command-finish-after = 5s  # minimum command duration (500ms | 5s | 1m | 1h)
+# no | unfocused | always — raise 🔔 when a command ends
+notify-on-command-finish = no
+# minimum command duration (500ms | 5s | 1m | 1h)
+notify-on-command-finish-after = 5s
 # notify-on-command-finish-action = bell  # bell | notify, comma list, no- negates (bell on, notify off)
-desktop-notifications = true    # OSC 9/777 may emit freedesktop notifications
-abnormal-command-exit-runtime = 250  # ms — a command dying faster stays held open with a notice
-grapheme-width-method = unicode # unicode | legacy — ZWJ clusters share cells vs per-scalar cells
+# OSC 9/777 may emit freedesktop notifications
+desktop-notifications = true
+# ms — a command dying faster stays held open with a notice
+abnormal-command-exit-runtime = 250
+# unicode | legacy — ZWJ clusters share cells vs per-scalar cells
+grapheme-width-method = unicode
 # shell = /bin/bash
 
 # Colors: overrides on top of the resolved theme
@@ -1288,8 +1311,10 @@ grapheme-width-method = unicode # unicode | legacy — ZWJ clusters share cells 
 # palette = 1=#e06c75   # indexed slot 0-255
 # command-palette-entry = title:Foo, description:Bar, action:goto_tab:1  # extra palette row
 
-mouse-scroll-multiplier = 1.0   # wheel scroll speed
-confirm-close-surface = true  # ask before closing a running program (true|false|always)
+# wheel scroll speed
+mouse-scroll-multiplier = 1.0
+# ask before closing a running program (true|false|always)
+confirm-close-surface = true
 # window-width = 800       # initial window size in points (0 = default)
 # fullscreen = false         # start windows fullscreen
 # window-height = 600
@@ -6245,5 +6270,21 @@ mod key_table_tests {
             cfg.seq_probe(&[sp('a', Code::KeyA, Modifiers::CONTROL)], &[]),
             SeqProbe::Miss
         ));
+    }
+
+    /// The generated template documents each value on its own line:
+    /// every key it sets parses without error to the value it
+    /// documents, so a trailing comment cannot creep back in and
+    /// corrupt the value (the grammar only allows full-line comments).
+    #[test]
+    fn template_values_parse_to_documented_defaults() {
+        let (cfg, errs) = AppConfig::parse(TEMPLATE);
+        assert!(errs.is_empty(), "template produced errors: {errs:?}");
+        assert_eq!(cfg.term, "xterm-256color");
+        assert_eq!(cfg.window_padding_x, 0.0);
+        assert_eq!(cfg.window_padding_y, 0.0);
+        assert!(!cfg.window_padding_balance);
+        assert_eq!(cfg.middle_click_action, MiddleClickAction::PrimaryPaste);
+        assert_eq!(cfg.right_click_action, RightClickAction::ContextMenu);
     }
 }
