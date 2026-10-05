@@ -1,20 +1,28 @@
-//! Turn the terminal grid into Scene2D commands: background runs, glyph runs
-//! with font fallback + ligature shaping, decorations (underline variants,
-//! strikethrough), the selection overlay, the cursor, and the scrollbar.
+//! Turn the terminal grid into Cherenkov commands: background runs, glyph
+//! runs with font fallback + ligature shaping, decorations (underline
+//! variants, strikethrough), the selection overlay, the cursor, and the
+//! scrollbar.
+
+use std::sync::Arc;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
-use kurbo::{Affine, BezPath, Rect, Shape, Stroke};
-use peniko::{Brush, Color, Fill, StyleRef};
-use waterui_graphics::scene2d::{Glyph, GlyphRun, Scene2D};
+use waterui_graphics::cherenkov::kurbo::{Affine, BezPath, Rect, Shape};
+use waterui_graphics::cherenkov::{
+    Color, Draw, Extend, Glyph, GlyphRun, GlyphStyle, Group, ImageId, ImagePattern, Recorder, Srgb,
+    Stroke,
+};
+use waterui_graphics::resources::RecordingResources;
 
 use crate::config::CellColor;
 use crate::fonts::TermFonts;
-use crate::palette::{Palette, peniko, peniko_alpha};
+use crate::palette::{Palette, working, working_alpha};
 use crate::terminal::EventProxy;
+use waterui_graphics::cherenkov::Sampling;
+use waterui_graphics::cherenkov::kurbo::Cap::Butt;
 
 /// Padding around the text area, in logical units (scaled to px at draw).
 pub const PADDING: f32 = 6.0;
@@ -39,6 +47,17 @@ pub struct HintSpan {
     pub segments: Vec<(usize, usize, usize)>,
     /// 1-based hint number the user types to open this link.
     pub label: usize,
+}
+
+/// `background-image` resolved for one frame: the registered image, the
+/// fit transform into surface space, the tiling mode and the draw
+/// opacity (a `Group` when < 1.0 — `ImagePattern` carries no alpha).
+#[derive(Clone, Copy)]
+pub struct BgPaint {
+    pub image: ImageId,
+    pub transform: Affine,
+    pub extend: Extend,
+    pub opacity: f32,
 }
 
 /// Runtime state the scene pass needs beyond the term's renderable content.
@@ -133,10 +152,11 @@ pub struct DrawContext<'a> {
     /// Ctrl-hovered link span to underline: `(start col, end col
     /// exclusive, viewport row)` per visible part (wrap-safe, like hints).
     pub hover_link: &'a [(usize, usize, usize)],
-    /// `background-image` brush + image-space→surface transform, drawn
-    /// between the theme base fill and the cell backgrounds so unstyled
-    /// cells show the image (Ghostty `background-image`).
-    pub bg_image: Option<(peniko::ImageBrush, kurbo::Affine)>,
+    /// `background-image` paint ready for the recorder — engine image id,
+    /// image→surface transform, tiling and opacity, drawn between the
+    /// theme base fill and the cell backgrounds so unstyled cells show
+    /// the image (Ghostty `background-image`).
+    pub bg_image: Option<BgPaint>,
     /// `unfocused-split-fill` — replaces the pane's default background
     /// while it is unfocused (cells with explicit backgrounds keep them).
     pub unfocused_fill: Option<Rgb>,
@@ -482,15 +502,16 @@ fn style_runs(row: &[CellData], break_cell: Option<usize>) -> Vec<(usize, usize,
     runs
 }
 
-/// Draw one frame into `scene`. `term` stays locked by the caller.
+/// Draw one frame into `recorder`. `term` stays locked by the caller.
 #[allow(clippy::too_many_lines)]
 /// Draw the terminal grid. `underlay`, when given, paints between the cell
 /// backgrounds/highlights and the text layer — used for z<0 kitty images.
 pub fn draw_term(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
+    resources: &mut RecordingResources<'_>,
     term: &Term<EventProxy>,
     ctx: &mut DrawContext<'_>,
-    underlay: &mut dyn FnMut(&mut dyn Scene2D),
+    underlay: &mut dyn FnMut(&mut Recorder, &mut RecordingResources<'_>),
 ) {
     let m = ctx.fonts.metrics;
     let (cw, ch, padx, pady) = (m.cell_w, m.cell_h, ctx.pad_x, ctx.pad_y);
@@ -509,25 +530,29 @@ pub fn draw_term(
     } else {
         theme_bg
     };
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        &Brush::Solid(peniko_alpha(default_bg, ctx.bg_opacity)),
-        None,
-        &rect(0.0, 0.0, ctx.width, ctx.height),
+    recorder.fill(
+        rect(0.0, 0.0, ctx.width, ctx.height),
+        working_alpha(default_bg, ctx.bg_opacity),
     );
 
     // -- `background-image` under the grid --------------------------------
     // Over the base fill, under cell backgrounds: cells on the default
     // bg skip their own fill so the image shows through unstyled text.
-    if let Some((brush, transform)) = &ctx.bg_image {
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &Brush::Image(brush.clone()),
-            Some(*transform),
-            &rect(0.0, 0.0, ctx.width, ctx.height),
-        );
+    if let Some(bg) = ctx.bg_image {
+        let pattern = ImagePattern {
+            image: bg.image,
+            transform: bg.transform,
+            extend_x: bg.extend,
+            extend_y: bg.extend,
+            sampling: Sampling::default(),
+        };
+        if bg.opacity < 1.0 {
+            recorder.group(Group::new().opacity(bg.opacity), |r| {
+                r.fill(rect(0.0, 0.0, ctx.width, ctx.height), pattern);
+            });
+        } else {
+            recorder.fill(rect(0.0, 0.0, ctx.width, ctx.height), pattern);
+        }
     }
 
     for (row_i, row) in grid.rows.iter().enumerate() {
@@ -544,19 +569,13 @@ pub fn draw_term(
             let x = col_x(padx, cw, start);
             let w = (end - start) as f32 * cw;
             let bgc = style.bg;
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &Brush::Solid(peniko_alpha(bgc, ctx.cell_bg_opacity)),
-                None,
-                &rect(x, y, w, ch),
-            );
+            recorder.fill(rect(x, y, w, ch), working_alpha(bgc, ctx.cell_bg_opacity));
         }
     }
 
     // -- `window-padding-color`: edge colors extended into the padding --
     if ctx.pad_mode != crate::config::WindowPaddingColor::Background {
-        paint_pad_extend(scene, term, &grid, theme_bg, ctx);
+        paint_pad_extend(recorder, term, &grid, theme_bg, ctx);
     }
 
     // -- Search highlights --------------------------------------------------
@@ -587,22 +606,19 @@ pub fn draw_term(
                 }
             }
         };
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(color, 1.0)),
-            None,
-            &rect(
+        recorder.fill(
+            rect(
                 col_x(padx, cw, c0),
                 row_y(pady, ch, r),
                 (c1 - c0) as f32 * cw,
                 ch,
             ),
+            working(color),
         );
     }
 
     // -- Images below text --------------------------------------------------
-    underlay(scene);
+    underlay(recorder, resources);
 
     // -- Text ---------------------------------------------------------------
     for (row_i, row) in grid.rows.iter().enumerate() {
@@ -616,24 +632,23 @@ pub fn draw_term(
             (ctx.shaping_break_cursor && row_i as i32 == cursor.row).then_some(cursor.col);
         for (start, end, style) in style_runs(row, break_cell) {
             draw_text_run(
-                scene, row, start, end, style, row_i, padx, pady, baseline_y, ctx,
+                recorder, resources, row, start, end, style, row_i, padx, pady, baseline_y, ctx,
             );
-            draw_decorations(scene, start, end, style, row_i, padx, ch, baseline_y, ctx);
+            draw_decorations(
+                recorder, start, end, style, row_i, padx, ch, baseline_y, ctx,
+            );
         }
     }
 
     // -- Ctrl-hover link underline -------------------------------------------
     if !ctx.hover_link.is_empty() {
-        let hover_line = Brush::Solid(peniko_alpha(palette.accent, 0.85));
+        let hover_line = working_alpha(palette.accent, 0.85);
         for &(c0, c1, row) in ctx.hover_link {
             let x = col_x(padx, cw, c0);
             let y = row_y(pady, ch, row);
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &hover_line,
-                None,
-                &rect(x, y + ch - 1.5, (c1 - c0) as f32 * cw, 1.5),
+            recorder.fill(
+                rect(x, y + ch - 1.5, (c1 - c0) as f32 * cw, 1.5),
+                hover_line,
             );
         }
     }
@@ -643,8 +658,8 @@ pub fn draw_term(
     // theme accent background + accent foreground — the URL text itself
     // stays fully readable (no wash over the span).
     if !ctx.hints.is_empty() || !ctx.hint_digits.is_empty() {
-        let chip_bg = Brush::Solid(peniko_alpha(palette.accent, 1.0));
-        let span_line = Brush::Solid(peniko_alpha(palette.accent, 0.6));
+        let chip_bg = working(palette.accent);
+        let span_line = working_alpha(palette.accent, 0.6);
         for h in ctx.hints {
             let label = h.label.to_string();
             let w = label.chars().count() as f32 * cw;
@@ -655,66 +670,61 @@ pub fn draw_term(
                 let x = col_x(padx, cw, c0);
                 let y = row_y(pady, ch, row);
                 let span_w = (c1 - c0) as f32 * cw;
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &span_line,
-                    None,
-                    &rect(x, y + ch - 1.5, span_w, 1.5),
-                );
+                recorder.fill(rect(x, y + ch - 1.5, span_w, 1.5), span_line);
             }
             let &(bc, _, brow) = &h.segments[0];
             let x = col_x(padx, cw, bc);
             let y = row_y(pady, ch, brow);
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &chip_bg,
-                None,
-                &rect(x, y, w, ch),
+            recorder.fill(rect(x, y, w, ch), chip_bg);
+            draw_chip_text(
+                recorder,
+                resources,
+                &label,
+                x,
+                y + m.baseline,
+                palette.accent_fg,
+                ctx,
             );
-            draw_chip_text(scene, &label, x, y + m.baseline, palette.accent_fg, ctx);
         }
         if !ctx.hint_digits.is_empty() {
             let label = format!("open: {}", ctx.hint_digits);
             let y = ctx.height - ch - 4.0;
             let w = label.chars().count() as f32 * cw;
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &chip_bg,
-                None,
-                &rect(4.0, y, w, ch),
+            recorder.fill(rect(4.0, y, w, ch), chip_bg);
+            draw_chip_text(
+                recorder,
+                resources,
+                &label,
+                4.0,
+                y + m.baseline,
+                palette.accent_fg,
+                ctx,
             );
-            draw_chip_text(scene, &label, 4.0, y + m.baseline, palette.accent_fg, ctx);
         }
     }
 
     // -- Cursor --------------------------------------------------------------
-    draw_cursor(scene, &grid, &cursor, ctx, mode);
+    draw_cursor(recorder, &grid, &cursor, ctx, mode);
 
     // -- IME preedit ----------------------------------------------------------
     let preedit = ctx.preedit.clone();
     if let Some((text, caret)) = preedit {
-        draw_preedit(scene, &text, caret, &cursor, ctx);
+        draw_preedit(recorder, resources, &text, caret, &cursor, ctx);
     }
 
     // -- Scrollbar ------------------------------------------------------------
-    draw_scrollbar(scene, ctx);
+    draw_scrollbar(recorder, ctx);
 
     // -- Bell flash -----------------------------------------------------------
     // Full-pane step flash in the theme's foreground colour — visible on
     // light and dark palettes alike (kitty `visual_bell` shape).
     if ctx.bell_flash > 0.0 {
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(
+        recorder.fill(
+            rect(0.0, 0.0, ctx.width, ctx.height),
+            working_alpha(
                 ctx.bell_color.unwrap_or(ctx.palette.foreground),
                 ctx.bell_flash,
-            )),
-            None,
-            &rect(0.0, 0.0, ctx.width, ctx.height),
+            ),
         );
     }
 
@@ -722,15 +732,10 @@ pub fn draw_term(
     // `bell-features` `border` — a ring around the alerted pane that stays
     // up until it is re-focused or receives input (Ghostty).
     if ctx.bell_border {
-        scene.stroke(
-            &Stroke::new(3.0),
-            Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(
-                ctx.bell_color.unwrap_or(ctx.palette.accent),
-                1.0,
-            )),
-            None,
-            &rect(1.5, 1.5, ctx.width - 1.5, ctx.height - 1.5).to_path(0.0),
+        recorder.stroke(
+            rect(1.5, 1.5, ctx.width - 1.5, ctx.height - 1.5).to_path(0.0),
+            Stroke::new(3.0),
+            working(ctx.bell_color.unwrap_or(ctx.palette.accent)),
         );
     }
 
@@ -746,12 +751,9 @@ pub fn draw_term(
             4 => (palette.at(11), f32::from(pct).min(100.0) / 100.0, 0.9),
             _ => (palette.accent, f32::from(pct).min(100.0) / 100.0, 0.9),
         };
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &Brush::Solid(peniko_alpha(color, alpha)),
-            None,
-            &rect(0.0, ctx.height - 3.0, ctx.width * frac, 3.0),
+        recorder.fill(
+            rect(0.0, ctx.height - 3.0, ctx.width * frac, 3.0),
+            working_alpha(color, alpha),
         );
     }
 }
@@ -762,7 +764,8 @@ pub fn draw_term(
 /// keeps every glyph at its grid position (ligatures included).
 #[allow(clippy::too_many_arguments)]
 fn draw_text_run(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
+    resources: &mut RecordingResources<'_>,
     row: &[CellData],
     start: usize,
     end: usize,
@@ -786,7 +789,7 @@ fn draw_text_run(
 
     let layout = ctx.fonts.shape_run(&text, style.bold, style.italic);
     let cw = ctx.fonts.metrics.cell_w;
-    let brush = Brush::Solid(peniko(style.fg));
+    let paint = working(style.fg);
     let mut glyphs: Vec<Glyph> = Vec::new();
 
     for line in layout.lines() {
@@ -819,6 +822,7 @@ fn draw_text_run(
                         id: g.id,
                         x: cell_x + pen + g.x,
                         y: g.y,
+                        transform: None,
                     });
                     pen += g.advance;
                 }
@@ -827,6 +831,7 @@ fn draw_text_run(
                 continue;
             }
 
+            let font = ctx.fonts.font_id(resources, run.font());
             let synthesis = crate::fonts::RunStyle::from(run.synthesis());
             let mut transform = Affine::translate((0.0, baseline_y as f64));
             if ctx.font_synthetic_italic
@@ -835,16 +840,15 @@ fn draw_text_run(
                 transform *= Affine::skew(f64::from(-deg).to_radians(), 0.0);
             }
             let out = GlyphRun {
-                font: run.font(),
-                font_size: run.font_size(),
-                normalized_coords: run.normalized_coords(),
-                transform,
-                brush: &brush,
-                brush_alpha: 1.0,
-                style: StyleRef::Fill(Fill::NonZero),
-                glyphs: &glyphs,
+                font,
+                size: run.font_size(),
+                coords: Arc::from(run.normalized_coords()),
+                glyphs: Arc::from(glyphs.as_slice()),
+                style: GlyphStyle::Fill,
             };
-            scene.draw_glyph_run(&out);
+            // The run's affine (baseline + italic skew) wraps the glyphs:
+            // `GlyphRun` positions stay in un-transformed local space.
+            recorder.transform(transform, |r| r.glyphs(out.clone(), paint));
 
             // Faux bold: redraw with a half-cell-fraction offset, like the
             // offset emboldening native text stacks apply. `font-thicken`
@@ -857,11 +861,9 @@ fn draw_text_run(
             };
             let dx = synth_dx.max(ctx.font_thicken);
             if dx > 0.0 {
-                let bold_run = GlyphRun {
-                    transform: Affine::translate((f64::from(dx), baseline_y as f64)),
-                    ..out
-                };
-                scene.draw_glyph_run(&bold_run);
+                recorder.transform(Affine::translate((f64::from(dx), baseline_y as f64)), |r| {
+                    r.glyphs(out.clone(), paint)
+                });
             }
         }
     }
@@ -870,7 +872,7 @@ fn draw_text_run(
 /// Underline + strikethrough for one style run.
 #[allow(clippy::too_many_arguments)]
 fn draw_decorations(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
     start: usize,
     end: usize,
     style: StyleKey,
@@ -884,7 +886,7 @@ fn draw_decorations(
     let cw = m.cell_w;
     let x = col_x(padx, cw, start);
     let w = (end - start) as f32 * cw;
-    let brush = Brush::Solid(peniko(style.ul_color.unwrap_or(style.fg)));
+    let paint = working(style.ul_color.unwrap_or(style.fg));
 
     let stroke_w = (m.stroke * ctx.underline_adjust.1).max(1.0) as f64;
     let underline_y = baseline_y as f64 + m.underline_pos as f64 + ctx.underline_adjust.0 as f64;
@@ -901,12 +903,12 @@ fn draw_decorations(
 
     if style.deco & DECO_UNDERLINE != 0 {
         let p = band(underline_y).to_path(0.0);
-        scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
+        recorder.fill(p, paint);
     }
     if style.deco & DECO_DOUBLE != 0 {
         for dy in [0.0, stroke_w * 2.0] {
             let p = band(underline_y + dy).to_path(0.0);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
+            recorder.fill(p, paint);
         }
     }
     if style.deco & DECO_CURL != 0 {
@@ -929,14 +931,12 @@ fn draw_decorations(
             xx = nx;
             up = !up;
         }
-        scene.stroke(
-            &Stroke::new(stroke_w)
-                .with_start_cap(kurbo::Cap::Butt)
-                .with_end_cap(kurbo::Cap::Butt),
-            Affine::IDENTITY,
-            &brush,
-            None,
-            &p,
+        recorder.stroke(
+            p,
+            Stroke::new(stroke_w)
+                .with_start_cap(Butt)
+                .with_end_cap(Butt),
+            paint,
         );
     }
     if style.deco & (DECO_DOTTED | DECO_DASHED) != 0 {
@@ -948,13 +948,7 @@ fn draw_decorations(
         let mut p = BezPath::new();
         p.move_to((x as f64, underline_y));
         p.line_to(((x + w) as f64, underline_y));
-        scene.stroke(
-            &Stroke::new(stroke_w).with_dashes(0.0, dash),
-            Affine::IDENTITY,
-            &brush,
-            None,
-            &p,
-        );
+        recorder.stroke(p, Stroke::new(stroke_w).with_dashes(0.0, dash), paint);
     }
     if style.deco & DECO_STRIKE != 0 {
         let y = baseline_y as f64 - m.strikeout_pos as f64 - ctx.strikethrough_adjust.0 as f64;
@@ -966,13 +960,13 @@ fn draw_decorations(
             y + w_stroke / 2.0,
         )
         .to_path(0.0);
-        scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &p);
+        recorder.fill(p, paint);
     }
 }
 
 /// Draw the cursor over its cell.
 fn draw_cursor(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
     _grid: &Grid,
     cursor: &CursorInfo,
     ctx: &mut DrawContext<'_>,
@@ -986,7 +980,7 @@ fn draw_cursor(
     let row = cursor.row as usize;
     let x = col_x(padx, cw, cursor.col);
     let y = row_y(pady, ch, row);
-    let brush = Brush::Solid(peniko(ctx.palette.cursor));
+    let paint = working(ctx.palette.cursor);
 
     match cursor.shape {
         CursorShape::Hidden => {}
@@ -999,13 +993,7 @@ fn draw_cursor(
                     (x + cw) as f64 - 0.5,
                     (y + ch) as f64 - 0.5,
                 );
-                scene.stroke(
-                    &Stroke::new(1.0),
-                    Affine::IDENTITY,
-                    &brush,
-                    None,
-                    &r.to_path(0.0),
-                );
+                recorder.stroke(r.to_path(0.0), Stroke::new(1.0), paint);
             }
             // Focused: the block was painted as the cell bg during harvest
             // when (blink_on || !blinking); in the blink-off phase nothing is
@@ -1014,13 +1002,7 @@ fn draw_cursor(
         CursorShape::Underline => {
             if ctx.blink_on || !cursor.blinking {
                 let t = (3.0 * ctx.cursor_thickness * ctx.cursor_height).clamp(1.0, ch);
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &brush,
-                    None,
-                    &rect(x, y + ch - t, cw, t),
-                );
+                recorder.fill(rect(x, y + ch - t, cw, t), paint);
             }
         }
         CursorShape::Beam => {
@@ -1030,13 +1012,7 @@ fn draw_cursor(
                 // height upward (bottom-anchored); it can only shrink,
                 // not exceed the cell.
                 let h = (ch * ctx.cursor_height).min(ch);
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &brush,
-                    None,
-                    &rect(x, y + ch - h, t, h),
-                );
+                recorder.fill(rect(x, y + ch - h, t, h), paint);
             }
         }
         CursorShape::HollowBlock => {
@@ -1046,20 +1022,15 @@ fn draw_cursor(
                 (x + cw) as f64 - 0.5,
                 (y + ch) as f64 - 0.5,
             );
-            scene.stroke(
-                &Stroke::new(1.0),
-                Affine::IDENTITY,
-                &brush,
-                None,
-                &r.to_path(0.0),
-            );
+            recorder.stroke(r.to_path(0.0), Stroke::new(1.0), paint);
         }
     }
 }
 
 /// IME preedit drawn at the caret with an underline.
 fn draw_preedit(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
+    resources: &mut RecordingResources<'_>,
     text: &str,
     _caret: usize,
     cursor: &CursorInfo,
@@ -1076,7 +1047,7 @@ fn draw_preedit(
     // Shape the preedit like any other run; the chip is sized off the total
     // advance so the composed text always has a backdrop.
     let layout = ctx.fonts.shape_run(text, false, false);
-    let brush = Brush::Solid(peniko(ctx.palette.foreground));
+    let paint = working(ctx.palette.foreground);
 
     // Collect positioned glyphs per parley run; pen advances across runs.
     let mut pen = 0.0f32;
@@ -1093,6 +1064,7 @@ fn draw_preedit(
                     id: g.id,
                     x: x0 + pen + g.x,
                     y: g.y,
+                    transform: None,
                 });
                 pen += g.advance;
             }
@@ -1101,17 +1073,14 @@ fn draw_preedit(
     }
 
     let w = pen.max(cw);
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        &Brush::Solid(peniko_alpha(
+    recorder.fill(
+        rect(x0, baseline_y - m.baseline, w, ch),
+        working_alpha(
             ctx.palette
                 .selection_bg
                 .unwrap_or_else(|| lerp_rgb(ctx.palette.background, ctx.palette.foreground, 0.15)),
             0.8,
-        )),
-        None,
-        &rect(x0, baseline_y - m.baseline, w, ch),
+        ),
     );
 
     let mut idx = 0usize;
@@ -1123,28 +1092,30 @@ fn draw_preedit(
             let (start, end) = runs[idx];
             idx += 1;
             let run = gr.run();
-            scene.draw_glyph_run(&GlyphRun {
-                font: run.font(),
-                font_size: run.font_size(),
-                normalized_coords: run.normalized_coords(),
-                transform: Affine::translate((0.0, baseline_y as f64)),
-                brush: &brush,
-                brush_alpha: 1.0,
-                style: StyleRef::Fill(Fill::NonZero),
-                glyphs: &glyphs[start..end],
+            let font = ctx.fonts.font_id(resources, run.font());
+            let out = GlyphRun {
+                font,
+                size: run.font_size(),
+                coords: Arc::from(run.normalized_coords()),
+                glyphs: Arc::from(&glyphs[start..end]),
+                style: GlyphStyle::Fill,
+            };
+            recorder.transform(Affine::translate((0.0, baseline_y as f64)), |r| {
+                r.glyphs(out, paint);
             });
         }
     }
     let mut p = BezPath::new();
     p.move_to((x0 as f64, (baseline_y + m.underline_pos) as f64));
     p.line_to(((x0 + w) as f64, (baseline_y + m.underline_pos) as f64));
-    scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, &brush, None, &p);
+    recorder.stroke(p, Stroke::new(1.0), paint);
 }
 
 /// Small text drawn inside a chip — same `shape_run` + `GlyphRun` path
 /// as the IME preedit, without the underline stroke.
 fn draw_chip_text(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
+    resources: &mut RecordingResources<'_>,
     text: &str,
     x0: f32,
     baseline_y: f32,
@@ -1152,7 +1123,7 @@ fn draw_chip_text(
     ctx: &mut DrawContext<'_>,
 ) {
     let layout = ctx.fonts.shape_run(text, false, false);
-    let brush = Brush::Solid(peniko(color));
+    let paint = working(color);
     let mut pen = 0.0f32;
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut glyphs: Vec<Glyph> = Vec::new();
@@ -1167,6 +1138,7 @@ fn draw_chip_text(
                     id: g.id,
                     x: x0 + pen + g.x,
                     y: g.y,
+                    transform: None,
                 });
                 pen += g.advance;
             }
@@ -1182,22 +1154,23 @@ fn draw_chip_text(
             let (start, end) = runs[idx];
             idx += 1;
             let run = gr.run();
-            scene.draw_glyph_run(&GlyphRun {
-                font: run.font(),
-                font_size: run.font_size(),
-                normalized_coords: run.normalized_coords(),
-                transform: Affine::translate((0.0, baseline_y as f64)),
-                brush: &brush,
-                brush_alpha: 1.0,
-                style: StyleRef::Fill(Fill::NonZero),
-                glyphs: &glyphs[start..end],
+            let font = ctx.fonts.font_id(resources, run.font());
+            let out = GlyphRun {
+                font,
+                size: run.font_size(),
+                coords: Arc::from(run.normalized_coords()),
+                glyphs: Arc::from(&glyphs[start..end]),
+                style: GlyphStyle::Fill,
+            };
+            recorder.transform(Affine::translate((0.0, baseline_y as f64)), |r| {
+                r.glyphs(out, paint);
             });
         }
     }
 }
 
 /// Thin scrollbar at the right edge when scrollback exists.
-fn draw_scrollbar(scene: &mut dyn Scene2D, ctx: &DrawContext<'_>) {
+fn draw_scrollbar(recorder: &mut Recorder, ctx: &DrawContext<'_>) {
     let s = &ctx.scroll;
     if s.history_size == 0 {
         return;
@@ -1209,12 +1182,9 @@ fn draw_scrollbar(scene: &mut dyn Scene2D, ctx: &DrawContext<'_>) {
     let track_h = ctx.height;
     let bar_h = (track_h * frac).max(24.0);
     let bar_y = track_h * thumb_top;
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        &Brush::Solid(Color::new([1.0, 1.0, 1.0, 0.25])),
-        None,
-        &rect(ctx.width - 4.0, bar_y, 3.0, bar_h),
+    recorder.fill(
+        rect(ctx.width - 4.0, bar_y, 3.0, bar_h),
+        Color::<Srgb>::new([1.0, 1.0, 1.0, 0.25]).to_working(),
     );
 }
 
@@ -1253,7 +1223,7 @@ pub(crate) fn pad_vertical_ok(
 /// Paint the padding strips with the adjacent cells' colors
 /// (`window-padding-color = extend|extend-always`).
 fn paint_pad_extend(
-    scene: &mut dyn Scene2D,
+    recorder: &mut Recorder,
     term: &Term<EventProxy>,
     grid: &Grid,
     theme_bg: Rgb,
@@ -1275,24 +1245,18 @@ fn paint_pad_extend(
         if padx > 0.0 {
             let bg = row[0].style.bg;
             if bg != theme_bg {
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &Brush::Solid(peniko_alpha(bg, ctx.cell_bg_opacity)),
-                    None,
-                    &rect(0.0, y, padx, ch),
+                recorder.fill(
+                    rect(0.0, y, padx, ch),
+                    working_alpha(bg, ctx.cell_bg_opacity),
                 );
             }
         }
         if grid_right < ctx.width {
             let bg = row[row.len() - 1].style.bg;
             if bg != theme_bg {
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    &Brush::Solid(peniko_alpha(bg, ctx.cell_bg_opacity)),
-                    None,
-                    &rect(grid_right, y, ctx.width - grid_right, ch),
+                recorder.fill(
+                    rect(grid_right, y, ctx.width - grid_right, ch),
+                    working_alpha(bg, ctx.cell_bg_opacity),
                 );
             }
         }
@@ -1330,12 +1294,9 @@ fn paint_pad_extend(
             }
             let x = col_x(padx, cw, start);
             let w = (end - start) as f32 * cw;
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                &Brush::Solid(peniko_alpha(style.bg, ctx.cell_bg_opacity)),
-                None,
-                &rect(x, band_top, w, h),
+            recorder.fill(
+                rect(x, band_top, w, h),
+                working_alpha(style.bg, ctx.cell_bg_opacity),
             );
         }
         // Corners take the corner cell's color so the padding is one
@@ -1350,12 +1311,9 @@ fn paint_pad_extend(
                 ),
             ] {
                 if cell.style.bg != theme_bg {
-                    scene.fill(
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        &Brush::Solid(peniko_alpha(cell.style.bg, ctx.cell_bg_opacity)),
-                        None,
-                        &rect(x0, band_top, w0, h),
+                    recorder.fill(
+                        rect(x0, band_top, w0, h),
+                        working_alpha(cell.style.bg, ctx.cell_bg_opacity),
                     );
                 }
             }

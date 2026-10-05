@@ -13,9 +13,12 @@
 //! placements), `t=t` shared memory, `t=o` file-descriptor passing,
 //! `a=f` frame animation, `C=`/`o=`/`H=`/`V=`/relative extents.
 
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
-use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use waterui_graphics::Registered;
+use waterui_graphics::cherenkov::ImageId;
+use waterui_graphics::{ImageData, Rgba8};
 
 /// One decoded `G...;payload` command.
 pub struct KittyCmd {
@@ -95,10 +98,25 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Share an `ImageData`'s `Arc` buffer into a new `ImageData` — the type
+/// is not `Clone`, so re-wrap through `new` (cheap: it only re-checks the
+/// length, and the stored pixels were already validated at the transmit
+/// boundary). Used where the protocol places or registers the same pixels.
+pub(crate) fn share_image_data(d: &ImageData<Rgba8>) -> ImageData<Rgba8> {
+    let mut out = ImageData::new(d.width, d.height, d.data.clone())
+        .expect("stored image data is well-formed");
+    out.color_space = d.color_space;
+    out.premultiplied = d.premultiplied;
+    out
+}
+
 /// A placed image: absolute buffer row + column at transmit time.
 pub struct KittyImage {
     pub id: u32,
-    pub brush: peniko::ImageBrush,
+    /// RGBA pixel data, registered with the scene engine on first draw.
+    pub data: ImageData<Rgba8>,
+    /// Engine-side registration, filled by the first recording that draws it.
+    pub registered: OnceCell<Registered<ImageId>>,
     /// Absolute line index (same convention as prompt marks).
     pub line: i64,
     pub col: usize,
@@ -115,11 +133,10 @@ pub struct KittyImage {
 }
 
 /// A transmitted image payload kept by id — `a=p` placements draw
-/// from it without re-sending data.
+/// from it without re-sending data. The buffer was validated at decode
+/// time, so the stored form is `ImageData` itself.
 struct StoredImage {
-    rgba: Vec<u8>,
-    w: u32,
-    h: u32,
+    data: ImageData<Rgba8>,
 }
 
 /// Per-session image store + in-flight chunked transmission.
@@ -193,21 +210,22 @@ impl KittyStore {
     /// `p=` names the placement, `x`/`y`/`w`/`h` crop the stored
     /// pixels, `c`/`r`/`z` size and layer it.
     fn put(&mut self, cmd: &KittyCmd, line: i64, col: usize) -> Handled {
-        let Some(stored) = self.data.get(&cmd.id()) else {
-            return (cmd.id(), "ENOENT:image id".to_string());
-        };
-        let (px, w, h) = (stored.rgba.clone(), stored.w, stored.h);
-        let (px, w, h) = match (cmd.num('w'), cmd.num('h')) {
-            (Some(cw), Some(ch)) => {
-                let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
-                match crop_rgba(&px, w, h, cx, cy, cw, ch) {
-                    Some(c) => c,
-                    None => return (cmd.id(), "EINVAL:crop".to_string()),
+        let data = {
+            let Some(stored) = self.data.get(&cmd.id()) else {
+                return (cmd.id(), "ENOENT:image id".to_string());
+            };
+            match (cmd.num('w'), cmd.num('h')) {
+                (Some(cw), Some(ch)) => {
+                    let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
+                    match crop_rgba(&stored.data, cx, cy, cw, ch) {
+                        Some(c) => c,
+                        None => return (cmd.id(), "EINVAL:crop".to_string()),
+                    }
                 }
+                _ => share_image_data(&stored.data),
             }
-            _ => (px, w, h),
         };
-        self.push_image(cmd, line, col, px, w, h);
+        self.push_image(cmd, line, col, data);
         (cmd.id(), "OK".to_string())
     }
 
@@ -221,7 +239,7 @@ impl KittyStore {
                 if let Some(id) = cmd.num('i') {
                     self.images.retain(|img| img.id != id);
                     if let Some(s) = self.data.remove(&id) {
-                        self.data_bytes -= s.rgba.len();
+                        self.data_bytes -= s.data.data.len();
                     }
                 }
             }
@@ -250,7 +268,7 @@ impl KittyStore {
                 Some(id) => {
                     self.images.retain(|img| img.id != id);
                     if let Some(s) = self.data.remove(&id) {
-                        self.data_bytes -= s.rgba.len();
+                        self.data_bytes -= s.data.data.len();
                     }
                 }
                 None => {
@@ -269,9 +287,8 @@ impl KittyStore {
             .and_then(|stored| self.store_checked(cmd.id(), stored, limit))
         {
             Ok(()) => {
-                let stored = &self.data[&cmd.id()];
-                let (px, w, h) = (stored.rgba.clone(), stored.w, stored.h);
-                self.push_image(cmd, line, col, px, w, h);
+                let data = share_image_data(&self.data[&cmd.id()].data);
+                self.push_image(cmd, line, col, data);
                 (cmd.id(), "OK".to_string())
             }
             Err(e) => (cmd.id(), e),
@@ -281,12 +298,13 @@ impl KittyStore {
     /// Insert a decoded payload honoring `image-storage-limit`: a
     /// rejected store frees nothing and reports `ETOOBIG` like kitty.
     fn store_checked(&mut self, id: u32, stored: StoredImage, limit: usize) -> Result<(), String> {
-        let replacing = self.data.get(&id).map(|s| s.rgba.len()).unwrap_or(0);
-        if self.data_bytes - replacing + stored.rgba.len() > limit {
+        let len = stored.data.data.len();
+        let replacing = self.data.get(&id).map(|s| s.data.data.len()).unwrap_or(0);
+        if self.data_bytes - replacing + len > limit {
             return Err("ETOOBIG:image-storage-limit".to_string());
         }
         self.data_bytes -= replacing;
-        self.data_bytes += stored.rgba.len();
+        self.data_bytes += len;
         self.data.insert(id, stored);
         Ok(())
     }
@@ -331,16 +349,25 @@ impl KittyStore {
             "100" => decode_png(&raw),
             "32" | "24" => {
                 let (w, h) = (cmd.num('s'), cmd.num('v'));
-                match (w, h) {
-                    (Some(w), Some(h)) => {
-                        let bpp = if fmt == "24" { 3 } else { 4 };
-                        if raw.len() < (w * h) as usize * bpp {
-                            None
-                        } else if bpp == 4 {
-                            Some((raw[..(w * h * 4) as usize].to_vec(), w, h))
+                let bpp = if fmt == "24" { 3usize } else { 4usize };
+                // Sizes are remote input: `s*v*bpp` is checked in usize,
+                // so an oversized transmit is EINVAL, never a wrapped
+                // length or an arithmetic panic.
+                let need = w.and_then(|w| {
+                    h.and_then(|h| {
+                        (w as usize)
+                            .checked_mul(h as usize)
+                            .and_then(|n| n.checked_mul(bpp))
+                            .map(|need| (w, h, need))
+                    })
+                });
+                match need {
+                    Some((w, h, need)) if raw.len() >= need => {
+                        if bpp == 4 {
+                            Some((raw[..need].to_vec(), w, h))
                         } else {
-                            let mut out = Vec::with_capacity((w * h * 3) as usize);
-                            for px in raw[..(w * h * 3) as usize].as_chunks::<3>().0 {
+                            let mut out = Vec::with_capacity(need);
+                            for px in raw[..need].as_chunks::<3>().0 {
                                 out.extend_from_slice(px);
                                 out.push(255);
                             }
@@ -355,37 +382,32 @@ impl KittyStore {
         let Some((px, w, h)) = rgba else {
             return Err("EINVAL:decode".to_string());
         };
+        let mut data = ImageData::<Rgba8>::new(w, h, px).map_err(|e| format!("EINVAL:{e}"))?;
         // `x,y,w,h` source crop (kitty places a sub-rectangle).
-        let (px, w, h) = match (cmd.num('w'), cmd.num('h')) {
-            (Some(cw), Some(ch)) => {
-                let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
-                match crop_rgba(&px, w, h, cx, cy, cw, ch) {
-                    Some(c) => c,
-                    None => return Err("EINVAL:crop".to_string()),
-                }
-            }
-            _ => (px, w, h),
-        };
-        Ok(StoredImage { rgba: px, w, h })
+        if let (Some(cw), Some(ch)) = (cmd.num('w'), cmd.num('h')) {
+            let (cx, cy) = (cmd.num('x').unwrap_or(0), cmd.num('y').unwrap_or(0));
+            data = match crop_rgba(&data, cx, cy, cw, ch) {
+                Some(d) => d,
+                None => return Err("EINVAL:crop".to_string()),
+            };
+        }
+        Ok(StoredImage { data })
     }
 
     /// One placement — `id`/`p=` replace any existing placement of the
-    /// same pair; `c`/`r`/`z` size and layer it.
-    fn push_image(&mut self, cmd: &KittyCmd, line: i64, col: usize, px: Vec<u8>, w: u32, h: u32) {
-        let image = ImageData {
-            data: Blob::new(std::sync::Arc::new(px)),
-            format: ImageFormat::Rgba8,
-            alpha_type: ImageAlphaType::Alpha,
-            width: w,
-            height: h,
-        };
+    /// same pair; `c`/`r`/`z` size and layer it. `data` was validated
+    /// at the transmit boundary.
+    fn push_image(&mut self, cmd: &KittyCmd, line: i64, col: usize, data: ImageData<Rgba8>) {
         let id = cmd.id();
         let placement = cmd.num('p').unwrap_or(0);
         self.images
             .retain(|img| !(img.id == id && img.placement == placement));
         self.images.push(KittyImage {
             id,
-            brush: peniko::ImageBrush::new(image),
+            px_w: data.width,
+            px_h: data.height,
+            data,
+            registered: OnceCell::new(),
             line,
             col,
             cols: cmd.num('c').unwrap_or(0),
@@ -395,8 +417,6 @@ impl KittyStore {
                 .and_then(|v| v.parse::<i32>().ok())
                 .unwrap_or(0),
             placement,
-            px_w: w,
-            px_h: h,
         });
     }
 }
@@ -406,7 +426,7 @@ impl KittyStore {
 /// `EXPAND | ALPHA | STRIP_16` normalizes palette and low-depth sources,
 /// but the `png` crate keeps 8-bit grayscale sources as Gray/LA — those
 /// are expanded to Rgba8 by hand so the caller can always assume a
-/// 4-bytes-per-pixel buffer (vello `ImageData` is declared Rgba8; a
+/// 4-bytes-per-pixel buffer (`ImageData<Rgba8>` is declared Rgba8; a
 /// shorter buffer aborts inside wgpu's `write_texture` validation).
 pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
@@ -444,25 +464,20 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgba, info.width, info.height))
 }
 
-/// Slice an RGBA8 buffer to `(x, y, w, h)`; bounds-checked.
-fn crop_rgba(
-    px: &[u8],
-    w: u32,
-    h: u32,
-    x: u32,
-    y: u32,
-    cw: u32,
-    ch: u32,
-) -> Option<(Vec<u8>, u32, u32)> {
-    if cw == 0 || ch == 0 || x.checked_add(cw)? > w || y.checked_add(ch)? > h {
+/// Slice an RGBA8 image to `(x, y, cw, ch)`; bounds-checked. Index
+/// arithmetic runs in usize so a huge source or crop cannot wrap.
+fn crop_rgba(src: &ImageData<Rgba8>, x: u32, y: u32, cw: u32, ch: u32) -> Option<ImageData<Rgba8>> {
+    if cw == 0 || ch == 0 || x.checked_add(cw)? > src.width || y.checked_add(ch)? > src.height {
         return None;
     }
-    let mut out = Vec::with_capacity((cw * ch * 4) as usize);
+    let (x, y, cw, ch) = (x as usize, y as usize, cw as usize, ch as usize);
+    let w = src.width as usize;
+    let mut out = Vec::with_capacity(cw.checked_mul(ch)?.checked_mul(4)?);
     for row in y..y + ch {
-        let s = ((row * w + x) * 4) as usize;
-        out.extend_from_slice(&px[s..s + (cw * 4) as usize]);
+        let s = (row * w + x) * 4;
+        out.extend_from_slice(&src.data[s..s + cw * 4]);
     }
-    Some((out, cw, ch))
+    ImageData::<Rgba8>::new(cw as u32, ch as u32, out).ok()
 }
 
 /// `t=s` payload read: `shm_open` the transmitted name read-only, take
@@ -567,11 +582,12 @@ mod tests {
     fn crop_slices_source() {
         // 2x2 RGBA, distinct channels per pixel; crop the right column.
         let px: Vec<u8> = (0u8..16).collect();
-        let (out, w, h) = crop_rgba(&px, 2, 2, 1, 0, 1, 2).unwrap();
-        assert_eq!((w, h), (1, 2));
-        assert_eq!(out, vec![4, 5, 6, 7, 12, 13, 14, 15]);
-        assert!(crop_rgba(&px, 2, 2, 1, 0, 2, 2).is_none()); // out of bounds
-        assert!(crop_rgba(&px, 2, 2, 0, 0, 0, 2).is_none()); // zero width
+        let img = ImageData::<Rgba8>::new(2, 2, px).unwrap();
+        let out = crop_rgba(&img, 1, 0, 1, 2).unwrap();
+        assert_eq!((out.width, out.height), (1, 2));
+        assert_eq!(&*out.data, [4, 5, 6, 7, 12, 13, 14, 15]);
+        assert!(crop_rgba(&img, 1, 0, 2, 2).is_none()); // out of bounds
+        assert!(crop_rgba(&img, 0, 0, 0, 2).is_none()); // zero width
     }
 
     #[test]
@@ -696,5 +712,52 @@ mod tests {
         let cmd = parse(&raw).unwrap();
         let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
         assert_eq!(status.as_str(), "EINVAL:unsupported medium");
+    }
+
+    /// `s=0`/`v=0` transmits are remote input errors, not a crash: each
+    /// gets an EINVAL reply and leaves nothing in the store or on screen.
+    #[test]
+    fn zero_sized_transmit_is_rejected() {
+        let mut s = KittyStore::default();
+        for keys in ["a=T,f=32,s=0,v=1", "a=T,f=32,s=1,v=0", "a=T,f=24,s=0,v=0"] {
+            let cmd = parse(format!("G{keys};AAAAAAAA").as_bytes()).unwrap();
+            let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+            assert!(status.starts_with("EINVAL"), "{keys}: {status}");
+        }
+        assert!(s.images.is_empty());
+        assert!(s.data.is_empty());
+    }
+
+    /// `s*v*bpp` must not wrap: dimensions that overflow usize arithmetic
+    /// are EINVAL, not a wrapped length check.
+    #[test]
+    fn overflowing_transmit_size_is_rejected() {
+        let mut s = KittyStore::default();
+        // u32::MAX × u32::MAX × 4 overflows usize's product chain.
+        let cmd = parse(b"Ga=T,f=32,s=4294967295,v=4294967295;AAAAAAAA").unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert!(status.starts_with("EINVAL"), "{status}");
+        // u32 arithmetic would have wrapped 65536*65536 to 0 — checked
+        // usize math sees the real (impossible) size instead.
+        let cmd = parse(b"Ga=T,f=32,s=65536,v=65536;AAAAAAAA").unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert!(status.starts_with("EINVAL"), "{status}");
+        assert!(s.images.is_empty());
+        assert!(s.data.is_empty());
+    }
+
+    /// A zero-dimension crop is EINVAL on both the transmit (`a=T`) and
+    /// placement (`a=p`) paths, leaving prior placements untouched.
+    #[test]
+    fn zero_crop_is_rejected() {
+        let mut s = KittyStore::default();
+        place_rgba(&mut s, "i=9", 0, 0);
+        let cmd = parse(b"Ga=T,f=32,s=2,v=2,x=0,y=0,w=0,h=2;AAAAAAAAAAAAAAAAAAAAAA==").unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert_eq!(status.as_str(), "EINVAL:crop");
+        let cmd = parse(b"Ga=p,i=9,x=0,y=0,w=2,h=0").unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert_eq!(status.as_str(), "EINVAL:crop");
+        assert_eq!(s.images.len(), 1, "the earlier placement stays");
     }
 }

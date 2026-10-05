@@ -1,7 +1,8 @@
 //! The `SceneContent` that hosts a terminal session: input routing (keyboard,
 //! IME, pointer, scroll), the PTY event drain, and resize bookkeeping. Drawing
-//! goes through the shared `Scene2D` facilities — the same path math/chart
-//! use — inside `build_scene`; rendering itself belongs to the backend.
+//! goes through the shared Cherenkov recording facilities — the same path
+//! math/chart use — inside `build_scene`; rendering itself belongs to the
+//! backend.
 //!
 //! The PTY parser runs on its own thread and cannot touch the main-thread
 //! `SceneInvalidator` (`Rc<dyn Fn()>`). Wake-ups therefore cross threads once —
@@ -28,10 +29,13 @@ use waterui::task::spawn_local;
 use waterui::window::{UserAttention, WindowState};
 use waterui_core::Str;
 use waterui_core::layout::{Rect as UiRect, Size as UiSize};
+use waterui_graphics::cherenkov::kurbo;
+use waterui_graphics::cherenkov::{Draw, Extend, ImageId, Recorder, Sampling};
 use waterui_graphics::input::{ScrollUnit, SurfaceInputEvent, SurfacePointerButton};
+use waterui_graphics::resources::RecordingResources;
 use waterui_graphics::scene_view::{SceneContent, SceneInvalidator};
-use waterui_graphics::scene2d::Scene2D;
-use waterui_graphics::{Code, Key, Modifiers, NamedKey};
+use waterui_graphics::{Code, Key, Modifiers, NamedKey, Registered};
+use waterui_graphics::{ImageData, Rgba8};
 use waterui_text::FontCollection;
 
 use crate::app::{AppState, Session};
@@ -651,10 +655,10 @@ pub struct TermSurface {
     last_key_at: Option<Instant>,
 }
 
-/// `background-image` decode cache: (config path, decoded brush + pixel dims).
+/// `background-image` decode cache: (config path, registered image + pixel dims).
 type BgImageCache = (
     Option<std::path::PathBuf>,
-    Option<(peniko::ImageBrush, u32, u32)>,
+    Option<(Registered<ImageId>, u32, u32)>,
 );
 
 /// The semantic `Modifiers` bit a physical modifier `Code` contributes
@@ -780,7 +784,15 @@ impl TermSurface {
     /// The `background-image` brush + its brush→rect transform for this
     /// frame, or `None`. File bytes are decoded once per config path and
     /// cached; opacity/fit/repeat are applied per frame (hot reload).
-    fn bg_image_draw(&self, w: f64, h: f64) -> Option<(peniko::ImageBrush, kurbo::Affine)> {
+    /// `background-image` resolved for this frame: registers the decoded
+    /// image on first decode (cached by path) and names it in the
+    /// recording; fit/repeat/position/opacity read per frame.
+    fn bg_image_draw(
+        &self,
+        resources: &mut RecordingResources<'_>,
+        w: f64,
+        h: f64,
+    ) -> Option<crate::scene::BgPaint> {
         use crate::config::BgFit;
         let (path, opacity, fit, repeat, pos) = self.app.config(|c| {
             (
@@ -799,31 +811,26 @@ impl TermSurface {
                 .ok()
                 .and_then(|bytes| crate::kitty::decode_png(&bytes))
                 .map(|(px, iw, ih)| {
-                    let image = peniko::ImageData {
-                        data: peniko::Blob::new(std::sync::Arc::new(px)),
-                        format: peniko::ImageFormat::Rgba8,
-                        alpha_type: peniko::ImageAlphaType::Alpha,
-                        width: iw,
-                        height: ih,
-                    };
-                    (peniko::ImageBrush::new(image), iw, ih)
+                    // Past the decode boundary: a well-formed buffer of
+                    // decoded pixels always makes `ImageData`, and a
+                    // well-formed `ImageData` always registers — both
+                    // failures are internal invariants, not user input.
+                    let data = ImageData::<Rgba8>::new(iw, ih, px).unwrap_or_else(|e| {
+                        panic!("decoded PNG {iw}x{ih} cannot form image data: {e:?}")
+                    });
+                    let reg = resources.image(data).unwrap_or_else(|e| {
+                        panic!("scene engine rejected decoded PNG {iw}x{ih}: {e:?}")
+                    });
+                    (reg, iw, ih)
                 });
             *cache = (Some(path), loaded);
         }
-        let (brush, iw, ih) = cache.1.clone()?;
+        let (registered, iw, ih) = cache.1.clone()?;
         let (iw, ih) = (f64::from(iw), f64::from(ih));
         // `background-image-repeat`: repeat into space the fit leaves
-        // blank (Ghostty); otherwise the brush edge-pads.
-        let ext = if repeat {
-            peniko::Extend::Repeat
-        } else {
-            peniko::Extend::Pad
-        };
-        let brush = brush
-            .with_alpha(opacity)
-            .with_x_extend(ext)
-            .with_y_extend(ext);
-        // brush_transform maps image-pixel space into the surface rect.
+        // blank (Ghostty); otherwise the image edge-pads.
+        let ext = if repeat { Extend::Repeat } else { Extend::Pad };
+        // transform maps image-pixel space into the surface rect.
         let transform = match fit {
             BgFit::Stretch => kurbo::Affine::scale_non_uniform(w / iw, h / ih),
             // `none`: native size, positioned; `repeat` then tiles it
@@ -841,7 +848,12 @@ impl TermSurface {
                     * kurbo::Affine::scale(s)
             }
         };
-        Some((brush, transform))
+        Some(crate::scene::BgPaint {
+            image: resources.name(&registered),
+            transform,
+            extend: ext,
+            opacity,
+        })
     }
 
     /// Surface-local logical position → (col, row) in viewport coords.
@@ -4029,8 +4041,14 @@ impl TermSurface {
 
     // -- scene plumbing -------------------------------------------------------
 
-    /// Draw the terminal into the frame's scene.
-    fn build(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) {
+    /// Record the terminal's drawing into the frame's recorder.
+    fn build(
+        &mut self,
+        recorder: &mut Recorder,
+        resources: &mut RecordingResources<'_>,
+        width: f32,
+        height: f32,
+    ) {
         // `scroll-to-bottom = output` — new program output while
         // scrolled snaps the viewport to the live edge before the
         // frame's grid read (Ghostty; the reference documents the
@@ -4157,7 +4175,7 @@ impl TermSurface {
         let focused = self.focused;
         let cursor_invert_fg_bg = self.app.config(|c| c.cursor_invert_fg_bg);
         let bg_opacity = self.app.config(|c| c.background_opacity);
-        let bg_image = self.bg_image_draw(f64::from(width), f64::from(height));
+        let bg_image = self.bg_image_draw(resources, f64::from(width), f64::from(height));
         let mut ctx = DrawContext {
             palette: &palette,
             fonts: &mut self.fonts,
@@ -4255,7 +4273,9 @@ impl TermSurface {
         let top = scroll.history_size as i64 - scroll.display_offset as i64;
         let m = ctx.fonts.metrics;
         let (pad, pad_y) = (self.pad_x, self.pad_y);
-        let draw_img = |scene: &mut dyn Scene2D, img: &crate::kitty::KittyImage| {
+        let draw_img = |recorder: &mut Recorder,
+                        resources: &mut RecordingResources<'_>,
+                        img: &crate::kitty::KittyImage| {
             let row = img.line - top;
             let rows = if img.rows > 0 {
                 img.rows as i64
@@ -4277,22 +4297,39 @@ impl TermSurface {
             } else {
                 img.px_h as f32
             };
-            let transform = kurbo::Affine::translate((x as f64, y as f64))
-                * kurbo::Affine::scale_non_uniform(
-                    w as f64 / img.px_w as f64,
-                    h as f64 / img.px_h as f64,
-                );
-            scene.draw_image(&img.brush, transform);
+            let registered = match img.registered.get() {
+                Some(reg) => reg.clone(),
+                None => {
+                    // The stored `ImageData` was validated at the transmit
+                    // boundary; registration fails only with `Lost`.
+                    let reg = resources
+                        .image(crate::kitty::share_image_data(&img.data))
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "scene engine rejected kitty image {}x{}: {e:?}",
+                                img.data.width, img.data.height
+                            )
+                        });
+                    let _ = img.registered.set(reg.clone());
+                    reg
+                }
+            };
+            let id = resources.name(&registered);
+            recorder.image(
+                id,
+                kurbo::Rect::new(x as f64, y as f64, (x + w) as f64, (y + h) as f64),
+                Sampling::default(),
+            );
         };
         // z<0 images draw over cell backgrounds but below the text layer.
         let images = self.session.kitty.borrow();
-        scene::draw_term(scene, &term, &mut ctx, &mut |scene| {
+        scene::draw_term(recorder, resources, &term, &mut ctx, &mut |r, res| {
             for img in images.images.iter().filter(|i| i.z < 0) {
-                draw_img(scene, img);
+                draw_img(r, res, img);
             }
         });
         for img in images.images.iter().filter(|i| i.z >= 0) {
-            draw_img(scene, img);
+            draw_img(recorder, resources, img);
         }
     }
 }
@@ -4313,7 +4350,25 @@ impl Drop for TermSurface {
 }
 
 impl SceneContent for TermSurface {
-    fn build_scene(&mut self, scene: &mut dyn Scene2D, width: f32, height: f32) -> bool {
+    /// Cached `Registered` handles are generation-bound to the previous
+    /// engine: drop them so the next recording re-registers fonts and
+    /// images into the new registry. The semantic inputs (font faces,
+    /// stored `ImageData`, the background-image path) are kept.
+    fn rebuild_for_engine(&mut self) {
+        self.fonts.clear_registrations();
+        *self.bg_img.borrow_mut() = (None, None);
+        for img in self.session.kitty.borrow_mut().images.iter_mut() {
+            let _ = img.registered.take();
+        }
+    }
+
+    fn build_scene(
+        &mut self,
+        recorder: &mut Recorder,
+        resources: &mut RecordingResources<'_>,
+        width: f32,
+        height: f32,
+    ) -> bool {
         let draw_start = Instant::now();
         if std::env::var_os("HYDRO_SNIFF").is_some() {
             eprintln!(
@@ -4384,7 +4439,7 @@ impl SceneContent for TermSurface {
             self.session.resize_label.set(None);
         }
 
-        self.build(scene, width, height);
+        self.build(recorder, resources, width, height);
 
         if self.input_stats {
             let keys = std::mem::take(&mut self.stat_keys);
@@ -5094,5 +5149,64 @@ mod tests {
         assert_eq!(cursor_click_seq(3), b"\x1b[C\x1b[C\x1b[C".to_vec());
         assert_eq!(cursor_click_seq(-2), b"\x1b[D\x1b[D".to_vec());
         assert!(cursor_click_seq(0).is_empty());
+    }
+
+    /// `rebuild_for_engine` must re-register the background image: after the
+    /// engine swap the cached `Registered<ImageId>` is dead, and the loader
+    /// only decodes when the cached path is cleared too. With a stale
+    /// `(Some(path), None)` cache the loader returns `None` on every frame.
+    #[test]
+    fn rebuild_for_engine_re_registers_background_image() {
+        use crate::app::Instance;
+        use std::collections::HashSet;
+        use std::sync::mpsc::channel;
+        use waterui_graphics::cherenkov::Engine;
+        use waterui_graphics::cherenkov::testing::{Null, NullConfig};
+        use waterui_graphics::resources::SceneResources;
+
+        // A 2x2 RGBA PNG (opaque pixels), valid for `crate::kitty::decode_png`.
+        const TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00r\xb6\r$\x00\x00\x00\x15IDATx\x9cc\xf8\xef\xd0\xf0\x1f\x84\x19\x1a\xfe;\xfc\x07a\x00a\xcc\n\xf9\xaf\xad\xee\xea\x00\x00\x00\x00IEND\xaeB`\x82";
+
+        // `AppState::new` spawns the first tab's session with a deferred
+        // terminal — no PTY is forked in the test.
+        let app = AppState::new(None, None, Instance::new());
+        let session = app
+            .focused_session()
+            .expect("AppState::new spawns the first tab's session");
+
+        let png =
+            std::env::temp_dir().join(format!("hydroterm-bg-test-{}.png", std::process::id()));
+        std::fs::write(&png, TEST_PNG).expect("write the PNG fixture");
+        app.cfg.borrow_mut().config.background_image = Some(png.clone());
+
+        let mut surface = TermSurface::new(
+            session,
+            app,
+            Rc::new(RefCell::new(Palette::default())),
+            FontCollection::new(parley::FontContext::new()),
+        );
+        let (events, _probe) = channel();
+        let engine = Rc::new(
+            Engine::<Null>::new(NullConfig {
+                events,
+                reject: HashSet::new(),
+            })
+            .expect("the null engine failed to start"),
+        );
+        let resources = SceneResources::with_shaders(engine.clone(), engine);
+
+        // First recording: decode + register.
+        let mut rec = resources.recording();
+        assert!(surface.bg_image_draw(&mut rec, 100.0, 100.0).is_some());
+        drop(rec);
+
+        // Engine swap: the next recording must decode and register again.
+        surface.rebuild_for_engine();
+        let mut rec = resources.recording();
+        assert!(surface.bg_image_draw(&mut rec, 100.0, 100.0).is_some());
+        drop(rec);
+        assert!(surface.bg_img.borrow().1.is_some());
+
+        let _ = std::fs::remove_file(&png);
     }
 }

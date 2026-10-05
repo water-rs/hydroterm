@@ -5,7 +5,11 @@
 //! The family's `parley::FontContext` is the host's own — installed into the
 //! environment at startup and shared through `FontCollection` — so a pane
 //! never enumerates system fonts for itself, and the shaped glyph runs hand
-//! back `peniko::FontData` the scene's `draw_glyph_run` consumes directly.
+//! back parley font data the scene registers as Cherenkov fonts by face
+//! identity (blob id plus collection index).
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use parley::fontique::Synthesis;
 use parley::setting::Tag;
@@ -14,6 +18,10 @@ use parley::{
     Alignment, AlignmentOptions, FontFamily, FontFamilyName, FontStyle, FontWeight, Layout,
     LayoutContext, StyleProperty, style::GenericFamily,
 };
+use waterui_graphics::FontSource;
+use waterui_graphics::Registered;
+use waterui_graphics::cherenkov::FontId;
+use waterui_graphics::resources::RecordingResources;
 use waterui_text::FontCollection;
 
 /// Parse one `font-feature` entry: `-tag` disables, `+tag`/`tag`/`tag=N`
@@ -30,6 +38,14 @@ pub fn parse_font_feature(spec: &str) -> Option<FontFeature> {
         None => (body.trim(), value),
     };
     Some(FontFeature::new(Tag::parse(tag_s)?, value))
+}
+
+/// Face identity for engine registration: the font blob's id plus the
+/// face's index inside it. Faces sharing one file — a `.ttc` collection —
+/// carry the same blob id and are only told apart by the index, so the
+/// pair is the registration key and the `FontSource` fed to the engine.
+fn font_key(fd: &parley::FontData) -> (u64, u32) {
+    (fd.data.id(), fd.index)
 }
 
 /// Families asked for first, in preference order. Everything they cannot
@@ -104,6 +120,11 @@ pub struct TermFonts {
     /// (`wght=700,wdth=85`); each applies only to its own run and does
     /// not inherit.
     variations: [Option<Vec<FontVariation>>; 4],
+    /// Engine-side font registrations keyed by face identity — the blob
+    /// id AND the collection index, since faces in one font file (a
+    /// `.ttc`) share the blob. An entry registers on first use and names
+    /// itself each frame after.
+    font_regs: HashMap<(u64, u32), Registered<FontId>>,
     pub metrics: CellMetrics,
 }
 
@@ -197,10 +218,42 @@ impl TermFonts {
             style_italic: None,
             style_bold_italic: None,
             variations: [None, None, None, None],
+            font_regs: HashMap::new(),
             metrics: CellMetrics::fallback(size_pt),
         };
         fonts.metrics = fonts.probe_metrics();
         fonts
+    }
+
+    /// Register `fd`'s face with the scene engine on first use and name its
+    /// `FontId` in this recording. Registering a valid parley face is an
+    /// internal invariant: the engine rejecting it panics with the face's
+    /// identity rather than silently dropping the shaped run.
+    pub fn font_id(
+        &mut self,
+        resources: &mut RecordingResources<'_>,
+        fd: &parley::FontData,
+    ) -> FontId {
+        let key = font_key(fd);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.font_regs.entry(key) {
+            let source = FontSource::bytes(Arc::<[u8]>::from(fd.data.data())).with_index(fd.index);
+            match resources.font(source) {
+                Ok(registered) => {
+                    e.insert(registered);
+                }
+                Err(err) => {
+                    panic!("scene engine rejected font face {key:?}: {err}");
+                }
+            }
+        }
+        resources.name(self.font_regs.get(&key).expect("face registered above"))
+    }
+
+    /// Drop every engine-side registration: the handles are bound to the
+    /// previous engine generation, and the next `font_id` re-registers
+    /// lazily. Called by `SceneContent::rebuild_for_engine`.
+    pub fn clear_registrations(&mut self) {
+        self.font_regs.clear();
     }
 
     /// Set `font-codepoint-map` — each entry's family resolved like
