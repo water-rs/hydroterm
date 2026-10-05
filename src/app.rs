@@ -2087,11 +2087,12 @@ impl AppState {
     /// platform gesture, the last-window policy, the quit-delay timer —
     /// runs the same shutdown.
     pub fn quit(&self) {
-        if let Some(env) = self.env.get()
-            && let Some(quit) = env.get::<Quit>()
-        {
-            quit.request();
-        }
+        self.env
+            .get()
+            .expect("the application environment is cached before any quit path can run")
+            .get::<Quit>()
+            .expect("the runner installs the Quit service in the application environment")
+            .request();
     }
 
     /// Shut every session down — the `on_terminate` hook's body, run
