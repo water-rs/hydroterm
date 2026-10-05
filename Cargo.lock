@@ -2004,6 +2004,7 @@ dependencies = [
  "regex",
  "rustix 1.1.5",
  "tracing",
+ "tracing-subscriber",
  "waterkit-clipboard",
  "waterkit-notification",
  "waterui",

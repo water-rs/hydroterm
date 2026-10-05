@@ -98,18 +98,6 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Share an `ImageData`'s `Arc` buffer into a new `ImageData` — the type
-/// is not `Clone`, so re-wrap through `new` (cheap: it only re-checks the
-/// length, and the stored pixels were already validated at the transmit
-/// boundary). Used where the protocol places or registers the same pixels.
-pub(crate) fn share_image_data(d: &ImageData<Rgba8>) -> ImageData<Rgba8> {
-    let mut out = ImageData::new(d.width, d.height, d.data.clone())
-        .expect("stored image data is well-formed");
-    out.color_space = d.color_space;
-    out.premultiplied = d.premultiplied;
-    out
-}
-
 /// A placed image: absolute buffer row + column at transmit time.
 pub struct KittyImage {
     pub id: u32,
@@ -222,7 +210,7 @@ impl KittyStore {
                         None => return (cmd.id(), "EINVAL:crop".to_string()),
                     }
                 }
-                _ => share_image_data(&stored.data),
+                _ => stored.data.clone(),
             }
         };
         self.push_image(cmd, line, col, data);
@@ -239,7 +227,7 @@ impl KittyStore {
                 if let Some(id) = cmd.num('i') {
                     self.images.retain(|img| img.id != id);
                     if let Some(s) = self.data.remove(&id) {
-                        self.data_bytes -= s.data.data.len();
+                        self.data_bytes -= s.data.data().len();
                     }
                 }
             }
@@ -268,7 +256,7 @@ impl KittyStore {
                 Some(id) => {
                     self.images.retain(|img| img.id != id);
                     if let Some(s) = self.data.remove(&id) {
-                        self.data_bytes -= s.data.data.len();
+                        self.data_bytes -= s.data.data().len();
                     }
                 }
                 None => {
@@ -287,7 +275,7 @@ impl KittyStore {
             .and_then(|stored| self.store_checked(cmd.id(), stored, limit))
         {
             Ok(()) => {
-                let data = share_image_data(&self.data[&cmd.id()].data);
+                let data = self.data[&cmd.id()].data.clone();
                 self.push_image(cmd, line, col, data);
                 (cmd.id(), "OK".to_string())
             }
@@ -298,8 +286,8 @@ impl KittyStore {
     /// Insert a decoded payload honoring `image-storage-limit`: a
     /// rejected store frees nothing and reports `ETOOBIG` like kitty.
     fn store_checked(&mut self, id: u32, stored: StoredImage, limit: usize) -> Result<(), String> {
-        let len = stored.data.data.len();
-        let replacing = self.data.get(&id).map(|s| s.data.data.len()).unwrap_or(0);
+        let len = stored.data.data().len();
+        let replacing = self.data.get(&id).map(|s| s.data.data().len()).unwrap_or(0);
         if self.data_bytes - replacing + len > limit {
             return Err("ETOOBIG:image-storage-limit".to_string());
         }
@@ -404,8 +392,8 @@ impl KittyStore {
             .retain(|img| !(img.id == id && img.placement == placement));
         self.images.push(KittyImage {
             id,
-            px_w: data.width,
-            px_h: data.height,
+            px_w: data.width(),
+            px_h: data.height(),
             data,
             registered: OnceCell::new(),
             line,
@@ -467,15 +455,15 @@ pub(crate) fn decode_png(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 /// Slice an RGBA8 image to `(x, y, cw, ch)`; bounds-checked. Index
 /// arithmetic runs in usize so a huge source or crop cannot wrap.
 fn crop_rgba(src: &ImageData<Rgba8>, x: u32, y: u32, cw: u32, ch: u32) -> Option<ImageData<Rgba8>> {
-    if cw == 0 || ch == 0 || x.checked_add(cw)? > src.width || y.checked_add(ch)? > src.height {
+    if cw == 0 || ch == 0 || x.checked_add(cw)? > src.width() || y.checked_add(ch)? > src.height() {
         return None;
     }
     let (x, y, cw, ch) = (x as usize, y as usize, cw as usize, ch as usize);
-    let w = src.width as usize;
+    let w = src.width() as usize;
     let mut out = Vec::with_capacity(cw.checked_mul(ch)?.checked_mul(4)?);
     for row in y..y + ch {
         let s = (row * w + x) * 4;
-        out.extend_from_slice(&src.data[s..s + cw * 4]);
+        out.extend_from_slice(&src.data()[s..s + cw * 4]);
     }
     ImageData::<Rgba8>::new(cw as u32, ch as u32, out).ok()
 }
@@ -584,8 +572,8 @@ mod tests {
         let px: Vec<u8> = (0u8..16).collect();
         let img = ImageData::<Rgba8>::new(2, 2, px).unwrap();
         let out = crop_rgba(&img, 1, 0, 1, 2).unwrap();
-        assert_eq!((out.width, out.height), (1, 2));
-        assert_eq!(&*out.data, [4, 5, 6, 7, 12, 13, 14, 15]);
+        assert_eq!((out.width(), out.height()), (1, 2));
+        assert_eq!(&out.data()[..], &[4, 5, 6, 7, 12, 13, 14, 15][..]);
         assert!(crop_rgba(&img, 1, 0, 2, 2).is_none()); // out of bounds
         assert!(crop_rgba(&img, 0, 0, 0, 2).is_none()); // zero width
     }
