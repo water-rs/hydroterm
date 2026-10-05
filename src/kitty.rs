@@ -318,19 +318,21 @@ impl KittyStore {
                 None => return Err("EBADMSG:base64".to_string()),
             },
             // `t=f`: the payload is the base64 of the file's path.
+            // `S=`/`O=` bound the bytes inside the file, as with `t=s`.
             "f" => {
                 let Some(path) = b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
                     return Err("EBADMSG:path".to_string());
                 };
                 match std::fs::read(path.trim()) {
-                    Ok(raw) => raw,
+                    Ok(raw) => raw[bounded_range(cmd, raw.len())?].to_vec(),
                     Err(e) => return Err(format!("ENOENT:{e}")),
                 }
             }
             // `t=s`: payload is the base64 of a POSIX shm name (leading `/`).
             // A shm object is not a filesystem file — it must be opened with
-            // shm_open and unlinked once read.
+            // shm_open and unlinked once read. `S=`/`O=` bound the payload
+            // inside the object.
             "s" => {
                 let Some(name) = b64_decode(&cmd.data).and_then(|p| String::from_utf8(p).ok())
                 else {
@@ -340,7 +342,7 @@ impl KittyStore {
                 if name.contains("..") || !name.starts_with('/') {
                     return Err("EINVAL:shm name".to_string());
                 }
-                shm_read(name)?
+                shm_read(name, cmd)?
             }
             _ => return Err("EINVAL:unsupported medium".to_string()),
         };
@@ -480,28 +482,71 @@ fn crop_rgba(src: &ImageData<Rgba8>, x: u32, y: u32, cw: u32, ch: u32) -> Option
     ImageData::<Rgba8>::new(cw as u32, ch as u32, out).ok()
 }
 
-/// `t=s` payload read: `shm_open` the transmitted name read-only, take
-/// its bytes, then `shm_unlink` as the protocol requires — the object
-/// dies with the read even when the read itself fails. The name was
-/// already validated (`/`-leading, no `..`) at the decode boundary.
-/// `rustix::shm` only exists where shm_open does, which excludes
-/// Windows and a few embedded targets.
+/// `S=<size>` and `O=<offset>` bound the payload inside the `t=f`/`t=s`
+/// carrier. Without `S` the whole carrier is the payload; an out-of-range
+/// or overflowing `O+S` is EINVAL at the input boundary — remote input,
+/// never a slice panic.
+fn bounded_range(cmd: &KittyCmd, total: usize) -> Result<std::ops::Range<usize>, String> {
+    let Some(size) = cmd.num('S') else {
+        return Ok(0..total);
+    };
+    let off = cmd.num('O').unwrap_or(0) as usize;
+    let end = off
+        .checked_add(size as usize)
+        .filter(|end| *end <= total)
+        .ok_or_else(|| "EINVAL:range".to_string())?;
+    Ok(off..end)
+}
+
+/// `t=s` payload read: `shm_open` the transmitted name read-only, map it,
+/// copy out the `S=`/`O=` slice, then `shm_unlink` as the protocol
+/// requires — the object dies with the read even when the read itself
+/// fails. The name was already validated (`/`-leading, no `..`) at the
+/// decode boundary. Darwin POSIX shm objects are mmap-only — `read()` on
+/// their fd fails ENXIO, and `MAP_PRIVATE` is rejected with EINVAL — so
+/// the bytes come out of a shared `PROT_READ` mapping instead of
+/// `read_to_end`. `rustix::shm` only exists where shm_open does, which
+/// excludes Windows and a few embedded targets.
 #[cfg(kitty_shm)]
-fn shm_read(name: &str) -> Result<Vec<u8>, String> {
-    use rustix::{fs::Mode, shm};
+fn shm_read(name: &str, cmd: &KittyCmd) -> Result<Vec<u8>, String> {
+    use rustix::{fs::Mode, mm, shm};
     let fd =
         shm::open(name, shm::OFlags::RDONLY, Mode::empty()).map_err(|e| format!("ENOENT:{e}"))?;
-    let mut file = std::fs::File::from(fd);
-    let mut raw = Vec::new();
-    let read = std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("ENOENT:{e}"));
+    let file = std::fs::File::from(fd);
+    let read = file
+        .metadata()
+        .map_err(|e| format!("ENOENT:{e}"))
+        .and_then(|meta| {
+            // fstat reports the object size (page-rounded on Darwin), and
+            // `S`/`O` bound the real payload inside it.
+            let total = meta.len() as usize;
+            if total == 0 {
+                return Ok(Vec::new());
+            }
+            let range = bounded_range(cmd, total)?;
+            unsafe {
+                let map = mm::mmap(
+                    std::ptr::null_mut(),
+                    total,
+                    mm::ProtFlags::READ,
+                    mm::MapFlags::SHARED,
+                    &file,
+                    0,
+                )
+                .map_err(|e| format!("ENOENT:{e}"))?;
+                let bytes = std::slice::from_raw_parts(map.cast::<u8>(), total)[range].to_vec();
+                let _ = mm::munmap(map, total);
+                Ok(bytes)
+            }
+        });
     let unlink = shm::unlink(name).map_err(|e| format!("ENOENT:{e}"));
-    read?;
+    let raw = read?;
     unlink?;
     Ok(raw)
 }
 
 #[cfg(not(kitty_shm))]
-fn shm_read(_name: &str) -> Result<Vec<u8>, String> {
+fn shm_read(_name: &str, _cmd: &KittyCmd) -> Result<Vec<u8>, String> {
     Err("EINVAL:unsupported medium".to_string())
 }
 
@@ -664,14 +709,10 @@ mod tests {
         assert_eq!(s.images[0].placement, 5);
     }
 
+    /// Darwin's PSHMNAMLEN is 31 bytes including the leading `/`: a short
+    /// prefix plus hex pid and a per-process counter fits on every platform.
     #[cfg(kitty_shm)]
-    #[test]
-    fn shm_medium() {
-        use rustix::{fs::Mode, shm};
-        use std::io::Write;
-        // Darwin's PSHMNAMLEN is 31 bytes including the leading `/`: a
-        // short prefix plus hex pid and a per-process counter fits on
-        // every platform.
+    fn shm_name() -> String {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
             "/ht-{:x}-{:x}",
@@ -682,13 +723,44 @@ mod tests {
             name.len() <= 31,
             "shm name {name:?} must fit PSHMNAMLEN (31 bytes)"
         );
+        name
+    }
+
+    /// Seed a shm object the way a remote `t=s` sender would. Darwin shm
+    /// fds are mmap-only — `write()` on them fails ENXIO — so the payload
+    /// goes in through a `PROT_WRITE` mapping on every platform.
+    #[cfg(kitty_shm)]
+    fn shm_fixture(name: &str, payload: &[u8]) {
+        use rustix::{fs::Mode, mm, shm};
         let fd = shm::open(
-            &name,
+            name,
             shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
-        std::fs::File::from(fd).write_all(b"pixels").unwrap();
+        rustix::fs::ftruncate(&fd, payload.len() as u64).unwrap();
+        let file = std::fs::File::from(fd);
+        unsafe {
+            let map = mm::mmap(
+                std::ptr::null_mut(),
+                payload.len(),
+                mm::ProtFlags::READ | mm::ProtFlags::WRITE,
+                mm::MapFlags::SHARED,
+                &file,
+                0,
+            )
+            .unwrap();
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), map.cast::<u8>(), payload.len());
+            mm::munmap(map, payload.len()).unwrap();
+        }
+    }
+
+    #[cfg(kitty_shm)]
+    #[test]
+    fn shm_medium() {
+        use rustix::{fs::Mode, shm};
+        let name = shm_name();
+        shm_fixture(&name, b"pixels");
         let mut s = KittyStore::default();
         use base64::Engine as _;
         let raw = format!(
@@ -702,6 +774,57 @@ mod tests {
         // The decode path unlinked the object after reading it.
         let err = shm::open(&name, shm::OFlags::RDONLY, Mode::empty()).unwrap_err();
         assert_eq!(err, rustix::io::Errno::NOENT);
+    }
+
+    /// `S=`/`O=` select the payload inside the object: Darwin reports the
+    /// object size page-rounded, and even on Linux the carrier may pad.
+    #[cfg(kitty_shm)]
+    #[test]
+    fn shm_size_offset_bounds_payload() {
+        let name = shm_name();
+        let px = [0x11u8, 0x22, 0x33, 0x44];
+        let mut obj = b"HEAD".to_vec();
+        obj.extend_from_slice(&px);
+        obj.extend_from_slice(b"TAIL");
+        shm_fixture(&name, &obj);
+        let mut s = KittyStore::default();
+        use base64::Engine as _;
+        let raw = format!(
+            "Ga=T,f=32,s=1,v=1,t=s,S=4,O=4;{}",
+            base64::engine::general_purpose::STANDARD.encode(name.as_bytes())
+        );
+        let cmd = parse(raw.as_bytes()).unwrap();
+        let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+        assert_eq!(status.as_str(), "OK");
+        assert_eq!(s.images[0].data.data[..], px[..]);
+    }
+
+    /// An `O`/`S` outside the mapped object is EINVAL at the input
+    /// boundary — remote input, never a slice panic.
+    #[cfg(kitty_shm)]
+    #[test]
+    fn shm_out_of_range_is_rejected() {
+        use base64::Engine as _;
+        let cases = [
+            // O=1MiB + S=8 lies past a small object on every platform —
+            // Darwin page-rounds the reported size, never this far.
+            "t=s,S=8,O=1048576",
+            // u32::MAX + u32::MAX must not wrap the end bound.
+            "t=s,S=4294967295,O=4294967295",
+        ];
+        for keys in cases {
+            let name = shm_name();
+            shm_fixture(&name, b"0123456789abcdef");
+            let mut s = KittyStore::default();
+            let raw = format!(
+                "Ga=T,f=32,s=1,v=1,{keys};{}",
+                base64::engine::general_purpose::STANDARD.encode(name.as_bytes())
+            );
+            let cmd = parse(raw.as_bytes()).unwrap();
+            let (_, status) = s.handle(cmd, 0, 0, usize::MAX);
+            assert!(status.starts_with("EINVAL"), "{keys}: {status}");
+            assert!(s.images.is_empty());
+        }
     }
 
     #[cfg(not(kitty_shm))]
