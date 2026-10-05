@@ -13,7 +13,6 @@ waterui-core = { git = "https://github.com/water-rs/waterui", rev = "50f5ae37187
 waterui-text = { features = ["font-collection"] , version = "0.5.1" }
 hydrolysis = { features = ["winit"] , version = "0.3.1" }
 hydrolysis-m3 = { git = "https://github.com/water-rs/hydrolysis-m3", rev = "bc412a1a7e796cedc30d2c62d33fe293634574a8" }
-nami = { version = "0.11.1" }
 alacritty_terminal = "0.26.0"
 waterkit-clipboard = { version = "0.1.4" }
 waterkit-notification = "0.1.4"

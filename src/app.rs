@@ -14,10 +14,6 @@ use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
 use hydrolysis_m3::color::{Scrim, SurfaceContainerHigh};
 use hydrolysis_m3::{MaterialElevationLevel, material_elevation};
-use nami::collection::{Collection, List as NamiList};
-use nami::impl_constant;
-use nami::zip::zip;
-use nami::{Binding, Signal, binding};
 use waterui::Identifiable;
 use waterui::Url;
 use waterui::accessibility::{AccessibilityRole, AccessibilityState};
@@ -25,6 +21,10 @@ use waterui::drag_drop::{Files, Transferable};
 use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::layout::frame::Frame;
 use waterui::prelude::*;
+use waterui::reactive::collection::{Collection, List as NamiList};
+use waterui::reactive::impl_constant;
+use waterui::reactive::zip::zip;
+use waterui::{Binding, Signal, binding};
 use waterui::shape::{FixedRoundedRectangle, ShapeExt};
 use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::state;
@@ -630,7 +630,7 @@ impl SplitNode {
 
 /// A tab: one layout tree of panes plus a focused pane.
 /// `Clone` shares the bindings (Rc-backed state), so a cloned item from
-/// `nami::collection::List` reads and writes the same tab state.
+/// `waterui::reactive::collection::List` reads and writes the same tab state.
 #[derive(Clone, Identifiable)]
 pub struct PaneTab {
     #[id]
@@ -5019,8 +5019,8 @@ mod tests {
         AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
         quit_delay_expired,
     };
-    use nami::collection::Collection;
-    use nami::{Binding, Signal};
+    use waterui::reactive::collection::Collection;
+    use waterui::{Binding, Signal};
     use waterui::Str;
 
     /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
