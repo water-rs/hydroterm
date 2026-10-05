@@ -25,7 +25,6 @@ use waterui::prelude::*;
 use waterui::reactive::collection::{Collection, List as NamiList};
 use waterui::reactive::impl_constant;
 use waterui::reactive::zip::zip;
-use waterui::{Binding, Signal, binding};
 use waterui::shape::{FixedRoundedRectangle, ShapeExt};
 use waterui::snackbar::{Snackbar, SnackbarManager};
 use waterui::state;
@@ -38,6 +37,7 @@ use waterui::window::{
     Activation, Monitor, MonitorSelector, UserAttention, Window, WindowLevel, WindowState,
     WindowStyle, conditional_window,
 };
+use waterui::{Binding, Signal, binding};
 use waterui_core::id::SelfId;
 use waterui_core::layout::{Point, Rect, Size};
 use waterui_core::resolve::Resolvable;
@@ -5034,9 +5034,9 @@ mod tests {
         AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
         quit_delay_expired,
     };
+    use waterui::Str;
     use waterui::reactive::collection::Collection;
     use waterui::{Binding, Signal};
-    use waterui::Str;
 
     /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
     /// first arm wins, a new surface cancels by taking the slot and
