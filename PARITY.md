@@ -93,7 +93,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Misc | `-e cmd`, `--config` args | ✅ | verified: `-e bash -c 'echo E_MARKER'` |
 | Misc | Quit action, process-group cleanup | ✅ | window close → Shutdown |
 | Links | Ctrl+hover affordance | ✅ | CONTROL-held pointer over a link draws an Accent underline across its full span (wrap-safe segments, same mapping as URL hints) and flips the cursor to pointing hand via `.cursor(Binding<CursorStyle>)` on the `SceneView`; releasing Ctrl or moving off clears both — verified live at 7bbd5f0 (underline appears/disappears; cursor change is real but invisible to `import` captures) |
-| Drag & drop | Files dropped onto a pane paste their paths | ✅ | Verified on X11/Hydrolysis with real external XDND drops. Typed `Files`/`Url` destinations preserve item boundaries through `DropFiles`; each path is URI-decoded and shell-quoted independently, with bracketed-paste wrapping when armed. Internal `TabDrag` stays non-text. Regression: `drop_files_preserve_filename_boundaries`. [Per-case evidence](#x11-file-drop-verification-28); macOS was not exercised in this run. |
+| Drag & drop | Files dropped onto a pane paste their paths | ✅ | Verified on X11/Hydrolysis with real external XDND drops and macOS/Hydrolysis with Finder file drops. Typed `Files`/`Url` destinations preserve item boundaries through `DropFiles`; each path is URI-decoded and shell-quoted independently, with bracketed-paste wrapping when armed. Internal `TabDrag` stays non-text. Regression: `drop_files_preserve_filename_boundaries`. Per-case evidence: [X11](#x11-file-drop-verification-28), [macOS](#macos-file-drop-verification-35). |
 | Config | `bold-is-bright` | ➖ legacy name | Pre-1.2 spelling of `bold-color` — rejected per the "reference's names only" rule (parse error, like `cursor-shape`/`word-select-chars`). The behavior lives in `bold-color = bright` (default); see that row. r49 audit: the earlier claim that the key parsed was wrong — it has always been rejected |
 
 ## X11 file-drop verification (#28)
@@ -114,6 +114,25 @@ The initial (a) run reached the PTY but lost quotes: 46 bytes,
 file list with spaces before whitespace-splitting it. Preserving each item until
 after decoding/quoting fixes this app-owned handler; no framework change was
 needed.
+
+## macOS file-drop verification (#35)
+
+Run on ARM64 macOS with `water run --platform macos --backend hydrolysis`, using
+the WaterUI CLI installed from the pinned revision
+`c5c9dfa87803d99eeff82a42eaeca7bec17f1840`. Real Finder drags supplied the external
+files; `cat` reading the raw PTY captured the bytes below (no trailing newline),
+with `cat -v` displaying control bytes. Evidence files are outside the repository
+in `/Users/devin/hydroterm-35-evidence/`.
+
+- (a) `a space.txt`: PASS — 48 bytes, `'/Users/devin/hydroterm-35-evidence/a space.txt'`; capture `a.bin`, screenshot `a.png`.
+- (b) `a space.txt` + `second.txt` in one Finder drop: PASS — 94 bytes, `'/Users/devin/hydroterm-35-evidence/a space.txt' /Users/devin/hydroterm-35-evidence/second.txt`; capture `b.bin`, screenshot `b.png`.
+- (c) `a space.txt` after `printf '\e[?2004h'`: PASS — 60 bytes, `\x1b[200~'/Users/devin/hydroterm-35-evidence/a space.txt'\x1b[201~` (`\x1b` denotes byte `0x1b`); capture `c.bin`, screenshot `c.png`.
+- (d) Active tab chip dragged onto its pane with two tabs open: PASS — zero bytes (`b''`), and the tab detached into a second window; capture `d.bin`, screenshot `d.png`.
+
+All four cases passed without app or framework changes. The Hydrolysis backend
+selector is required for this app's Hydrolysis/Material3 entry point; the default
+Apple-backend launch failed before displaying a pane and was not used for the
+drop verification.
 
 ## Metrics (to be filled by benchmark task)
 
