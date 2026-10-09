@@ -18,6 +18,7 @@ use waterui::Identifiable;
 use waterui::Url;
 use waterui::accessibility::{AccessibilityRole, AccessibilityState};
 use waterui::app::Quit;
+use waterui::component::ShortcutKey;
 use waterui::drag_drop::{Files, Transferable};
 use waterui::key::{Key, KeyHandling, KeyPress, Modifiers, NamedKey};
 use waterui::layout::frame::Frame;
@@ -3171,7 +3172,9 @@ impl View for PaneLeaf {
         let menu_state = self.state.clone();
         // Clipboard liveness for the Paste row is checked when the menu
         // items evaluate (menu open), not on pointer moves.
-        let menu_clip = waterkit_clipboard::Clipboard::new().ok();
+        let menu_clip = waterkit_clipboard::Clipboard::new()
+            .inspect_err(|err| tracing::warn!(%err, "clipboard unavailable: Paste stays disabled"))
+            .ok();
         let menu = zip(zip(reporting, menu_enabled.clone()), menu_ctx)
             .map(move |((reporting, menu_enabled), ctx)| -> Vec<MenuItem> {
                 if reporting || !menu_enabled {
@@ -3214,7 +3217,13 @@ impl View for PaneLeaf {
                             // Clipboard liveness is read fresh at
                             // snapshot time — the surface can't see the
                             // secondary press (the framework claims it).
-                            .disabled(!menu_clip.as_ref().is_some_and(|c| c.has_text()))
+                            .disabled(!menu_clip.as_ref().is_some_and(|c| {
+                                c.has_text()
+                                    .inspect_err(|err| {
+                                        tracing::warn!(%err, "clipboard query failed: Paste disabled");
+                                    })
+                                    .unwrap_or(false)
+                            }))
                             .into(),
                         "Select All"
                             .action(|s: PaneSession| s.push_action(TermAction::SelectAll))
@@ -4999,6 +5008,38 @@ fn settings_view(state: AppState) -> impl View {
     vstack((panel, Spacer::flexible())).background(Srgb::BLACK.with_opacity(0.45))
 }
 
+/// A canonical keybind key (`config::canonical_key_name`) as a menu
+/// shortcut key. `catch_all` matches any unbound press, so it names no key.
+fn shortcut_key(key: &str) -> Option<ShortcutKey> {
+    let w3c = match key {
+        "catch_all" => return None,
+        "arrowup" => "ArrowUp".to_string(),
+        "arrowdown" => "ArrowDown".to_string(),
+        "arrowleft" => "ArrowLeft".to_string(),
+        "arrowright" => "ArrowRight".to_string(),
+        "pageup" => "PageUp".to_string(),
+        "pagedown" => "PageDown".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "insert" => "Insert".to_string(),
+        "delete" => "Delete".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "tab" => "Tab".to_string(),
+        "enter" => "Enter".to_string(),
+        "escape" => "Escape".to_string(),
+        "space" => " ".to_string(),
+        function if function.len() > 1 && function.starts_with('f') => {
+            function.to_ascii_uppercase()
+        }
+        character => character.to_string(),
+    };
+    Some(
+        w3c.parse().unwrap_or_else(|err| {
+            panic!("canonical keybind key {key:?} has no shortcut form: {err}")
+        }),
+    )
+}
+
 /// First configured keybind for `action` as `Shortcut` menu metadata:
 /// the normalized `ctrl+alt+shift+super+key` string maps ctrl→control,
 /// alt→option, shift→shift, super→command; the last part is the key.
@@ -5012,7 +5053,7 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
     let (mods, key) = chord
         .rsplit_once('+')
         .map_or(("", chord.as_str()), |(m, k)| (m, k));
-    let mut sc = Shortcut::new(key.to_string());
+    let mut sc = Shortcut::new(shortcut_key(key)?);
     let mods = format!("{mods}+");
     if mods.contains("ctrl+") {
         sc = sc.control();
@@ -5033,9 +5074,23 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 mod tests {
     use super::{
         AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
-        quit_delay_expired,
+        quit_delay_expired, shortcut_key,
     };
     use waterui::Str;
+    use waterui::component::{NamedKey, ShortcutKey};
+
+    #[test]
+    fn canonical_keys_map_to_shortcut_keys() {
+        assert_eq!(shortcut_key("t"), Some(ShortcutKey::from('t')));
+        assert_eq!(shortcut_key(","), Some(ShortcutKey::from(',')));
+        assert_eq!(shortcut_key("space"), Some(ShortcutKey::from(' ')));
+        assert_eq!(
+            shortcut_key("pageup"),
+            Some(ShortcutKey::from(NamedKey::PageUp))
+        );
+        assert_eq!(shortcut_key("f12"), Some(ShortcutKey::from(NamedKey::F12)));
+        assert_eq!(shortcut_key("catch_all"), None);
+    }
     use waterui::reactive::collection::Collection;
     use waterui::{Binding, Signal};
 
