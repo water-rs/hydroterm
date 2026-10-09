@@ -22,4 +22,4 @@ knowledge:
   - name: notes
     contents: |
       # Drive the running UI headlessly: wmctrl -a hydroterm; xdotool type/key/mousemove/click.
-      # Input-debug env: HYDROTERM_DEBUG_INPUT=1; see WATERUI_FEEDBACK.md for upstream gaps.
+      # Input-debug env: HYDROTERM_DEBUG_INPUT=1; upstream gaps are tracked as issues in water-rs/waterui.
