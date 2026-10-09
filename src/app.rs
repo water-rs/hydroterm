@@ -719,12 +719,12 @@ pub struct AppShared {
     /// Pending user-attention request — `bell-features = attention`
     /// sets `Some(Informational)`; the runner maps it to the WM's
     /// demands-attention hint and clears it on focus (closes the WM
-    /// half of WATERUI_FEEDBACK #51).
+    /// half of water-rs/waterui#1268).
     pub attention: Binding<Option<UserAttention>>,
     /// Current cell size in points — the first surface to lay out
     /// writes it; `window-step-resize` feeds it to the WM's
     /// resize-increments hint so interactive resizes snap to cells
-    /// (the other half of WATERUI_FEEDBACK #51).
+    /// (the other half of water-rs/waterui#1268).
     pub cell_size: Binding<Size>,
     /// The main window's `frame` binding (hydrolysis writes live geometry
     /// back on Moved/Resize) — captured in `main` so the save-state poller
@@ -2797,9 +2797,9 @@ impl AppState {
             // Re-arming while a prompt is already up is a no-op: a second
             // real `ctrl+shift+w` is a legitimate repeat press, and a chord
             // that straddles a window focus gain is also re-delivered by the
-            // platform layer (winit FocusIn key replay — WATERUI_FEEDBACK
-            // #47). Either way a duplicate `set` remounts the snackbar and
-            // stacks a dead copy over the live one.
+            // platform layer (winit FocusIn key replay —
+            // water-rs/hydrolysis#211). Either way a duplicate `set` remounts
+            // the snackbar and stacks a dead copy over the live one.
             if pending.snapshot().is_none() {
                 pending.set(Some((label, false)));
             }
@@ -3350,7 +3350,7 @@ impl View for PaneLeaf {
                 // (or Enter / Escape on the surface's key gate). Ghostty asks
                 // with both actions visible; the framework's Snackbar has a
                 // single action slot and no two-choice transient primitive at
-                // this pin (WATERUI_FEEDBACK #30), so the prompt is a composed
+                // this pin (water-rs/waterui#1210), so the prompt is a composed
                 // card — Allow is the filled primary (`BorderedProminent`), Deny
                 // the lower-emphasis `Bordered` secondary (not the snackbar's
                 // close ✕, which would silently deny).
@@ -4172,7 +4172,7 @@ pub fn tabs_view(state: AppState) -> impl View {
                     .background(signal_color(hover_bg))
                     // Natural order again — hydrolysis#256 made `.state`
                     // order-independent within a modifier chain
-                    // (was WATERUI_FEEDBACK #61 / water-rs/waterui#1292).
+                    // (was water-rs/waterui#1292).
                     .state(&hovered)
                     .on_hover_enter(|State(h): State<Binding<bool>>| h.set(true))
                     .on_hover_exit(|State(h): State<Binding<bool>>| h.set(false))

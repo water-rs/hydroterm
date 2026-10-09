@@ -2110,7 +2110,7 @@ impl TermSurface {
                     // attention alert cleared by `clear_notify_badge`.
                     // Ghostty's `attention` also raises the WM urgency
                     // hint; no waterui/hydrolysis surface reaches
-                    // `request_user_attention` — WATERUI_FEEDBACK #51,
+                    // `request_user_attention` — water-rs/waterui#1268,
                     // unimplemented rather than faked.
                     let attention = self.app.config(|c| c.bell_attention);
                     let title = self.app.config(|c| c.bell_title);
@@ -2122,7 +2122,7 @@ impl TermSurface {
                         // Ghostty's `attention` also raises the WM
                         // urgency hint — `Window::attention` reaches
                         // `request_user_attention` (runner clears it
-                        // on focus). WATERUI_FEEDBACK #51, now wired.
+                        // on focus). water-rs/waterui#1268, now wired.
                         self.app.attention.set(Some(UserAttention::Informational));
                     }
                     // `bell-features` `border` — a ring around the pane
