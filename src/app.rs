@@ -57,6 +57,19 @@ use waterui::form::picker::picker;
 /// Fixed height of the tab strip at every window size.
 const TAB_STRIP_HEIGHT: f32 = 30.0;
 
+fn configured_window_background(
+    config: &AppConfig,
+    palette: &Palette,
+    opacity: f32,
+) -> WindowBackground {
+    if config.background_blur && opacity < 1.0 {
+        WindowBackground::Material(Material::UltraThin)
+    } else {
+        let bg = palette.background;
+        WindowBackground::Color(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity))
+    }
+}
+
 /// Strip height for geometry math outside this module (the
 /// `vt-window-resize-allowed` content→frame conversion).
 pub(crate) fn tab_strip_height() -> f32 {
@@ -1137,13 +1150,10 @@ impl AppState {
                 } else {
                     WindowStyle::Borderless
                 }),
-                window_background: binding(WindowBackground::Color(
-                    Color::srgb(
-                        palette.background.r,
-                        palette.background.g,
-                        palette.background.b,
-                    )
-                    .with_opacity(watcher.config.background_opacity),
+                window_background: binding(configured_window_background(
+                    &watcher.config,
+                    &palette,
+                    watcher.config.background_opacity,
                 )),
                 background_opacity: binding(watcher.config.background_opacity),
                 background_opaque: Cell::new(false),
@@ -1593,10 +1603,11 @@ impl AppState {
         } else {
             config.background_opacity
         };
-        let bg = self.palette.borrow().background;
         self.background_opacity.set(opacity);
-        self.window_background.set(WindowBackground::Color(
-            Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity),
+        self.window_background.set(configured_window_background(
+            config,
+            &self.palette.borrow(),
+            opacity,
         ));
     }
 
@@ -5121,7 +5132,9 @@ mod tests {
         binding, quit_delay_expired, shortcut_key,
     };
     use waterui::Str;
+    use waterui::background::Material;
     use waterui::component::{NamedKey, ShortcutKey};
+    use waterui::window::WindowBackground;
 
     #[test]
     fn canonical_keys_map_to_shortcut_keys() {
@@ -5164,17 +5177,56 @@ mod tests {
         let instance = Instance::new();
         let app = AppState::new_inner(None, None, false, instance.clone(), None);
         let other = AppState::new_inner(None, None, false, instance, None);
-        for opacity in [0.0, 0.4, 1.0] {
-            app.cfg.borrow_mut().config.background_opacity = opacity;
-            app.background_opaque.set(false);
-            app.update_window_background(&app.cfg.borrow().config);
-            let other_opacity = other.background_opacity.snapshot();
-            app.toggle_background_opacity();
-            assert_eq!(app.background_opacity.snapshot(), 1.0);
-            assert_eq!(other.background_opacity.snapshot(), other_opacity);
-            app.toggle_background_opacity();
-            assert_eq!(app.background_opacity.snapshot(), opacity);
-            assert_eq!(app.config(|c| c.background_opacity), opacity);
+        for blur in [false, true] {
+            for opacity in [0.0, 0.4, 1.0] {
+                app.cfg.borrow_mut().config.background_blur = blur;
+                app.cfg.borrow_mut().config.background_opacity = opacity;
+                app.background_opaque.set(false);
+                app.update_window_background(&app.cfg.borrow().config);
+                let is_blurred = || {
+                    matches!(
+                        app.window_background.snapshot(),
+                        WindowBackground::Material(Material::UltraThin)
+                    )
+                };
+                assert_eq!(is_blurred(), blur && opacity < 1.0);
+                let other_opacity = other.background_opacity.snapshot();
+                app.toggle_background_opacity();
+                assert_eq!(app.background_opacity.snapshot(), 1.0);
+                assert!(matches!(
+                    app.window_background.snapshot(),
+                    WindowBackground::Color(_)
+                ));
+                assert_eq!(other.background_opacity.snapshot(), other_opacity);
+                app.toggle_background_opacity();
+                assert_eq!(app.background_opacity.snapshot(), opacity);
+                assert_eq!(is_blurred(), blur && opacity < 1.0);
+                assert_eq!(app.config(|c| c.background_opacity), opacity);
+                assert_eq!(app.config(|c| c.background_blur), blur);
+            }
+        }
+    }
+
+    #[test]
+    fn background_blur_requires_translucency_and_reloads() {
+        let app = AppState::new_inner(None, None, false, Instance::new(), None);
+        let mut config = crate::config::AppConfig::default();
+        for (blur, opacity, material) in [
+            (true, 0.4, true),
+            (false, 0.4, false),
+            (true, 1.0, false),
+            (true, 0.0, true),
+        ] {
+            config.background_blur = blur;
+            config.background_opacity = opacity;
+            app.apply_config(&config);
+            assert_eq!(
+                matches!(
+                    app.window_background.snapshot(),
+                    WindowBackground::Material(Material::UltraThin)
+                ),
+                material
+            );
         }
     }
 
