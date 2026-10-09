@@ -2,8 +2,11 @@
 //! application-cursor modes, modifier parameters, function keys, Alt
 //! meta-prefixed text, and the kitty keyboard-protocol disambiguation flag.
 
+use std::sync::LazyLock;
+
 use alacritty_terminal::term::TermMode;
 use keyboard_types::{Code, Key, Modifiers, NamedKey};
+use waterui::component::{Shortcut, ShortcutKey};
 
 /// Build the byte sequence for a key press. `text` is the already-composed
 /// text for the key when the platform produced it (text input comes via
@@ -322,13 +325,436 @@ fn kitty_csi_u(codepoint: u32, mods: Modifiers, release: bool) -> Vec<u8> {
     }
 }
 
+#[derive(Clone)]
+struct ActionBinding {
+    shortcut: Shortcut,
+    action: TermAction,
+}
+
+fn shortcut(key: impl Into<ShortcutKey>, mods: Modifiers) -> Shortcut {
+    let mut shortcut = Shortcut::new(key);
+    if mods.contains(Modifiers::CONTROL) {
+        shortcut = shortcut.control();
+    }
+    if mods.contains(Modifiers::ALT) {
+        shortcut = shortcut.option();
+    }
+    if mods.contains(Modifiers::SHIFT) {
+        shortcut = shortcut.shift();
+    }
+    if mods.contains(Modifiers::META) {
+        shortcut = shortcut.command();
+    }
+    shortcut
+}
+
+fn binding(key: impl Into<ShortcutKey>, mods: Modifiers, action: TermAction) -> ActionBinding {
+    ActionBinding {
+        shortcut: shortcut(key, mods),
+        action,
+    }
+}
+
+fn shortcut_key_matches(shortcut: &Shortcut, key: &Key, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        shortcut.key.to_key() == *key
+    } else {
+        match (&shortcut.key, key) {
+            (ShortcutKey::Character(expected), Key::Character(pressed)) => {
+                pressed.to_ascii_lowercase() == expected.to_string()
+            }
+            (ShortcutKey::Named(expected), Key::Named(pressed)) => expected == pressed,
+            _ => false,
+        }
+    }
+}
+
+fn binding_matches(
+    binding: &ActionBinding,
+    key: &Key,
+    mods: Modifiers,
+    case_sensitive: bool,
+) -> bool {
+    let required = &binding.shortcut.modifiers;
+    let mut expected = Modifiers::empty();
+    if required.control() {
+        expected |= Modifiers::CONTROL;
+    }
+    if required.option() {
+        expected |= Modifiers::ALT;
+    }
+    if required.shift() {
+        expected |= Modifiers::SHIFT;
+    }
+    if required.command() {
+        expected |= Modifiers::META;
+    }
+    expected == mods && shortcut_key_matches(&binding.shortcut, key, case_sensitive)
+}
+
+fn lookup_action(
+    bindings: &[ActionBinding],
+    key: &Key,
+    mods: Modifiers,
+    case_sensitive: bool,
+) -> Option<TermAction> {
+    bindings
+        .iter()
+        .find(|binding| binding_matches(binding, key, mods, case_sensitive))
+        .map(|binding| binding.action.clone())
+}
+
+fn shared_action_bindings() -> &'static [ActionBinding] {
+    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
+        vec![binding(
+            NamedKey::F11,
+            Modifiers::empty(),
+            TermAction::Fullscreen,
+        )]
+    });
+    &BINDINGS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_action_bindings() -> &'static [ActionBinding] {
+    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
+        let c = Modifiers::CONTROL;
+        let h = Modifiers::SHIFT;
+        let a = Modifiers::ALT;
+        vec![
+            binding('c', c | h, TermAction::Copy),
+            binding('v', c | h, TermAction::Paste),
+            binding('t', c | h, TermAction::NewTab),
+            binding('w', c | h, TermAction::CloseTab),
+            binding('n', c | h, TermAction::NewWindow),
+            binding('a', c | h, TermAction::SelectAll),
+            binding('e', c | h, TermAction::SplitRight),
+            binding('d', c | h, TermAction::SplitDown),
+            binding('z', c | h, TermAction::PaneZoom),
+            binding(']', c | h, TermAction::FocusNextPane),
+            binding('}', c | h, TermAction::FocusNextPane),
+            binding('[', c | h, TermAction::FocusPrevPane),
+            binding('{', c | h, TermAction::FocusPrevPane),
+            binding('=', c | h, TermAction::IncreaseFontSize(1)),
+            binding('+', c | h, TermAction::IncreaseFontSize(1)),
+            binding('-', c | h, TermAction::DecreaseFontSize(1)),
+            binding('_', c | h, TermAction::DecreaseFontSize(1)),
+            binding('0', c | h, TermAction::FontReset),
+            binding(')', c | h, TermAction::FontReset),
+            binding('k', c | h, TermAction::ClearScrollback),
+            binding('o', c | h, TermAction::CopyLastOutput),
+            binding('u', c | h, TermAction::UrlHints),
+            binding('g', c | h, TermAction::OpenScrollbackEditor),
+            binding('f', c | h, TermAction::Search),
+            binding('p', c | h, TermAction::Palette),
+            binding(',', c | h, TermAction::ReloadConfig),
+            binding('<', c | h, TermAction::ReloadConfig),
+            binding('l', c | h, TermAction::ClearScreen),
+            binding(NamedKey::ArrowUp, c | h, TermAction::JumpToPrompt(-1)),
+            binding(NamedKey::ArrowDown, c | h, TermAction::JumpToPrompt(1)),
+            binding(NamedKey::PageUp, c | h, TermAction::MoveTab(-1)),
+            binding(NamedKey::PageDown, c | h, TermAction::MoveTab(1)),
+            binding(NamedKey::Home, c | h, TermAction::ScrollToTop),
+            binding(NamedKey::End, c | h, TermAction::ScrollToBottom),
+            binding(NamedKey::Enter, c | h, TermAction::PaneZoom),
+            binding('1', c | a, TermAction::GotoSplit(0)),
+            binding('2', c | a, TermAction::GotoSplit(1)),
+            binding('3', c | a, TermAction::GotoSplit(2)),
+            binding('4', c | a, TermAction::GotoSplit(3)),
+            binding('5', c | a, TermAction::GotoSplit(4)),
+            binding('6', c | a, TermAction::GotoSplit(5)),
+            binding('7', c | a, TermAction::GotoSplit(6)),
+            binding('8', c | a, TermAction::GotoSplit(7)),
+            binding('9', c | a, TermAction::GotoSplit(8)),
+            binding(
+                NamedKey::ArrowLeft,
+                c | h | a,
+                TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false,
+                },
+            ),
+            binding(
+                NamedKey::ArrowRight,
+                c | h | a,
+                TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: true,
+                },
+            ),
+            binding(
+                NamedKey::ArrowUp,
+                c | h | a,
+                TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: false,
+                },
+            ),
+            binding(
+                NamedKey::ArrowDown,
+                c | h | a,
+                TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: true,
+                },
+            ),
+            binding(NamedKey::PageUp, c | h | a, TermAction::FocusPrevPane),
+            binding(NamedKey::PageDown, c | h | a, TermAction::FocusNextPane),
+            binding(
+                NamedKey::ArrowLeft,
+                a | h,
+                TermAction::ResizePane {
+                    horizontal: true,
+                    forward: false,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowRight,
+                a | h,
+                TermAction::ResizePane {
+                    horizontal: true,
+                    forward: true,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowUp,
+                a | h,
+                TermAction::ResizePane {
+                    horizontal: false,
+                    forward: false,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowDown,
+                a | h,
+                TermAction::ResizePane {
+                    horizontal: false,
+                    forward: true,
+                    px: 48,
+                },
+            ),
+            binding(NamedKey::PageUp, h, TermAction::ScrollPageUp),
+            binding(NamedKey::PageDown, h, TermAction::ScrollPageDown),
+            binding(NamedKey::ArrowUp, h, TermAction::ScrollPageLines(-1)),
+            binding(NamedKey::ArrowDown, h, TermAction::ScrollPageLines(1)),
+            binding(NamedKey::Insert, h, TermAction::Paste),
+            binding(NamedKey::Tab, c, TermAction::NextTab),
+            binding(NamedKey::Tab, c | h, TermAction::PrevTab),
+            binding(NamedKey::PageDown, c, TermAction::NextTab),
+            binding(NamedKey::PageUp, c, TermAction::PrevTab),
+        ]
+    });
+    &BINDINGS
+}
+
+#[cfg(target_os = "macos")]
+fn platform_action_bindings() -> &'static [ActionBinding] {
+    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
+        let s = Modifiers::META;
+        let c = Modifiers::CONTROL;
+        let a = Modifiers::ALT;
+        let h = Modifiers::SHIFT;
+        vec![
+            binding('t', s, TermAction::NewTab),
+            binding('n', s, TermAction::NewWindow),
+            binding(',', s | h, TermAction::ReloadConfig),
+            binding(',', s, TermAction::OpenConfig),
+            binding('c', s, TermAction::Copy),
+            binding('v', s, TermAction::Paste),
+            binding('=', s, TermAction::IncreaseFontSize(1)),
+            binding('+', s, TermAction::IncreaseFontSize(1)),
+            binding('-', s, TermAction::DecreaseFontSize(1)),
+            binding('0', s, TermAction::FontReset),
+            binding('q', s, TermAction::Quit),
+            binding('k', s, TermAction::ClearScreen),
+            binding('a', s, TermAction::SelectAll),
+            binding('j', s | c | h, TermAction::WriteScreenFile(FileSink::Copy)),
+            binding('j', s | h, TermAction::WriteScreenFile(FileSink::Paste)),
+            binding('j', s | h | a, TermAction::WriteScreenFile(FileSink::Open)),
+            binding('j', s, TermAction::ScrollToSelection),
+            binding('t', s | h, TermAction::Undo),
+            binding('z', s, TermAction::Undo),
+            binding('z', s | h, TermAction::Redo),
+            binding('w', s | h | a, TermAction::CloseAllWindows),
+            binding('w', s | h, TermAction::CloseWindow),
+            binding('w', s | a, TermAction::CloseTab),
+            binding('w', s, TermAction::CloseSurface),
+            binding('{', s | h, TermAction::PrevTab),
+            binding('}', s | h, TermAction::NextTab),
+            binding('d', s, TermAction::SplitRight),
+            binding('d', s | h, TermAction::SplitDown),
+            binding('[', s, TermAction::FocusPrevPane),
+            binding(']', s, TermAction::FocusNextPane),
+            binding('=', s | c, TermAction::EqualizeSplits),
+            binding('f', s, TermAction::StartSearch),
+            binding('e', s, TermAction::SearchSelection),
+            binding('f', s | h, TermAction::EndSearch),
+            binding('g', s, TermAction::NavigateSearch(1)),
+            binding('g', s | h, TermAction::NavigateSearch(-1)),
+            binding('i', s | a, TermAction::Inspector),
+            binding('f', s | c, TermAction::Fullscreen),
+            binding('v', s | h, TermAction::PasteFromSelection),
+            binding('p', s | h, TermAction::Palette),
+            binding(NamedKey::Escape, Modifiers::empty(), TermAction::EndSearch),
+            binding(NamedKey::Tab, c, TermAction::NextTab),
+            binding(NamedKey::Tab, c | h, TermAction::PrevTab),
+            binding(
+                NamedKey::ArrowLeft,
+                h,
+                TermAction::AdjustSelection(AdjustSel::Left),
+            ),
+            binding(
+                NamedKey::ArrowRight,
+                h,
+                TermAction::AdjustSelection(AdjustSel::Right),
+            ),
+            binding(
+                NamedKey::ArrowUp,
+                h,
+                TermAction::AdjustSelection(AdjustSel::Up),
+            ),
+            binding(
+                NamedKey::ArrowDown,
+                h,
+                TermAction::AdjustSelection(AdjustSel::Down),
+            ),
+            binding(
+                NamedKey::PageUp,
+                h,
+                TermAction::AdjustSelection(AdjustSel::PageUp),
+            ),
+            binding(
+                NamedKey::PageDown,
+                h,
+                TermAction::AdjustSelection(AdjustSel::PageDown),
+            ),
+            binding(
+                NamedKey::Home,
+                h,
+                TermAction::AdjustSelection(AdjustSel::Home),
+            ),
+            binding(
+                NamedKey::End,
+                h,
+                TermAction::AdjustSelection(AdjustSel::End),
+            ),
+            binding(NamedKey::Home, s, TermAction::ScrollToTop),
+            binding(NamedKey::End, s, TermAction::ScrollToBottom),
+            binding(NamedKey::PageUp, s, TermAction::ScrollPageUp),
+            binding(NamedKey::PageDown, s, TermAction::ScrollPageDown),
+            binding(NamedKey::ArrowUp, s, TermAction::JumpToPrompt(-1)),
+            binding(NamedKey::ArrowDown, s, TermAction::JumpToPrompt(1)),
+            binding(NamedKey::ArrowUp, s | h, TermAction::JumpToPrompt(-1)),
+            binding(NamedKey::ArrowDown, s | h, TermAction::JumpToPrompt(1)),
+            binding(
+                NamedKey::ArrowLeft,
+                s | a,
+                TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: false,
+                },
+            ),
+            binding(
+                NamedKey::ArrowRight,
+                s | a,
+                TermAction::FocusPaneDir {
+                    horizontal: true,
+                    forward: true,
+                },
+            ),
+            binding(
+                NamedKey::ArrowUp,
+                s | a,
+                TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: false,
+                },
+            ),
+            binding(
+                NamedKey::ArrowDown,
+                s | a,
+                TermAction::FocusPaneDir {
+                    horizontal: false,
+                    forward: true,
+                },
+            ),
+            binding(
+                NamedKey::ArrowLeft,
+                s | c,
+                TermAction::ResizePane {
+                    horizontal: true,
+                    forward: false,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowRight,
+                s | c,
+                TermAction::ResizePane {
+                    horizontal: true,
+                    forward: true,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowUp,
+                s | c,
+                TermAction::ResizePane {
+                    horizontal: false,
+                    forward: false,
+                    px: 48,
+                },
+            ),
+            binding(
+                NamedKey::ArrowDown,
+                s | c,
+                TermAction::ResizePane {
+                    horizontal: false,
+                    forward: true,
+                    px: 48,
+                },
+            ),
+            binding(NamedKey::ArrowRight, s, TermAction::TypeText("\x05".into())),
+            binding(NamedKey::ArrowLeft, s, TermAction::TypeText("\x01".into())),
+            binding(NamedKey::Backspace, s, TermAction::TypeText("\x15".into())),
+            binding(NamedKey::ArrowLeft, a, TermAction::EscSeq("b".into())),
+            binding(NamedKey::ArrowRight, a, TermAction::EscSeq("f".into())),
+            binding('1', s, TermAction::SelectTab(1)),
+            binding('2', s, TermAction::SelectTab(2)),
+            binding('3', s, TermAction::SelectTab(3)),
+            binding('4', s, TermAction::SelectTab(4)),
+            binding('5', s, TermAction::SelectTab(5)),
+            binding('6', s, TermAction::SelectTab(6)),
+            binding('7', s, TermAction::SelectTab(7)),
+            binding('8', s, TermAction::SelectTab(8)),
+            binding('9', s, TermAction::LastTab),
+        ]
+    });
+    &BINDINGS
+}
+
+pub fn default_action_shortcut(action: &TermAction) -> Option<Shortcut> {
+    platform_action_bindings()
+        .iter()
+        .chain(shared_action_bindings())
+        .find(|binding| binding.action == *action)
+        .map(|binding| binding.shortcut.clone())
+}
+
 /// The terminal-action chord test: Ctrl+Shift (Linux/Windows convention).
 /// Returns the action name so the caller can run it instead of writing to
 /// the PTY.
 pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
-    // F11 alone toggles fullscreen (GNOME Terminal / VTE convention).
-    if matches!(key, Key::Named(NamedKey::F11)) && mods.is_empty() {
-        return Some(TermAction::Fullscreen);
+    if let Some(action) = lookup_action(
+        shared_action_bindings(),
+        key,
+        mods,
+        cfg!(target_os = "macos"),
+    ) {
+        return Some(action);
     }
     #[cfg(target_os = "macos")]
     {
@@ -352,19 +778,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::ALT)
             && !mods.contains(Modifiers::META)
         {
-            if let Key::Named(named) = key {
-                return match named {
-                    NamedKey::PageUp => Some(TermAction::ScrollPageUp),
-                    NamedKey::PageDown => Some(TermAction::ScrollPageDown),
-                    // Shift+Up/Down scroll one line — xterm/kitty convention.
-                    NamedKey::ArrowUp => Some(TermAction::ScrollPageLines(-1)),
-                    NamedKey::ArrowDown => Some(TermAction::ScrollPageLines(1)),
-                    // Shift+Insert pastes — the xterm/VTE convention.
-                    NamedKey::Insert => Some(TermAction::Paste),
-                    _ => None,
-                };
-            }
-            return None;
+            return lookup_action(platform_action_bindings(), key, Modifiers::SHIFT, false);
         }
         // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
         // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
@@ -375,30 +789,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && mods.contains(Modifiers::SHIFT)
             && !mods.contains(Modifiers::META)
         {
-            if let Key::Named(named) = key {
-                return match named {
-                    NamedKey::ArrowLeft => Some(TermAction::FocusPaneDir {
-                        horizontal: true,
-                        forward: false,
-                    }),
-                    NamedKey::ArrowRight => Some(TermAction::FocusPaneDir {
-                        horizontal: true,
-                        forward: true,
-                    }),
-                    NamedKey::ArrowUp => Some(TermAction::FocusPaneDir {
-                        horizontal: false,
-                        forward: false,
-                    }),
-                    NamedKey::ArrowDown => Some(TermAction::FocusPaneDir {
-                        horizontal: false,
-                        forward: true,
-                    }),
-                    NamedKey::PageUp => Some(TermAction::FocusPrevPane),
-                    NamedKey::PageDown => Some(TermAction::FocusNextPane),
-                    _ => None,
-                };
-            }
-            return None;
+            return lookup_action(
+                platform_action_bindings(),
+                key,
+                Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT,
+                false,
+            );
         }
         // Ctrl+Alt+1..9: jump straight to the nth split. (Plain
         // Ctrl+Alt+Arrow was the directional-focus chord until r23 — KDE and
@@ -410,24 +806,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::SHIFT)
             && !mods.contains(Modifiers::META)
         {
-            if let Key::Named(_) = key {
-                return None;
-            }
-            if let Key::Character(text) = key {
-                return match text.as_str() {
-                    "1" => Some(TermAction::GotoSplit(0)),
-                    "2" => Some(TermAction::GotoSplit(1)),
-                    "3" => Some(TermAction::GotoSplit(2)),
-                    "4" => Some(TermAction::GotoSplit(3)),
-                    "5" => Some(TermAction::GotoSplit(4)),
-                    "6" => Some(TermAction::GotoSplit(5)),
-                    "7" => Some(TermAction::GotoSplit(6)),
-                    "8" => Some(TermAction::GotoSplit(7)),
-                    "9" => Some(TermAction::GotoSplit(8)),
-                    _ => None,
-                };
-            }
-            return None;
+            return lookup_action(
+                platform_action_bindings(),
+                key,
+                Modifiers::CONTROL | Modifiers::ALT,
+                false,
+            );
         }
         // Alt+Shift+Arrow: move the divider beside the focused pane — the
         // keyboard half of split resizing (pointer half is the divider drag
@@ -439,80 +823,22 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::CONTROL)
             && !mods.contains(Modifiers::META)
         {
-            if let Key::Named(named) = key {
-                return match named {
-                    NamedKey::ArrowLeft => Some(TermAction::ResizePane {
-                        horizontal: true,
-                        forward: false,
-                        px: 48,
-                    }),
-                    NamedKey::ArrowRight => Some(TermAction::ResizePane {
-                        horizontal: true,
-                        forward: true,
-                        px: 48,
-                    }),
-                    NamedKey::ArrowUp => Some(TermAction::ResizePane {
-                        horizontal: false,
-                        forward: false,
-                        px: 48,
-                    }),
-                    NamedKey::ArrowDown => Some(TermAction::ResizePane {
-                        horizontal: false,
-                        forward: true,
-                        px: 48,
-                    }),
-                    _ => None,
-                };
-            }
-            return None;
+            return lookup_action(
+                platform_action_bindings(),
+                key,
+                Modifiers::ALT | Modifiers::SHIFT,
+                false,
+            );
         }
         if !(mods.contains(Modifiers::CONTROL) && mods.contains(Modifiers::SHIFT)) {
             return None;
         }
-        if let Key::Named(named) = key {
-            return Some(match named {
-                NamedKey::ArrowUp => TermAction::JumpToPrompt(-1),
-                NamedKey::ArrowDown => TermAction::JumpToPrompt(1),
-                // Ctrl+Shift+PageUp/Down reorders tabs (Chrome/Firefox
-                // convention) — plain Ctrl+PageUp/Down cycles them.
-                NamedKey::PageUp => TermAction::MoveTab(-1),
-                NamedKey::PageDown => TermAction::MoveTab(1),
-                NamedKey::Home => TermAction::ScrollToTop,
-                NamedKey::End => TermAction::ScrollToBottom,
-                // Ctrl+Shift+Enter zooms the focused pane (kitty/tmux
-                // convention) — same action as Ctrl+Shift+Z.
-                NamedKey::Enter => TermAction::PaneZoom,
-                _ => return None,
-            });
-        }
-        let Key::Character(text) = key else {
-            return None;
-        };
-        Some(match text.to_ascii_lowercase().as_str() {
-            "c" => TermAction::Copy,
-            "v" => TermAction::Paste,
-            "t" => TermAction::NewTab,
-            "w" => TermAction::CloseTab,
-            "n" => TermAction::NewWindow,
-            "a" => TermAction::SelectAll,
-            "e" => TermAction::SplitRight,
-            "d" => TermAction::SplitDown,
-            "z" => TermAction::PaneZoom,
-            "]" | "}" => TermAction::FocusNextPane,
-            "[" | "{" => TermAction::FocusPrevPane,
-            "+" | "=" => TermAction::IncreaseFontSize(1),
-            "-" | "_" => TermAction::DecreaseFontSize(1),
-            "0" | ")" => TermAction::FontReset,
-            "k" => TermAction::ClearScrollback,
-            "o" => TermAction::CopyLastOutput,
-            "u" => TermAction::UrlHints,
-            "g" => TermAction::OpenScrollbackEditor,
-            "f" => TermAction::Search,
-            "p" => TermAction::Palette,
-            "," | "<" => TermAction::ReloadConfig,
-            "l" => TermAction::ClearScreen,
-            _ => return None,
-        })
+        lookup_action(
+            platform_action_bindings(),
+            key,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            false,
+        )
     }
 }
 
@@ -526,148 +852,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
 /// consumed upstream via [`TermAction::Ignore`].
 #[cfg(target_os = "macos")]
 fn macos_action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
-    const S: Modifiers = Modifiers::META;
-    const C: Modifiers = Modifiers::CONTROL;
-    const A: Modifiers = Modifiers::ALT;
-    const H: Modifiers = Modifiers::SHIFT;
-    if let Key::Named(named) = key {
-        return Some(match named {
-            // `end_search` — a no-op (and non-consuming) without an open
-            // search, so bare Escape still reaches vim (the surface's
-            // performable gate drops it to bytes then).
-            NamedKey::Escape if mods.is_empty() => TermAction::EndSearch,
-            NamedKey::Tab if mods == C | H => TermAction::PrevTab,
-            NamedKey::Tab if mods == C => TermAction::NextTab,
-            // Expand selection — the shared shift-only binds.
-            NamedKey::ArrowLeft if mods == H => TermAction::AdjustSelection(AdjustSel::Left),
-            NamedKey::ArrowRight if mods == H => TermAction::AdjustSelection(AdjustSel::Right),
-            NamedKey::ArrowUp if mods == H => TermAction::AdjustSelection(AdjustSel::Up),
-            NamedKey::ArrowDown if mods == H => TermAction::AdjustSelection(AdjustSel::Down),
-            NamedKey::PageUp if mods == H => TermAction::AdjustSelection(AdjustSel::PageUp),
-            NamedKey::PageDown if mods == H => TermAction::AdjustSelection(AdjustSel::PageDown),
-            NamedKey::Home if mods == H => TermAction::AdjustSelection(AdjustSel::Home),
-            NamedKey::End if mods == H => TermAction::AdjustSelection(AdjustSel::End),
-            // Mac viewport scrolling.
-            NamedKey::Home if mods == S => TermAction::ScrollToTop,
-            NamedKey::End if mods == S => TermAction::ScrollToBottom,
-            NamedKey::PageUp if mods == S => TermAction::ScrollPageUp,
-            NamedKey::PageDown if mods == S => TermAction::ScrollPageDown,
-            // Semantic prompts: super+shift+arrows (Ghostty) and
-            // super+arrows (Terminal.app) both jump.
-            NamedKey::ArrowUp if mods == S || mods == S | H => TermAction::JumpToPrompt(-1),
-            NamedKey::ArrowDown if mods == S || mods == S | H => TermAction::JumpToPrompt(1),
-            // Split navigation: super+alt+arrows goto, super+ctrl+arrows
-            // resize (Ghostty's 10-unit step ≈ our 48px chord step).
-            NamedKey::ArrowLeft if mods == S | A => TermAction::FocusPaneDir {
-                horizontal: true,
-                forward: false,
-            },
-            NamedKey::ArrowRight if mods == S | A => TermAction::FocusPaneDir {
-                horizontal: true,
-                forward: true,
-            },
-            NamedKey::ArrowUp if mods == S | A => TermAction::FocusPaneDir {
-                horizontal: false,
-                forward: false,
-            },
-            NamedKey::ArrowDown if mods == S | A => TermAction::FocusPaneDir {
-                horizontal: false,
-                forward: true,
-            },
-            NamedKey::ArrowLeft if mods == S | C => TermAction::ResizePane {
-                horizontal: true,
-                forward: false,
-                px: 48,
-            },
-            NamedKey::ArrowRight if mods == S | C => TermAction::ResizePane {
-                horizontal: true,
-                forward: true,
-                px: 48,
-            },
-            NamedKey::ArrowUp if mods == S | C => TermAction::ResizePane {
-                horizontal: false,
-                forward: false,
-                px: 48,
-            },
-            NamedKey::ArrowDown if mods == S | C => TermAction::ResizePane {
-                horizontal: false,
-                forward: true,
-                px: 48,
-            },
-            // Natural text editing — forces legacy encoding (the text:
-            // action emits raw bytes, matching the reference).
-            NamedKey::ArrowRight if mods == S => TermAction::TypeText("\x05".into()),
-            NamedKey::ArrowLeft if mods == S => TermAction::TypeText("\x01".into()),
-            NamedKey::Backspace if mods == S => TermAction::TypeText("\x15".into()),
-            NamedKey::ArrowLeft if mods == A => TermAction::EscSeq("b".into()),
-            NamedKey::ArrowRight if mods == A => TermAction::EscSeq("f".into()),
-            _ => return None,
-        });
-    }
-    let Key::Character(text) = key else {
-        return None;
-    };
-    let t = text.as_str();
-    Some(match t {
-        "," if mods == S | H => TermAction::ReloadConfig,
-        "," if mods == S => TermAction::OpenConfig,
-        "c" if mods == S => TermAction::Copy,
-        "v" if mods == S => TermAction::Paste,
-        "=" | "+" if mods == S => TermAction::IncreaseFontSize(1),
-        "-" if mods == S => TermAction::DecreaseFontSize(1),
-        "0" if mods == S => TermAction::FontReset,
-        // write_screen_file: copy (ctrl+shift+super) / paste (shift+super)
-        // / open (shift+alt+super) — the `ctrlOrSuper` shared binds.
-        "j" if mods == S | C | H => TermAction::WriteScreenFile(FileSink::Copy),
-        "j" if mods == S | H => TermAction::WriteScreenFile(FileSink::Paste),
-        "j" if mods == S | H | A => TermAction::WriteScreenFile(FileSink::Open),
-        "j" if mods == S => TermAction::ScrollToSelection,
-        "q" if mods == S => TermAction::Quit,
-        "k" if mods == S => TermAction::ClearScreen,
-        "a" if mods == S => TermAction::SelectAll,
-        "t" if mods == S | H => TermAction::Undo,
-        "z" if mods == S => TermAction::Undo,
-        "z" if mods == S | H => TermAction::Redo,
-        // Mac windowing.
-        "n" if mods == S => TermAction::NewWindow,
-        "w" if mods == S | H | A => TermAction::CloseAllWindows,
-        "w" if mods == S | H => TermAction::CloseWindow,
-        "w" if mods == S | A => TermAction::CloseTab,
-        "w" if mods == S => TermAction::CloseSurface,
-        "t" if mods == S => TermAction::NewTab,
-        "{" if mods == S | H => TermAction::PrevTab,
-        "}" if mods == S | H => TermAction::NextTab,
-        "d" if mods == S => TermAction::SplitRight,
-        "d" if mods == S | H => TermAction::SplitDown,
-        "[" if mods == S => TermAction::FocusPrevPane,
-        "]" if mods == S => TermAction::FocusNextPane,
-        "=" if mods == S | C => TermAction::EqualizeSplits,
-        "f" if mods == S => TermAction::StartSearch,
-        "e" if mods == S => TermAction::SearchSelection,
-        "f" if mods == S | H => TermAction::EndSearch,
-        "g" if mods == S => TermAction::NavigateSearch(1),
-        "g" if mods == S | H => TermAction::NavigateSearch(-1),
-        "i" if mods == S | A => TermAction::Inspector,
-        "f" if mods == S | C => TermAction::Fullscreen,
-        "v" if mods == S | H => TermAction::PasteFromSelection,
-        "p" if mods == S | H => TermAction::Palette,
-        _ => {
-            // Cmd+digit selects tabs 1-8; Cmd+9 the last tab (unicode
-            // chars only — physical-digit binds cover AZERTY upstream
-            // but macOS keyboard layouts produce the digit as text).
-            if mods == S {
-                match t {
-                    "9" => TermAction::LastTab,
-                    _ if t.len() == 1 && matches!(t.as_bytes()[0], b'1'..=b'8') => {
-                        TermAction::SelectTab((t.as_bytes()[0] - b'0') as usize)
-                    }
-                    _ => return None,
-                }
-            } else {
-                return None;
-            }
-        }
-    })
+    lookup_action(platform_action_bindings(), key, mods, true)
 }
 
 /// Ctrl (no shift) digits select tabs 1-8; Alt+digits select tabs 1-9;
@@ -702,21 +887,17 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
                 return Some(TermAction::SelectTab(n));
             }
         }
-        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::SHIFT) {
-            if matches!(key, Key::Named(NamedKey::Tab)) {
-                return Some(TermAction::NextTab);
-            }
-            if matches!(key, Key::Named(NamedKey::PageDown)) {
-                return Some(TermAction::NextTab);
-            }
-            if matches!(key, Key::Named(NamedKey::PageUp)) {
-                return Some(TermAction::PrevTab);
-            }
-        }
-        if mods.contains(Modifiers::CONTROL | Modifiers::SHIFT)
-            && matches!(key, Key::Named(NamedKey::Tab))
+        let cycling_mods = if mods.contains(Modifiers::CONTROL | Modifiers::SHIFT) {
+            Modifiers::CONTROL | Modifiers::SHIFT
+        } else if mods.contains(Modifiers::CONTROL) {
+            Modifiers::CONTROL
+        } else {
+            mods
+        };
+        if let Some(action) = lookup_action(platform_action_bindings(), key, cycling_mods, false)
+            && matches!(action, TermAction::NextTab | TermAction::PrevTab)
         {
-            return Some(TermAction::PrevTab);
+            return Some(action);
         }
         None
     }
@@ -1097,6 +1278,82 @@ mod tests {
             ),
             Some(TermAction::Palette)
         );
+        assert_eq!(
+            default_action_shortcut(&TermAction::NewTab)
+                .expect("New Tab has a macOS default")
+                .to_string(),
+            "⌘T"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::Palette)
+                .expect("Palette has a macOS default")
+                .to_string(),
+            "⇧⌘P"
+        );
+        assert_eq!(
+            action_chord(&Key::Named(NamedKey::F11), Modifiers::empty()),
+            Some(TermAction::Fullscreen)
+        );
+    }
+
+    #[test]
+    fn macos_chords_keep_exact_modifiers_and_character_case() {
+        assert_eq!(
+            macos_action_chord(&Key::Character("T".into()), Modifiers::META),
+            None
+        );
+        assert_eq!(
+            action_chord(&Key::Character("T".into()), Modifiers::META),
+            Some(TermAction::Ignore)
+        );
+        assert_eq!(
+            macos_action_chord(
+                &Key::Character("t".into()),
+                Modifiers::META | Modifiers::SHIFT
+            ),
+            Some(TermAction::Undo)
+        );
+        assert_eq!(
+            macos_action_chord(
+                &Key::Character("t".into()),
+                Modifiers::META | Modifiers::CAPS_LOCK
+            ),
+            None
+        );
+        assert_eq!(
+            action_chord(&Key::Named(NamedKey::ArrowLeft), Modifiers::META),
+            Some(TermAction::TypeText("\x01".into()))
+        );
+        assert_eq!(
+            action_chord(&Key::Named(NamedKey::ArrowLeft), Modifiers::ALT),
+            Some(TermAction::EscSeq("b".into()))
+        );
+    }
+
+    #[test]
+    fn dispatch_table_chord_bindings_round_trip() {
+        for binding in platform_action_bindings()
+            .iter()
+            .chain(shared_action_bindings())
+        {
+            let key = binding.shortcut.key.to_key();
+            let mut mods = Modifiers::empty();
+            if binding.shortcut.modifiers.control() {
+                mods |= Modifiers::CONTROL;
+            }
+            if binding.shortcut.modifiers.option() {
+                mods |= Modifiers::ALT;
+            }
+            if binding.shortcut.modifiers.shift() {
+                mods |= Modifiers::SHIFT;
+            }
+            if binding.shortcut.modifiers.command() {
+                mods |= Modifiers::META;
+            }
+            let action =
+                action_chord(&key, mods).or_else(|| tab_chord(&key, Code::Unidentified, mods));
+            assert_eq!(action, Some(binding.action.clone()));
+        }
     }
 
     #[test]
@@ -1107,6 +1364,132 @@ mod tests {
                 Modifiers::CONTROL | Modifiers::SHIFT
             ),
             None
+        );
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_table_chord_bindings_round_trip() {
+        for binding in platform_action_bindings()
+            .iter()
+            .chain(shared_action_bindings())
+        {
+            let key = binding.shortcut.key.to_key();
+            let mut mods = Modifiers::empty();
+            if binding.shortcut.modifiers.control() {
+                mods |= Modifiers::CONTROL;
+            }
+            if binding.shortcut.modifiers.option() {
+                mods |= Modifiers::ALT;
+            }
+            if binding.shortcut.modifiers.shift() {
+                mods |= Modifiers::SHIFT;
+            }
+            let action =
+                action_chord(&key, mods).or_else(|| tab_chord(&key, Code::Unidentified, mods));
+            assert_eq!(action, Some(binding.action.clone()));
+        }
+    }
+
+    #[test]
+    fn canonical_chord_aliases_and_physical_digits_remain_stable() {
+        assert_eq!(
+            action_chord(
+                &Key::Character("t".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            Some(TermAction::NewTab)
+        );
+        assert_eq!(
+            action_chord(
+                &Key::Character("t".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::META
+            ),
+            Some(TermAction::NewTab)
+        );
+        assert_eq!(
+            action_chord(
+                &Key::Character("p".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            Some(TermAction::Palette)
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::NewTab)
+                .expect("New Tab has a Linux default")
+                .to_string(),
+            "Ctrl+Shift+T"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::Palette)
+                .expect("Palette has a Linux default")
+                .to_string(),
+            "Ctrl+Shift+P"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::Paste)
+                .expect("Paste has a Linux default")
+                .to_string(),
+            "Ctrl+Shift+V"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::PaneZoom)
+                .expect("Pane zoom has a Linux default")
+                .to_string(),
+            "Ctrl+Shift+Z"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::NextTab)
+                .expect("Next Tab has a Linux default")
+                .to_string(),
+            "Ctrl+Tab"
+        );
+        assert_eq!(
+            default_action_shortcut(&TermAction::PrevTab)
+                .expect("Previous Tab has a Linux default")
+                .to_string(),
+            "Ctrl+Shift+Tab"
+        );
+        assert_eq!(
+            action_chord(&Key::Named(NamedKey::F11), Modifiers::empty()),
+            Some(TermAction::Fullscreen)
+        );
+        assert_eq!(
+            action_chord(
+                &Key::Character("=".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            Some(TermAction::IncreaseFontSize(1))
+        );
+        assert_eq!(
+            action_chord(
+                &Key::Character("K".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            Some(TermAction::ClearScrollback)
+        );
+        assert_eq!(
+            action_chord(
+                &Key::Character("K".into()),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            ),
+            None
+        );
+        assert_eq!(
+            tab_chord(
+                &Key::Character("1".into()),
+                Code::Digit1,
+                Modifiers::CONTROL
+            ),
+            Some(TermAction::SelectTab(1))
+        );
+        assert_eq!(
+            tab_chord(&Key::Character("9".into()), Code::Digit9, Modifiers::ALT),
+            Some(TermAction::SelectTab(9))
         );
     }
 }
