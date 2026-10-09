@@ -93,8 +93,27 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 | Misc | `-e cmd`, `--config` args | ✅ | verified: `-e bash -c 'echo E_MARKER'` |
 | Misc | Quit action, process-group cleanup | ✅ | window close → Shutdown |
 | Links | Ctrl+hover affordance | ✅ | CONTROL-held pointer over a link draws an Accent underline across its full span (wrap-safe segments, same mapping as URL hints) and flips the cursor to pointing hand via `.cursor(Binding<CursorStyle>)` on the `SceneView`; releasing Ctrl or moving off clears both — verified live at 7bbd5f0 (underline appears/disappears; cursor change is real but invisible to `import` captures) |
-| Drag & drop | Files dropped onto a pane paste their paths | 🟡 | `.drop_destination` is wired on each pane's `SceneView` and `drop_text` does the Ghostty/kitty part (URI-decode, shell-quote, bracketed-paste wrap — unit-tested in `drop_payload`), but hydrolysis has no `InputEvent` arm for winit `DroppedFile`/`HoveredFile` — OS drops never reach the handler (in-app `.draggable` drags only). water-rs/waterui#1254. **r42 fix**: the pane's `drop_destination` now rejects `hydroterm-tab:` payloads — before, dragging a tab chip onto the grid inserted `'hydroterm-tab:1'` at the prompt (verified live); after, internal drags are swallowed (same capture shows no text). |
+| Drag & drop | Files dropped onto a pane paste their paths | ✅ | Verified on X11/Hydrolysis with real external XDND drops. Typed `Files`/`Url` destinations preserve item boundaries through `DropFiles`; each path is URI-decoded and shell-quoted independently, with bracketed-paste wrapping when armed. Internal `TabDrag` stays non-text. Regression: `drop_files_preserve_filename_boundaries`. [Per-case evidence](#x11-file-drop-verification-28); macOS was not exercised in this run. |
 | Config | `bold-is-bright` | ➖ legacy name | Pre-1.2 spelling of `bold-color` — rejected per the "reference's names only" rule (parse error, like `cursor-shape`/`word-select-chars`). The behavior lives in `bold-color = bright` (default); see that row. r49 audit: the earlier claim that the key parsed was wrong — it has always been rejected |
+
+## X11 file-drop verification (#28)
+
+Run with `water run --platform linux --backend hydrolysis` at the WaterUI pin
+`c5c9dfa87803d99eeff82a42eaeca7bec17f1840`, under Xvfb and Openbox. An external
+Python/Xlib XDND source supplied `text/uri-list`; `cat` reading the raw PTY
+captured the bytes below (no trailing newline). Evidence files are outside the
+repository in `/home/ubuntu/hydroterm-28-evidence/`.
+
+- (a) `a space.txt`: PASS — 48 bytes, `'/home/ubuntu/hydroterm-28-evidence/a space.txt'`; capture `a-final.bin`, screenshot `a-final.png`.
+- (b) `a space.txt` + `second.txt` in one drop: PASS — 94 bytes, `'/home/ubuntu/hydroterm-28-evidence/a space.txt' /home/ubuntu/hydroterm-28-evidence/second.txt`; capture `b-fixed.bin`, screenshot `b-fixed-focus.png`.
+- (c) `a space.txt` after `printf '\e[?2004h'`: PASS — 60 bytes, `\x1b[200~'/home/ubuntu/hydroterm-28-evidence/a space.txt'\x1b[201~` (`\x1b` denotes byte `0x1b`); capture `c-fixed.bin`, screenshot `c-fixed.png`.
+- (d) Active tab chip dragged onto its pane with two tabs open: PASS — zero bytes (`b''`), and the tab detached into a second window; capture `d-final.bin`, screenshot `d-final.png`.
+
+The initial (a) run reached the PTY but lost quotes: 46 bytes,
+`/home/ubuntu/hydroterm-28-evidence/a space.txt`. Hydroterm flattened the typed
+file list with spaces before whitespace-splitting it. Preserving each item until
+after decoding/quoting fixes this app-owned handler; no framework change was
+needed.
 
 ## Metrics (to be filled by benchmark task)
 

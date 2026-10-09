@@ -3283,21 +3283,15 @@ impl View for PaneLeaf {
                     // (Ghostty's drag-out). One destination per payload kind — the
                     // hit test delivers to the topmost acceptor.
                     .drop_destination(move |files: Files, session: PaneSession| {
-                        let text = files
-                            .urls()
-                            .iter()
-                            .map(|url| url.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if !text.is_empty() {
-                            session.push_action(TermAction::DropText(text));
-                        }
+                        session.push_action(TermAction::DropFiles(
+                            files.urls().iter().map(|url| url.to_string()).collect(),
+                        ));
                     })
                     .drop_destination(move |text: Str, session: PaneSession| {
                         session.push_action(TermAction::DropText(text.to_string()));
                     })
                     .drop_destination(move |url: Url, session: PaneSession| {
-                        session.push_action(TermAction::DropText(url.to_string()));
+                        session.push_action(TermAction::DropFiles(vec![url.to_string()]));
                     })
                     .drop_destination({
                         let app = self.state.clone();
