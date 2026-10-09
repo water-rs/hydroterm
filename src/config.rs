@@ -515,6 +515,8 @@ pub struct AppConfig {
     /// transparent when this starts below 1.0 — raising it live works;
     /// dropping it on an opaque-start window just darkens.
     pub background_opacity: f32,
+    /// Request compositor blur behind translucent windows. Radius is unsupported.
+    pub background_blur: bool,
     /// `background-opacity-cells` — when true the `background-opacity`
     /// alpha also applies to cells with an explicit (non-default)
     /// background color; false keeps cell backgrounds opaque over a
@@ -1066,6 +1068,7 @@ impl Default for AppConfig {
             bell_attention: true,
             bell_border: false,
             background_opacity: 1.0,
+            background_blur: false,
             background_opacity_cells: false,
             paste_protection: true,
             mouse_hide_typing: true,
@@ -1380,6 +1383,7 @@ confirm-close-surface = true
 # Alpha of the terminal background fill (0..1); set below 1.0 at launch
 # for a translucent window over the desktop.
 # background-opacity = 0.85
+# background-blur = true
 ";
 
 impl AppConfig {
@@ -1766,6 +1770,14 @@ impl AppConfig {
                 "background-opacity" => match value.parse::<f32>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => cfg.background_opacity = v,
                     _ => errors.push(format!("line {}: bad background-opacity {value:?}", n + 1)),
+                },
+                "background-blur" => match value {
+                    "true" => cfg.background_blur = true,
+                    "false" => cfg.background_blur = false,
+                    _ => errors.push(format!(
+                        "line {}: bad background-blur {value:?}: expected true or false; WaterUI Material has no blur-radius API (integer radii unsupported)",
+                        n + 1
+                    )),
                 },
                 "clipboard-paste-protection" => match value {
                     "true" | "1" => cfg.paste_protection = true,
@@ -4823,6 +4835,22 @@ mod tests {
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::ToggleBackgroundOpacity));
         let (_, errs) = AppConfig::parse("keybind = f6=toggle_background_opacity:0.5");
         assert_eq!(errs.len(), 1, "unexpected arguments rejected: {errs:?}");
+    }
+
+    #[test]
+    fn background_blur_parse() {
+        assert!(!AppConfig::default().background_blur);
+        for (value, expected) in [("true", true), ("false", false)] {
+            let (cfg, errs) = AppConfig::parse(&format!("background-blur = {value}"));
+            assert!(errs.is_empty(), "{errs:?}");
+            assert_eq!(cfg.background_blur, expected);
+        }
+        for value in ["0", "1", "20", "-1", "1.5", "invalid"] {
+            let (cfg, errs) = AppConfig::parse(&format!("background-blur = {value}"));
+            assert!(!cfg.background_blur);
+            assert_eq!(errs.len(), 1, "{value}: {errs:?}");
+            assert!(errs[0].contains("WaterUI Material has no blur-radius API"));
+        }
     }
 
     #[test]
