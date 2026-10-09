@@ -2,8 +2,6 @@
 //! application-cursor modes, modifier parameters, function keys, Alt
 //! meta-prefixed text, and the kitty keyboard-protocol disambiguation flag.
 
-use std::sync::LazyLock;
-
 use alacritty_terminal::term::TermMode;
 use keyboard_types::{Code, Key, Modifiers, NamedKey};
 use waterui::component::{Shortcut, ShortcutKey};
@@ -327,39 +325,43 @@ fn kitty_csi_u(codepoint: u32, mods: Modifiers, release: bool) -> Vec<u8> {
 
 #[derive(Clone)]
 struct ActionBinding {
-    shortcut: Shortcut,
+    key: ShortcutKey,
+    modifiers: Modifiers,
     action: TermAction,
 }
 
-fn shortcut(key: impl Into<ShortcutKey>, mods: Modifiers) -> Shortcut {
-    let mut shortcut = Shortcut::new(key);
-    if mods.contains(Modifiers::CONTROL) {
-        shortcut = shortcut.control();
+impl ActionBinding {
+    fn shortcut(&self) -> Shortcut {
+        let mut shortcut = Shortcut::new(self.key.clone());
+        if self.modifiers.contains(Modifiers::CONTROL) {
+            shortcut = shortcut.control();
+        }
+        if self.modifiers.contains(Modifiers::ALT) {
+            shortcut = shortcut.option();
+        }
+        if self.modifiers.contains(Modifiers::SHIFT) {
+            shortcut = shortcut.shift();
+        }
+        if self.modifiers.contains(Modifiers::META) {
+            shortcut = shortcut.command();
+        }
+        shortcut
     }
-    if mods.contains(Modifiers::ALT) {
-        shortcut = shortcut.option();
-    }
-    if mods.contains(Modifiers::SHIFT) {
-        shortcut = shortcut.shift();
-    }
-    if mods.contains(Modifiers::META) {
-        shortcut = shortcut.command();
-    }
-    shortcut
 }
 
-fn binding(key: impl Into<ShortcutKey>, mods: Modifiers, action: TermAction) -> ActionBinding {
+const fn binding(key: ShortcutKey, modifiers: Modifiers, action: TermAction) -> ActionBinding {
     ActionBinding {
-        shortcut: shortcut(key, mods),
+        key,
+        modifiers,
         action,
     }
 }
 
-fn shortcut_key_matches(shortcut: &Shortcut, key: &Key, case_sensitive: bool) -> bool {
+fn shortcut_key_matches(binding: &ActionBinding, key: &Key, case_sensitive: bool) -> bool {
     if case_sensitive {
-        shortcut.key.to_key() == *key
+        binding.key.to_key() == *key
     } else {
-        match (&shortcut.key, key) {
+        match (&binding.key, key) {
             (ShortcutKey::Character(expected), Key::Character(pressed)) => {
                 pressed.to_ascii_lowercase() == expected.to_string()
             }
@@ -375,21 +377,7 @@ fn binding_matches(
     mods: Modifiers,
     case_sensitive: bool,
 ) -> bool {
-    let required = &binding.shortcut.modifiers;
-    let mut expected = Modifiers::empty();
-    if required.control() {
-        expected |= Modifiers::CONTROL;
-    }
-    if required.option() {
-        expected |= Modifiers::ALT;
-    }
-    if required.shift() {
-        expected |= Modifiers::SHIFT;
-    }
-    if required.command() {
-        expected |= Modifiers::META;
-    }
-    expected == mods && shortcut_key_matches(&binding.shortcut, key, case_sensitive)
+    binding.modifiers == mods && shortcut_key_matches(binding, key, case_sensitive)
 }
 
 fn lookup_action(
@@ -405,104 +393,266 @@ fn lookup_action(
 }
 
 fn shared_action_bindings() -> &'static [ActionBinding] {
-    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
-        vec![binding(
-            NamedKey::F11,
-            Modifiers::empty(),
-            TermAction::Fullscreen,
-        )]
-    });
-    &BINDINGS
+    const BINDINGS: &[ActionBinding] = &[binding(
+        ShortcutKey::Named(NamedKey::F11),
+        Modifiers::empty(),
+        TermAction::Fullscreen,
+    )];
+    BINDINGS
 }
 
 #[cfg(not(target_os = "macos"))]
-fn platform_action_bindings() -> &'static [ActionBinding] {
-    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
+fn platform_action_bindings() -> impl AsRef<[ActionBinding]> {
+    const BINDINGS: &[ActionBinding] = {
         let c = Modifiers::CONTROL;
         let h = Modifiers::SHIFT;
         let a = Modifiers::ALT;
-        vec![
-            binding('c', c | h, TermAction::Copy),
-            binding('v', c | h, TermAction::Paste),
-            binding('t', c | h, TermAction::NewTab),
-            binding('w', c | h, TermAction::CloseTab),
-            binding('n', c | h, TermAction::NewWindow),
-            binding('a', c | h, TermAction::SelectAll),
-            binding('e', c | h, TermAction::SplitRight),
-            binding('d', c | h, TermAction::SplitDown),
-            binding('z', c | h, TermAction::PaneZoom),
-            binding(']', c | h, TermAction::FocusNextPane),
-            binding('}', c | h, TermAction::FocusNextPane),
-            binding('[', c | h, TermAction::FocusPrevPane),
-            binding('{', c | h, TermAction::FocusPrevPane),
-            binding('=', c | h, TermAction::IncreaseFontSize(1)),
-            binding('+', c | h, TermAction::IncreaseFontSize(1)),
-            binding('-', c | h, TermAction::DecreaseFontSize(1)),
-            binding('_', c | h, TermAction::DecreaseFontSize(1)),
-            binding('0', c | h, TermAction::FontReset),
-            binding(')', c | h, TermAction::FontReset),
-            binding('k', c | h, TermAction::ClearScrollback),
-            binding('o', c | h, TermAction::CopyLastOutput),
-            binding('u', c | h, TermAction::UrlHints),
-            binding('g', c | h, TermAction::OpenScrollbackEditor),
-            binding('f', c | h, TermAction::Search),
-            binding('p', c | h, TermAction::Palette),
-            binding(',', c | h, TermAction::ReloadConfig),
-            binding('<', c | h, TermAction::ReloadConfig),
-            binding('l', c | h, TermAction::ClearScreen),
-            binding(NamedKey::ArrowUp, c | h, TermAction::JumpToPrompt(-1)),
-            binding(NamedKey::ArrowDown, c | h, TermAction::JumpToPrompt(1)),
-            binding(NamedKey::PageUp, c | h, TermAction::MoveTab(-1)),
-            binding(NamedKey::PageDown, c | h, TermAction::MoveTab(1)),
-            binding(NamedKey::Home, c | h, TermAction::ScrollToTop),
-            binding(NamedKey::End, c | h, TermAction::ScrollToBottom),
-            binding(NamedKey::Enter, c | h, TermAction::PaneZoom),
-            binding('1', c | a, TermAction::GotoSplit(0)),
-            binding('2', c | a, TermAction::GotoSplit(1)),
-            binding('3', c | a, TermAction::GotoSplit(2)),
-            binding('4', c | a, TermAction::GotoSplit(3)),
-            binding('5', c | a, TermAction::GotoSplit(4)),
-            binding('6', c | a, TermAction::GotoSplit(5)),
-            binding('7', c | a, TermAction::GotoSplit(6)),
-            binding('8', c | a, TermAction::GotoSplit(7)),
-            binding('9', c | a, TermAction::GotoSplit(8)),
+        &[
+            binding(ShortcutKey::Character('c'), c.union(h), TermAction::Copy),
+            binding(ShortcutKey::Character('v'), c.union(h), TermAction::Paste),
+            binding(ShortcutKey::Character('t'), c.union(h), TermAction::NewTab),
             binding(
-                NamedKey::ArrowLeft,
-                c | h | a,
+                ShortcutKey::Character('w'),
+                c.union(h),
+                TermAction::CloseTab,
+            ),
+            binding(
+                ShortcutKey::Character('n'),
+                c.union(h),
+                TermAction::NewWindow,
+            ),
+            binding(
+                ShortcutKey::Character('a'),
+                c.union(h),
+                TermAction::SelectAll,
+            ),
+            binding(
+                ShortcutKey::Character('e'),
+                c.union(h),
+                TermAction::SplitRight,
+            ),
+            binding(
+                ShortcutKey::Character('d'),
+                c.union(h),
+                TermAction::SplitDown,
+            ),
+            binding(
+                ShortcutKey::Character('z'),
+                c.union(h),
+                TermAction::PaneZoom,
+            ),
+            binding(
+                ShortcutKey::Character(']'),
+                c.union(h),
+                TermAction::FocusNextPane,
+            ),
+            binding(
+                ShortcutKey::Character('}'),
+                c.union(h),
+                TermAction::FocusNextPane,
+            ),
+            binding(
+                ShortcutKey::Character('['),
+                c.union(h),
+                TermAction::FocusPrevPane,
+            ),
+            binding(
+                ShortcutKey::Character('{'),
+                c.union(h),
+                TermAction::FocusPrevPane,
+            ),
+            binding(
+                ShortcutKey::Character('='),
+                c.union(h),
+                TermAction::IncreaseFontSize(1),
+            ),
+            binding(
+                ShortcutKey::Character('+'),
+                c.union(h),
+                TermAction::IncreaseFontSize(1),
+            ),
+            binding(
+                ShortcutKey::Character('-'),
+                c.union(h),
+                TermAction::DecreaseFontSize(1),
+            ),
+            binding(
+                ShortcutKey::Character('_'),
+                c.union(h),
+                TermAction::DecreaseFontSize(1),
+            ),
+            binding(
+                ShortcutKey::Character('0'),
+                c.union(h),
+                TermAction::FontReset,
+            ),
+            binding(
+                ShortcutKey::Character(')'),
+                c.union(h),
+                TermAction::FontReset,
+            ),
+            binding(
+                ShortcutKey::Character('k'),
+                c.union(h),
+                TermAction::ClearScrollback,
+            ),
+            binding(
+                ShortcutKey::Character('o'),
+                c.union(h),
+                TermAction::CopyLastOutput,
+            ),
+            binding(
+                ShortcutKey::Character('u'),
+                c.union(h),
+                TermAction::UrlHints,
+            ),
+            binding(
+                ShortcutKey::Character('g'),
+                c.union(h),
+                TermAction::OpenScrollbackEditor,
+            ),
+            binding(ShortcutKey::Character('f'), c.union(h), TermAction::Search),
+            binding(ShortcutKey::Character('p'), c.union(h), TermAction::Palette),
+            binding(
+                ShortcutKey::Character(','),
+                c.union(h),
+                TermAction::ReloadConfig,
+            ),
+            binding(
+                ShortcutKey::Character('<'),
+                c.union(h),
+                TermAction::ReloadConfig,
+            ),
+            binding(
+                ShortcutKey::Character('l'),
+                c.union(h),
+                TermAction::ClearScreen,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowUp),
+                c.union(h),
+                TermAction::JumpToPrompt(-1),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowDown),
+                c.union(h),
+                TermAction::JumpToPrompt(1),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::PageUp),
+                c.union(h),
+                TermAction::MoveTab(-1),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::PageDown),
+                c.union(h),
+                TermAction::MoveTab(1),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::Home),
+                c.union(h),
+                TermAction::ScrollToTop,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::End),
+                c.union(h),
+                TermAction::ScrollToBottom,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::Enter),
+                c.union(h),
+                TermAction::PaneZoom,
+            ),
+            binding(
+                ShortcutKey::Character('1'),
+                c.union(a),
+                TermAction::GotoSplit(0),
+            ),
+            binding(
+                ShortcutKey::Character('2'),
+                c.union(a),
+                TermAction::GotoSplit(1),
+            ),
+            binding(
+                ShortcutKey::Character('3'),
+                c.union(a),
+                TermAction::GotoSplit(2),
+            ),
+            binding(
+                ShortcutKey::Character('4'),
+                c.union(a),
+                TermAction::GotoSplit(3),
+            ),
+            binding(
+                ShortcutKey::Character('5'),
+                c.union(a),
+                TermAction::GotoSplit(4),
+            ),
+            binding(
+                ShortcutKey::Character('6'),
+                c.union(a),
+                TermAction::GotoSplit(5),
+            ),
+            binding(
+                ShortcutKey::Character('7'),
+                c.union(a),
+                TermAction::GotoSplit(6),
+            ),
+            binding(
+                ShortcutKey::Character('8'),
+                c.union(a),
+                TermAction::GotoSplit(7),
+            ),
+            binding(
+                ShortcutKey::Character('9'),
+                c.union(a),
+                TermAction::GotoSplit(8),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowLeft),
+                c.union(h).union(a),
                 TermAction::FocusPaneDir {
                     horizontal: true,
                     forward: false,
                 },
             ),
             binding(
-                NamedKey::ArrowRight,
-                c | h | a,
+                ShortcutKey::Named(NamedKey::ArrowRight),
+                c.union(h).union(a),
                 TermAction::FocusPaneDir {
                     horizontal: true,
                     forward: true,
                 },
             ),
             binding(
-                NamedKey::ArrowUp,
-                c | h | a,
+                ShortcutKey::Named(NamedKey::ArrowUp),
+                c.union(h).union(a),
                 TermAction::FocusPaneDir {
                     horizontal: false,
                     forward: false,
                 },
             ),
             binding(
-                NamedKey::ArrowDown,
-                c | h | a,
+                ShortcutKey::Named(NamedKey::ArrowDown),
+                c.union(h).union(a),
                 TermAction::FocusPaneDir {
                     horizontal: false,
                     forward: true,
                 },
             ),
-            binding(NamedKey::PageUp, c | h | a, TermAction::FocusPrevPane),
-            binding(NamedKey::PageDown, c | h | a, TermAction::FocusNextPane),
             binding(
-                NamedKey::ArrowLeft,
-                a | h,
+                ShortcutKey::Named(NamedKey::PageUp),
+                c.union(h).union(a),
+                TermAction::FocusPrevPane,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::PageDown),
+                c.union(h).union(a),
+                TermAction::FocusNextPane,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowLeft),
+                a.union(h),
                 TermAction::ResizePane {
                     horizontal: true,
                     forward: false,
@@ -510,8 +660,8 @@ fn platform_action_bindings() -> &'static [ActionBinding] {
                 },
             ),
             binding(
-                NamedKey::ArrowRight,
-                a | h,
+                ShortcutKey::Named(NamedKey::ArrowRight),
+                a.union(h),
                 TermAction::ResizePane {
                     horizontal: true,
                     forward: true,
@@ -519,8 +669,8 @@ fn platform_action_bindings() -> &'static [ActionBinding] {
                 },
             ),
             binding(
-                NamedKey::ArrowUp,
-                a | h,
+                ShortcutKey::Named(NamedKey::ArrowUp),
+                a.union(h),
                 TermAction::ResizePane {
                     horizontal: false,
                     forward: false,
@@ -528,220 +678,380 @@ fn platform_action_bindings() -> &'static [ActionBinding] {
                 },
             ),
             binding(
-                NamedKey::ArrowDown,
-                a | h,
+                ShortcutKey::Named(NamedKey::ArrowDown),
+                a.union(h),
                 TermAction::ResizePane {
                     horizontal: false,
                     forward: true,
                     px: 48,
                 },
             ),
-            binding(NamedKey::PageUp, h, TermAction::ScrollPageUp),
-            binding(NamedKey::PageDown, h, TermAction::ScrollPageDown),
-            binding(NamedKey::ArrowUp, h, TermAction::ScrollPageLines(-1)),
-            binding(NamedKey::ArrowDown, h, TermAction::ScrollPageLines(1)),
-            binding(NamedKey::Insert, h, TermAction::Paste),
-            binding(NamedKey::Tab, c, TermAction::NextTab),
-            binding(NamedKey::Tab, c | h, TermAction::PrevTab),
-            binding(NamedKey::PageDown, c, TermAction::NextTab),
-            binding(NamedKey::PageUp, c, TermAction::PrevTab),
+            binding(
+                ShortcutKey::Named(NamedKey::PageUp),
+                h,
+                TermAction::ScrollPageUp,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::PageDown),
+                h,
+                TermAction::ScrollPageDown,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowUp),
+                h,
+                TermAction::ScrollPageLines(-1),
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::ArrowDown),
+                h,
+                TermAction::ScrollPageLines(1),
+            ),
+            binding(ShortcutKey::Named(NamedKey::Insert), h, TermAction::Paste),
+            binding(ShortcutKey::Named(NamedKey::Tab), c, TermAction::NextTab),
+            binding(
+                ShortcutKey::Named(NamedKey::Tab),
+                c.union(h),
+                TermAction::PrevTab,
+            ),
+            binding(
+                ShortcutKey::Named(NamedKey::PageDown),
+                c,
+                TermAction::NextTab,
+            ),
+            binding(ShortcutKey::Named(NamedKey::PageUp), c, TermAction::PrevTab),
         ]
-    });
-    &BINDINGS
+    };
+    BINDINGS
 }
 
 #[cfg(target_os = "macos")]
-fn platform_action_bindings() -> &'static [ActionBinding] {
-    static BINDINGS: LazyLock<Vec<ActionBinding>> = LazyLock::new(|| {
-        let s = Modifiers::META;
-        let c = Modifiers::CONTROL;
-        let a = Modifiers::ALT;
-        let h = Modifiers::SHIFT;
-        vec![
-            binding('t', s, TermAction::NewTab),
-            binding('n', s, TermAction::NewWindow),
-            binding(',', s | h, TermAction::ReloadConfig),
-            binding(',', s, TermAction::OpenConfig),
-            binding('c', s, TermAction::Copy),
-            binding('v', s, TermAction::Paste),
-            binding('=', s, TermAction::IncreaseFontSize(1)),
-            binding('+', s, TermAction::IncreaseFontSize(1)),
-            binding('-', s, TermAction::DecreaseFontSize(1)),
-            binding('0', s, TermAction::FontReset),
-            binding('q', s, TermAction::Quit),
-            binding('k', s, TermAction::ClearScreen),
-            binding('a', s, TermAction::SelectAll),
-            binding('j', s | c | h, TermAction::WriteScreenFile(FileSink::Copy)),
-            binding('j', s | h, TermAction::WriteScreenFile(FileSink::Paste)),
-            binding('j', s | h | a, TermAction::WriteScreenFile(FileSink::Open)),
-            binding('j', s, TermAction::ScrollToSelection),
-            binding('t', s | h, TermAction::Undo),
-            binding('z', s, TermAction::Undo),
-            binding('z', s | h, TermAction::Redo),
-            binding('w', s | h | a, TermAction::CloseAllWindows),
-            binding('w', s | h, TermAction::CloseWindow),
-            binding('w', s | a, TermAction::CloseTab),
-            binding('w', s, TermAction::CloseSurface),
-            binding('{', s | h, TermAction::PrevTab),
-            binding('}', s | h, TermAction::NextTab),
-            binding('d', s, TermAction::SplitRight),
-            binding('d', s | h, TermAction::SplitDown),
-            binding('[', s, TermAction::FocusPrevPane),
-            binding(']', s, TermAction::FocusNextPane),
-            binding('=', s | c, TermAction::EqualizeSplits),
-            binding('f', s, TermAction::StartSearch),
-            binding('e', s, TermAction::SearchSelection),
-            binding('f', s | h, TermAction::EndSearch),
-            binding('g', s, TermAction::NavigateSearch(1)),
-            binding('g', s | h, TermAction::NavigateSearch(-1)),
-            binding('i', s | a, TermAction::Inspector),
-            binding('f', s | c, TermAction::Fullscreen),
-            binding('v', s | h, TermAction::PasteFromSelection),
-            binding('p', s | h, TermAction::Palette),
-            binding(NamedKey::Escape, Modifiers::empty(), TermAction::EndSearch),
-            binding(NamedKey::Tab, c, TermAction::NextTab),
-            binding(NamedKey::Tab, c | h, TermAction::PrevTab),
-            binding(
-                NamedKey::ArrowLeft,
-                h,
-                TermAction::AdjustSelection(AdjustSel::Left),
-            ),
-            binding(
-                NamedKey::ArrowRight,
-                h,
-                TermAction::AdjustSelection(AdjustSel::Right),
-            ),
-            binding(
-                NamedKey::ArrowUp,
-                h,
-                TermAction::AdjustSelection(AdjustSel::Up),
-            ),
-            binding(
-                NamedKey::ArrowDown,
-                h,
-                TermAction::AdjustSelection(AdjustSel::Down),
-            ),
-            binding(
-                NamedKey::PageUp,
-                h,
-                TermAction::AdjustSelection(AdjustSel::PageUp),
-            ),
-            binding(
-                NamedKey::PageDown,
-                h,
-                TermAction::AdjustSelection(AdjustSel::PageDown),
-            ),
-            binding(
-                NamedKey::Home,
-                h,
-                TermAction::AdjustSelection(AdjustSel::Home),
-            ),
-            binding(
-                NamedKey::End,
-                h,
-                TermAction::AdjustSelection(AdjustSel::End),
-            ),
-            binding(NamedKey::Home, s, TermAction::ScrollToTop),
-            binding(NamedKey::End, s, TermAction::ScrollToBottom),
-            binding(NamedKey::PageUp, s, TermAction::ScrollPageUp),
-            binding(NamedKey::PageDown, s, TermAction::ScrollPageDown),
-            binding(NamedKey::ArrowUp, s, TermAction::JumpToPrompt(-1)),
-            binding(NamedKey::ArrowDown, s, TermAction::JumpToPrompt(1)),
-            binding(NamedKey::ArrowUp, s | h, TermAction::JumpToPrompt(-1)),
-            binding(NamedKey::ArrowDown, s | h, TermAction::JumpToPrompt(1)),
-            binding(
-                NamedKey::ArrowLeft,
-                s | a,
-                TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: false,
-                },
-            ),
-            binding(
-                NamedKey::ArrowRight,
-                s | a,
-                TermAction::FocusPaneDir {
-                    horizontal: true,
-                    forward: true,
-                },
-            ),
-            binding(
-                NamedKey::ArrowUp,
-                s | a,
-                TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: false,
-                },
-            ),
-            binding(
-                NamedKey::ArrowDown,
-                s | a,
-                TermAction::FocusPaneDir {
-                    horizontal: false,
-                    forward: true,
-                },
-            ),
-            binding(
-                NamedKey::ArrowLeft,
-                s | c,
-                TermAction::ResizePane {
-                    horizontal: true,
-                    forward: false,
-                    px: 48,
-                },
-            ),
-            binding(
-                NamedKey::ArrowRight,
-                s | c,
-                TermAction::ResizePane {
-                    horizontal: true,
-                    forward: true,
-                    px: 48,
-                },
-            ),
-            binding(
-                NamedKey::ArrowUp,
-                s | c,
-                TermAction::ResizePane {
-                    horizontal: false,
-                    forward: false,
-                    px: 48,
-                },
-            ),
-            binding(
-                NamedKey::ArrowDown,
-                s | c,
-                TermAction::ResizePane {
-                    horizontal: false,
-                    forward: true,
-                    px: 48,
-                },
-            ),
-            binding(NamedKey::ArrowRight, s, TermAction::TypeText("\x05".into())),
-            binding(NamedKey::ArrowLeft, s, TermAction::TypeText("\x01".into())),
-            binding(NamedKey::Backspace, s, TermAction::TypeText("\x15".into())),
-            binding(NamedKey::ArrowLeft, a, TermAction::EscSeq("b".into())),
-            binding(NamedKey::ArrowRight, a, TermAction::EscSeq("f".into())),
-            binding('1', s, TermAction::SelectTab(1)),
-            binding('2', s, TermAction::SelectTab(2)),
-            binding('3', s, TermAction::SelectTab(3)),
-            binding('4', s, TermAction::SelectTab(4)),
-            binding('5', s, TermAction::SelectTab(5)),
-            binding('6', s, TermAction::SelectTab(6)),
-            binding('7', s, TermAction::SelectTab(7)),
-            binding('8', s, TermAction::SelectTab(8)),
-            binding('9', s, TermAction::LastTab),
-        ]
-    });
-    &BINDINGS
+fn platform_action_bindings() -> impl AsRef<[ActionBinding]> {
+    // Natural-editing actions own strings, so build this table per lookup.
+    let s = Modifiers::META;
+    let c = Modifiers::CONTROL;
+    let a = Modifiers::ALT;
+    let h = Modifiers::SHIFT;
+    [
+        binding(ShortcutKey::Character('t'), s, TermAction::NewTab),
+        binding(ShortcutKey::Character('n'), s, TermAction::NewWindow),
+        binding(
+            ShortcutKey::Character(','),
+            s.union(h),
+            TermAction::ReloadConfig,
+        ),
+        binding(ShortcutKey::Character(','), s, TermAction::OpenConfig),
+        binding(ShortcutKey::Character('c'), s, TermAction::Copy),
+        binding(ShortcutKey::Character('v'), s, TermAction::Paste),
+        binding(
+            ShortcutKey::Character('='),
+            s,
+            TermAction::IncreaseFontSize(1),
+        ),
+        binding(
+            ShortcutKey::Character('+'),
+            s,
+            TermAction::IncreaseFontSize(1),
+        ),
+        binding(
+            ShortcutKey::Character('-'),
+            s,
+            TermAction::DecreaseFontSize(1),
+        ),
+        binding(ShortcutKey::Character('0'), s, TermAction::FontReset),
+        binding(ShortcutKey::Character('q'), s, TermAction::Quit),
+        binding(ShortcutKey::Character('k'), s, TermAction::ClearScreen),
+        binding(ShortcutKey::Character('a'), s, TermAction::SelectAll),
+        binding(
+            ShortcutKey::Character('j'),
+            s.union(c).union(h),
+            TermAction::WriteScreenFile(FileSink::Copy),
+        ),
+        binding(
+            ShortcutKey::Character('j'),
+            s.union(h),
+            TermAction::WriteScreenFile(FileSink::Paste),
+        ),
+        binding(
+            ShortcutKey::Character('j'),
+            s.union(h).union(a),
+            TermAction::WriteScreenFile(FileSink::Open),
+        ),
+        binding(
+            ShortcutKey::Character('j'),
+            s,
+            TermAction::ScrollToSelection,
+        ),
+        binding(ShortcutKey::Character('t'), s.union(h), TermAction::Undo),
+        binding(ShortcutKey::Character('z'), s, TermAction::Undo),
+        binding(ShortcutKey::Character('z'), s.union(h), TermAction::Redo),
+        binding(
+            ShortcutKey::Character('w'),
+            s.union(h).union(a),
+            TermAction::CloseAllWindows,
+        ),
+        binding(
+            ShortcutKey::Character('w'),
+            s.union(h),
+            TermAction::CloseWindow,
+        ),
+        binding(
+            ShortcutKey::Character('w'),
+            s.union(a),
+            TermAction::CloseTab,
+        ),
+        binding(ShortcutKey::Character('w'), s, TermAction::CloseSurface),
+        binding(ShortcutKey::Character('{'), s.union(h), TermAction::PrevTab),
+        binding(ShortcutKey::Character('}'), s.union(h), TermAction::NextTab),
+        binding(ShortcutKey::Character('d'), s, TermAction::SplitRight),
+        binding(
+            ShortcutKey::Character('d'),
+            s.union(h),
+            TermAction::SplitDown,
+        ),
+        binding(ShortcutKey::Character('['), s, TermAction::FocusPrevPane),
+        binding(ShortcutKey::Character(']'), s, TermAction::FocusNextPane),
+        binding(
+            ShortcutKey::Character('='),
+            s.union(c),
+            TermAction::EqualizeSplits,
+        ),
+        binding(ShortcutKey::Character('f'), s, TermAction::StartSearch),
+        binding(ShortcutKey::Character('e'), s, TermAction::SearchSelection),
+        binding(
+            ShortcutKey::Character('f'),
+            s.union(h),
+            TermAction::EndSearch,
+        ),
+        binding(
+            ShortcutKey::Character('g'),
+            s,
+            TermAction::NavigateSearch(1),
+        ),
+        binding(
+            ShortcutKey::Character('g'),
+            s.union(h),
+            TermAction::NavigateSearch(-1),
+        ),
+        binding(
+            ShortcutKey::Character('i'),
+            s.union(a),
+            TermAction::Inspector,
+        ),
+        binding(
+            ShortcutKey::Character('f'),
+            s.union(c),
+            TermAction::Fullscreen,
+        ),
+        binding(
+            ShortcutKey::Character('v'),
+            s.union(h),
+            TermAction::PasteFromSelection,
+        ),
+        binding(ShortcutKey::Character('p'), s.union(h), TermAction::Palette),
+        binding(
+            ShortcutKey::Named(NamedKey::Escape),
+            Modifiers::empty(),
+            TermAction::EndSearch,
+        ),
+        binding(ShortcutKey::Named(NamedKey::Tab), c, TermAction::NextTab),
+        binding(
+            ShortcutKey::Named(NamedKey::Tab),
+            c.union(h),
+            TermAction::PrevTab,
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowLeft),
+            h,
+            TermAction::AdjustSelection(AdjustSel::Left),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowRight),
+            h,
+            TermAction::AdjustSelection(AdjustSel::Right),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowUp),
+            h,
+            TermAction::AdjustSelection(AdjustSel::Up),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowDown),
+            h,
+            TermAction::AdjustSelection(AdjustSel::Down),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::PageUp),
+            h,
+            TermAction::AdjustSelection(AdjustSel::PageUp),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::PageDown),
+            h,
+            TermAction::AdjustSelection(AdjustSel::PageDown),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::Home),
+            h,
+            TermAction::AdjustSelection(AdjustSel::Home),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::End),
+            h,
+            TermAction::AdjustSelection(AdjustSel::End),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::Home),
+            s,
+            TermAction::ScrollToTop,
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::End),
+            s,
+            TermAction::ScrollToBottom,
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::PageUp),
+            s,
+            TermAction::ScrollPageUp,
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::PageDown),
+            s,
+            TermAction::ScrollPageDown,
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowUp),
+            s,
+            TermAction::JumpToPrompt(-1),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowDown),
+            s,
+            TermAction::JumpToPrompt(1),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowUp),
+            s.union(h),
+            TermAction::JumpToPrompt(-1),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowDown),
+            s.union(h),
+            TermAction::JumpToPrompt(1),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowLeft),
+            s.union(a),
+            TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: false,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowRight),
+            s.union(a),
+            TermAction::FocusPaneDir {
+                horizontal: true,
+                forward: true,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowUp),
+            s.union(a),
+            TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: false,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowDown),
+            s.union(a),
+            TermAction::FocusPaneDir {
+                horizontal: false,
+                forward: true,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowLeft),
+            s.union(c),
+            TermAction::ResizePane {
+                horizontal: true,
+                forward: false,
+                px: 48,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowRight),
+            s.union(c),
+            TermAction::ResizePane {
+                horizontal: true,
+                forward: true,
+                px: 48,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowUp),
+            s.union(c),
+            TermAction::ResizePane {
+                horizontal: false,
+                forward: false,
+                px: 48,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowDown),
+            s.union(c),
+            TermAction::ResizePane {
+                horizontal: false,
+                forward: true,
+                px: 48,
+            },
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowRight),
+            s,
+            TermAction::TypeText("\x05".into()),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowLeft),
+            s,
+            TermAction::TypeText("\x01".into()),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::Backspace),
+            s,
+            TermAction::TypeText("\x15".into()),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowLeft),
+            a,
+            TermAction::EscSeq("b".into()),
+        ),
+        binding(
+            ShortcutKey::Named(NamedKey::ArrowRight),
+            a,
+            TermAction::EscSeq("f".into()),
+        ),
+        binding(ShortcutKey::Character('1'), s, TermAction::SelectTab(1)),
+        binding(ShortcutKey::Character('2'), s, TermAction::SelectTab(2)),
+        binding(ShortcutKey::Character('3'), s, TermAction::SelectTab(3)),
+        binding(ShortcutKey::Character('4'), s, TermAction::SelectTab(4)),
+        binding(ShortcutKey::Character('5'), s, TermAction::SelectTab(5)),
+        binding(ShortcutKey::Character('6'), s, TermAction::SelectTab(6)),
+        binding(ShortcutKey::Character('7'), s, TermAction::SelectTab(7)),
+        binding(ShortcutKey::Character('8'), s, TermAction::SelectTab(8)),
+        binding(ShortcutKey::Character('9'), s, TermAction::LastTab),
+    ]
 }
 
 pub fn default_action_shortcut(action: &TermAction) -> Option<Shortcut> {
-    platform_action_bindings()
+    let bindings = platform_action_bindings();
+    bindings
+        .as_ref()
         .iter()
         .chain(shared_action_bindings())
         .find(|binding| binding.action == *action)
-        .map(|binding| binding.shortcut.clone())
+        .map(ActionBinding::shortcut)
 }
 
 /// The terminal-action chord test: Ctrl+Shift (Linux/Windows convention).
@@ -778,7 +1088,12 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::ALT)
             && !mods.contains(Modifiers::META)
         {
-            return lookup_action(platform_action_bindings(), key, Modifiers::SHIFT, false);
+            return lookup_action(
+                platform_action_bindings().as_ref(),
+                key,
+                Modifiers::SHIFT,
+                false,
+            );
         }
         // Ctrl+Shift+Alt+Arrow: directional pane focus — Ghostty's own
         // Linux goto_split default (`ctrl+shift+alt+left/right/up/down`).
@@ -790,7 +1105,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::META)
         {
             return lookup_action(
-                platform_action_bindings(),
+                platform_action_bindings().as_ref(),
                 key,
                 Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT,
                 false,
@@ -807,7 +1122,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::META)
         {
             return lookup_action(
-                platform_action_bindings(),
+                platform_action_bindings().as_ref(),
                 key,
                 Modifiers::CONTROL | Modifiers::ALT,
                 false,
@@ -824,7 +1139,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             && !mods.contains(Modifiers::META)
         {
             return lookup_action(
-                platform_action_bindings(),
+                platform_action_bindings().as_ref(),
                 key,
                 Modifiers::ALT | Modifiers::SHIFT,
                 false,
@@ -834,7 +1149,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
             return None;
         }
         lookup_action(
-            platform_action_bindings(),
+            platform_action_bindings().as_ref(),
             key,
             Modifiers::CONTROL | Modifiers::SHIFT,
             false,
@@ -852,7 +1167,7 @@ pub fn action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
 /// consumed upstream via [`TermAction::Ignore`].
 #[cfg(target_os = "macos")]
 fn macos_action_chord(key: &Key, mods: Modifiers) -> Option<TermAction> {
-    lookup_action(platform_action_bindings(), key, mods, true)
+    lookup_action(platform_action_bindings().as_ref(), key, mods, true)
 }
 
 /// Ctrl (no shift) digits select tabs 1-8; Alt+digits select tabs 1-9;
@@ -894,8 +1209,12 @@ pub fn tab_chord(key: &Key, code: Code, mods: Modifiers) -> Option<TermAction> {
         } else {
             mods
         };
-        if let Some(action) = lookup_action(platform_action_bindings(), key, cycling_mods, false)
-            && matches!(action, TermAction::NextTab | TermAction::PrevTab)
+        if let Some(action) = lookup_action(
+            platform_action_bindings().as_ref(),
+            key,
+            cycling_mods,
+            false,
+        ) && matches!(action, TermAction::NextTab | TermAction::PrevTab)
         {
             return Some(action);
         }
@@ -1332,22 +1651,21 @@ mod tests {
 
     #[test]
     fn dispatch_table_chord_bindings_round_trip() {
-        for binding in platform_action_bindings()
-            .iter()
-            .chain(shared_action_bindings())
-        {
-            let key = binding.shortcut.key.to_key();
+        let bindings = platform_action_bindings();
+        for binding in bindings.as_ref().iter().chain(shared_action_bindings()) {
+            let shortcut = binding.shortcut();
+            let key = shortcut.key.to_key();
             let mut mods = Modifiers::empty();
-            if binding.shortcut.modifiers.control() {
+            if shortcut.modifiers.control() {
                 mods |= Modifiers::CONTROL;
             }
-            if binding.shortcut.modifiers.option() {
+            if shortcut.modifiers.option() {
                 mods |= Modifiers::ALT;
             }
-            if binding.shortcut.modifiers.shift() {
+            if shortcut.modifiers.shift() {
                 mods |= Modifiers::SHIFT;
             }
-            if binding.shortcut.modifiers.command() {
+            if shortcut.modifiers.command() {
                 mods |= Modifiers::META;
             }
             let action =
@@ -1374,19 +1692,18 @@ mod tests {
 
     #[test]
     fn dispatch_table_chord_bindings_round_trip() {
-        for binding in platform_action_bindings()
-            .iter()
-            .chain(shared_action_bindings())
-        {
-            let key = binding.shortcut.key.to_key();
+        let bindings = platform_action_bindings();
+        for binding in bindings.as_ref().iter().chain(shared_action_bindings()) {
+            let shortcut = binding.shortcut();
+            let key = shortcut.key.to_key();
             let mut mods = Modifiers::empty();
-            if binding.shortcut.modifiers.control() {
+            if shortcut.modifiers.control() {
                 mods |= Modifiers::CONTROL;
             }
-            if binding.shortcut.modifiers.option() {
+            if shortcut.modifiers.option() {
                 mods |= Modifiers::ALT;
             }
-            if binding.shortcut.modifiers.shift() {
+            if shortcut.modifiers.shift() {
                 mods |= Modifiers::SHIFT;
             }
             let action =
