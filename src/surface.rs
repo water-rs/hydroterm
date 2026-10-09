@@ -1527,6 +1527,7 @@ impl TermSurface {
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
             TermAction::ToggleMaximize => self.app.toggle_maximize(),
             TermAction::ToggleWindowFloatOnTop => self.app.toggle_window_float_on_top(),
+            TermAction::ToggleWindowDecorations => self.app.toggle_window_decorations(),
             TermAction::ToggleBackgroundOpacity => self.app.toggle_background_opacity(),
             TermAction::Palette => self.app.toggle_palette(),
             TermAction::Settings => self.app.toggle_settings(),

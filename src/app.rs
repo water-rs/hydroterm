@@ -730,6 +730,7 @@ pub struct AppShared {
     /// `Normal` and `AlwaysOnTop`; the runner applies it through
     /// `set_window_level` (waterui `Window::level`, #1315 wave).
     pub window_level: Binding<WindowLevel>,
+    pub window_style: Binding<WindowStyle>,
     pub window_background: Binding<WindowBackground>,
     pub background_opacity: Binding<f32>,
     background_opaque: Cell<bool>,
@@ -1144,6 +1145,11 @@ impl AppState {
                     WindowState::Normal
                 }),
                 window_level: binding(WindowLevel::Normal),
+                window_style: binding(if for_declared && watcher.config.window_decoration {
+                    WindowStyle::Titled
+                } else {
+                    WindowStyle::Borderless
+                }),
                 window_background: binding(configured_window_background(
                     &watcher.config,
                     &palette,
@@ -1582,6 +1588,15 @@ impl AppState {
         self.window_level.set(next);
     }
 
+    pub fn toggle_window_decorations(&self) {
+        let next = match self.window_style.snapshot() {
+            WindowStyle::Borderless => WindowStyle::Titled,
+            _ => WindowStyle::Borderless,
+        };
+        self.window_style.set(next);
+        tracing::info!(?next, "window decorations toggled");
+    }
+
     fn update_window_background(&self, config: &AppConfig) {
         let opacity = if self.background_opaque.get() {
             1.0
@@ -1782,9 +1797,10 @@ impl AppState {
         let title = app.window_title.clone();
         let level = app.window_level.clone();
         let attention = app.attention.clone();
+        let style = app.window_style.clone();
         let background = app.window_background.clone();
         let mut w = Window::new(title, state.clone(), move || app_root((*app).clone()))
-            .style(WindowStyle::Borderless)
+            .style(style)
             .resizable(false)
             .background(background)
             .level(level);
@@ -1998,11 +2014,7 @@ impl AppState {
             move || app_root(state.clone())
         })
         // `window-decoration` applies to spawned windows too.
-        .style(if state.config(|c| c.window_decoration) {
-            WindowStyle::Titled
-        } else {
-            WindowStyle::Borderless
-        })
+        .style(state.window_style.clone())
         // `toggle_window_float_on_top` state lives on the shared
         // binding — the runner diffs `level` on every pump.
         .level(state.window_level.clone())
@@ -2113,11 +2125,7 @@ impl AppState {
             let state = state.clone();
             move || app_root(state.clone())
         })
-        .style(if state.config(|c| c.window_decoration) {
-            WindowStyle::Titled
-        } else {
-            WindowStyle::Borderless
-        })
+        .style(state.window_style.clone())
         .background(state.window_background.clone());
         let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
             window.app_id(Str::from(cls))
@@ -4872,6 +4880,7 @@ impl AppState {
             TermAction::Fullscreen => self.toggle_fullscreen(),
             TermAction::ToggleMaximize => self.toggle_maximize(),
             TermAction::ToggleWindowFloatOnTop => self.toggle_window_float_on_top(),
+            TermAction::ToggleWindowDecorations => self.toggle_window_decorations(),
             TermAction::ToggleBackgroundOpacity => self.toggle_background_opacity(),
             TermAction::Quit => self.quit(),
             _ => {}
@@ -5119,8 +5128,8 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, auto_split_dir, binding,
-        quit_delay_expired, shortcut_key,
+        AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, WindowStyle, auto_split_dir,
+        binding, quit_delay_expired, shortcut_key,
     };
     use waterui::Str;
     use waterui::background::Material;
@@ -5141,6 +5150,27 @@ mod tests {
     }
     use waterui::reactive::collection::Collection;
     use waterui::{Binding, Signal};
+
+    #[test]
+    fn window_decorations_toggle_is_window_local() {
+        let instance = Instance::new();
+        let app = AppState::new_inner(None, None, false, instance.clone(), None);
+        let other = AppState::new_inner(None, None, false, instance, None);
+        let configured = app.config(|c| c.window_decoration);
+        let other_style = other.window_style.snapshot();
+        for (initial, toggled) in [
+            (WindowStyle::Titled, WindowStyle::Borderless),
+            (WindowStyle::Borderless, WindowStyle::Titled),
+        ] {
+            app.window_style.set(initial);
+            app.run_palette_action(crate::keys::TermAction::ToggleWindowDecorations);
+            assert_eq!(app.window_style.snapshot(), toggled);
+            assert_eq!(other.window_style.snapshot(), other_style);
+            app.toggle_window_decorations();
+            assert_eq!(app.window_style.snapshot(), initial);
+            assert_eq!(app.config(|c| c.window_decoration), configured);
+        }
+    }
 
     #[test]
     fn background_opacity_toggle_is_window_local_and_uses_configured_alpha() {

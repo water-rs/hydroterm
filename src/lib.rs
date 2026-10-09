@@ -37,7 +37,6 @@ use waterui::prelude::*;
 use waterui::theme::Theme;
 use waterui::window::Window;
 use waterui::window::WindowState::{Fullscreen, Maximized};
-use waterui::window::WindowStyle::{Borderless, Titled};
 
 /// `hydroterm [--config PATH] [-e|-- COMMAND...] [+ACTION]`
 fn cli() -> (Option<std::path::PathBuf>, Option<Vec<String>>) {
@@ -123,13 +122,7 @@ pub fn app(env: Environment) -> App {
         let state = state.clone();
         move || app::app_root(state.clone())
     })
-    // `window-decoration = false` maps the window borderless (Ghostty
-    // `window-decoration`); the default keeps the titled frame.
-    .style(if state.config(|c| c.window_decoration) {
-        Titled
-    } else {
-        Borderless
-    })
+    .style(state.window_style.clone())
     // `toggle_window_float_on_top` flips the shared binding; the
     // runner diffs `level` each pump (`Window::level`).
     .level(state.window_level.clone())
