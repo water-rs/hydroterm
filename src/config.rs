@@ -3336,6 +3336,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "toggle_maximize",
     "toggle_window_float_on_top",
     "toggle_window_decorations",
+    "toggle_background_opacity",
     "toggle_command_palette",
     "settings",
     "new_split:<right|down|left|up|auto>",
@@ -4225,6 +4226,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "toggle_maximize" => TermAction::ToggleMaximize,
         "toggle_window_float_on_top" => TermAction::ToggleWindowFloatOnTop,
         "toggle_window_decorations" => TermAction::ToggleWindowDecorations,
+        "toggle_background_opacity" => TermAction::ToggleBackgroundOpacity,
         "toggle_command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
         // Ghostty `write_*_file[:open|copy|paste]` — the suffix names
@@ -4822,6 +4824,15 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.keybinds[0].1, Some(TermAction::ToggleWindowDecorations));
         let (_, errs) = AppConfig::parse("keybind = f6=toggle_window_decorations:false");
+        assert_eq!(errs.len(), 1, "unexpected arguments rejected: {errs:?}");
+    }
+
+    #[test]
+    fn toggle_background_opacity_action_parse() {
+        let (cfg, errs) = AppConfig::parse("keybind = f6=toggle_background_opacity");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::ToggleBackgroundOpacity));
+        let (_, errs) = AppConfig::parse("keybind = f6=toggle_background_opacity:0.5");
         assert_eq!(errs.len(), 1, "unexpected arguments rejected: {errs:?}");
     }
 
