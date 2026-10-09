@@ -234,15 +234,15 @@ fn menus() -> Vec<Menu> {
             (
                 cmd(
                     "New Window",
-                    Shortcut::new("n").command(),
+                    Shortcut::new('n').command(),
                     TermAction::NewWindow,
                 ),
-                cmd("New Tab", Shortcut::new("t").command(), TermAction::NewTab),
+                cmd("New Tab", Shortcut::new('t').command(), TermAction::NewTab),
                 // ⌘W is `close_surface` in the Ghostty Darwin table —
                 // a sole surface takes its tab (and window) with it.
                 cmd(
                     "Close",
-                    Shortcut::new("w").command(),
+                    Shortcut::new('w').command(),
                     TermAction::CloseSurface,
                 ),
             ),
@@ -250,8 +250,8 @@ fn menus() -> Vec<Menu> {
         Menu::new(
             "Edit",
             (
-                cmd("Copy", Shortcut::new("c").command(), TermAction::Copy),
-                cmd("Paste", Shortcut::new("v").command(), TermAction::Paste),
+                cmd("Copy", Shortcut::new('c').command(), TermAction::Copy),
+                cmd("Paste", Shortcut::new('v').command(), TermAction::Paste),
             ),
         ),
         Menu::new(
@@ -264,7 +264,7 @@ fn menus() -> Vec<Menu> {
                     }),
                 cmd(
                     "Command Palette",
-                    Shortcut::new("p").command().shift(),
+                    Shortcut::new('p').command().shift(),
                     TermAction::Palette,
                 ),
             ),
