@@ -119,10 +119,6 @@ pub fn app(env: Environment) -> App {
         &mut env,
     );
     let title = state.window_title.clone();
-    // A background Color below full opacity flips hydrolysis into a
-    // transparent winit window; at 1.0 the window stays opaque.
-    let opacity = state.config(|c| c.background_opacity);
-    let bg = state.config(|c| c.resolve_theme().background);
     let window = Window::new(title, state.window_state.clone(), {
         let state = state.clone();
         move || app::app_root(state.clone())
@@ -137,7 +133,7 @@ pub fn app(env: Environment) -> App {
     // `toggle_window_float_on_top` flips the shared binding; the
     // runner diffs `level` each pump (`Window::level`).
     .level(state.window_level.clone())
-    .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+    .background(state.window_background.clone());
     let mut window = window;
     // `bell-features = attention` writes `Some(UserAttention)` here;
     // the runner maps it to the WM's demands-attention hint and

@@ -896,6 +896,8 @@ pub enum TermAction {
     /// Ghostty `toggle_window_float_on_top` — always-on-top
     /// stacking level.
     ToggleWindowFloatOnTop,
+    /// Toggle this window between opaque and its configured background opacity.
+    ToggleBackgroundOpacity,
     /// Reset every split in the tab to equal shares
     /// (Ghostty `equalize_splits`, tmux `select-layout -E`).
     EqualizeSplits,

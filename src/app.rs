@@ -35,8 +35,8 @@ use waterui::theme::color::{Accent, Background, Border, Foreground, MutedForegro
 use waterui::widget::condition::when;
 use waterui::window::WindowPresentation;
 use waterui::window::{
-    Activation, Monitor, MonitorSelector, UserAttention, Window, WindowLevel, WindowState,
-    WindowStyle, conditional_window,
+    Activation, Monitor, MonitorSelector, UserAttention, Window, WindowBackground, WindowLevel,
+    WindowState, WindowStyle, conditional_window,
 };
 use waterui::{Binding, Signal, binding};
 use waterui_core::id::SelfId;
@@ -717,6 +717,9 @@ pub struct AppShared {
     /// `Normal` and `AlwaysOnTop`; the runner applies it through
     /// `set_window_level` (waterui `Window::level`, #1315 wave).
     pub window_level: Binding<WindowLevel>,
+    pub window_background: Binding<WindowBackground>,
+    pub background_opacity: Binding<f32>,
+    background_opaque: Cell<bool>,
     /// Pending user-attention request — `bell-features = attention`
     /// sets `Some(Informational)`; the runner maps it to the WM's
     /// demands-attention hint and clears it on focus (closes the WM
@@ -1128,6 +1131,16 @@ impl AppState {
                     WindowState::Normal
                 }),
                 window_level: binding(WindowLevel::Normal),
+                window_background: binding(WindowBackground::Color(
+                    Color::srgb(
+                        palette.background.r,
+                        palette.background.g,
+                        palette.background.b,
+                    )
+                    .with_opacity(watcher.config.background_opacity),
+                )),
+                background_opacity: binding(watcher.config.background_opacity),
+                background_opaque: Cell::new(false),
                 attention: Binding::default(),
                 cell_size: binding(Size::new(9.0, 18.0)),
                 titlebar_bg: Binding::container(watcher.config.titlebar_background),
@@ -1277,6 +1290,7 @@ impl AppState {
         if self.theme_dirty.swap(false, Ordering::Relaxed) {
             let config = &self.cfg.borrow().config;
             *self.palette.borrow_mut() = Palette::for_config(config);
+            self.update_window_background(config);
             // Desktop flips matter only to `window-theme = system`; `auto`
             // follows the terminal background (recomputed on config reload).
             if matches!(config.window_theme, crate::config::WindowTheme::System) {
@@ -1430,6 +1444,7 @@ impl AppState {
     /// (mtime watcher) and `reload_config` (the manual action).
     fn apply_config(&self, config: &AppConfig) {
         *self.palette.borrow_mut() = Palette::for_config(config);
+        self.update_window_background(config);
         self.tab_bar_min.set(config.tab_bar_min_tabs);
         // A reload restores the `window-show-tab-bar` threshold — the
         // `toggle_tab_bar` manual override was documented to hold only
@@ -1555,6 +1570,35 @@ impl AppState {
             _ => WindowLevel::AlwaysOnTop,
         };
         self.window_level.set(next);
+    }
+
+    fn update_window_background(&self, config: &AppConfig) {
+        let opacity = if self.background_opaque.get() {
+            1.0
+        } else {
+            config.background_opacity
+        };
+        let bg = self.palette.borrow().background;
+        self.background_opacity.set(opacity);
+        self.window_background.set(WindowBackground::Color(
+            Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity),
+        ));
+    }
+
+    pub fn toggle_background_opacity(&self) {
+        let config = self.cfg.borrow();
+        if config.config.background_opacity >= 1.0 {
+            return;
+        }
+        self.background_opaque.set(!self.background_opaque.get());
+        self.update_window_background(&config.config);
+        tracing::info!(
+            opacity = self.background_opacity.snapshot(),
+            "window background opacity toggled"
+        );
+        for session in self.sessions.borrow().iter() {
+            session.terminal.proxy.request_frame();
+        }
     }
 
     /// Every registered window is `Closed` (or already gone).
@@ -1727,9 +1771,11 @@ impl AppState {
         let title = app.window_title.clone();
         let level = app.window_level.clone();
         let attention = app.attention.clone();
+        let background = app.window_background.clone();
         let mut w = Window::new(title, state.clone(), move || app_root((*app).clone()))
             .style(WindowStyle::Borderless)
             .resizable(false)
+            .background(background)
             .level(level);
         w.attention = attention;
         // `class =` — the quick-terminal window shares the app's
@@ -1936,10 +1982,6 @@ impl AppState {
             state.cfg.borrow_mut().config.working_directory = Some(cwd);
         }
         state.open_first_tab();
-        // Same launch-time transparency as the main window.
-        let opacity = state.config(|c| c.background_opacity);
-        // `background =` overrides the theme's fill (same as the grid).
-        let bg = state.palette.borrow().background;
         let window = Window::new(state.window_title.clone(), state.window_state.clone(), {
             let state = state.clone();
             move || app_root(state.clone())
@@ -1953,7 +1995,7 @@ impl AppState {
         // `toggle_window_float_on_top` state lives on the shared
         // binding — the runner diffs `level` on every pump.
         .level(state.window_level.clone())
-        .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        .background(state.window_background.clone());
         let mut window = window;
         // `bell-features = attention` writes here; the runner turns it
         // into the WM urgency hint and clears it on focus.
@@ -2056,8 +2098,6 @@ impl AppState {
         state.focus_owner.set(Some((tab_id, focused)));
         // The new window opens on the moved surface's title.
         state.bell_title(focused);
-        let opacity = state.config(|c| c.background_opacity);
-        let bg = state.palette.borrow().background;
         let window = Window::new(state.window_title.clone(), state.window_state.clone(), {
             let state = state.clone();
             move || app_root(state.clone())
@@ -2067,7 +2107,7 @@ impl AppState {
         } else {
             WindowStyle::Borderless
         })
-        .background(Color::srgb(bg.r, bg.g, bg.b).with_opacity(opacity));
+        .background(state.window_background.clone());
         let window = if let Some(cls) = state.config(|c| c.app_class.clone()) {
             window.app_id(Str::from(cls))
         } else {
@@ -4821,6 +4861,7 @@ impl AppState {
             TermAction::Fullscreen => self.toggle_fullscreen(),
             TermAction::ToggleMaximize => self.toggle_maximize(),
             TermAction::ToggleWindowFloatOnTop => self.toggle_window_float_on_top(),
+            TermAction::ToggleBackgroundOpacity => self.toggle_background_opacity(),
             TermAction::Quit => self.quit(),
             _ => {}
         }
@@ -5087,6 +5128,25 @@ mod tests {
     }
     use waterui::reactive::collection::Collection;
     use waterui::{Binding, Signal};
+
+    #[test]
+    fn background_opacity_toggle_is_window_local_and_uses_configured_alpha() {
+        let instance = Instance::new();
+        let app = AppState::new_inner(None, None, false, instance.clone(), None);
+        let other = AppState::new_inner(None, None, false, instance, None);
+        for opacity in [0.0, 0.4, 1.0] {
+            app.cfg.borrow_mut().config.background_opacity = opacity;
+            app.background_opaque.set(false);
+            app.update_window_background(&app.cfg.borrow().config);
+            let other_opacity = other.background_opacity.snapshot();
+            app.toggle_background_opacity();
+            assert_eq!(app.background_opacity.snapshot(), 1.0);
+            assert_eq!(other.background_opacity.snapshot(), other_opacity);
+            app.toggle_background_opacity();
+            assert_eq!(app.background_opacity.snapshot(), opacity);
+            assert_eq!(app.config(|c| c.background_opacity), opacity);
+        }
+    }
 
     /// `quit-after-last-window-closed-delay`: the armed flag's lifecycle —
     /// first arm wins, a new surface cancels by taking the slot and

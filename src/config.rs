@@ -3335,6 +3335,7 @@ pub const ACTION_NAMES: &[&str] = &[
     "toggle_fullscreen",
     "toggle_maximize",
     "toggle_window_float_on_top",
+    "toggle_background_opacity",
     "toggle_command_palette",
     "settings",
     "new_split:<right|down|left|up|auto>",
@@ -4223,6 +4224,7 @@ pub fn action_from_str(name: &str, raw: &str) -> Option<TermAction> {
         "toggle_fullscreen" => TermAction::Fullscreen,
         "toggle_maximize" => TermAction::ToggleMaximize,
         "toggle_window_float_on_top" => TermAction::ToggleWindowFloatOnTop,
+        "toggle_background_opacity" => TermAction::ToggleBackgroundOpacity,
         "toggle_command_palette" => TermAction::Palette,
         "settings" => TermAction::Settings,
         // Ghostty `write_*_file[:open|copy|paste]` — the suffix names
@@ -4812,6 +4814,15 @@ mod tests {
             let (_, errs) = AppConfig::parse(legacy);
             assert_eq!(errs.len(), 1, "{legacy} rejected: {errs:?}");
         }
+    }
+
+    #[test]
+    fn toggle_background_opacity_action_parse() {
+        let (cfg, errs) = AppConfig::parse("keybind = f6=toggle_background_opacity");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.keybinds[0].1, Some(TermAction::ToggleBackgroundOpacity));
+        let (_, errs) = AppConfig::parse("keybind = f6=toggle_background_opacity:0.5");
+        assert_eq!(errs.len(), 1, "unexpected arguments rejected: {errs:?}");
     }
 
     #[test]
