@@ -1247,6 +1247,7 @@ impl TermSurface {
             TermAction::Paste => self.paste_clipboard(),
             TermAction::PasteConfirm => self.paste_confirm(true),
             TermAction::DropText(text) => self.drop_text(&text),
+            TermAction::DropFiles(files) => self.paste_drop(&drop_file_payload(&files)),
             TermAction::NewTab => {
                 self.app.new_tab();
             }
@@ -3503,7 +3504,10 @@ impl TermSurface {
     /// (Ghostty/kitty drop behaviour — `file://` URIs decoded, each path
     /// shell-quoted so it lands as one argument).
     pub fn drop_text(&mut self, text: &str) {
-        let out = drop_payload(text);
+        self.paste_drop(&drop_payload(text));
+    }
+
+    fn paste_drop(&mut self, out: &str) {
         if out.is_empty() {
             return;
         }
@@ -3514,7 +3518,7 @@ impl TermSurface {
             .lock()
             .mode()
             .contains(TermMode::BRACKETED_PASTE);
-        self.paste_text(&out, bracketed);
+        self.paste_text(out, bracketed);
     }
 
     fn on_pointer_button(&mut self, pressed: bool, button: SurfacePointerButton, x: f64, y: f64) {
@@ -4887,8 +4891,16 @@ fn file_uri_to_path(text: &str) -> String {
 /// Dropped text → the line written to the PTY: each whitespace-separated
 /// item is URI-decoded and shell-quoted, joined with spaces.
 fn drop_payload(text: &str) -> String {
+    drop_items(text.split_whitespace())
+}
+
+fn drop_file_payload(files: &[String]) -> String {
+    drop_items(files.iter().map(String::as_str))
+}
+
+fn drop_items<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = String::new();
-    for item in text.split_whitespace() {
+    for item in items {
         let path = file_uri_to_path(item);
         if !out.is_empty() {
             out.push(' ');
@@ -4989,6 +5001,23 @@ mod tests {
         // (non-ASCII letters are alphanumeric → stay unquoted).
         assert_eq!(drop_payload("file:///tmp/%C3%A4"), "/tmp/ä");
         assert_eq!(drop_payload("   "), "");
+    }
+
+    #[test]
+    fn drop_files_preserve_filename_boundaries() {
+        let files = [waterui::Url::from_file_path("/tmp/a space.txt").to_string()];
+        assert_eq!(drop_file_payload(&files), "'/tmp/a space.txt'");
+
+        let files = [
+            waterui::Url::from_file_path("/tmp/a space.txt").to_string(),
+            waterui::Url::from_file_path("/tmp/it's.txt").to_string(),
+            "file:///tmp/encoded%20space.txt".to_string(),
+        ];
+        assert_eq!(
+            drop_file_payload(&files),
+            "'/tmp/a space.txt' '/tmp/it'\\''s.txt' '/tmp/encoded space.txt'"
+        );
+        assert_eq!(drop_file_payload(&[]), "");
     }
 
     #[test]

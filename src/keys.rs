@@ -828,6 +828,8 @@ pub enum TermAction {
     CloseConfirm,
     /// Drag-and-drop: paste the dropped item's path (shell-quoted).
     DropText(String),
+    /// Typed file drops keep path boundaries even when filenames contain spaces.
+    DropFiles(Vec<String>),
     /// Copy the output of the last finished (or running) command — the
     /// rows between its OSC 133 `C` and `D` marks.
     CopyLastOutput,
