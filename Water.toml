@@ -2,6 +2,18 @@
 name = "hydroterm"
 bundle_identifier = "dev.lexoliu.hydroterm"
 
+[platforms.macos]
+backend = "hydrolysis"
+
+[platforms.linux]
+backend = "hydrolysis"
+
+[platforms.windows]
+backend = "hydrolysis"
+
+[platforms.android]
+backend = "hydrolysis"
+
 [framework]
 channel = "dev"
 repository = "https://github.com/water-rs/waterui"

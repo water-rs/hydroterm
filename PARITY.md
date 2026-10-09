@@ -98,7 +98,7 @@ Status legend: ✅ implemented · 🟡 partial · ❌ missing · 🚫 not applic
 
 ## X11 file-drop verification (#28)
 
-Run with `water run --platform linux --backend hydrolysis` at the WaterUI pin
+Run with `water run --platform linux`. The verification below used the WaterUI pin
 `c5c9dfa87803d99eeff82a42eaeca7bec17f1840`, under Xvfb and Openbox. An external
 Python/Xlib XDND source supplied `text/uri-list`; `cat` reading the raw PTY
 captured the bytes below (no trailing newline). Evidence files are outside the
@@ -117,8 +117,8 @@ needed.
 
 ## macOS file-drop verification (#35)
 
-Run on ARM64 macOS with `water run --platform macos --backend hydrolysis`, using
-the WaterUI CLI installed from the pinned revision
+Run on ARM64 macOS with `water run --platform macos`. The verification below used
+the WaterUI CLI installed from revision
 `c5c9dfa87803d99eeff82a42eaeca7bec17f1840`. Real Finder drags supplied the external
 files; `cat` reading the raw PTY captured the bytes below (no trailing newline),
 with `cat -v` displaying control bytes. Evidence files are outside the repository
@@ -129,15 +129,15 @@ in `/Users/devin/hydroterm-35-evidence/`.
 - (c) `a space.txt` after `printf '\e[?2004h'`: PASS — 60 bytes, `\x1b[200~'/Users/devin/hydroterm-35-evidence/a space.txt'\x1b[201~` (`\x1b` denotes byte `0x1b`); capture `c.bin`, screenshot `c.png`.
 - (d) Active tab chip dragged onto its pane with two tabs open: PASS — zero bytes (`b''`), and the tab detached into a second window; capture `d.bin`, screenshot `d.png`.
 
-All four cases passed without app or framework changes. The Hydrolysis backend
-selector is required for this app's Hydrolysis/Material3 entry point; the default
-Apple-backend launch failed before displaying a pane and was not used for the
-drop verification.
+All four cases passed without app or framework changes. Hydrolysis is declared
+in `Water.toml` for this app's Hydrolysis/Material3 entry point. Before that
+declaration, the default Apple-backend launch failed before displaying a pane
+and was not used for the drop verification.
 
 ## macOS window background verification (#40)
 
-Verified on ARM64 macOS 26.5.2 with `water run --platform macos --backend
-hydrolysis`, using the CLI installed from WaterUI revision
+Run with `water run --platform macos`. The verification below used ARM64 macOS
+26.5.2 and the CLI installed from WaterUI revision
 `21b2b1edafb3d757290d3d81549c9d414985008a`. `MACOSX_DEPLOYMENT_TARGET=26.0`
 was exported only in the shell. A colourful Chrome window with text and fine
 lines sat behind hydroterm; `ctrl+shift+o` was bound to
