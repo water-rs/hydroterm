@@ -1527,6 +1527,7 @@ impl TermSurface {
             TermAction::Fullscreen => self.app.toggle_fullscreen(),
             TermAction::ToggleMaximize => self.app.toggle_maximize(),
             TermAction::ToggleWindowFloatOnTop => self.app.toggle_window_float_on_top(),
+            TermAction::ToggleBackgroundOpacity => self.app.toggle_background_opacity(),
             TermAction::Palette => self.app.toggle_palette(),
             TermAction::Settings => self.app.toggle_settings(),
             // `text:`/`esc:`/`csi:` payloads — literal bytes on the pty,
@@ -4189,7 +4190,7 @@ impl TermSurface {
         let blink_on = self.blink_on();
         let focused = self.focused;
         let cursor_invert_fg_bg = self.app.config(|c| c.cursor_invert_fg_bg);
-        let bg_opacity = self.app.config(|c| c.background_opacity);
+        let bg_opacity = self.app.background_opacity.snapshot();
         let bg_image = self.bg_image_draw(resources, f64::from(width), f64::from(height));
         let mut ctx = DrawContext {
             palette: &palette,
@@ -4215,9 +4216,9 @@ impl TermSurface {
             bell_flash: bell_alpha,
             bell_border: self.bell_border,
             bg_opacity,
-            cell_bg_opacity: self.app.config(|c| {
-                crate::config::cell_bg_alpha(c.background_opacity_cells, c.background_opacity)
-            }),
+            cell_bg_opacity: self
+                .app
+                .config(|c| crate::config::cell_bg_alpha(c.background_opacity_cells, bg_opacity)),
             pad_mode: self.app.config(|c| c.window_padding_color),
             hints: &hint_spans,
             hint_digits: &hint_digits,
