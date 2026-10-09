@@ -4022,12 +4022,12 @@ impl TermSurface {
 
         // Alternate scroll: in the alt screen send arrow keys instead.
         if mode.contains(TermMode::ALTERNATE_SCROLL) && mode.contains(TermMode::ALT_SCREEN) {
-            let key = if dy > 0.0 { b"\x1bOA" } else { b"\x1bOB" };
+            let key = if dy > 0.0 { b"\x1bOB" } else { b"\x1bOA" };
             let app_cursor = mode.contains(TermMode::APP_CURSOR);
             let seq: &[u8] = if !app_cursor && dy > 0.0 {
-                b"\x1b[A"
-            } else if !app_cursor {
                 b"\x1b[B"
+            } else if !app_cursor {
+                b"\x1b[A"
             } else {
                 key
             };
@@ -4039,7 +4039,7 @@ impl TermSurface {
 
         self.hints = None; // viewport moved — stale chips would mislead
         let mut term = self.session.terminal.term.lock();
-        term.scroll_display(Scroll::Delta(lines_delta as i32));
+        term.scroll_display(Scroll::Delta(-lines_delta as i32));
         drop(term);
         // The cell under a still pointer changed with the viewport.
         if self

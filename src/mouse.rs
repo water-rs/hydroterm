@@ -90,8 +90,22 @@ pub fn wheel_button(delta_y: f64) -> Option<(u8, usize)> {
         return None;
     }
     if delta_y > 0.0 {
-        Some((64, delta_y.ceil().max(1.0) as usize))
+        Some((65, delta_y.ceil().max(1.0) as usize))
     } else {
-        Some((65, (-delta_y).ceil().max(1.0) as usize))
+        Some((64, (-delta_y).ceil().max(1.0) as usize))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_button;
+
+    #[test]
+    fn wheel_button_w3c_sign() {
+        assert_eq!(wheel_button(1.0), Some((65, 1)));
+        assert_eq!(wheel_button(3.2), Some((65, 4)));
+        assert_eq!(wheel_button(-1.0), Some((64, 1)));
+        assert_eq!(wheel_button(-0.4), Some((64, 1)));
+        assert_eq!(wheel_button(0.0), None);
     }
 }
