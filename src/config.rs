@@ -3893,7 +3893,7 @@ fn parse_physical_chord(chord: &str) -> Result<(String, String, Code), String> {
             "shift" => mods[2] = true,
             "super" => mods[3] = true,
             _ => {
-                if !parts.peek().is_none() || out.1.is_some() {
+                if parts.peek().is_some() || out.1.is_some() {
                     return Err(format!("bad keybind chord {chord:?}"));
                 }
                 let name = canonical_key_name(&p)?;
