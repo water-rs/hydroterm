@@ -4386,7 +4386,6 @@ type QuickGeo = (
 /// A command-palette row: display name, chord hint, action.
 pub struct PaletteItem {
     pub name: &'static str,
-    pub chord: &'static str,
     pub action: TermAction,
 }
 
@@ -4394,197 +4393,158 @@ pub struct PaletteItem {
 pub const PALETTE_ITEMS: &[PaletteItem] = &[
     PaletteItem {
         name: "New Tab",
-        chord: "ctrl+shift+t",
         action: TermAction::NewTab,
     },
     PaletteItem {
         name: "New Window",
-        chord: "ctrl+shift+n",
         action: TermAction::NewWindow,
     },
     PaletteItem {
         name: "Reload Config",
-        chord: "ctrl+shift+,",
         action: TermAction::ReloadConfig,
     },
     PaletteItem {
         name: "Close Pane / Tab",
-        chord: "ctrl+shift+w",
         action: TermAction::CloseTab,
     },
     PaletteItem {
         name: "Split Right",
-        chord: "ctrl+shift+e",
         action: TermAction::SplitRight,
     },
     PaletteItem {
         name: "Split Down",
-        chord: "ctrl+shift+d",
         action: TermAction::SplitDown,
     },
     PaletteItem {
         name: "Toggle Pane Zoom",
-        chord: "ctrl+shift+z",
         action: TermAction::PaneZoom,
     },
     PaletteItem {
         name: "Equalize Splits",
-        chord: "",
         action: TermAction::EqualizeSplits,
     },
     PaletteItem {
         name: "Focus Next Pane",
-        chord: "ctrl+shift+]",
         action: TermAction::FocusNextPane,
     },
     PaletteItem {
         name: "Focus Previous Pane",
-        chord: "ctrl+shift+[",
         action: TermAction::FocusPrevPane,
     },
     PaletteItem {
         name: "Copy",
-        chord: "ctrl+shift+c",
         action: TermAction::Copy,
     },
     PaletteItem {
         name: "Paste",
-        chord: "ctrl+shift+v",
         action: TermAction::Paste,
     },
     PaletteItem {
         name: "Select All",
-        chord: "ctrl+shift+a",
         action: TermAction::SelectAll,
     },
     PaletteItem {
         name: "Find in Buffer",
-        chord: "ctrl+shift+f",
         action: TermAction::Search,
     },
     PaletteItem {
         name: "Settings",
-        chord: "ctrl+shift+,",
         action: TermAction::Settings,
     },
     PaletteItem {
         name: "Clear Scrollback",
-        chord: "ctrl+shift+k",
         action: TermAction::ClearScrollback,
     },
     PaletteItem {
         name: "Clear Screen",
-        chord: "ctrl+shift+l",
         action: TermAction::ClearScreen,
     },
     PaletteItem {
         name: "Reset Terminal",
-        chord: "",
         action: TermAction::Reset,
     },
     PaletteItem {
         name: "Write Screen to File",
-        chord: "",
         action: TermAction::WriteScreenFile(crate::keys::FileSink::Open),
     },
     PaletteItem {
         name: "Write Scrollback to File",
-        chord: "",
         action: TermAction::WriteScrollbackFile(crate::keys::FileSink::Open),
     },
     PaletteItem {
         name: "Write Selection to File",
-        chord: "",
         action: TermAction::WriteSelectionFile(crate::keys::FileSink::Open),
     },
     PaletteItem {
         name: "Write Last Output to File",
-        chord: "",
         action: TermAction::WriteLastOutputFile(crate::keys::FileSink::Open),
     },
     PaletteItem {
         name: "Scroll to Selection",
-        chord: "",
         action: TermAction::ScrollToSelection,
     },
     PaletteItem {
         name: "Clear Selection",
-        chord: "",
         action: TermAction::ClearSelection,
     },
     PaletteItem {
         name: "Open Config",
-        chord: "",
         action: TermAction::OpenConfig,
     },
     PaletteItem {
         name: "Increase Font Size",
-        chord: "ctrl+shift+=",
         action: TermAction::IncreaseFontSize(1),
     },
     PaletteItem {
         name: "Decrease Font Size",
-        chord: "ctrl+shift+-",
         action: TermAction::DecreaseFontSize(1),
     },
     PaletteItem {
         name: "Reset Font Size",
-        chord: "ctrl+shift+0",
         action: TermAction::FontReset,
     },
     PaletteItem {
         name: "Jump to Previous Prompt",
-        chord: "ctrl+shift+up",
         action: TermAction::JumpToPrompt(-1),
     },
     PaletteItem {
         name: "Jump to Next Prompt",
-        chord: "ctrl+shift+down",
         action: TermAction::JumpToPrompt(1),
     },
     PaletteItem {
         name: "Scroll to Top",
-        chord: "ctrl+shift+home",
         action: TermAction::ScrollToTop,
     },
     PaletteItem {
         name: "Scroll to Bottom",
-        chord: "ctrl+shift+end",
         action: TermAction::ScrollToBottom,
     },
     PaletteItem {
         name: "Scroll Page Up",
-        chord: "shift+pageup",
         action: TermAction::ScrollPageUp,
     },
     PaletteItem {
         name: "Scroll Page Down",
-        chord: "shift+pagedown",
         action: TermAction::ScrollPageDown,
     },
     PaletteItem {
         name: "Scroll Line Up",
-        chord: "shift+up",
         action: TermAction::ScrollPageLines(-1),
     },
     PaletteItem {
         name: "Scroll Line Down",
-        chord: "shift+down",
         action: TermAction::ScrollPageLines(1),
     },
     PaletteItem {
         name: "Move Tab Left",
-        chord: "ctrl+shift+pageup",
         action: TermAction::MoveTab(-1),
     },
     PaletteItem {
         name: "Move Tab Right",
-        chord: "ctrl+shift+pagedown",
         action: TermAction::MoveTab(1),
     },
     PaletteItem {
         name: "Focus Pane Left",
-        chord: "ctrl+shift+alt+left",
         action: TermAction::FocusPaneDir {
             horizontal: true,
             forward: false,
@@ -4592,7 +4552,6 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     },
     PaletteItem {
         name: "Focus Pane Right",
-        chord: "ctrl+shift+alt+right",
         action: TermAction::FocusPaneDir {
             horizontal: true,
             forward: true,
@@ -4600,7 +4559,6 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     },
     PaletteItem {
         name: "Focus Pane Up",
-        chord: "ctrl+shift+alt+up",
         action: TermAction::FocusPaneDir {
             horizontal: false,
             forward: false,
@@ -4608,7 +4566,6 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     },
     PaletteItem {
         name: "Focus Pane Down",
-        chord: "ctrl+shift+alt+down",
         action: TermAction::FocusPaneDir {
             horizontal: false,
             forward: true,
@@ -4616,82 +4573,66 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
     },
     PaletteItem {
         name: "URL Hints (open link by number)",
-        chord: "ctrl+shift+u",
         action: TermAction::UrlHints,
     },
     PaletteItem {
         name: "Copy Last Command Output",
-        chord: "ctrl+shift+o",
         action: TermAction::CopyLastOutput,
     },
     PaletteItem {
         name: "Next Tab",
-        chord: "ctrl+tab",
         action: TermAction::NextTab,
     },
     PaletteItem {
         name: "Previous Tab",
-        chord: "ctrl+shift+tab",
         action: TermAction::PrevTab,
     },
     PaletteItem {
         name: "Last Tab (previously selected)",
-        chord: "",
         action: TermAction::LastTab,
     },
     PaletteItem {
         name: "Close Window (all tabs)",
-        chord: "",
         action: TermAction::CloseWindow,
     },
     PaletteItem {
         name: "Close All Tabs",
-        chord: "",
         action: TermAction::CloseAllTabs,
     },
     PaletteItem {
         name: "Close Other Tabs",
-        chord: "",
         action: TermAction::CloseOtherTabs,
     },
     PaletteItem {
         name: "Toggle Tab Bar",
-        chord: "",
         action: TermAction::ToggleTabBar,
     },
     PaletteItem {
         name: "Start Selection (keyboard select)",
-        chord: "",
         action: TermAction::StartSelection,
     },
     PaletteItem {
         name: "Toggle Fullscreen",
-        chord: "f11",
         action: TermAction::Fullscreen,
     },
     PaletteItem {
         name: "Undo Close Tab",
-        chord: "ctrl+shift+z",
         action: TermAction::Undo,
     },
     PaletteItem {
         name: "Toggle Mark",
-        chord: "",
         action: TermAction::ToggleMark,
     },
     PaletteItem {
         name: "Jump to Mark: Previous",
-        chord: "",
         action: TermAction::JumpToMark(-1),
     },
     PaletteItem {
         name: "Jump to Mark: Next",
-        chord: "",
         action: TermAction::JumpToMark(1),
     },
     PaletteItem {
         name: "Quit",
-        chord: "",
         action: TermAction::Quit,
     },
 ];
@@ -4728,17 +4669,22 @@ pub struct PaletteRow {
     pub action: TermAction,
 }
 
+fn builtin_palette_row(item: &PaletteItem) -> PaletteRow {
+    PaletteRow {
+        name: Str::from(item.name),
+        hint: Str::from(
+            crate::keys::default_action_shortcut(&item.action)
+                .map(|shortcut| shortcut.to_string())
+                .unwrap_or_default(),
+        ),
+        action: item.action.clone(),
+    }
+}
+
 /// Built-in `PALETTE_ITEMS` plus the config's `command-palette-entry`
 /// rows (Ghostty: custom rows sort after the built-ins).
 pub fn palette_rows(state: &AppState) -> Vec<PaletteRow> {
-    let mut rows: Vec<PaletteRow> = PALETTE_ITEMS
-        .iter()
-        .map(|item| PaletteRow {
-            name: Str::from(item.name),
-            hint: Str::from(item.chord),
-            action: item.action.clone(),
-        })
-        .collect();
+    let mut rows: Vec<PaletteRow> = PALETTE_ITEMS.iter().map(builtin_palette_row).collect();
     for entry in state.config(|c| c.palette_entries.clone()) {
         let lower = entry.action.to_ascii_lowercase();
         if let Some(action) = crate::config::action_from_str(&lower, &entry.action) {
@@ -5128,9 +5074,11 @@ fn menu_shortcut(state: &AppState, action: &TermAction) -> Option<Shortcut> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Instance, PaneTab, SplitDir, SplitNode, WindowState, WindowStyle, auto_split_dir,
-        binding, quit_delay_expired, shortcut_key,
+        AppState, Instance, PALETTE_ITEMS, PaneTab, SplitDir, SplitNode, WindowState, WindowStyle,
+        auto_split_dir, binding, builtin_palette_row, quit_delay_expired, shortcut_key,
     };
+    use crate::keys::{TermAction, action_chord, default_action_shortcut, tab_chord};
+    use keyboard_types::{Code, Modifiers};
     use waterui::Str;
     use waterui::background::Material;
     use waterui::component::{NamedKey, ShortcutKey};
@@ -5148,6 +5096,71 @@ mod tests {
         assert_eq!(shortcut_key("f12"), Some(ShortcutKey::from(NamedKey::F12)));
         assert_eq!(shortcut_key("catch_all"), None);
     }
+
+    #[test]
+    fn builtin_palette_hints_round_trip_shared_bindings() {
+        for item in PALETTE_ITEMS {
+            let row = builtin_palette_row(item);
+            let shortcut = default_action_shortcut(&item.action);
+            assert_eq!(
+                row.hint.to_string(),
+                shortcut
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                "{} hint diverged from its default shortcut",
+                item.name
+            );
+            if let Some(shortcut) = shortcut {
+                let mut mods = Modifiers::empty();
+                if shortcut.modifiers.control() {
+                    mods |= Modifiers::CONTROL;
+                }
+                if shortcut.modifiers.option() {
+                    mods |= Modifiers::ALT;
+                }
+                if shortcut.modifiers.shift() {
+                    mods |= Modifiers::SHIFT;
+                }
+                if shortcut.modifiers.command() {
+                    mods |= Modifiers::META;
+                }
+                let key = shortcut.key.to_key();
+                let actual =
+                    action_chord(&key, mods).or_else(|| tab_chord(&key, Code::Unidentified, mods));
+                assert_eq!(
+                    actual,
+                    Some(item.action.clone()),
+                    "{} shortcut did not round-trip",
+                    item.name
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_palette_rows_display_canonical_shortcuts() {
+        let new_tab = PALETTE_ITEMS
+            .iter()
+            .find(|item| item.action == TermAction::NewTab)
+            .expect("New Tab palette row exists");
+        assert_eq!(
+            builtin_palette_row(new_tab).hint.to_string(),
+            "Ctrl+Shift+T"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_palette_rows_display_canonical_shortcuts() {
+        let new_tab = PALETTE_ITEMS
+            .iter()
+            .find(|item| item.action == TermAction::NewTab)
+            .expect("New Tab palette row exists");
+        assert_eq!(builtin_palette_row(new_tab).hint.to_string(), "⌘T");
+    }
+
     use waterui::reactive::collection::Collection;
     use waterui::{Binding, Signal};
 
