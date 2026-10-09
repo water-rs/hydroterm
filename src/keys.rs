@@ -896,6 +896,8 @@ pub enum TermAction {
     /// Ghostty `toggle_window_float_on_top` — always-on-top
     /// stacking level.
     ToggleWindowFloatOnTop,
+    /// Show or hide decorations on the current window.
+    ToggleWindowDecorations,
     /// Reset every split in the tab to equal shares
     /// (Ghostty `equalize_splits`, tmux `select-layout -E`).
     EqualizeSplits,
