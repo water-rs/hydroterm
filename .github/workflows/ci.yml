@@ -57,7 +57,7 @@ jobs:
         # release tarballs instead of compiling from source.
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-dylint@6.0.4,dylint-link@6.0.4
+          tool: cargo-dylint@6.3.2,dylint-link@6.3.2
 
       - name: Dylint
         run: cargo dylint --all
